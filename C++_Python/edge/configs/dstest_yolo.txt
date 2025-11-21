@@ -1,0 +1,44 @@
+# DeepStream Primary Inference Config for YOLO11
+# Primary GIE (PGIE) - Vehicle Detection
+
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+model-color-format=0
+
+# Model files
+model-engine-file=../models/yolo11n.engine
+labelfile-path=../models/coco_labels.txt
+int8-calib-file=../models/cal_trt.bin
+
+# Inference config
+batch-size=1
+network-mode=2
+num-detected-classes=80
+interval=0
+gie-unique-id=1
+process-mode=1
+network-type=0
+cluster-mode=2
+maintain-aspect-ratio=1
+parse-bbox-func-name=NvDsInferParseYolo
+custom-lib-path=/opt/nvidia/deepstream/deepstream/lib/libnvdsinfer_custom_impl_Yolo.so
+
+[class-attrs-all]
+nms-iou-threshold=0.45
+pre-cluster-threshold=0.25
+topk=300
+
+# Only detect vehicles (car, motorcycle, bus, truck)
+# COCO classes: 2=car, 3=motorcycle, 5=bus, 7=truck
+[class-attrs-2]
+pre-cluster-threshold=0.4
+
+[class-attrs-3]
+pre-cluster-threshold=0.4
+
+[class-attrs-5]
+pre-cluster-threshold=0.4
+
+[class-attrs-7]
+pre-cluster-threshold=0.4

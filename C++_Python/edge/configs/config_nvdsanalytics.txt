@@ -1,0 +1,23 @@
+# NvDsAnalytics Configuration
+# ROI and line crossing analytics
+
+[property]
+enable=1
+config-width=1280
+config-height=720
+
+[roi-filtering-stream-0]
+enable=1
+roi-RF=295;643;579;634;642;913;56;828
+
+[overcrowding-stream-0]
+enable=0
+
+[line-crossing-stream-0]
+enable=1
+line-crossing-Entry=789;72;1106;900
+line-crossing-Exit=1106;900;789;72
+class-id=2;3;5;7
+
+[direction-detection-stream-0]
+enable=0

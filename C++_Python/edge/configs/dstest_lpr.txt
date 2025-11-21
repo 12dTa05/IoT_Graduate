@@ -1,0 +1,34 @@
+# DeepStream Secondary Inference Config for LPRNet
+# Secondary GIE (SGIE) - License Plate Recognition
+
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+model-color-format=0
+
+# Model files
+model-engine-file=../models/lprnet.engine
+labelfile-path=../models/lpr_labels.txt
+
+# Inference config
+batch-size=16
+network-mode=2
+process-mode=2
+model-color-format=0
+gie-unique-id=2
+operate-on-gie-id=1
+operate-on-class-ids=2;3;5;7
+
+# LPRNet specific
+network-input-order=0
+network-type=100
+interval=0
+infer-dims=3;24;94
+maintain-aspect-ratio=0
+symmetric-padding=0
+
+# Output
+output-blob-names=output
+
+[class-attrs-all]
+threshold=0.5
