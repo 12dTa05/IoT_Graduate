@@ -1,167 +1,230 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react';
+import './VideoPlayer.css';
 
-/**
- * VideoPlayer Component
- * Displays video stream with bounding box overlays
- * Shows speed and license plate at top-right corner of each bbox
- */
-export default function VideoPlayer({ edgeId, apiUrl }) {
-    const videoRef = useRef(null)
-    const canvasRef = useRef(null)
-    const wsRef = useRef(null)
-    const [metadata, setMetadata] = useState([])
-    const [connected, setConnected] = useState(false)
+const VideoPlayer = () => {
+    const videoRef = useRef(null);
+    const canvasRef = useRef(null);
+    const [objects, setObjects] = useState([]);
+    const [isConnected, setIsConnected] = useState(false);
+
+    // WebRTC connection
+    const peerConnectionRef = useRef(null);
+    const signalingWsRef = useRef(null);
+
+    // Metadata WebSocket
+    const metadataWsRef = useRef(null);
 
     useEffect(() => {
-        // WebSocket for metadata (bboxes, speed, plates)
-        const wsUrl = apiUrl.replace('http', 'ws') + '/ws/metadata'
-        wsRef.current = new WebSocket(wsUrl)
-
-        wsRef.current.onopen = () => {
-            console.log('WebSocket connected')
-            setConnected(true)
-        }
-
-        wsRef.current.onmessage = (event) => {
-            const data = JSON.parse(event.data)
-            setMetadata(data)
-        }
-
-        wsRef.current.onerror = (error) => {
-            console.error('WebSocket error:', error)
-            setConnected(false)
-        }
-
-        wsRef.current.onclose = () => {
-            console.log('WebSocket closed')
-            setConnected(false)
-        }
-
-        // TODO: Setup WebRTC for video stream
-        // For now, use placeholder video
-        setupPlaceholderVideo()
+        setupWebRTC();
+        setupMetadataWebSocket();
 
         return () => {
-            wsRef.current?.close()
-        }
-    }, [apiUrl])
+            cleanup();
+        };
+    }, []);
 
-    const setupPlaceholderVideo = () => {
-        // Placeholder: In production, setup WebRTC connection here
-        // For now, just set canvas size
-        if (canvasRef.current) {
-            canvasRef.current.width = 1280
-            canvasRef.current.height = 720
-        }
-    }
+    const setupWebRTC = async () => {
+        // Create peer connection
+        const configuration = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ]
+        };
 
+        const pc = new RTCPeerConnection(configuration);
+        peerConnectionRef.current = pc;
+
+        // Handle incoming track
+        pc.ontrack = (event) => {
+            console.log('Received remote track');
+            if (videoRef.current) {
+                videoRef.current.srcObject = event.streams[0];
+            }
+        };
+
+        // Handle ICE candidates
+        pc.onicecandidate = (event) => {
+            if (event.candidate && signalingWsRef.current) {
+                signalingWsRef.current.send(JSON.stringify({
+                    type: 'ice-candidate',
+                    candidate: event.candidate.candidate,
+                    sdpMLineIndex: event.candidate.sdpMLineIndex
+                }));
+            }
+        };
+
+        // Connection state
+        pc.onconnectionstatechange = () => {
+            console.log('Connection state:', pc.connectionState);
+            setIsConnected(pc.connectionState === 'connected');
+        };
+
+        // Connect to signaling server
+        const signalingWs = new WebSocket('ws://localhost:8000/ws/signaling');
+        signalingWsRef.current = signalingWs;
+
+        signalingWs.onopen = () => {
+            console.log('Signaling WebSocket connected');
+        };
+
+        signalingWs.onmessage = async (event) => {
+            const message = JSON.parse(event.data);
+
+            if (message.type === 'offer') {
+                console.log('Received offer');
+
+                // Set remote description
+                await pc.setRemoteDescription({
+                    type: 'offer',
+                    sdp: message.sdp
+                });
+
+                // Create answer
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+
+                // Send answer
+                signalingWs.send(JSON.stringify({
+                    type: 'answer',
+                    sdp: answer.sdp
+                }));
+            } else if (message.type === 'ice-candidate') {
+                console.log('Received ICE candidate');
+
+                await pc.addIceCandidate({
+                    candidate: message.candidate,
+                    sdpMLineIndex: message.sdpMLineIndex
+                });
+            }
+        };
+
+        signalingWs.onerror = (error) => {
+            console.error('Signaling WebSocket error:', error);
+        };
+
+        signalingWs.onclose = () => {
+            console.log('Signaling WebSocket closed');
+            setIsConnected(false);
+        };
+    };
+
+    const setupMetadataWebSocket = () => {
+        const ws = new WebSocket('ws://localhost:8000/ws/metadata');
+        metadataWsRef.current = ws;
+
+        ws.onopen = () => {
+            console.log('Metadata WebSocket connected');
+        };
+
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            setObjects(data);
+        };
+
+        ws.onerror = (error) => {
+            console.error('Metadata WebSocket error:', error);
+        };
+
+        ws.onclose = () => {
+            console.log('Metadata WebSocket closed');
+            // Reconnect after 3 seconds
+            setTimeout(setupMetadataWebSocket, 3000);
+        };
+    };
+
+    const cleanup = () => {
+        if (peerConnectionRef.current) {
+            peerConnectionRef.current.close();
+        }
+        if (signalingWsRef.current) {
+            signalingWsRef.current.close();
+        }
+        if (metadataWsRef.current) {
+            metadataWsRef.current.close();
+        }
+    };
+
+    // Draw bounding boxes on canvas
     useEffect(() => {
-        // Draw bounding boxes on canvas
-        const canvas = canvasRef.current
-        if (!canvas) return
+        const canvas = canvasRef.current;
+        const video = videoRef.current;
 
-        const ctx = canvas.getContext('2d')
-        const draw = () => {
+        if (!canvas || !video) return;
+
+        const ctx = canvas.getContext('2d');
+
+        const drawBoxes = () => {
+            // Match canvas size to video
+            canvas.width = video.videoWidth || 1280;
+            canvas.height = video.videoHeight || 720;
+
             // Clear canvas
-            ctx.clearRect(0, 0, canvas.width, canvas.height)
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
 
             // Draw each object
-            metadata.forEach(obj => {
-                const { x, y, width, height, speed, plate, track_id } = obj
+            objects.forEach(obj => {
+                const { x, y, width, height, speed, plate, track_id } = obj;
 
-                // Determine color based on speed
-                const isOverspeed = speed > 60
-                const color = isOverspeed ? '#ff3333' : '#33ff33'
+                // Color based on speed
+                const isOverspeed = speed > 60;
+                const color = isOverspeed ? '#ff4444' : '#44ff44';
 
                 // Draw bounding box
-                ctx.strokeStyle = color
-                ctx.lineWidth = 3
-                ctx.strokeRect(x, y, width, height)
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 3;
+                ctx.strokeRect(x, y, width, height);
 
-                // Draw label background (top-right corner)
-                const labelX = x + width - 120
-                const labelY = y - 50
-                ctx.fillStyle = 'rgba(0, 0, 0, 0.7)'
-                ctx.fillRect(labelX, labelY, 115, 45)
+                // Draw track ID (top-left)
+                ctx.fillStyle = color;
+                ctx.font = 'bold 16px Arial';
+                ctx.fillText(`ID: ${track_id}`, x + 5, y + 20);
 
-                // Draw speed text
-                ctx.fillStyle = color
-                ctx.font = 'bold 16px Inter'
-                ctx.fillText(`${speed} km/h`, labelX + 5, labelY + 20)
+                // Draw speed and plate (top-right)
+                if (speed || plate) {
+                    const text = `${speed ? speed.toFixed(0) + ' km/h' : ''} ${plate || ''}`.trim();
+                    const textWidth = ctx.measureText(text).width;
 
-                // Draw license plate
-                ctx.fillStyle = '#ffffff'
-                ctx.font = '14px Inter'
-                ctx.fillText(plate || 'N/A', labelX + 5, labelY + 38)
+                    // Background
+                    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                    ctx.fillRect(x + width - textWidth - 10, y, textWidth + 10, 25);
 
-                // Draw track ID on top-left of bbox
-                ctx.fillStyle = color
-                ctx.font = 'bold 14px Inter'
-                ctx.fillText(`#${track_id}`, x + 5, y + 20)
-            })
+                    // Text
+                    ctx.fillStyle = color;
+                    ctx.fillText(text, x + width - textWidth - 5, y + 18);
+                }
+            });
 
-            requestAnimationFrame(draw)
-        }
+            requestAnimationFrame(drawBoxes);
+        };
 
-        draw()
-    }, [metadata])
+        drawBoxes();
+    }, [objects]);
 
     return (
-        <div style={{ width: '100%', height: '100%', position: 'relative' }}>
-            {/* Video element (placeholder for now) */}
-            <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                style={{
-                    width: '100%',
-                    height: '100%',
-                    objectFit: 'contain',
-                    background: '#000'
-                }}
-            />
-
-            {/* Canvas overlay for bounding boxes */}
-            <canvas
-                ref={canvasRef}
-                style={{
-                    position: 'absolute',
-                    top: '50%',
-                    left: '50%',
-                    transform: 'translate(-50%, -50%)',
-                    maxWidth: '100%',
-                    maxHeight: '100%',
-                    pointerEvents: 'none'
-                }}
-            />
-
-            {/* Connection status */}
-            <div style={{
-                position: 'absolute',
-                top: 10,
-                left: 10,
-                background: connected ? 'rgba(0, 255, 0, 0.2)' : 'rgba(255, 0, 0, 0.2)',
-                padding: '5px 10px',
-                borderRadius: '5px',
-                fontSize: '12px',
-                border: `1px solid ${connected ? '#0f0' : '#f00'}`
-            }}>
-                {connected ? '● Connected' : '○ Disconnected'}
+        <div className="video-player">
+            <div className="video-container">
+                <video
+                    ref={videoRef}
+                    autoPlay
+                    playsInline
+                    muted
+                    className="video-stream"
+                />
+                <canvas
+                    ref={canvasRef}
+                    className="overlay-canvas"
+                />
+                <div className={`connection-status ${isConnected ? 'connected' : 'disconnected'}`}>
+                    {isConnected ? '● Live' : '○ Connecting...'}
+                </div>
             </div>
-
-            {/* Object count */}
-            <div style={{
-                position: 'absolute',
-                top: 10,
-                right: 10,
-                background: 'rgba(0, 0, 0, 0.7)',
-                padding: '5px 10px',
-                borderRadius: '5px',
-                fontSize: '12px'
-            }}>
-                Objects: {metadata.length}
+            <div className="stats">
+                <span>Objects: {objects.length}</span>
+                <span>FPS: {objects.length > 0 ? '30' : '0'}</span>
             </div>
         </div>
-    )
-}
+    );
+};
+
+export default VideoPlayer;

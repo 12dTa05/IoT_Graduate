@@ -176,6 +176,7 @@ npm run dev
 - ✅ Bounding boxes with speed & license plate
 - ✅ System metrics display
 - ✅ WebSocket real-time updates
+- ✅ Shared memory for zero-copy metadata
 
 ### Center Dashboard Features
 
@@ -184,6 +185,36 @@ npm run dev
 - ✅ Load balancing panel
 - ✅ Active offload monitoring
 - ✅ Manual offload controls
+
+## Advanced Features
+
+### Zenoh P2P Offloading
+
+See [ZENOH_SETUP.md](ZENOH_SETUP.md) for detailed setup guide.
+
+- Edge-to-edge inference offloading
+- Intelligent load balancing
+- Frame compression for efficient transmission
+- Automatic fallback to local processing
+
+### WebRTC Video Streaming
+
+See [WEBRTC_SETUP.md](WEBRTC_SETUP.md) for detailed setup guide.
+
+- Real-time video streaming (50-100ms latency)
+- Hardware-accelerated H.264 encoding
+- Browser-native WebRTC playback
+- SDP signaling via WebSocket
+
+### Performance Optimization
+
+See [OPTIMIZATION.md](OPTIMIZATION.md) for comprehensive optimization guide.
+
+- Jetson performance tuning
+- DeepStream optimization
+- Network optimization
+- Python/ReactJS optimization
+- Monitoring and profiling
 
 ## TODO
 

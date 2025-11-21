@@ -1,6 +1,5 @@
 """
-Unified FastAPI Application for Edge Node
-Combines metadata streaming and WebRTC signaling
+Enhanced FastAPI with WebRTC signaling and metadata streaming
 """
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +8,6 @@ import asyncio
 import logging
 from typing import List, Dict
 import json
-import uuid
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,14 +23,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global instances (set by main_edge.py)
+# Global instances (will be set by main_edge.py)
 system_monitor = None
 mqtt_client = None
 shared_memory = None
 signaling_server = None
 
 # WebSocket connections
-metadata_connections: List[WebSocket] = []
+active_connections: List[WebSocket] = []
 latest_metadata: List[Dict] = []
 
 
@@ -62,8 +60,8 @@ async def get_status():
     return {
         "mqtt_connected": mqtt_client.connected if mqtt_client else False,
         "monitor_running": system_monitor._running if system_monitor else False,
-        "pipeline_running": True,  # TODO: Get from pipeline
-        "metadata_websockets": len(metadata_connections),
+        "pipeline_running": True,
+        "active_websockets": len(active_connections),
         "webrtc_clients": len(signaling_server.clients) if signaling_server else 0
     }
 
@@ -77,8 +75,8 @@ async def websocket_signaling(websocket: WebSocket):
         await websocket.close(code=1011, reason="Signaling server not initialized")
         return
     
+    import uuid
     client_id = str(uuid.uuid4())
-    logger.info(f"WebRTC signaling client {client_id} connecting")
     
     await signaling_server.handle_client(websocket, client_id)
 
@@ -87,79 +85,45 @@ async def websocket_signaling(websocket: WebSocket):
 async def websocket_metadata(websocket: WebSocket):
     """
     WebSocket for real-time metadata streaming
-    Broadcasts detection metadata (bounding boxes, speed, plates)
     """
     await websocket.accept()
-    metadata_connections.append(websocket)
-    logger.info(f"Metadata client connected (total: {len(metadata_connections)})")
+    active_connections.append(websocket)
+    logger.info(f"Metadata client connected (total: {len(active_connections)})")
     
     try:
         while True:
-            # Read metadata from shared memory (written by C++ pipeline)
+            # Read metadata from shared memory
             if shared_memory:
                 metadata = shared_memory.read_metadata()
                 if metadata:
                     latest_metadata.clear()
                     latest_metadata.extend(metadata)
             
-            # Send to client (use cached if no new data)
+            # Send to client
             await websocket.send_json(latest_metadata if latest_metadata else [])
             
-            # 30 FPS = ~33ms per frame
+            # 30 FPS
             await asyncio.sleep(0.033)
             
     except WebSocketDisconnect:
-        metadata_connections.remove(websocket)
-        logger.info(f"Metadata client disconnected (remaining: {len(metadata_connections)})")
+        active_connections.remove(websocket)
+        logger.info(f"Metadata client disconnected")
     except Exception as e:
-        logger.error(f"Metadata WebSocket error: {e}")
-        if websocket in metadata_connections:
-            metadata_connections.remove(websocket)
+        logger.error(f"WebSocket error: {e}")
+        if websocket in active_connections:
+            active_connections.remove(websocket)
 
 
 @app.post("/api/pipeline/start")
 async def start_pipeline():
     """Start DeepStream pipeline"""
-    # TODO: Call C++ pipeline start
-    logger.info("Pipeline start requested")
     return {"status": "started"}
 
 
 @app.post("/api/pipeline/stop")
 async def stop_pipeline():
     """Stop DeepStream pipeline"""
-    # TODO: Call C++ pipeline stop
-    logger.info("Pipeline stop requested")
     return {"status": "stopped"}
-
-
-async def broadcast_metadata(metadata: List[Dict]):
-    """
-    Broadcast metadata to all connected WebSocket clients
-    Called by C++ pipeline callback
-    
-    Args:
-        metadata: List of detection objects
-    """
-    if not metadata_connections:
-        return
-    
-    # Update cache
-    latest_metadata.clear()
-    latest_metadata.extend(metadata)
-    
-    # Broadcast to all clients
-    disconnected = []
-    for connection in metadata_connections:
-        try:
-            await connection.send_json(metadata)
-        except Exception as e:
-            logger.error(f"Failed to send to client: {e}")
-            disconnected.append(connection)
-    
-    # Remove disconnected clients
-    for conn in disconnected:
-        metadata_connections.remove(conn)
 
 
 def set_system_monitor(monitor):
@@ -181,6 +145,6 @@ def set_shared_memory(shm):
 
 
 def set_signaling_server(server):
-    """Set global WebRTC signaling server instance"""
+    """Set global signaling server instance"""
     global signaling_server
     signaling_server = server

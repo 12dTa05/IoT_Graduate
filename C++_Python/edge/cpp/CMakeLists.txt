@@ -32,30 +32,4 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 # Source files
 set(SOURCES
     deepstream/ds_pipeline.cpp
-    deepstream/ds_probes.cpp
-    deepstream/python_api.cpp
-    zenoh/zenoh_client.cpp
-    zenoh/frame_serializer.cpp
-)
-
-# Create shared library for Python binding
-add_library(deepstream_wrapper SHARED ${SOURCES})
-
-target_link_libraries(deepstream_wrapper
-    ${CUDA_LIBRARIES}
-    ${GSTREAMER_LIBRARIES}
-    ${OpenCV_LIBS}
-    nvdsgst_meta
-    nvds_meta
-    nvdsgst_helper
-    nvdsgst_smartrecord
-    nvds_utils
-    nvds_msgbroker
-    nvdsinfer
-    # zenohc::lib  # If using Zenoh
-)
-
-# Python bindings (pybind11)
-# find_package(pybind11 REQUIRED)
-# pybind11_add_module(deepstream_py deepstream_wrapper.cpp)
 # target_link_libraries(deepstream_py PRIVATE deepstream_wrapper)
