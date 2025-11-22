@@ -85,6 +85,16 @@ torch.onnx.export(
         'output': {0: 'batch_size'}
     }
 )
+
+#Simplifier
+model_onnx = onnx.load("lprnet.onnx")
+model_simp, check = simplify(model_onnx)
+
+if check:
+    onnx.save(model_simp, "lprnet_simplified.onnx")
+    print("Simplified model saved as lprnet_simplified.onnx")
+else:
+    print("Failed to simplify model")
 ```
 
 ### Bước 3: Convert ONNX → TensorRT

@@ -38,7 +38,7 @@ RUN mkdir -p build && cd build && \
 
 # Copy sample video for testing (if available)
 # You can mount your own video at runtime
-RUN mkdir -p /app/videos
+# RUN mkdir -p /app/videos
 
 # Set environment variables
 ENV PYTHONPATH=/app/edge:$PYTHONPATH

@@ -30,6 +30,5 @@ link_directories(${DEEPSTREAM_DIR}/lib)
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
 # Source files
-set(SOURCES
-    deepstream/ds_pipeline.cpp
+set (SOURCES "deepstream/ds_pipeline.cpp")
 # target_link_libraries(deepstream_py PRIVATE deepstream_wrapper)

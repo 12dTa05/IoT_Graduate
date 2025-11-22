@@ -1,0 +1,104 @@
+// FlatBuffers Schema for Detection Metadata
+// Optimized for zero-copy, high-performance serialization
+
+namespace metadata;
+
+// Bounding box coordinates
+struct BoundingBox {
+  x: float;
+  y: float;
+  width: float;
+  height: float;
+}
+
+// Single detected object
+table DetectionObject {
+  // Tracking
+  track_id: uint32;
+  
+  // Bounding box
+  bbox: BoundingBox;
+  
+  // Classification
+  class_id: int;
+  class_name: string;
+  confidence: float;
+  
+  // Speed calculation
+  speed: float = 0.0;
+  speed_unit: string = "km/h";
+  
+  // License plate recognition
+  plate: string;
+  plate_confidence: float = 0.0;
+  
+  // Timestamps
+  timestamp: double;
+  first_seen: double = 0.0;
+  last_seen: double = 0.0;
+  
+  // Additional metadata
+  is_overspeed: bool = false;
+  direction: string;
+}
+
+// Frame-level metadata
+table FrameMetadata {
+  // Frame info
+  frame_number: uint32;
+  timestamp: double;
+  
+  // Detections
+  objects: [DetectionObject];
+  object_count: uint32;
+  
+  // Performance metrics
+  fps: float;
+  inference_time_ms: float;
+  tracking_time_ms: float;
+  total_time_ms: float;
+  
+  // Source info
+  source_id: string;
+  resolution_width: uint32;
+  resolution_height: uint32;
+}
+
+// Batch of frames (for buffering)
+table FrameBatch {
+  frames: [FrameMetadata];
+  batch_id: uint32;
+  edge_id: string;
+}
+
+// Alert message
+table Alert {
+  alert_id: string;
+  alert_type: string;  // "overspeed", "wrong_direction", etc.
+  severity: int;       // 1=low, 2=medium, 3=high
+  
+  object: DetectionObject;
+  
+  timestamp: double;
+  edge_id: string;
+  
+  message: string;
+  metadata: string;    // JSON for additional data
+}
+
+// System metrics
+table SystemMetrics {
+  edge_id: string;
+  timestamp: double;
+  
+  cpu_usage: float;
+  gpu_usage: float;
+  memory_usage: float;
+  temperature: float;
+  power_usage: float;
+  
+  pipeline_fps: float;
+  dropped_frames: uint32;
+}
+
+root_type FrameMetadata;
