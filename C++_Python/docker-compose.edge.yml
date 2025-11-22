@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  edge-standalone:
+    build:
+      context: .
+      dockerfile: edge/Dockerfile
+    runtime: nvidia
+    container_name: edge-node-test
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount video directory
+      - ./videos:/app/videos
+      # Mount models directory
+      - ./edge/models:/app/edge/models
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    command: >
+      python3 main_edge_standalone.py
+      --source file:///app/videos/sample.mp4
+      --port 8000
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+  # Optional: Frontend dashboard
+  edge-dashboard:
+    build:
+      context: edge/frontend
+      dockerfile: Dockerfile.frontend
+    container_name: edge-dashboard
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - edge-standalone
