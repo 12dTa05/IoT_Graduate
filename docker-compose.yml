@@ -5,65 +5,30 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: traffic-monitor:latest
+    image: iot-traffic-monitor:latest
     container_name: traffic-monitor
-    
-    # Use host network for display
-    network_mode: host
-    
-    # NVIDIA GPU runtime
     runtime: nvidia
-    
-    # Environment variables
     environment:
-      - DISPLAY=${DISPLAY:-:0}
-      - VIDEO_FILE=${VIDEO_FILE:-/app/test_videos/test.mp4}
-      - CUDA_VISIBLE_DEVICES=0
-      - LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1
-      - QT_X11_NO_MITSHM=1
-      - XAUTHORITY=/tmp/.docker.xauth
-    
-    # Volume mounts
+      # Video processing settings
+      - VIDEO_FILE=/app/videos/input.mp4
+      - OUTPUT_FILE=/app/output/output.mp4
+      - HOMO_YML=/app/configs/points_source_target.yml
+      - SPEED_LIMIT=60
+      # DeepStream settings
+      - GST_DEBUG=2
+      - CUDA_VER=11.4
     volumes:
-      # Configuration files
-      - ./configs:/app/configs:ro
-      
-      # Model files (YOLO engines)
-      - ./DeepStream-YoLo:/app/DeepStream-YoLo:ro
-      
-      # Logs and outputs (persistent)
-      - ./logs:/app/logs
+      # Mount your video file here
+      - ./videos:/app/videos
+      # Output directory
       - ./output:/app/output
-      
-      # Video files for testing
-      - ./test_videos:/app/test_videos:ro
-      
-      # X11 socket for display
-      - /tmp/.X11-unix:/tmp/.X11-unix:rw
-      - /tmp/.docker.xauth:/tmp/.docker.xauth:rw
-    
-    # Devices
+      # Logs and snapshots
+      - ./logs:/app/logs
+      # Configuration files (optional, if you want to modify)
+      - ./configs:/app/configs
+      # YOLO model files
+      - ./DeepStream-YoLo:/app/DeepStream-YoLo
     devices:
-      - /dev/video0:/dev/video0  # USB camera (if needed)
-    
-    # Restart policy
+      - /dev/video0:/dev/video0  # Optional: if you need camera access
+    network_mode: host
     restart: unless-stopped
-    
-    # Resource limits (optional)
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
-    
-    # Logging
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    
-    # Command - process MP4 file and display on screen
-    command: python3 run_file.py ${VIDEO_FILE}

@@ -1,267 +1,238 @@
-# 🐳 Docker Quick Start - File Display Mode
+# Docker Deployment Guide - IoT Traffic Monitoring System
 
-Hướng dẫn nhanh để chạy Traffic Monitoring với **file MP4** và hiển thị kết quả trên màn hình host.
+Hướng dẫn triển khai hệ thống giám sát tốc độ xe sử dụng Docker với NVIDIA DeepStream L4T 6.4 Triton.
 
----
+## Yêu cầu hệ thống
 
-## 📋 Yêu Cầu
+### Phần cứng
+- **NVIDIA Jetson AGX Orin** (hoặc Jetson Xavier/Orin NX)
+- Tối thiểu 8GB RAM
+- 20GB dung lượng trống
 
-- **NVIDIA Jetson AGX Orin** với JetPack 5.x/6.x
-- **Docker** và **NVIDIA Container Runtime** đã cài đặt
-- **X Server** đang chạy (để hiển thị output)
+### Phần mềm
+- **JetPack 5.1+** đã cài đặt
+- **Docker** và **NVIDIA Container Runtime**
+- **Docker Compose** (tùy chọn nhưng khuyến nghị)
 
----
+## Cài đặt Docker trên Jetson
 
-## 🚀 Quick Start (3 bước)
-
-### Bước 1: Chuẩn bị video file
+Nếu chưa cài Docker, chạy lệnh sau:
 
 ```bash
-# Tạo thư mục test_videos
-mkdir -p test_videos
+# Cài đặt Docker
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+sudo usermod -aG docker $USER
 
-# Copy video file của bạn vào
-cp /path/to/your/video.mp4 test_videos/test.mp4
+# Cài đặt NVIDIA Container Runtime (thường đã có sẵn với JetPack)
+sudo apt-get install -y nvidia-container-runtime
+
+# Cài đặt Docker Compose
+sudo apt-get install -y docker-compose
 ```
 
-### Bước 2: Setup X11 permissions
-
+Khởi động lại để áp dụng quyền:
 ```bash
-# Cho phép Docker container truy cập X server
-xhost +local:docker
-
-# Tạo X authority file
-touch /tmp/.docker.xauth
-xauth nlist $DISPLAY | sed -e 's/^..../ffff/' | xauth -f /tmp/.docker.xauth nmerge -
+sudo reboot
 ```
 
-### Bước 3: Chạy với Docker Compose
+## Chuẩn bị YOLO Model
+
+Hệ thống cần file TensorRT engine cho YOLO11. Bạn có 2 lựa chọn:
+
+### Option 1: Sử dụng model có sẵn
+Nếu bạn đã có file `.engine`, copy vào thư mục:
+```bash
+cp your_model.engine DeepStream-YoLo/model_b1_gpu0_fp32.engine
+```
+
+### Option 2: Build model từ ONNX
+```bash
+cd DeepStream-YoLo
+
+# Download YOLO11 ONNX model (ví dụ: yolo11s)
+wget https://github.com/ultralytics/assets/releases/download/v0.0.0/yolo11s.onnx
+
+# Model sẽ được build tự động khi chạy lần đầu
+# Hoặc build thủ công bằng DeepStream tools
+```
+
+## Build Docker Image
 
 ```bash
-# Build và chạy
-docker-compose up --build
+cd /path/to/IoT_Graduate
 
-# Hoặc chạy ở background
-docker-compose up -d --build
+# Build image (mất khoảng 10-15 phút)
+docker build -t iot-traffic-monitor:latest .
+```
+
+## Chuẩn bị Video và Cấu hình
+
+### 1. Tạo thư mục videos
+```bash
+mkdir -p videos output logs
+```
+
+### 2. Copy video test vào thư mục
+```bash
+cp /path/to/your/video.mp4 videos/input.mp4
+```
+
+### 3. Cấu hình homography (tùy chọn)
+Nếu cần calibrate lại điểm homography cho camera của bạn, chỉnh sửa file:
+```bash
+configs/points_source_target.yml
+```
+
+## Chạy Container
+
+### Cách 1: Sử dụng Docker Compose (Khuyến nghị)
+
+```bash
+# Chạy container
+docker-compose up
+
+# Hoặc chạy ở chế độ background
+docker-compose up -d
 
 # Xem logs
 docker-compose logs -f
+
+# Dừng container
+docker-compose down
 ```
 
-**Kết quả**: Cửa sổ hiển thị video với bounding boxes và tốc độ sẽ xuất hiện trên màn hình!
-
----
-
-## 🎯 Chạy với video khác
-
-### Cách 1: Sửa file .env
+### Cách 2: Sử dụng Docker Run
 
 ```bash
-# Copy template
-cp .env.example .env
-
-# Edit .env
-nano .env
-```
-
-Thay đổi:
-```bash
-VIDEO_FILE=/app/test_videos/your_video.mp4
-```
-
-### Cách 2: Override environment variable
-
-```bash
-VIDEO_FILE=/app/test_videos/another_video.mp4 docker-compose up
-```
-
-### Cách 3: Chạy trực tiếp với docker run
-
-```bash
-docker run -it --rm \
-  --runtime nvidia \
-  --network host \
-  -e DISPLAY=$DISPLAY \
-  -e VIDEO_FILE=/app/test_videos/test.mp4 \
-  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-  -v /tmp/.docker.xauth:/tmp/.docker.xauth:rw \
-  -v $(pwd)/test_videos:/app/test_videos:ro \
-  -v $(pwd)/configs:/app/configs:ro \
-  -v $(pwd)/DeepStream-YoLo:/app/DeepStream-YoLo:ro \
+docker run --runtime nvidia \
+  -v $(pwd)/videos:/app/videos \
+  -v $(pwd)/output:/app/output \
   -v $(pwd)/logs:/app/logs \
-  traffic-monitor:latest
+  -v $(pwd)/DeepStream-YoLo:/app/DeepStream-YoLo \
+  -e VIDEO_FILE=/app/videos/input.mp4 \
+  -e OUTPUT_FILE=/app/output/output.mp4 \
+  -e SPEED_LIMIT=60 \
+  --name traffic-monitor \
+  iot-traffic-monitor:latest
 ```
 
----
+## Tùy chỉnh cấu hình
 
-## 📁 Cấu Trúc Thư Mục
+Chỉnh sửa file `docker-compose.yml` hoặc truyền biến môi trường:
+
+```yaml
+environment:
+  - VIDEO_FILE=/app/videos/input.mp4      # Video đầu vào
+  - OUTPUT_FILE=/app/output/output.mp4    # Video đầu ra
+  - SPEED_LIMIT=60                        # Giới hạn tốc độ (km/h)
+  - VIDEO_FPS=25                          # FPS của video
+  - MUX_WIDTH=1920                        # Độ phân giải xử lý
+  - MUX_HEIGHT=1080
+```
+
+## Kết quả
+
+Sau khi xử lý xong:
+
+- **Video đầu ra**: `output/output.mp4` - Video có overlay tốc độ và bounding boxes
+- **Logs**: `logs/speed_log.csv` - Log tốc độ các xe
+- **Snapshots**: `logs/overspeed_snaps/` - Ảnh chụp xe vi phạm tốc độ
+
+## Xử lý nhiều video
+
+Để xử lý nhiều video, tạo script:
+
+```bash
+#!/bin/bash
+for video in videos/*.mp4; do
+    filename=$(basename "$video" .mp4)
+    docker run --runtime nvidia \
+        -v $(pwd)/videos:/app/videos \
+        -v $(pwd)/output:/app/output \
+        -v $(pwd)/logs:/app/logs \
+        -v $(pwd)/DeepStream-YoLo:/app/DeepStream-YoLo \
+        -e VIDEO_FILE=/app/videos/$(basename "$video") \
+        -e OUTPUT_FILE=/app/output/${filename}_processed.mp4 \
+        iot-traffic-monitor:latest
+done
+```
+
+## Troubleshooting
+
+### Lỗi: "Failed to create nvinfer"
+- Kiểm tra file engine đã tồn tại: `DeepStream-YoLo/model_b1_gpu0_fp32.engine`
+- Kiểm tra đường dẫn trong `DeepStream-YoLo/config_infer_primary_yolo11.txt`
+
+### Lỗi: "Could not find library libnvds_nvmultiobjecttracker.so"
+- Đảm bảo đang dùng image DeepStream L4T đúng phiên bản
+- Kiểm tra runtime: `docker run --runtime nvidia ...`
+
+### Video đầu ra bị lag hoặc không mượt
+- Giảm resolution: `MUX_WIDTH=1280 MUX_HEIGHT=720`
+- Tăng bitrate encoder trong `speedflow/pipeline_file.py`
+
+### Tốc độ tính toán không chính xác
+- Calibrate lại homography points trong `configs/points_source_target.yml`
+- Kiểm tra FPS của video: `VIDEO_FPS=<your_fps>`
+
+### Không phát hiện được xe
+- Kiểm tra model YOLO có phù hợp không
+- Điều chỉnh threshold trong `DeepStream-YoLo/config_infer_primary_yolo11.txt`:
+  ```
+  pre-cluster-threshold=0.25  # Giảm xuống 0.2 nếu cần
+  ```
+
+## Performance Tips
+
+### Tối ưu cho Jetson AGX Orin
+1. Sử dụng FP16 precision cho TensorRT engine
+2. Giảm tracker resolution nếu cần:
+   ```python
+   tracker.set_property('tracker-width', 512)
+   tracker.set_property('tracker-height', 384)
+   ```
+3. Sử dụng DLA (Deep Learning Accelerator) nếu có
+
+### Monitor GPU Usage
+```bash
+# Trong container
+watch -n 1 nvidia-smi
+
+# Hoặc từ host
+sudo tegrastats
+```
+
+## Cấu trúc thư mục
 
 ```
 IoT_Graduate/
-├── test_videos/           # Đặt video files ở đây
-│   └── test.mp4
-├── configs/               # Configuration files
+├── Dockerfile                  # Docker image definition
+├── docker-compose.yml          # Docker Compose config
+├── docker-entrypoint.sh        # Container entrypoint script
+├── requirements.txt            # Python dependencies
+├── .dockerignore              # Files to exclude from build
+├── .env.example               # Environment variables template
+├── speedflow/                 # Core application code
+│   ├── pipeline_file.py       # File processing pipeline
+│   ├── probes.py             # Speed calculation logic
+│   ├── homography.py         # Coordinate transformation
+│   └── settings.py           # Configuration settings
+├── configs/                   # Configuration files
 │   ├── config_nvdsanalytics.txt
 │   └── points_source_target.yml
-├── DeepStream-YoLo/       # YOLO model files
-├── logs/                  # Output logs và snapshots
-│   └── overspeed_snaps/
-├── Dockerfile
-├── docker-compose.yml
-└── .env
+├── DeepStream-YoLo/          # YOLO model files
+│   ├── config_infer_primary_yolo11.txt
+│   ├── model_b1_gpu0_fp32.engine
+│   └── labels.txt
+├── videos/                    # Input videos (mounted)
+├── output/                    # Processed videos (mounted)
+└── logs/                      # Logs and snapshots (mounted)
 ```
 
----
+## Liên hệ & Hỗ trợ
 
-## ⚙️ Configuration
-
-### Homography Points
-
-Edit `configs/points_source_target.yml` để calibrate cho video của bạn:
-
-```yaml
-source:  # 4 điểm trên video (pixel coordinates)
-  - [100, 200]
-  - [500, 200]
-  - [50, 600]
-  - [550, 600]
-
-target:  # Khoảng cách thực tế (meters)
-  - [0, 0]
-  - [10, 0]
-  - [0, 20]
-  - [10, 20]
-```
-
-### Speed Settings
-
-Edit `speedflow/settings.py`:
-
-```python
-VIDEO_FPS = 25.0           # FPS của video
-SPEED_LIMIT_KMH = 60.0     # Ngưỡng vi phạm tốc độ
-```
-
----
-
-## � Xem Kết Quả
-
-### Logs
-
-```bash
-# Real-time logs
-docker-compose logs -f
-
-# Speed calculations
-cat logs/speed_log.csv
-```
-
-### Overspeed Snapshots
-
-```bash
-# Xem ảnh các phương tiện vi phạm
-ls -la logs/overspeed_snaps/
-```
-
----
-
-## 🐛 Troubleshooting
-
-### Không hiển thị cửa sổ
-
-**Giải pháp:**
-```bash
-# Kiểm tra DISPLAY
-echo $DISPLAY
-
-# Cho phép X11 forwarding
-xhost +local:docker
-
-# Kiểm tra X authority
-ls -la /tmp/.docker.xauth
-```
-
-### "Cannot open display"
-
-**Giải pháp:**
-```bash
-# Export DISPLAY
-export DISPLAY=:0
-
-# Tạo lại X authority
-xauth nlist $DISPLAY | sed -e 's/^..../ffff/' | xauth -f /tmp/.docker.xauth nmerge -
-```
-
-### Video file not found
-
-**Giải pháp:**
-```bash
-# Kiểm tra file tồn tại
-ls -la test_videos/
-
-# Kiểm tra path trong .env
-cat .env | grep VIDEO_FILE
-
-# Path phải là /app/test_videos/... (path trong container)
-```
-
-### Low FPS / Lag
-
-**Giải pháp:**
-- Giảm resolution trong `speedflow/settings.py`
-- Sử dụng video có resolution thấp hơn
-- Kiểm tra GPU memory: `nvidia-smi`
-
----
-
-## � Stop Container
-
-```bash
-# Stop
-docker-compose down
-
-# Stop và xóa volumes
-docker-compose down -v
-
-# Revoke X11 permissions
-xhost -local:docker
-```
-
----
-
-## � Tips
-
-1. **Test với video ngắn** (30-60s) trước khi chạy video dài
-2. **Calibrate homography** cẩn thận để tính tốc độ chính xác
-3. **Check logs** để debug nếu có vấn đề
-4. **Mount logs volume** để lưu kết quả
-5. **Sử dụng video có FPS ổn định** (25 hoặc 30 FPS)
-
----
-
-## 📞 Common Commands
-
-```bash
-# Build image
-docker-compose build
-
-# Run (foreground)
-docker-compose up
-
-# Run (background)
-docker-compose up -d
-
-# View logs
-docker-compose logs -f
-
-# Stop
-docker-compose down
-
-# Rebuild and run
-docker-compose up --build
-
-# Shell vào container
-docker-compose exec traffic-monitor bash
-```
-
-Happy testing! 🚗💨
+Nếu gặp vấn đề, vui lòng:
+1. Kiểm tra logs: `docker-compose logs -f`
+2. Kiểm tra GPU: `nvidia-smi` hoặc `tegrastats`
+3. Xem DeepStream debug: Tăng `GST_DEBUG=3` trong docker-compose.yml

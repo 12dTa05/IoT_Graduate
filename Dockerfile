@@ -1,73 +1,63 @@
 FROM nvcr.io/nvidia/deepstream-l4t:6.4-triton-multiarch
 
-# Metadata
-LABEL maintainer="IoT Graduate Project"
-LABEL description="Traffic Monitoring System with DeepStream 6.4 + YOLO + WebRTC"
-
 # Set working directory
 WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     python3-pip \
-    python3-gi \
     python3-dev \
-    python3-numpy \
-    libgstreamer1.0-dev \
-    libgstreamer-plugins-base1.0-dev \
-    libgstreamer-plugins-bad1.0-dev \
-    gstreamer1.0-plugins-base \
-    gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad \
-    gstreamer1.0-plugins-ugly \
-    gstreamer1.0-libav \
-    gstreamer1.0-tools \
-    gstreamer1.0-x \
-    gstreamer1.0-alsa \
-    gstreamer1.0-gl \
-    gstreamer1.0-gtk3 \
-    gstreamer1.0-qt5 \
-    gstreamer1.0-pulseaudio \
-    libgomp1 \
+    python3-gi \
+    python3-gi-cairo \
+    gir1.2-gst-rtsp-server-1.0 \
+    libgstrtspserver-1.0-0 \
+    libgirepository1.0-dev \
+    libcairo2-dev \
+    pkg-config \
+    git \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
+# Install Python dependencies
+COPY requirements.txt /app/
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Install X11 libraries for display
-RUN apt-get update && apt-get install -y \
-    libx11-6 \
-    libxext6 \
-    libxrender1 \
-    libxtst6 \
-    && rm -rf /var/lib/apt/lists/*
+# Clone and install DeepStream Python bindings
+RUN cd /opt/nvidia/deepstream/deepstream/sources && \
+    git clone https://github.com/NVIDIA-AI-IOT/deepstream_python_apps.git && \
+    cd deepstream_python_apps && \
+    git submodule update --init && \
+    cd 3rdparty/gst-python/ && \
+    ./autogen.sh && \
+    make && \
+    make install
+
+# Install pyds bindings
+RUN cd /opt/nvidia/deepstream/deepstream/sources/deepstream_python_apps/bindings && \
+    mkdir -p build && cd build && \
+    cmake .. -DPYTHON_MAJOR_VERSION=3 -DPYTHON_MINOR_VERSION=8 && \
+    make && \
+    pip3 install ./pyds-*.whl
 
 # Copy application code
-COPY speedflow/ ./speedflow/
-COPY configs/ ./configs/
-COPY DeepStream-YoLo/ ./DeepStream-YoLo/
-COPY deepstream_python_apps/ ./deepstream_python_apps/
-COPY run_webrtc.py run_RTSP.py run_file.py ./
+COPY speedflow/ /app/speedflow/
+COPY configs/ /app/configs/
+COPY DeepStream-YoLo/ /app/DeepStream-YoLo/
+COPY run_file.py /app/
+COPY config_cam.txt /app/
 
-# Create directories for outputs
-RUN mkdir -p /app/logs /app/logs/overspeed_snaps /app/output
+# Create necessary directories
+RUN mkdir -p /app/logs /app/output /app/logs/overspeed_snaps /app/models /app/videos
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
-ENV LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1
-ENV DEEPSTREAM_PATH=/opt/nvidia/deepstream/deepstream
-ENV GST_PLUGIN_PATH=/opt/nvidia/deepstream/deepstream/lib/gst-plugins/
-
-# Add DeepStream Python bindings to PYTHONPATH
-ENV PYTHONPATH=/opt/nvidia/deepstream/deepstream/lib:${PYTHONPATH}
+ENV GST_DEBUG=2
+ENV CUDA_VER=11.4
+ENV LD_LIBRARY_PATH=/opt/nvidia/deepstream/deepstream/lib:$LD_LIBRARY_PATH
 
 # Copy entrypoint script
-COPY docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY docker-entrypoint.sh /app/
+RUN chmod +x /app/docker-entrypoint.sh
 
-# Default entrypoint
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-
-# Default command (can be overridden)
-CMD ["python3", "run_file.py", "/app/test_videos/test.mp4"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["--help"]

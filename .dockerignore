@@ -1,54 +1,47 @@
-# Python cache
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
+# Git files
+.git
+.gitignore
 
-# Virtual environments
-venv/
-env/
-ENV/
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
 
 # IDE
-.vscode/
-.idea/
+.vscode
+.idea
 *.swp
 *.swo
-*~
 
-# Logs and outputs
+# Logs and outputs (will be mounted as volumes)
 logs/
-*.log
 output/
+*.log
+*.csv
+
+# Local videos (will be mounted as volumes)
+videos/
 *.mp4
 *.avi
 *.mkv
 
-# Model files (too large, should be mounted)
-*.engine
-*.onnx
-*.pt
-*.pth
-*.weights
-
-# Git
-.git/
-.gitignore
+# Documentation
+README.md
+DOCKER_README.md
+*.md
 
 # Temporary files
-*.tmp
-*.pid
 .pipeline.pid
+*.tmp
+*.bak
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
-
-# Test data
-test_videos/
-test_data/
-
-# Documentation (keep in repo, not in image)
-*.md
-!README.md
