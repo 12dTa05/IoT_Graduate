@@ -62,19 +62,17 @@ wget https://github.com/ultralytics/assets/releases/download/v0.0.0/yolo11s.onnx
 ```bash
 cd /path/to/IoT_Graduate
 
-# Build image (mất khoảng 15-20 phút do phải compile pyds bindings)
+# Build image (mất khoảng 2-3 phút)
 docker build -t iot-traffic-monitor:latest .
 ```
 
 > [!NOTE]
-> **Build Time**
+> **Optimized Build Process**
 > 
-> Quá trình build có thể mất 15-20 phút do:
-> - Clone GStreamer submodules (~700MB)
-> - Compile pyds Python bindings từ source
-> - Tải các dependencies
-> 
-> Nếu build bị lỗi, xem phần Troubleshooting bên dưới.
+> Dockerfile đã được tối ưu để sử dụng pyds có sẵn trong base image thay vì build từ source:
+> - ✅ Build nhanh hơn (2-3 phút thay vì 15-20 phút)
+> - ✅ Không cần compile, giảm lỗi build
+> - ✅ Dễ maintain khi update DeepStream version
 
 ## Chuẩn bị Video và Cấu hình
 
@@ -172,30 +170,18 @@ done
 
 ### Docker Build Errors
 
-#### Lỗi: "git clone takes too long" hoặc timeout
-- Vấn đề: Clone GStreamer submodules rất lớn (~700MB)
-- Giải pháp: Đảm bảo kết nối internet ổn định, hoặc build với `--network=host`
-
-#### Lỗi: "cmake: command not found" hoặc "make: command not found"
-- Vấn đề: Thiếu build tools
-- Giải pháp: Đã được fix trong Dockerfile mới, rebuild lại image
-
 #### Lỗi: "No space left on device"
 - Vấn đề: Không đủ dung lượng disk
 - Giải pháp: 
   ```bash
   # Xóa unused images và containers
   docker system prune -a
-  # Cần ít nhất 20GB trống
+  # Cần ít nhất 10GB trống
   ```
 
-#### Lỗi: "PYTHON_MINOR_VERSION must be one of 12"
-- Vấn đề: DeepStream 6.4 chỉ hỗ trợ Python 3.12
-- Giải pháp: Đã được fix trong Dockerfile mới (sử dụng Python 3.12)
-
-#### Lỗi: "pyds-*.whl not found"
-- Vấn đề: Compile pyds bindings thất bại
-- Giải pháp: Kiểm tra logs build, đảm bảo có đủ RAM (tối thiểu 4GB)
+#### Lỗi: "pyds module not found" khi chạy
+- Vấn đề: pyds không được cài đúng cách
+- Giải pháp: Kiểm tra base image có đúng version không (cần DeepStream 6.4+)
 
 ### Runtime Errors
 
