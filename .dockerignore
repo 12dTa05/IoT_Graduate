@@ -1,0 +1,54 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs and outputs
+logs/
+*.log
+output/
+*.mp4
+*.avi
+*.mkv
+
+# Model files (too large, should be mounted)
+*.engine
+*.onnx
+*.pt
+*.pth
+*.weights
+
+# Git
+.git/
+.gitignore
+
+# Temporary files
+*.tmp
+*.pid
+.pipeline.pid
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test data
+test_videos/
+test_data/
+
+# Documentation (keep in repo, not in image)
+*.md
+!README.md

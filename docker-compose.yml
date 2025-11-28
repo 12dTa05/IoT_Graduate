@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  traffic-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: traffic-monitor:latest
+    container_name: traffic-monitor
+    
+    # Use host network to access RTSP cameras on local network
+    network_mode: host
+    
+    # NVIDIA GPU runtime
+    runtime: nvidia
+    
+    # Environment variables
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - VIDEO_SOURCE=${VIDEO_SOURCE:-rtsp://admin:password@192.168.1.64:554/Streaming/Channels/101}
+      - WEBRTC_SERVER=${WEBRTC_SERVER:-192.168.0.158}
+      - WEBRTC_ROOM=${WEBRTC_ROOM:-demo}
+      - CONFIG_FILE=${CONFIG_FILE:-/app/configs/config_cam.txt}
+      - CUDA_VISIBLE_DEVICES=0
+      - LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1
+    
+    # Volume mounts
+    volumes:
+      # Configuration files
+      - ./configs:/app/configs:ro
+      
+      # Model files (YOLO engines)
+      - ./DeepStream-YoLo:/app/DeepStream-YoLo:ro
+      
+      # Logs and outputs (persistent)
+      - ./logs:/app/logs
+      - ./output:/app/output
+      
+      # Optional: mount video files for testing
+      # - ./test_videos:/app/test_videos:ro
+      
+      # X11 socket for GUI (if needed)
+      # - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    
+    # Devices
+    devices:
+      - /dev/video0:/dev/video0  # USB camera (if needed)
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Resource limits (optional)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Command override (optional)
+    # command: python3 run_webrtc.py ${VIDEO_SOURCE} --server ${WEBRTC_SERVER} --room ${WEBRTC_ROOM} --cfg ${CONFIG_FILE}
