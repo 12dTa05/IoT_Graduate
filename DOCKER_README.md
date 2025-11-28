@@ -1,444 +1,267 @@
-# 🐳 Docker Deployment Guide - Traffic Monitoring System
+# 🐳 Docker Quick Start - File Display Mode
 
-Hướng dẫn triển khai hệ thống Traffic Monitoring trên **NVIDIA Jetson AGX Orin** sử dụng Docker với image `deepstream-l4t-6.4-triton-multiarch`.
-
----
-
-## 📋 Yêu Cầu Hệ Thống
-
-### Phần Cứng
-- **NVIDIA Jetson AGX Orin** (32GB recommended)
-- **JetPack 5.x hoặc 6.x** đã cài đặt
-- **GPU Memory**: Tối thiểu 4GB available
-- **Storage**: Tối thiểu 20GB free space
-
-### Phần Mềm
-- **Docker** đã cài đặt
-- **NVIDIA Container Runtime** đã cài đặt
-- **Docker Compose** (optional, nhưng recommended)
-
-### Kiểm Tra Cài Đặt
-
-```bash
-# Kiểm tra Docker
-docker --version
-
-# Kiểm tra NVIDIA runtime
-docker run --rm --runtime nvidia nvcr.io/nvidia/l4t-base:r35.1.0 nvidia-smi
-
-# Kiểm tra Docker Compose
-docker-compose --version
-```
+Hướng dẫn nhanh để chạy Traffic Monitoring với **file MP4** và hiển thị kết quả trên màn hình host.
 
 ---
 
-## 🚀 Quick Start
+## 📋 Yêu Cầu
 
-### 1. Clone Repository (hoặc copy code)
+- **NVIDIA Jetson AGX Orin** với JetPack 5.x/6.x
+- **Docker** và **NVIDIA Container Runtime** đã cài đặt
+- **X Server** đang chạy (để hiển thị output)
+
+---
+
+## 🚀 Quick Start (3 bước)
+
+### Bước 1: Chuẩn bị video file
 
 ```bash
-cd /path/to/IoT_Graduate
+# Tạo thư mục test_videos
+mkdir -p test_videos
+
+# Copy video file của bạn vào
+cp /path/to/your/video.mp4 test_videos/test.mp4
 ```
 
-### 2. Chuẩn Bị Model Files
-
-**QUAN TRỌNG**: YOLO model engine files (`.engine`) cần được build trên Jetson với TensorRT tương ứng.
+### Bước 2: Setup X11 permissions
 
 ```bash
-# Tạo thư mục models nếu chưa có
-mkdir -p DeepStream-YoLo/models
+# Cho phép Docker container truy cập X server
+xhost +local:docker
 
-# Build YOLO engine (ví dụ với YOLOv11)
-# Làm theo hướng dẫn tại: https://github.com/marcoslucianops/DeepStream-Yolo
-cd DeepStream-YoLo
-# ... build engine theo hướng dẫn ...
+# Tạo X authority file
+touch /tmp/.docker.xauth
+xauth nlist $DISPLAY | sed -e 's/^..../ffff/' | xauth -f /tmp/.docker.xauth nmerge -
 ```
 
-### 3. Cấu Hình Environment Variables
+### Bước 3: Chạy với Docker Compose
+
+```bash
+# Build và chạy
+docker-compose up --build
+
+# Hoặc chạy ở background
+docker-compose up -d --build
+
+# Xem logs
+docker-compose logs -f
+```
+
+**Kết quả**: Cửa sổ hiển thị video với bounding boxes và tốc độ sẽ xuất hiện trên màn hình!
+
+---
+
+## 🎯 Chạy với video khác
+
+### Cách 1: Sửa file .env
 
 ```bash
 # Copy template
 cp .env.example .env
 
-# Edit .env file
+# Edit .env
 nano .env
 ```
 
-**Cấu hình trong `.env`:**
+Thay đổi:
 ```bash
-# RTSP camera
-VIDEO_SOURCE=rtsp://admin:password@192.168.1.64:554/Streaming/Channels/101
-
-# Hoặc video file
-# VIDEO_SOURCE=file:///app/test_videos/test.mp4
-
-WEBRTC_SERVER=192.168.0.158
-WEBRTC_ROOM=demo
-CONFIG_FILE=/app/configs/config_cam.txt
+VIDEO_FILE=/app/test_videos/your_video.mp4
 ```
 
-### 4. Chuẩn Bị Configuration Files
-
-Đảm bảo các file config tồn tại và đúng paths:
+### Cách 2: Override environment variable
 
 ```bash
-# Kiểm tra config files
-ls -la configs/
-# Cần có:
-# - config_cam.txt (hoặc config tương tự)
-# - config_nvdsanalytics.txt
-# - points_source_target.yml (homography points)
+VIDEO_FILE=/app/test_videos/another_video.mp4 docker-compose up
 ```
 
-**Chỉnh sửa paths trong config files** để phù hợp với Docker container:
-
-`configs/config_cam.txt`:
-```ini
-ANALYTICS_CFG=/app/configs/config_nvdsanalytics.txt
-HOMO_YML=/app/configs/points_source_target.yml
-VIDEO_FPS=25
-MUX_WIDTH=1920
-MUX_HEIGHT=1080
-```
-
-### 5. Build Docker Image
+### Cách 3: Chạy trực tiếp với docker run
 
 ```bash
-# Build image
-docker build -t traffic-monitor:latest .
-
-# Kiểm tra image đã build
-docker images | grep traffic-monitor
-```
-
-### 6. Chạy Container
-
-#### Option A: Sử dụng Docker Compose (Recommended)
-
-```bash
-# Start service
-docker-compose up -d
-
-# Xem logs
-docker-compose logs -f
-
-# Stop service
-docker-compose down
-```
-
-#### Option B: Sử dụng Docker Run
-
-```bash
-docker run -d \
-  --name traffic-monitor \
+docker run -it --rm \
   --runtime nvidia \
   --network host \
+  -e DISPLAY=$DISPLAY \
+  -e VIDEO_FILE=/app/test_videos/test.mp4 \
+  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  -v /tmp/.docker.xauth:/tmp/.docker.xauth:rw \
+  -v $(pwd)/test_videos:/app/test_videos:ro \
   -v $(pwd)/configs:/app/configs:ro \
   -v $(pwd)/DeepStream-YoLo:/app/DeepStream-YoLo:ro \
   -v $(pwd)/logs:/app/logs \
-  -v $(pwd)/output:/app/output \
-  -e VIDEO_SOURCE="rtsp://admin:password@192.168.1.64:554/Streaming/Channels/101" \
-  -e WEBRTC_SERVER="192.168.0.158" \
-  -e WEBRTC_ROOM="demo" \
-  -e CONFIG_FILE="/app/configs/config_cam.txt" \
   traffic-monitor:latest
-
-# Xem logs
-docker logs -f traffic-monitor
 ```
 
 ---
 
-## 📝 Các Chế Độ Chạy
+## 📁 Cấu Trúc Thư Mục
 
-### 1. RTSP Camera Streaming
-
-```bash
-# Sử dụng environment variables
-docker run --runtime nvidia --network host \
-  -v $(pwd)/configs:/app/configs:ro \
-  -v $(pwd)/logs:/app/logs \
-  -e VIDEO_SOURCE="rtsp://admin:password@192.168.1.64:554/Streaming/Channels/101" \
-  -e WEBRTC_SERVER="192.168.0.158" \
-  -e WEBRTC_ROOM="camera1" \
-  -e CONFIG_FILE="/app/configs/config_cam.txt" \
-  traffic-monitor:latest
 ```
-
-### 2. Video File Processing
-
-```bash
-# Mount video files vào container
-docker run --runtime nvidia --network host \
-  -v $(pwd)/configs:/app/configs:ro \
-  -v $(pwd)/test_videos:/app/test_videos:ro \
-  -v $(pwd)/logs:/app/logs \
-  -e VIDEO_SOURCE="file:///app/test_videos/test.mp4" \
-  -e WEBRTC_SERVER="192.168.0.158" \
-  -e WEBRTC_ROOM="test" \
-  -e CONFIG_FILE="/app/configs/config_cam.txt" \
-  traffic-monitor:latest
-```
-
-### 3. Multiple Cameras (Docker Compose)
-
-Edit `docker-compose.yml` để thêm multiple services:
-
-```yaml
-services:
-  camera1:
-    extends: traffic-monitor
-    environment:
-      - VIDEO_SOURCE=rtsp://admin:password@192.168.1.64:554/Streaming/Channels/101
-      - WEBRTC_ROOM=camera1
-    container_name: traffic-monitor-cam1
-
-  camera2:
-    extends: traffic-monitor
-    environment:
-      - VIDEO_SOURCE=rtsp://admin:password@192.168.1.96:554/Streaming/Channels/101
-      - WEBRTC_ROOM=camera2
-    container_name: traffic-monitor-cam2
+IoT_Graduate/
+├── test_videos/           # Đặt video files ở đây
+│   └── test.mp4
+├── configs/               # Configuration files
+│   ├── config_nvdsanalytics.txt
+│   └── points_source_target.yml
+├── DeepStream-YoLo/       # YOLO model files
+├── logs/                  # Output logs và snapshots
+│   └── overspeed_snaps/
+├── Dockerfile
+├── docker-compose.yml
+└── .env
 ```
 
 ---
 
-## 🔧 Configuration
+## ⚙️ Configuration
 
-### Homography Calibration
+### Homography Points
 
-Để tính toán tốc độ chính xác, cần calibrate homography matrix cho từng camera:
-
-1. **Chọn 4 điểm trên video** (source points)
-2. **Đo khoảng cách thực tế** (target points in meters)
-3. **Cập nhật file** `configs/points_source_target.yml`:
+Edit `configs/points_source_target.yml` để calibrate cho video của bạn:
 
 ```yaml
-source:
-  - [100, 200]   # Top-left
-  - [500, 200]   # Top-right
-  - [50, 600]    # Bottom-left
-  - [550, 600]   # Bottom-right
+source:  # 4 điểm trên video (pixel coordinates)
+  - [100, 200]
+  - [500, 200]
+  - [50, 600]
+  - [550, 600]
 
-target:
-  - [0, 0]       # Tọa độ thực (meters)
+target:  # Khoảng cách thực tế (meters)
+  - [0, 0]
   - [10, 0]
   - [0, 20]
   - [10, 20]
 ```
 
-### Analytics ROI Configuration
-
-Edit `configs/config_nvdsanalytics.txt` để định nghĩa ROI:
-
-```ini
-[property]
-enable=1
-config-width=1920
-config-height=1080
-
-[roi-filtering-stream-0]
-enable=1
-roi-RF=100;200;500;200;550;600;50;600
-```
-
-### Speed Limit Configuration
+### Speed Settings
 
 Edit `speedflow/settings.py`:
 
 ```python
-SPEED_LIMIT_KMH = 60.0  # Ngưỡng vi phạm tốc độ
-VIDEO_FPS = 25.0        # FPS của video
+VIDEO_FPS = 25.0           # FPS của video
+SPEED_LIMIT_KMH = 60.0     # Ngưỡng vi phạm tốc độ
 ```
 
 ---
 
-## 📊 Monitoring & Logs
+## � Xem Kết Quả
 
-### Xem Logs Real-time
+### Logs
 
 ```bash
-# Docker Compose
+# Real-time logs
 docker-compose logs -f
 
-# Docker run
-docker logs -f traffic-monitor
-```
-
-### Kiểm Tra Outputs
-
-```bash
-# Speed logs
+# Speed calculations
 cat logs/speed_log.csv
-
-# Overspeed snapshots
-ls -la logs/overspeed_snaps/
 ```
 
-### Container Stats
+### Overspeed Snapshots
 
 ```bash
-# CPU, Memory, GPU usage
-docker stats traffic-monitor
-
-# GPU memory (inside container)
-docker exec traffic-monitor nvidia-smi
+# Xem ảnh các phương tiện vi phạm
+ls -la logs/overspeed_snaps/
 ```
 
 ---
 
 ## 🐛 Troubleshooting
 
-### 1. Container không start
+### Không hiển thị cửa sổ
 
-**Kiểm tra logs:**
+**Giải pháp:**
 ```bash
-docker logs traffic-monitor
+# Kiểm tra DISPLAY
+echo $DISPLAY
+
+# Cho phép X11 forwarding
+xhost +local:docker
+
+# Kiểm tra X authority
+ls -la /tmp/.docker.xauth
 ```
 
-**Các lỗi thường gặp:**
+### "Cannot open display"
 
-- **"DeepStream not found"**: Kiểm tra base image đúng version
-- **"Config file not found"**: Kiểm tra volume mounts và paths
-- **"nvstreammux plugin not found"**: DeepStream plugins chưa load
-
-### 2. RTSP Connection Failed
-
+**Giải pháp:**
 ```bash
-# Test RTSP stream bên ngoài container
-ffplay rtsp://admin:password@192.168.1.64:554/Streaming/Channels/101
+# Export DISPLAY
+export DISPLAY=:0
 
-# Kiểm tra network connectivity từ container
-docker exec traffic-monitor ping 192.168.1.64
+# Tạo lại X authority
+xauth nlist $DISPLAY | sed -e 's/^..../ffff/' | xauth -f /tmp/.docker.xauth nmerge -
 ```
 
-### 3. WebRTC Không Kết Nối
+### Video file not found
 
-- Kiểm tra WebRTC server đang chạy
-- Kiểm tra firewall/network configuration
-- Verify WebSocket URL: `ws://{server}:8080/ws?room={room}&role=pub`
-
-### 4. GPU Not Available
-
+**Giải pháp:**
 ```bash
-# Kiểm tra NVIDIA runtime
-docker run --rm --runtime nvidia nvcr.io/nvidia/l4t-base:r35.1.0 nvidia-smi
+# Kiểm tra file tồn tại
+ls -la test_videos/
 
-# Kiểm tra Docker daemon config
-cat /etc/docker/daemon.json
-# Cần có:
-# {
-#   "default-runtime": "nvidia",
-#   "runtimes": {
-#     "nvidia": {
-#       "path": "nvidia-container-runtime",
-#       "runtimeArgs": []
-#     }
-#   }
-# }
+# Kiểm tra path trong .env
+cat .env | grep VIDEO_FILE
+
+# Path phải là /app/test_videos/... (path trong container)
 ```
 
-### 5. Model Engine Not Found
+### Low FPS / Lag
 
-```bash
-# Kiểm tra model files
-docker exec traffic-monitor ls -la /app/DeepStream-YoLo/
-
-# Rebuild engine nếu cần (trên Jetson)
-cd DeepStream-YoLo
-# Follow build instructions
-```
-
-### 6. Low FPS / Performance Issues
-
-**Giảm resolution:**
-```ini
-# config_cam.txt
-MUX_WIDTH=1280
-MUX_HEIGHT=720
-```
-
-**Giảm tracker resolution:**
-```python
-# speedflow/pipeline_webrtc.py
-tracker.set_property('tracker-width', 480)
-tracker.set_property('tracker-height', 320)
-```
-
-**Sử dụng INT8 inference:**
-- Build YOLO engine với INT8 quantization
-- Xem hướng dẫn tại DeepStream-YoLo docs
+**Giải pháp:**
+- Giảm resolution trong `speedflow/settings.py`
+- Sử dụng video có resolution thấp hơn
+- Kiểm tra GPU memory: `nvidia-smi`
 
 ---
 
-## 🔄 Updates & Maintenance
-
-### Update Code
+## � Stop Container
 
 ```bash
-# Pull latest code
-git pull
-
-# Rebuild image
-docker-compose build
-
-# Restart service
-docker-compose up -d
-```
-
-### Cleanup
-
-```bash
-# Stop và remove containers
+# Stop
 docker-compose down
 
-# Remove old images
-docker image prune -a
+# Stop và xóa volumes
+docker-compose down -v
 
-# Clear logs
-rm -rf logs/*
+# Revoke X11 permissions
+xhost -local:docker
 ```
 
-### Backup Configuration
+---
+
+## � Tips
+
+1. **Test với video ngắn** (30-60s) trước khi chạy video dài
+2. **Calibrate homography** cẩn thận để tính tốc độ chính xác
+3. **Check logs** để debug nếu có vấn đề
+4. **Mount logs volume** để lưu kết quả
+5. **Sử dụng video có FPS ổn định** (25 hoặc 30 FPS)
+
+---
+
+## 📞 Common Commands
 
 ```bash
-# Backup configs
-tar -czf configs_backup_$(date +%Y%m%d).tar.gz configs/
+# Build image
+docker-compose build
 
-# Backup logs
-tar -czf logs_backup_$(date +%Y%m%d).tar.gz logs/
+# Run (foreground)
+docker-compose up
+
+# Run (background)
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+
+# Stop
+docker-compose down
+
+# Rebuild and run
+docker-compose up --build
+
+# Shell vào container
+docker-compose exec traffic-monitor bash
 ```
 
----
-
-## 📚 Additional Resources
-
-- **DeepStream SDK**: https://developer.nvidia.com/deepstream-sdk
-- **DeepStream-YOLO**: https://github.com/marcoslucianops/DeepStream-Yolo
-- **Ultralytics DeepStream Guide**: https://docs.ultralytics.com/guides/deepstream-nvidia-jetson/
-- **NVIDIA Container Toolkit**: https://github.com/NVIDIA/nvidia-docker
-
----
-
-## 💡 Tips & Best Practices
-
-1. **Always use host network** khi truy cập RTSP cameras trên local network
-2. **Mount logs volume** để persist data khi container restart
-3. **Monitor GPU memory** để tránh OOM errors
-4. **Calibrate homography** cẩn thận cho từng camera position
-5. **Test với video file** trước khi deploy với RTSP cameras
-6. **Backup configs** thường xuyên
-7. **Use docker-compose** cho production deployment
-
----
-
-## 📞 Support
-
-Nếu gặp vấn đề, kiểm tra:
-1. Logs trong container
-2. GPU availability
-3. Network connectivity
-4. Config file paths
-5. Model engine files
-
-Happy monitoring! 🚗💨
+Happy testing! 🚗💨

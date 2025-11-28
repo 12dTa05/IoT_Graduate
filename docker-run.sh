@@ -59,34 +59,46 @@ run_container() {
     check_env
     source .env
     
+    # Setup X11
+    echo -e "${GREEN}Setting up X11...${NC}"
+    xhost +local:docker > /dev/null 2>&1 || echo "Warning: xhost failed"
+    
     echo -e "${GREEN}Running container: ${CONTAINER_NAME}${NC}"
     echo "Configuration:"
-    echo "  VIDEO_SOURCE: ${VIDEO_SOURCE}"
-    echo "  WEBRTC_SERVER: ${WEBRTC_SERVER}"
-    echo "  WEBRTC_ROOM: ${WEBRTC_ROOM}"
-    echo "  CONFIG_FILE: ${CONFIG_FILE}"
+    echo "  VIDEO_FILE: ${VIDEO_FILE}"
+    echo "  DISPLAY: ${DISPLAY}"
     echo ""
     
     docker run -it --rm \
         --name ${CONTAINER_NAME} \
         --runtime nvidia \
         --network host \
+        -e DISPLAY=${DISPLAY} \
+        -e VIDEO_FILE="${VIDEO_FILE}" \
+        -e CUDA_VISIBLE_DEVICES=0 \
+        -e QT_X11_NO_MITSHM=1 \
+        -e XAUTHORITY=/tmp/.docker.xauth \
+        -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+        -v /tmp/.docker.xauth:/tmp/.docker.xauth:rw \
+        -v $(pwd)/test_videos:/app/test_videos:ro \
         -v $(pwd)/configs:/app/configs:ro \
         -v $(pwd)/DeepStream-YoLo:/app/DeepStream-YoLo:ro \
         -v $(pwd)/logs:/app/logs \
         -v $(pwd)/output:/app/output \
-        -e VIDEO_SOURCE="${VIDEO_SOURCE}" \
-        -e WEBRTC_SERVER="${WEBRTC_SERVER}" \
-        -e WEBRTC_ROOM="${WEBRTC_ROOM}" \
-        -e CONFIG_FILE="${CONFIG_FILE}" \
-        -e CUDA_VISIBLE_DEVICES=0 \
         ${IMAGE_NAME}:${IMAGE_TAG}
+    
+    # Cleanup X11
+    xhost -local:docker > /dev/null 2>&1 || true
 }
 
 # Start container in background
 start_container() {
     check_env
     source .env
+    
+    # Setup X11
+    echo -e "${GREEN}Setting up X11...${NC}"
+    xhost +local:docker > /dev/null 2>&1 || echo "Warning: xhost failed"
     
     echo -e "${GREEN}Starting container: ${CONTAINER_NAME}${NC}"
     
@@ -95,15 +107,18 @@ start_container() {
         --runtime nvidia \
         --network host \
         --restart unless-stopped \
+        -e DISPLAY=${DISPLAY} \
+        -e VIDEO_FILE="${VIDEO_FILE}" \
+        -e CUDA_VISIBLE_DEVICES=0 \
+        -e QT_X11_NO_MITSHM=1 \
+        -e XAUTHORITY=/tmp/.docker.xauth \
+        -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+        -v /tmp/.docker.xauth:/tmp/.docker.xauth:rw \
+        -v $(pwd)/test_videos:/app/test_videos:ro \
         -v $(pwd)/configs:/app/configs:ro \
         -v $(pwd)/DeepStream-YoLo:/app/DeepStream-YoLo:ro \
         -v $(pwd)/logs:/app/logs \
         -v $(pwd)/output:/app/output \
-        -e VIDEO_SOURCE="${VIDEO_SOURCE}" \
-        -e WEBRTC_SERVER="${WEBRTC_SERVER}" \
-        -e WEBRTC_ROOM="${WEBRTC_ROOM}" \
-        -e CONFIG_FILE="${CONFIG_FILE}" \
-        -e CUDA_VISIBLE_DEVICES=0 \
         ${IMAGE_NAME}:${IMAGE_TAG}
     
     echo -e "${GREEN}Container started successfully!${NC}"

@@ -35,6 +35,14 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
+# Install X11 libraries for display
+RUN apt-get update && apt-get install -y \
+    libx11-6 \
+    libxext6 \
+    libxrender1 \
+    libxtst6 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy application code
 COPY speedflow/ ./speedflow/
 COPY configs/ ./configs/
@@ -62,4 +70,4 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 # Default command (can be overridden)
-CMD ["python3", "run_webrtc.py"]
+CMD ["python3", "run_file.py", "/app/test_videos/test.mp4"]

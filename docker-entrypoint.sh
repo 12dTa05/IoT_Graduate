@@ -1,45 +1,20 @@
 #!/bin/bash
 set -e
 
-echo "=== Traffic Monitor Docker Entrypoint ==="
+echo "=== Traffic Monitor Docker Entrypoint (File Display Mode) ==="
 
 # Set LD_PRELOAD for libgomp
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1
 
-# Validate required environment variables
-if [ -z "$VIDEO_SOURCE" ]; then
-    echo "ERROR: VIDEO_SOURCE environment variable is not set"
-    echo "Example: VIDEO_SOURCE=rtsp://admin:password@192.168.1.64:554/Streaming/Channels/101"
-    exit 1
-fi
-
-if [ -z "$WEBRTC_SERVER" ]; then
-    echo "WARNING: WEBRTC_SERVER not set, using default: 192.168.0.158"
-    export WEBRTC_SERVER="192.168.0.158"
-fi
-
-if [ -z "$WEBRTC_ROOM" ]; then
-    echo "WARNING: WEBRTC_ROOM not set, using default: demo"
-    export WEBRTC_ROOM="demo"
-fi
-
-if [ -z "$CONFIG_FILE" ]; then
-    echo "WARNING: CONFIG_FILE not set, using default: /app/configs/config_cam.txt"
-    export CONFIG_FILE="/app/configs/config_cam.txt"
-fi
-
-# Check if config file exists
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "ERROR: Config file not found: $CONFIG_FILE"
-    exit 1
+# Check DISPLAY variable
+if [ -z "$DISPLAY" ]; then
+    echo "WARNING: DISPLAY not set, using default: :0"
+    export DISPLAY=":0"
 fi
 
 # Print configuration
 echo "Configuration:"
-echo "  VIDEO_SOURCE: $VIDEO_SOURCE"
-echo "  WEBRTC_SERVER: $WEBRTC_SERVER"
-echo "  WEBRTC_ROOM: $WEBRTC_ROOM"
-echo "  CONFIG_FILE: $CONFIG_FILE"
+echo "  DISPLAY: $DISPLAY"
 echo "  LD_PRELOAD: $LD_PRELOAD"
 
 # Check DeepStream installation
@@ -62,13 +37,21 @@ echo "GStreamer DeepStream plugins OK"
 mkdir -p /app/logs/overspeed_snaps
 mkdir -p /app/output
 
-# If no command specified, run run_webrtc.py with environment variables
+# If no command specified, run run_file.py with video file
 if [ $# -eq 0 ]; then
-    echo "Starting run_webrtc.py..."
-    exec python3 /app/run_webrtc.py "$VIDEO_SOURCE" \
-        --server "$WEBRTC_SERVER" \
-        --room "$WEBRTC_ROOM" \
-        --cfg "$CONFIG_FILE"
+    if [ -z "$VIDEO_FILE" ]; then
+        echo "ERROR: VIDEO_FILE environment variable is not set"
+        echo "Example: VIDEO_FILE=/app/test_videos/test.mp4"
+        exit 1
+    fi
+    
+    if [ ! -f "$VIDEO_FILE" ]; then
+        echo "ERROR: Video file not found: $VIDEO_FILE"
+        exit 1
+    fi
+    
+    echo "Starting run_file.py with video: $VIDEO_FILE"
+    exec python3 /app/run_file.py "$VIDEO_FILE"
 else
     # Execute provided command
     echo "Executing: $@"
