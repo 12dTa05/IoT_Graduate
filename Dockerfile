@@ -22,12 +22,17 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt /app/
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Verify pyds is available (should be pre-installed in DeepStream 6.4 image)
-# If not available, we'll install from the samples directory
-RUN python3 -c "import pyds" 2>/dev/null || \
-    (echo "pyds not found in base image, checking for pre-built wheel..." && \
-     find /opt/nvidia/deepstream -name "pyds*.whl" -exec pip3 install {} \; || \
-     echo "Warning: pyds installation may need manual setup")
+# Install pyds from DeepStream samples (pre-built wheel)
+# DeepStream 6.4 includes pre-built pyds wheels in the samples directory
+RUN find /opt/nvidia/deepstream -name "pyds*.whl" -type f -exec pip3 install {} \; || \
+    (echo "ERROR: pyds wheel not found in DeepStream installation" && \
+     echo "Searching in common locations..." && \
+     find /opt/nvidia -name "*.whl" -type f && \
+     exit 1)
+
+# Verify pyds installation
+RUN python3 -c "import pyds; print('pyds version:', pyds.__version__ if hasattr(pyds, '__version__') else 'installed')" || \
+    (echo "ERROR: pyds import failed after installation" && exit 1)
 
 # Copy application code
 COPY speedflow/ /app/speedflow/
