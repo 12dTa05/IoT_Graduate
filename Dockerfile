@@ -39,7 +39,7 @@ RUN cd /opt/nvidia/deepstream/deepstream/sources && \
 # Build and install pyds bindings
 RUN cd /opt/nvidia/deepstream/deepstream/sources/deepstream_python_apps/bindings && \
     mkdir -p build && cd build && \
-    cmake .. -DPYTHON_MAJOR_VERSION=3 -DPYTHON_MINOR_VERSION=8 && \
+    cmake .. -DPYTHON_MAJOR_VERSION=3 -DPYTHON_MINOR_VERSION=12 && \
     make -j$(nproc) && \
     pip3 install ./pyds-*.whl
 

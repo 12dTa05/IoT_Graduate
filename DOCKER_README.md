@@ -189,6 +189,10 @@ done
   # Cần ít nhất 20GB trống
   ```
 
+#### Lỗi: "PYTHON_MINOR_VERSION must be one of 12"
+- Vấn đề: DeepStream 6.4 chỉ hỗ trợ Python 3.12
+- Giải pháp: Đã được fix trong Dockerfile mới (sử dụng Python 3.12)
+
 #### Lỗi: "pyds-*.whl not found"
 - Vấn đề: Compile pyds bindings thất bại
 - Giải pháp: Kiểm tra logs build, đảm bảo có đủ RAM (tối thiểu 4GB)
