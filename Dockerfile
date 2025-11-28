@@ -22,21 +22,25 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt /app/
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Clone and install DeepStream Python bindings
+# Install additional dependencies for pyds
+RUN apt-get update && apt-get install -y \
+    python3-numpy \
+    python3-opencv \
+    cmake \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone and install DeepStream Python bindings (pyds)
 RUN cd /opt/nvidia/deepstream/deepstream/sources && \
     git clone https://github.com/NVIDIA-AI-IOT/deepstream_python_apps.git && \
     cd deepstream_python_apps && \
-    git submodule update --init && \
-    cd 3rdparty/gst-python/ && \
-    ./autogen.sh && \
-    make && \
-    make install
+    git submodule update --init
 
-# Install pyds bindings
+# Build and install pyds bindings
 RUN cd /opt/nvidia/deepstream/deepstream/sources/deepstream_python_apps/bindings && \
     mkdir -p build && cd build && \
     cmake .. -DPYTHON_MAJOR_VERSION=3 -DPYTHON_MINOR_VERSION=8 && \
-    make && \
+    make -j$(nproc) && \
     pip3 install ./pyds-*.whl
 
 # Copy application code

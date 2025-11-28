@@ -62,9 +62,19 @@ wget https://github.com/ultralytics/assets/releases/download/v0.0.0/yolo11s.onnx
 ```bash
 cd /path/to/IoT_Graduate
 
-# Build image (mất khoảng 10-15 phút)
+# Build image (mất khoảng 15-20 phút do phải compile pyds bindings)
 docker build -t iot-traffic-monitor:latest .
 ```
+
+> [!NOTE]
+> **Build Time**
+> 
+> Quá trình build có thể mất 15-20 phút do:
+> - Clone GStreamer submodules (~700MB)
+> - Compile pyds Python bindings từ source
+> - Tải các dependencies
+> 
+> Nếu build bị lỗi, xem phần Troubleshooting bên dưới.
 
 ## Chuẩn bị Video và Cấu hình
 
@@ -159,6 +169,31 @@ done
 ```
 
 ## Troubleshooting
+
+### Docker Build Errors
+
+#### Lỗi: "git clone takes too long" hoặc timeout
+- Vấn đề: Clone GStreamer submodules rất lớn (~700MB)
+- Giải pháp: Đảm bảo kết nối internet ổn định, hoặc build với `--network=host`
+
+#### Lỗi: "cmake: command not found" hoặc "make: command not found"
+- Vấn đề: Thiếu build tools
+- Giải pháp: Đã được fix trong Dockerfile mới, rebuild lại image
+
+#### Lỗi: "No space left on device"
+- Vấn đề: Không đủ dung lượng disk
+- Giải pháp: 
+  ```bash
+  # Xóa unused images và containers
+  docker system prune -a
+  # Cần ít nhất 20GB trống
+  ```
+
+#### Lỗi: "pyds-*.whl not found"
+- Vấn đề: Compile pyds bindings thất bại
+- Giải pháp: Kiểm tra logs build, đảm bảo có đủ RAM (tối thiểu 4GB)
+
+### Runtime Errors
 
 ### Lỗi: "Failed to create nvinfer"
 - Kiểm tra file engine đã tồn tại: `DeepStream-YoLo/model_b1_gpu0_fp32.engine`
