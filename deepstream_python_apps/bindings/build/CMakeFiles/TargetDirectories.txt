@@ -1,3 +1,0 @@
-/home/mta/Documents/IoT_Graduate/deepstream_python_apps/bindings/build/CMakeFiles/pyds.dir
-/home/mta/Documents/IoT_Graduate/deepstream_python_apps/bindings/build/CMakeFiles/edit_cache.dir
-/home/mta/Documents/IoT_Graduate/deepstream_python_apps/bindings/build/CMakeFiles/rebuild_cache.dir
