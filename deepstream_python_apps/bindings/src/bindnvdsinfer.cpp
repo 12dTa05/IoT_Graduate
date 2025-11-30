@@ -246,7 +246,6 @@ namespace pydeepstream {
                               &NvDsInferSegmentationMeta::class_map)
                 .def_readonly("class_probabilities_map",
                               &NvDsInferSegmentationMeta::class_probabilities_map)
-                .def_readonly("unique_id", &NvDsInferSegmentationMeta::unique_id)
 
                 .def("cast",
                      [](void *data) {

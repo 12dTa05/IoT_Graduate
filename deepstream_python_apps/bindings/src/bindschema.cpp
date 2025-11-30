@@ -160,8 +160,6 @@ namespace pydeepstream {
                     g_free (srcData->extMsg);
                     srcData->extMsgSize = 0;
                 }
-                g_free(srcData);
-                srcMeta->user_meta_data = NULL;
             }
         }
     }

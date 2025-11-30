@@ -25,7 +25,8 @@ import gi
 import configparser
 
 gi.require_version('Gst', '1.0')
-from gi.repository import GLib, Gst
+gi.require_version('GstRtspServer', '1.0')
+from gi.repository import GLib, Gst, GstRtspServer
 from ctypes import *
 import time
 import sys
@@ -253,7 +254,7 @@ def create_source_bin(index, uri):
         return None
     return nbin
 
-def main(uri_inputs):
+def main(uri_inputs,codec,bitrate ):
     # Check input arguments
     number_sources = len(uri_inputs)
     global perf_data
@@ -337,21 +338,51 @@ def main(uri_inputs):
     nvosd = Gst.ElementFactory.make("nvdsosd", "onscreendisplay")
     if not nvosd:
         sys.stderr.write(" Unable to create nvosd \n")
-    # Finally render the osd output
+    nvvidconv_postosd = Gst.ElementFactory.make("nvvideoconvert", "convertor_postosd")
+    if not nvvidconv_postosd:
+        sys.stderr.write(" Unable to create nvvidconv_postosd \n")
+    
+    # Create a caps filter
+    caps = Gst.ElementFactory.make("capsfilter", "filter")
+    caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=I420"))
+    
+    # Make the encoder
+    if codec == "H264":
+        encoder = Gst.ElementFactory.make("nvv4l2h264enc", "encoder")
+        print("Creating H264 Encoder")
+    elif codec == "H265":
+        encoder = Gst.ElementFactory.make("nvv4l2h265enc", "encoder")
+        print("Creating H265 Encoder")
+    if not encoder:
+        sys.stderr.write(" Unable to create encoder")
+    encoder.set_property('bitrate', bitrate)
     if platform_info.is_integrated_gpu():
-        print("Creating nv3dsink \n")
-        sink = Gst.ElementFactory.make("nv3dsink", "nv3d-sink")
-        if not sink:
-            sys.stderr.write(" Unable to create nv3dsink \n")
-    else:
-        if platform_info.is_platform_aarch64():
-            print("Creating nv3dsink \n")
-            sink = Gst.ElementFactory.make("nv3dsink", "nv3d-sink")
-        else:
-            print("Creating EGLSink \n")
-            sink = Gst.ElementFactory.make("nveglglessink", "nvvideo-renderer")
-        if not sink:
-            sys.stderr.write(" Unable to create egl sink \n")
+        encoder.set_property('preset-level', 1)
+        encoder.set_property('insert-sps-pps', 1)
+        #encoder.set_property('bufapi-version', 1)
+    
+    # Make the payload-encode video into RTP packets
+    if codec == "H264":
+        rtppay = Gst.ElementFactory.make("rtph264pay", "rtppay")
+        print("Creating H264 rtppay")
+    elif codec == "H265":
+        rtppay = Gst.ElementFactory.make("rtph265pay", "rtppay")
+        print("Creating H265 rtppay")
+    if not rtppay:
+        sys.stderr.write(" Unable to create rtppay")
+    
+    # Make the UDP sink
+    updsink_port_num = 5400
+    sink = Gst.ElementFactory.make("udpsink", "udpsink")
+    if not sink:
+        sys.stderr.write(" Unable to create udpsink")
+    
+    sink.set_property('host', '224.224.255.255')
+    sink.set_property('port', updsink_port_num)
+    sink.set_property('async', False)
+    sink.set_property('sync', 1)
+    
+    print("Playing file {} ".format(uri_inputs))
     
     streammux.set_property('width', 1920)
     streammux.set_property('height', 1080)
@@ -378,6 +409,7 @@ def main(uri_inputs):
         nvvidconv.set_property("nvbuf-memory-type", mem_type)
         nvvidconv1.set_property("nvbuf-memory-type", mem_type)
         tiler.set_property("nvbuf-memory-type", mem_type)
+        nvvidconv_postosd.set_property("nvbuf-memory-type", mem_type)
 
     print("Adding elements to Pipeline \n")
     pipeline.add(pgie)
@@ -386,6 +418,10 @@ def main(uri_inputs):
     pipeline.add(filter1)
     pipeline.add(nvvidconv1)
     pipeline.add(nvosd)
+    pipeline.add(nvvidconv_postosd)
+    pipeline.add(caps)
+    pipeline.add(encoder)
+    pipeline.add(rtppay)
     pipeline.add(sink)
 
     print("Linking elements in the Pipeline \n")
@@ -395,13 +431,31 @@ def main(uri_inputs):
     filter1.link(tiler)
     tiler.link(nvvidconv)
     nvvidconv.link(nvosd)
-    nvosd.link(sink)
+    nvosd.link(nvvidconv_postosd)
+    nvvidconv_postosd.link(caps)
+    caps.link(encoder)
+    encoder.link(rtppay)
+    rtppay.link(sink)
     
     # create an event loop and feed gstreamer bus mesages to it
     loop = GLib.MainLoop()
     bus = pipeline.get_bus()
     bus.add_signal_watch()
     bus.connect("message", bus_call, loop)
+    
+    # Start streaming
+    rtsp_port_num = 8554
+    
+    server = GstRtspServer.RTSPServer.new()
+    server.props.service = "%d" % rtsp_port_num
+    server.attach(None)
+    
+    factory = GstRtspServer.RTSPMediaFactory.new()
+    factory.set_launch( "( udpsrc name=pay0 port=%d buffer-size=524288 caps=\"application/x-rtp, media=video, clock-rate=90000, encoding-name=(string)%s, payload=96 \" )" % (updsink_port_num, codec))
+    factory.set_shared(True)
+    server.get_mount_points().add_factory("/ds-test", factory)
+    
+    print("\n *** DeepStream: Launched RTSP Streaming at rtsp://localhost:%d/ds-test ***\n\n" % rtsp_port_num)
     
     tiler_sink_pad = tiler.get_static_pad("sink")
     if not tiler_sink_pad:
@@ -429,7 +483,10 @@ def parse_args():
     parser.add_argument("-i","--uri_inputs", metavar='N', type=str, nargs='+',
                     help='Path to inputs URI e.g. rtsp:// ...  or file:// seperated by space')
 					
-
+    parser.add_argument("-c", "--codec", default="H264",
+                  help="RTSP Streaming Codec H264/H265 , default=H264", choices=['H264','H265'])
+    parser.add_argument("-b", "--bitrate", default=4000000,
+                  help="Set the encoding bitrate ", type=int)
     # Check input arguments
     if len(sys.argv)==1:
         parser.print_help(sys.stderr)
@@ -438,8 +495,8 @@ def parse_args():
         
     print("URI Inputs: " + str(args.uri_inputs ))
     
-    return args.uri_inputs
+    return args.uri_inputs , args.codec, args.bitrate
 
 if __name__ == '__main__':
-    uri_inputs = parse_args()
-sys.exit(main(uri_inputs))
+    uri_inputs , out_codec, out_bitrate = parse_args()
+    sys.exit(main(uri_inputs, out_codec, out_bitrate ))

@@ -47,15 +47,15 @@ Installing:
 Compile bindings as per [Python Binding instructions](../../bindings)
 
 ### step2
-#### Python 3.12
+#### Python 3.10
 ```
-apt install python3-venv
-python3 -m venv env
+apt install python3.10-venv
+python3.10 -m venv env
 ```
 ### step3
 ```
 . env/bin/activate
-pip install /opt/nvidia/deepstream/deepstream/sources/deepstream_python_apps/bindings/dist/pyds-1.2.2*.whl
+pip install /opt/nvidia/deepstream/deepstream/sources/deepstream_python_apps/bindings/dist/pyds-1.2.0*.whl
 pip install pytest pygobject cuda-python numpy==1.26.0
 cd /opt/nvidia/deepstream/deepstream/sources/deepstream_python_apps/tests/integration
 pytest test.py
@@ -85,6 +85,3 @@ Tests are written in 3 parts:
 * Data initialization
 * Executing behavior
 * Checking results
-
-### Note
-For DeepStream 8.0 on WSL, there is a known issue with object encoding. Thus, test3 pipeline has been disabled for WSL.

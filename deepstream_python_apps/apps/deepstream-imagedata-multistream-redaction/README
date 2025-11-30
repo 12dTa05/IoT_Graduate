@@ -16,30 +16,38 @@
 ################################################################################
 
 Prerequisites:
-- DeepStreamSDK 8.0
-- Python 3.12
+- DeepStreamSDK 7.1
+- Python 3.10
 - Gst-python
 - NumPy package <2.0, >=1.22 (2.0 and above not supported)
 - OpenCV package
+- GstRtspServer
 
 To install required packages:
-$ source /path/to/pyds/bin/activate  # Activate the environment
-$ pip3 install --force-reinstall numpy==1.26.0
-$ pip3 install opencv-python
+  $ sudo apt update
+  $ sudo apt install python3-numpy python3-opencv -y
+
+Installing GstRtspServer and instrospection typelib
+===================================================
+  $ sudo apt update
+  $ sudo apt-get install libgstrtspserver-1.0-0 gstreamer1.0-rtsp
+For gst-rtsp-server (and other GStreamer stuff) to be accessible in
+Python through gi.require_version(), it needs to be built with
+gobject-introspection enabled (libgstrtspserver-1.0-0 is already).
+Yet, we need to install the introspection typelib package:
+  $ sudo apt-get install libgirepository1.0-dev
+  $ sudo apt-get install gobject-introspection gir1.2-gst-rtsp-server-1.0
 
 Download Peoplenet model:
-  $ mkdir -p /opt/nvidia/deepstream/deepstream/samples/models/peoplenet
-  $ cd /opt/nvidia/deepstream/deepstream/samples/models/peoplenet
-  $ wget --content-disposition 'https://api.ngc.nvidia.com/v2/models/org/nvidia/team/tao/peoplenet/pruned_quantized_decrypted_v2.3.4/files?redirect=true&path=resnet34_peoplenet_int8.onnx' -O resnet34_peoplenet_int8.onnx
-  $ wget --content-disposition 'https://api.ngc.nvidia.com/v2/models/org/nvidia/team/tao/peoplenet/pruned_quantized_decrypted_v2.3.4/files?redirect=true&path=resnet34_peoplenet_int8.txt' -O resnet34_peoplenet_int8.txt
-  $ wget --content-disposition 'https://api.ngc.nvidia.com/v2/models/org/nvidia/team/tao/peoplenet/pruned_quantized_decrypted_v2.3.4/files?redirect=true&path=labels.txt' -O labels.txt
+  Please follow instructions from the README.md located at : /opt/nvidia/deepstream/deepstream/samples/configs/tao_pretrained_models/README.md
+  to download latest supported peoplenet model
 
 To run:
-  $ python3 deepstream_imagedata-multistream_redaction.py -i <uri1> [uri2] ... [uriN]
-For command line argument details:
-  $ python3 deepstream_imagedata-multistream_redaction.py -h
+  $ python3 deepstream_imagedata-multistream_redaction.py -i <uri1> [uri2] ... [uriN] -c {H264,H265} -b BITRATE
+For command line argument details:  
+  $ python3 deepstream_imagedata-multistream_redaction.py -h 
 e.g.
-  $ python3 deepstream_imagedata-multistream_redaction.py -i file:///opt/nvidia/deepstream/deepstream/samples/streams/sample_720p.mp4 file:///opt/nvidia/deepstream/deepstream/samples/streams/sample_720p.mp4
+  $ python3 deepstream_imagedata-multistream_redaction.py file:///home/ubuntu/video1.mp4 file:///home/ubuntu/video2.mp4 -c H264
 
 This document describes the sample deepstream-imagedata-multistream-redaction application.
 
@@ -61,7 +69,7 @@ This sample builds on top of the deepstream-imagedata-multistream sample to demo
   supported container format, and any codec can be used as input.
 * Configure the stream-muxer to generate a batch of frames and infer on the
   batch for better resource utilization.
-* Display output locally using eglglessink (x86) or nv3dsink (ARM/Tegra)
+* Stream output to rtsp
 
 NOTE:
 - For x86, only CUDA unified memory is supported. Consequently, vGPU is not supported.
@@ -92,3 +100,4 @@ to -1 to make the stream-muxer wait infinitely.
 The "nvmultistreamtiler" composite streams based on their stream-ids in
 row-major order (starting from stream 0, left to right across the top row, then
 across the next row, etc.).
+

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -73,7 +73,7 @@ class CMakeBuild(build_ext):
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="pyds",
-    version="1.2.2",
+    version="1.2.0",
     author="NVIDIA",
     description="Install precompiled DeepStream Python bindings extension",
     url="nvidia.com",
@@ -81,5 +81,5 @@ setup(
     ext_modules=[CMakeExtension("pyds")],
     cmdclass={"build_ext": CMakeBuild},
     zip_safe=False,
-    python_requires=">=3.12",
+    python_requires=">=3.10",
 )

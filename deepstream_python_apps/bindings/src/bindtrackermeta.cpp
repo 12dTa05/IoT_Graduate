@@ -48,7 +48,7 @@ namespace pydeepstream {
                 .def_readwrite("uniqueId", &NvDsTargetMiscDataObject::uniqueId)
                 .def_readwrite("classId", &NvDsTargetMiscDataObject::classId)
                 .def_property("objLabel",
-                              STRING_CHAR_ARRAY(NvDsTargetMiscDataObject, objLabel, MAX_LABEL_SIZE))
+                              STRING_CHAR_ARRAY(NvDsTargetMiscDataObject, objLabel))
 
                 .def("cast",
                      [](void *data) {

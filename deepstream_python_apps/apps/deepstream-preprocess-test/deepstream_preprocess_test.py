@@ -127,55 +127,6 @@ def pgie_src_pad_buffer_probe(pad, info, u_data):
         except StopIteration:
             break
 
-    l_user_meta = batch_meta.batch_user_meta_list
-
-    while l_user_meta is not None:
-        try:
-            # Casting l_user_meta.data to pyds.NvDsUserMeta
-            user_meta = pyds.NvDsUserMeta.cast(l_user_meta.data)
-        except StopIteration:
-            break
-        if (user_meta.base_meta.meta_type == pyds.NVDS_PREPROCESS_BATCH_META):
-            try:
-                # Casting user_meta.data to pyds.GstNvDsPreProcessBatchMeta
-                preprocess_batchmeta = pyds.GstNvDsPreProcessBatchMeta.cast(user_meta.user_meta_data)
-            except StopIteration:
-                break
-            roi_cnt = 0
-            
-            for roi_meta in preprocess_batchmeta.roi_vector:
-                 # Label ROI in display
-                display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
-                display_meta.num_labels = 1
-
-                txt_params = display_meta.text_params[0]
-                txt_params.display_text = f"Roi:{roi_cnt}"
-                
-                txt_params.x_offset = int(roi_meta.roi.left)
-                txt_params.y_offset = int(roi_meta.roi.top)
-                
-                txt_params.font_params.font_name = "Serif"
-                txt_params.font_params.font_size = 10
-                txt_params.font_params.font_color.red = 1.0
-                txt_params.font_params.font_color.green = 1.0
-                txt_params.font_params.font_color.blue = 1.0
-                txt_params.font_params.font_color.alpha = 1.0
-                
-                txt_params.set_bg_clr = 1
-                txt_params.text_bg_clr.red = 0.0
-                txt_params.text_bg_clr.green = 0.0
-                txt_params.text_bg_clr.blue = 0.0
-                txt_params.text_bg_clr.alpha = 0.5
-
-                pyds.nvds_add_display_meta_to_frame(roi_meta.frame_meta, display_meta)
-                print(f"frame {roi_meta.frame_meta.frame_num} src {roi_meta.frame_meta.source_id} roi {roi_cnt}")
-
-                roi_cnt += 1
-        try:
-            l_user_meta = l_user_meta.next
-        except StopIteration:
-            break
-        
     return Gst.PadProbeReturn.OK
 
 
@@ -384,6 +335,7 @@ def main(args):
     pgie.set_property("config-file-path", "dstest1_pgie_config.txt")
 
     pgie_batch_size = pgie.get_property("batch-size")
+    pgie.set_property("input-tensor-meta", True)
     if pgie_batch_size != number_sources:
         print(
             "WARNING: Overriding infer-config batch-size",

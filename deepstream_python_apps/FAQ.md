@@ -13,8 +13,6 @@
     - [Pipeline unable to perform at real time](#pipeline-unable-to-perform-at-real-time)
     - [Triton container problems with multi-GPU setup](#triton-container-problems-with-multi-gpu-setup)
     - [ModuleNotFoundError: No module named 'pyds'](#modulenotfounderror-no-module-named-pyds)
-    - [error: externally-managed-environment](#error-externally-managed-environment)
-    - [Running deepstream-segmentation app on x86 with mjpeg streams](#running-deepstream-segmentation-app-on-x86-with-mjpeg-streams)
 
 <a name="faq11"></a>
 ### App causes Jetson Orin Nano to freeze and reboot
@@ -168,45 +166,4 @@ The pyds wheel installs the pyds.so library where all the pip packages are store
 Command to install the pyds wheel is:
 ```bash
    $ pip3 install ./pyds-1.2.0*.whl
-```
-
-<a name="faq9"></a>  
-### error: externally-managed-environment
-Python 3.12 requires a virtual environment to install and import pip packages. To create a virtual environment for pyds:
-```
-sudo apt install python3-venv
-
-# Create a venv for pyds
-python3 -m venv pyds
-# Activate the environment
-source ./pyds/bin/activate
-```
-
-<a name="faq12"></a>  
-### Running deepstream-segmentation app on x86 with mjpeg streams
-There is a current limitation in deepstream-segmentation app. When mjpeg streams are used on x86, the app hangs. However, there is a workaround. Please apply below patch to the app and it should work with mjpeg as well as jpeg streams on x86:
-```
-diff --git a/apps/deepstream-segmentation/deepstream_segmentation.py b/apps/deepstream-segmentation/deepstream_segmentation.py
-index ec38b1c..13c28f9 100755
---- a/apps/deepstream-segmentation/deepstream_segmentation.py
-+++ b/apps/deepstream-segmentation/deepstream_segmentation.py
-@@ -168,7 +168,7 @@ def main(args):
- 
-     # Use nvdec for hardware accelerated decode on GPU
-     print("Creating Decoder \n")
--    decoder = Gst.ElementFactory.make("nvjpegdec", "nvjpeg-decoder")
-+    decoder = Gst.ElementFactory.make("nvv4l2decoder", "nvjpeg-decoder")
-     if not decoder:
-         sys.stderr.write(" Unable to create NvJPEG Decoder \n")
- 
-@@ -214,6 +214,9 @@ def main(args):
- 
-     print("Playing file %s " % args[2])
-     source.set_property('location', args[2])
-+    if platform_info.is_integrated_gpu() and ("mjpeg" in args[2] or "mjpg" in args[2]):
-+        print ("setting decoder mjpeg property")
-+        decoder.set_property('mjpeg', 1)
- 
-     streammux.set_property('width', 1920)
-     streammux.set_property('height', 1080)
 ```

@@ -16,36 +16,18 @@
 ################################################################################
 
 Prerequisites:
-- DeepStreamSDK 8.0
-- Python 3.12
+- DeepStreamSDK 7.0 **NOT SUPPORTED BY 7.1**
+- Python 3.10
 - Gst-python
 - NumPy package <2.0, >=1.22 (2.0 and above not supported)
 - OpenCV package
 
 To install required packages:
-$ source /path/to/pyds/bin/activate  # Activate the environment
-$ pip3 install --force-reinstall numpy==1.26.0
-$ pip3 install opencv-python
+$ sudo apt update
+$ sudo apt install python3-numpy python3-opencv -y
 
 If on Jetson, the libgomp.so.1 must be added to LD_PRELOAD:
   $ export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1
-
-Download CitySegSemFormer model:
-  $ mkdir -p /opt/nvidia/deepstream/deepstream/samples/models/citysemsegformer
-  $ cd /opt/nvidia/deepstream/deepstream/samples/models/citysemsegformer
-  $ wget --content-disposition 'https://api.ngc.nvidia.com/v2/models/org/nvidia/team/tao/citysemsegformer/deployable_onnx_v1.0/files?redirect=true&path=citysemsegformer.onnx' -O citysemsegformer.onnx
-  $ wget --content-disposition 'https://api.ngc.nvidia.com/v2/models/org/nvidia/team/tao/citysemsegformer/deployable_onnx_v1.0/files?redirect=true&path=labels.txt' -O labels.txt
-
-Additionally, compile the libnvds_infercustomparser_tao.so lib:
-$ git clone https://github.com/NVIDIA-AI-IOT/deepstream_tao_apps.git
-$ cd /path/to/deepstream_tao_apps/post_processor
-For x86:
-$ export CUDA_VER=12.8
-For aarch64:
-$ export CUDA_VER=13.0
-For both platforms:
-$ make
-$ cp -r /path/to/deepstream_tao_apps/post_processor/libnvds_infercustomparser_tao.so /opt/nvidia/deepstream/deepstream/lib/
 
 To run:
   $ python3 deepstream_segmentation.py <config_file> <jpeg/mjpeg stream> <FOLDER NAME TO SAVE FRAMES>
@@ -63,10 +45,14 @@ important as considerable behaviors of the instance are parameterized
 through these configs.
 
 For reference, here are the config files used for this sample :
-1. The 19-class segmentation model configured through dstest_segmentation_citysemsegformer_config.txt
+1. The 4-class segmentation model configured through dstest_segmentation_config_semantic.txt 
+2. The 2-class segmentation model configured through dstest_segmentation_config_industrial.txt
 
 In this sample, we first create one instance of "nvinfer", referred as the pgie.
-Later nvinfer element attach some MetaData 
+for semantic segmentation, it needs semantic model which can get 4 classes map,
+including backgroud, car, person, bicycle. Then "nvsegvidsual" plugin chooses 4 different 
+colors for them and to display. Similarlty for industrial segmentation, it needs industrial 
+model which can only get defective area map. Later nvinfer element attach some MetaData 
 to the buffer. By attaching the probe function at the end of the pipeline, one can 
 extract meaningful information from this inference. Please refer 
 the "tiler_src_pad_buffer_probe" function in the sample code. For details on the 

@@ -16,8 +16,8 @@
 ################################################################################
 
 Prequisites:
-- DeepStreamSDK 8.0
-- Python 3.12
+- DeepStreamSDK 7.1
+- Python 3.10
 - Gst-python
 - GstRtspServer
 
@@ -70,7 +70,7 @@ This sample app specifically includes following :
     Person".
 
   If NVInferserver is selected then:
-    1. Uses Triton Inference Server for inference processing.
+    1. Uses SSD neural network running on Triton Inference Server
     2. Selects custom post-processing in the Triton Inference Server config file
     3. Parses the inference output into bounding boxes
     4. Performs post-processing on the generated boxes with NMS (Non-maximum Suppression)

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.12 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
 
 # Setting values not set by user
 function(check_variable_set variable_name default_value)
@@ -23,7 +23,7 @@ function(check_variable_set variable_name default_value)
 endfunction()
 
 check_variable_set(PYTHON_MAJOR_VERSION 3)
-check_variable_set(PYTHON_MINOR_VERSION 12)
+check_variable_set(PYTHON_MINOR_VERSION 10)
 
 check_variable_set(DS_PATH "/opt/nvidia/deepstream/deepstream")
 if (DEFINED IS_SBSA)
@@ -39,7 +39,7 @@ macro(check_variable_allowed var_name var_list)
 endmacro()
 set(PYTHON_MAJVERS_ALLOWED 3)
 check_variable_allowed(PYTHON_MAJOR_VERSION PYTHON_MAJVERS_ALLOWED)
-set(PYTHON_MINVERS_ALLOWED 12)
+set(PYTHON_MINVERS_ALLOWED 10)
 check_variable_allowed(PYTHON_MINOR_VERSION PYTHON_MINVERS_ALLOWED)
 
 # Setting C++ values
@@ -50,6 +50,7 @@ set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--no-undefined")
 
 # Setting python build versions
 set(PYTHON_VERSION ${PYTHON_MAJOR_VERSION}.${PYTHON_MINOR_VERSION})
+set(PIP_WHEEL pyds-1.1.11-py3-none-${PIP_PLATFORM}.whl)
 
 # Describing pyds build
 project(pyds DESCRIPTION "Python bindings for Deepstream")
@@ -58,7 +59,6 @@ add_compile_options(-Wall -Wextra -pedantic -O3)
 include_directories(
         include/
         ${DS_PATH}/sources/includes/
-        ${DS_PATH}/sources/gst-plugins/gst-nvdspreprocess/include
         include/bind
         include/nvds
         3rdparty/pybind11/include/pybind11/
@@ -74,8 +74,7 @@ add_library(pyds SHARED src/pyds.cpp src/utils.cpp src/bindanalyticsmeta.cpp
             src/bindfunctions.cpp src/bindgstnvdsmeta.cpp
             src/bindmeta360.cpp src/bindnvbufsurface.cpp src/bindnvdsinfer.cpp
             src/bindnvdsmeta.cpp src/bindnvosd.cpp src/bindopticalflow.cpp
-            src/bindschema.cpp src/bindtrackermeta.cpp src/custom_binding/bindcustom.cpp
-            src/bindpreprocessmeta.cpp src/bindroimeta.cpp)
+            src/bindschema.cpp src/bindtrackermeta.cpp src/custom_binding/bindcustom.cpp)
 
 set_target_properties(pyds PROPERTIES PREFIX "")
 set_target_properties(pyds PROPERTIES OUTPUT_NAME "pyds")

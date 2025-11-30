@@ -86,7 +86,7 @@ namespace pydeepstream {
                 .def_readwrite("scaleImg", &NvDsObjEncUsrArgs::scaleImg)
                 .def_readwrite("scaledWidth", &NvDsObjEncUsrArgs::scaledWidth)
                 .def_readwrite("scaledHeight", &NvDsObjEncUsrArgs::scaledHeight)
-                .def_property("fileNameImg", STRING_CHAR_ARRAY(NvDsObjEncUsrArgs, fileNameImg, FILE_NAME_SIZE))
+                .def_property("fileNameImg", STRING_CHAR_ARRAY(NvDsObjEncUsrArgs, fileNameImg))
                 .def_readwrite("objNum", &NvDsObjEncUsrArgs::objNum)
                 .def_readwrite("quality", &NvDsObjEncUsrArgs::quality)
                 .def_readwrite("isFrame", &NvDsObjEncUsrArgs::isFrame)

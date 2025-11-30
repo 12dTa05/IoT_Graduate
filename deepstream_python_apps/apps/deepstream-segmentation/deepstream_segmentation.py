@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 ################################################################################
-# SPDX-FileCopyrightText: Copyright (c) 2019-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2019-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,12 +39,10 @@ MUXER_OUTPUT_HEIGHT = 1080
 MUXER_BATCH_TIMEOUT_USEC = 33000
 TILED_OUTPUT_WIDTH = 1280
 TILED_OUTPUT_HEIGHT = 720
-# This citysemsegformer segments the urban cityscapes into 19 classes
 COLORS = [[128, 128, 64], [0, 0, 128], [0, 128, 128], [128, 0, 0],
           [128, 0, 128], [128, 128, 0], [0, 128, 0], [0, 0, 64],
           [0, 0, 192], [0, 128, 64], [0, 128, 192], [128, 0, 64],
-          [128, 0, 192], [128, 128, 128], [128, 64, 128], [128, 64, 0],
-          [0, 64, 128],[192, 128, 0], [192, 128, 64]]
+          [128, 0, 192], [128, 128, 128]]
 
 def map_mask_as_display_bgr(mask):
     """ Assigning multiple colors as image output using the information
@@ -52,6 +50,7 @@ def map_mask_as_display_bgr(mask):
     """
     # getting a list of available classes
     m_list = list(set(mask.flatten()))
+
     shp = mask.shape
     bgr = np.zeros((shp[0], shp[1], 3))
     for idx in m_list:
@@ -111,7 +110,6 @@ def seg_src_pad_buffer_probe(pad, info, u_data):
                 masks = np.array(masks, copy=True, order='C')
                 # map the obtained masks to colors of 2 classes.
                 frame_image = map_mask_as_display_bgr(masks)
-                print("Frame Number = ", frame_number, " Mask shape = ", masks.shape)
                 cv2.imwrite(folder_name + "/" + str(frame_number) + ".jpg", frame_image)
             try:
                 l_user = l_user.next
@@ -168,14 +166,9 @@ def main(args):
 
     # Use nvdec for hardware accelerated decode on GPU
     print("Creating Decoder \n")
-    decoder = Gst.ElementFactory.make("nvjpegdec", "nvjpeg-decoder")
+    decoder = Gst.ElementFactory.make("nvv4l2decoder", "nvv4l2-decoder")
     if not decoder:
-        sys.stderr.write(" Unable to create NvJPEG Decoder \n")
-
-    # Create nvvideoconvert to convert jpegdecoder's I420 to NV12
-    nvvidconv1 = Gst.ElementFactory.make("nvvideoconvert", "nvvideconvert1")
-    if not nvvidconv1:
-        sys.stderr.write(" Unable to create nvvideoconvert \n")
+        sys.stderr.write(" Unable to create Nvv4l2 Decoder \n")
 
     # Create nvstreammux instance to form batches from one or more sources.
     streammux = Gst.ElementFactory.make("nvstreammux", "Stream-muxer")
@@ -214,7 +207,9 @@ def main(args):
 
     print("Playing file %s " % args[2])
     source.set_property('location', args[2])
-
+    if platform_info.is_integrated_gpu() and ("mjpeg" in args[2] or "mjpg" in args[2]):
+        print ("setting decoder mjpeg property")
+        decoder.set_property('mjpeg', 1)
     streammux.set_property('width', 1920)
     streammux.set_property('height', 1080)
     streammux.set_property('batch-size', 1)
@@ -236,7 +231,6 @@ def main(args):
     pipeline.add(decoder)
     pipeline.add(streammux)
     pipeline.add(nvvidconv)
-    pipeline.add(nvvidconv1)
     pipeline.add(seg)
     pipeline.add(nvsegvisual)
     pipeline.add(sink)
@@ -247,12 +241,11 @@ def main(args):
     print("Linking elements in the Pipeline \n")
     source.link(jpegparser)
     jpegparser.link(decoder)
-    decoder.link(nvvidconv1)
 
     sinkpad = streammux.request_pad_simple("sink_0")
     if not sinkpad:
         sys.stderr.write(" Unable to get the sink pad of streammux \n")
-    srcpad = nvvidconv1.get_static_pad("src")
+    srcpad = decoder.get_static_pad("src")
     if not srcpad:
         sys.stderr.write(" Unable to get source pad of decoder \n")
     srcpad.link(sinkpad)

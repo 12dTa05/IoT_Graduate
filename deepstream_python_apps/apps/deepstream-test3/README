@@ -1,5 +1,5 @@
 ################################################################################
-# SPDX-FileCopyrightText: Copyright (c) 2019-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2019-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,9 +16,9 @@
 ################################################################################
 
 Prerequisites:
-- DeepStreamSDK 8.0
+- DeepStreamSDK 7.1
 - NVIDIA Triton Inference Server (optional)
-- Python 3.12
+- Python 3.10
 - Gst-python
 
 To set up Triton Inference Server: (optional)
@@ -33,7 +33,7 @@ For x86_64 and Jetson Docker:
      $ pip3 install pathlib
   4. Build and install pyds bindings:
      Follow the instructions in bindings README in this repo to build and install
-     pyds wheel for Ubuntu 24.04
+     pyds wheel for Ubuntu 22.04
   5. For Triton gRPC setup, please follow the instructions at below location:
      /opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app-triton-grpc/README
 
@@ -44,28 +44,59 @@ For Jetson without Docker:
      2.2 Prepare at least the Triton detector models
   2. Build and install pyds bindings:
      Follow the instructions in bindings README in this repo to build and install
-     pyds wheel for Ubuntu 24.04
+     pyds wheel for Ubuntu 22.04
   3. Clear the GStreamer cache if pipeline creation fails:
      rm ~/.cache/gstreamer-1.0/*
   4. For Triton gRPC setup, please follow the instructions at below location:
      /opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app-triton-grpc/README
 
 To setup peoplenet model and configs (optional):
-Download Peoplenet model:
-  $ mkdir -p /opt/nvidia/deepstream/deepstream/samples/models/peoplenet
-  $ cd /opt/nvidia/deepstream/deepstream/samples/models/peoplenet
-  $ wget --content-disposition 'https://api.ngc.nvidia.com/v2/models/org/nvidia/team/tao/peoplenet/pruned_quantized_decrypted_v2.3.4/files?redirect=true&path=resnet34_peoplenet_int8.onnx' -O resnet34_peoplenet_int8.onnx
-  $ wget --content-disposition 'https://api.ngc.nvidia.com/v2/models/org/nvidia/team/tao/peoplenet/pruned_quantized_decrypted_v2.3.4/files?redirect=true&path=resnet34_peoplenet_int8.txt' -O resnet34_peoplenet_int8.txt
-  $ wget --content-disposition 'https://api.ngc.nvidia.com/v2/models/org/nvidia/team/tao/peoplenet/pruned_quantized_decrypted_v2.3.4/files?redirect=true&path=labels.txt' -O labels.txt
+Please follow instructions in the README located here : /opt/nvidia/deepstream/deepstream/samples/configs/tao_pretrained_models/README
 
-Additionally, for Triton and Triton gRPC
-   $ cp config.pbtxt /opt/nvidia/deepstream/deepstream/samples/models/peoplenet
-   $ mkdir -p /opt/nvidia/deepstream/deepstream/samples/models/peoplenet/1
-   $ /usr/src/tensorrt/bin/trtexec --onnx=/opt/nvidia/deepstream/deepstream/samples/models/peoplenet/resnet34_peoplenet_int8.onnx --fp16 \
-   --saveEngine=/opt/nvidia/deepstream/deepstream/samples/models/peoplenet/1/resnet34_peoplenet_int8.onnx_b2_gpu0_fp16.engine \
-   --minShapes="input_1:0":1x3x544x960 \
-   --optShapes="input_1:0":2x3x544x960 \
-   --maxShapes="input_1:0":2x3x544x960
+Also follow these instructions for multi-stream Triton support (optional):
+  1. Update the max_batch_size in config_triton_infer_primary_peoplenet.txt to the maximum expected number of streams
+  2. Regenerate engine file for peoplenet as described below using deepstream-app:
+      a. cd to /opt/nvidia/deepstream/deepstream/samples/configs/tao_pretrained_models
+ 
+      b. Edit "primary-pgie" section in the deepstream_app_source1_peoplenet.txt file to reflect below:
+            "
+            enable=1
+            plugin-type=0
+            model-engine-file=../../models/tao_pretrained_models/peopleNet/<.engine file>
+            batch-size=<max_batch_size>
+            config-file=config_infer_primary_peoplenet.txt
+            "
+      c. Make sure that you make corresponding changes in the config_infer_primary_peoplenet.txt file in above dir.
+         For ex.
+            "
+            tlt-model-key=tlt_encode
+            tlt-encoded-model=../../models/tao_pretrained_models/peopleNet/resnet34_peoplenet_int8.etlt
+            labelfile-path=/opt/nvidia/deepstream/deepstream/samples/configs/tao_pretrained_models/labels_peoplenet.txt
+            model-engine-file=../../models/tao_pretrained_models/peopleNet/<.engine file>
+            int8-calib-file=../../models/tao_pretrained_models/peopleNet/resnet34_peoplenet_int8.txt
+            batch-size=16
+            "
+      d. While inside the dir /opt/nvidia/deepstream/deepstream/samples/configs/tao_pretrained_models/ , run the deepstream-app
+         as follows:
+            deepstream-app -c deepstream_app_source1_peoplenet.txt
+
+         This would generate the engine file required for the next step.
+
+      e. Create the following dir if not present:
+         sudo mkdir -p /opt/nvidia/deepstream/deepstream/samples/triton_model_repo/peoplenet/1/
+
+      f. Copy engine file from dir /opt/nvidia/deepstream/deepstream/samples/models/tao_pretrained_models/peopleNet/
+         to
+         /opt/nvidia/deepstream/deepstream/samples/triton_model_repo/peoplenet/1/
+
+      g. Copy file config.pbtxt from deepstream-test3 dir to /opt/nvidia/deepstream/deepstream/samples/triton_model_repo/peoplenet/ dir
+
+      h. cd to /opt/nvidia/deepstream/deepstream/samples/triton_model_repo/peoplenet and make sure that config.pbtxt
+         has the correct "max_batch_size" set along with "default_model_filename" set to the newly moved engine file
+
+Note: For gRPC case, grpc url according to the grpc server configuration and make sure that the labelfile_path points to the
+      correct/expected labelfile
+
 
 To run:
   $ python3 deepstream_test_3.py -i <uri1> [uri2] ... [uriN] [--no-display] [--silent]
@@ -77,22 +108,18 @@ To run peoplenet, test3 now supports 3 modes:
 
   1. nvinfer + peoplenet: this mode still uses TRT for inferencing.
 
-     $ python3 deepstream_test_3.py -i <uri1> [uri2] ... [uriN] --pgie nvinfer -c config_infer_primary_peoplenet.txt [--no-display] [--silent]
+     $ python3 deepstream_test_3.py -i <uri1> [uri2] ... [uriN] --pgie nvinfer -c <configfile> [--no-display] [--silent]
 
   2. nvinferserver + peoplenet : this mode uses Triton for inferencing.
 
-     $ python3 deepstream_test_3.py -i <uri1> [uri2] ... [uriN] --pgie nvinferserver -c config_triton_infer_primary_peoplenet.txt [--no-display] [-s]
+     $ python3 deepstream_test_3.py -i <uri1> [uri2] ... [uriN] --pgie nvinferserver -c <configfile> [--no-display] [-s]
 
   3. nvinferserver (gRPC) + peoplenet : this mode uses Triton gRPC for inferencing.
 
-     $ mkdir -p /opt/nvidia/deepstream/deepstream/samples/models/peoplenet-grpc/peoplenet
-     $ cp /opt/nvidia/deepstream/deepstream/samples/models/peoplenet/config.pbtxt /opt/nvidia/deepstream/deepstream/samples/models/peoplenet-grpc/peoplenet/config.pbtxt
-     $ cp -a /opt/nvidia/deepstream/deepstream/samples/models/peoplenet/1 /opt/nvidia/deepstream/deepstream/samples/models/peoplenet-grpc/peoplenet/1
-     $ tritonserver --model-repository=/opt/nvidia/deepstream/deepstream/samples/models/peoplenet-grpc
-     $ python3 deepstream_test_3.py -i <uri1> [uri2] ... [uriN] --pgie nvinferserver-grpc -c config_triton_grpc_infer_primary_peoplenet.txt [--no-display] [--silent]
+     $ python3 deepstream_test_3.py -i <uri1> [uri2] ... [uriN] --pgie nvinferserver-grpc -c <configfile> [--no-display] [--silent]
 
 e.g.
-  $ python3 deepstream_test_3.py -i file:///home/ubuntu/video1.mp4 file:///home/ubuntu/video2.mp4 --pgie nvinfer -c config_infer_primary_peoplenet.txt --no-display --silent
+  $ python3 deepstream_test_3.py -i file:///home/ubuntu/video1.mp4 file:///home/ubuntu/video2.mp4 --pgie nvinfer -c config_infer_primary_peoplenet.tx --no-display --silent
   $ python3 deepstream_test_3.py -i rtsp://127.0.0.1/video1 rtsp://127.0.0.1/video2 --pgie nvinferserver -c config_triton_infer_primary_peoplenet.txt -s
   $ python3 deepstream_test_3.py -i rtsp://127.0.0.1/video1 rtsp://127.0.0.1/video2 --pgie nvinferserver-grpc -c config_triton_grpc_infer_primary_peoplenet.txt --no-display --silent
 

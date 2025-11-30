@@ -140,7 +140,6 @@ namespace pydsdoc
                 corresponding frame_meta or object_user_meta_list of the corresponding object
                 with the meta_type set to NVDSINFER_SEGMENTATION_META. Get mask data using :py:func:`get_segmentation_masks`.
 
-                :ivar unique_id: *int*, Unique ID of the gst-nvinfer instance which attached this meta.
                 :ivar classes: *int*, Number of classes in the segmentation output.
                 :ivar width: *int*, Width of the segmentation output class map.
                 :ivar height: *int*, Height of the segmentation output class map.

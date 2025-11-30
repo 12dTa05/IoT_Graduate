@@ -16,38 +16,27 @@
 ################################################################################
 
 Prerequisites:
-- DeepStreamSDK 8.0
-- Python 3.12
+- DeepStreamSDK 7.0 **NOT CURRENTLY SUPPORTED BY 7.1**
+- Python 3.10
 - Gst-python
 - NumPy package <2.0, >=1.22 (2.0 and above not supported)
 - OpenCV package
 
 To install required packages:
-$ source /path/to/pyds/bin/activate  # Activate the environment
-$ pip3 install --force-reinstall numpy==1.26.0
-$ pip3 install opencv-python
+$ sudo apt update
+$ sudo apt install python3-numpy python3-opencv -y
 
-Download mask2former model:
-  $ mkdir -p /opt/nvidia/deepstream/deepstream/samples/models/mask2former
-  $ cd /opt/nvidia/deepstream/deepstream/samples/models/mask2former
-  $ wget --content-disposition 'https://api.ngc.nvidia.com/v2/models/org/nvidia/team/tao/mask2former/mask2former_swint_deployable_v1.0/files?redirect=true&path=mask2former_swint.onnx' -O mask2former.onnx
+**NOTE**: this application is not currently supported by DeepStream 7.1, due to removal of segmentation models.
 
-Additionally, compile the libnvds_infercustomparser_tao.so lib:
-$ git clone https://github.com/NVIDIA-AI-IOT/deepstream_tao_apps.git
-$ cd /path/to/deepstream_tao_apps/post_processor
-For x86:
-$ export CUDA_VER=12.8
-For aarch64:
-$ export CUDA_VER=13.0
-For both platforms:
-$ make
-$ cp -r /path/to/deepstream_tao_apps/post_processor/libnvds_infercustomparser_tao.so /opt/nvidia/deepstream/deepstream/lib/
+Download PeopleSegNet model:
+  Please follow instructions from the README.md located at : /opt/nvidia/deepstream/deepstream/samples/configs/tao_pretrained_models/README.md
+  to download latest supported PeopleSegNet model
 
 To run:
   $ python3 deepstream_segmask.py -i <uri1> [uri2] ... [uriN] -o <FOLDER NAME TO SAVE FRAMES>
 e.g.
-  $ python3 deepstream_segmask.py -i file:///home/ubuntu/video1.mp4 file:///home/ubuntu/video2.mp4 -o frames
-  $ python3 deepstream_segmask.py -i rtsp://127.0.0.1/video1 rtsp://127.0.0.1/video2 -o frames
+  $ python3 deepstream_segmask.py file:///home/ubuntu/video1.mp4 file:///home/ubuntu/video2.mp4 -o frames
+  $ python3 deepstream_segmask.py rtsp://127.0.0.1/video1 rtsp://127.0.0.1/video2 -o frames
 
 This document describes the sample deepstream-segmask application.
 

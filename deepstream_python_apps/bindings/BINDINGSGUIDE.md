@@ -270,15 +270,13 @@ Note that a _return value policy_ must be set. In this case, we want to prevent 
 
 The [```include/bind/bind_string_property_definitions.h```](include/bind/bind_string_property_definitions.h) header file includes this macro definition:
 ```c++
-#define STRING_CHAR_ARRAY(TYPE, FIELD, FIELD_SIZE)                 \
+#define STRING_CHAR_ARRAY(TYPE, FIELD)                             \
         [](const TYPE &self)->std::string {                        \
             return std::string(self.FIELD);                        \
         },                                                         \
         [](TYPE &self, std::string str) {                          \
             int strSize = str.size();                              \
-            memset(self.FIELD, 0, FIELD_SIZE);                     \
-            int len = FIELD_SIZE - 1 > strSize ? strSize : FIELD_SIZE - 1; \
-            str.copy(self.FIELD, len);                             \
+            str.copy(self.FIELD, strSize);                         \
         },                                                         \
         py::return_value_policy::reference
 

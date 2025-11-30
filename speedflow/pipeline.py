@@ -39,7 +39,7 @@ def build_rtsp_pipeline(rtsp_uri: str):
     pgie.set_property('config-file-path', str(INFER_CONFIG))
 
     tracker = make_e("tracker","nvtracker")
-    tracker.set_property('ll-lib-file', "/opt/nvidia/deepstream/deepstream-6.3/lib/libnvds_nvmultiobjecttracker.so")
+    tracker.set_property('ll-lib-file', "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
     tracker.set_property('ll-config-file', str(TRACKER_CFG))
     tracker.set_property('tracker-width', 640)
     tracker.set_property('tracker-height', 384)

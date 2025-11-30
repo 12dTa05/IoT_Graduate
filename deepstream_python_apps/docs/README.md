@@ -2,7 +2,7 @@ Please follow the following steps to build html files
 
 requirements
 ===================
-1. python 3.12 (The default `python --version` should be 3.12)
+1. python 3.10 (The default `python --version` should be 3.10)
 2. sphinx (>=4.2)
 3. breathe extension
 4. recommonmark

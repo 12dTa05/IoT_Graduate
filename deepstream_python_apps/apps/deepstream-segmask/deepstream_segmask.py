@@ -83,6 +83,7 @@ def tiler_sink_pad_buffer_probe(pad, info, u_data):
         l_obj = frame_meta.obj_meta_list
         num_rects = frame_meta.num_obj_meta
         is_first_obj = True
+        save_image = False
         obj_number = 0
         while l_obj is not None:
             try:
@@ -90,14 +91,15 @@ def tiler_sink_pad_buffer_probe(pad, info, u_data):
                 obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
             except StopIteration:
                 break
-            if is_first_obj and frame_number % 30 == 0 and obj_meta.mask_params.data is not None:
+            if is_first_obj and frame_number % 30 == 0:
                 is_first_obj = False
                 rectparams = obj_meta.rect_params # Retrieve rectparams for re-sizing mask to correct dims
                 maskparams = obj_meta.mask_params # Retrieve maskparams
                 mask_image = resize_mask(maskparams, math.floor(rectparams.width), math.floor(rectparams.height)) # Get resized mask array
-
+                
                 img_path = "{}/stream_{}/frame_{}.jpg".format(folder_name, frame_meta.pad_index, frame_number)
                 cv2.imwrite(img_path, mask_image) # Save mask to image
+            
             try:
                 l_obj = l_obj.next
                 obj_number += 1
@@ -116,14 +118,52 @@ def tiler_sink_pad_buffer_probe(pad, info, u_data):
 
     return Gst.PadProbeReturn.OK
 
+
+def clip(val, low, high):
+    if val < low:
+        return low 
+    elif val > high:
+        return high 
+    else:
+        return val
+
 # Resize and binarize mask array for interpretable segmentation mask
 def resize_mask(maskparams, target_width, target_height):
-    src = maskparams.get_mask_array()
-    src_2d = src.reshape((maskparams.height, maskparams.width))
+    src = maskparams.get_mask_array() # Retrieve mask array
+    dst = np.empty((target_height, target_width), src.dtype) # Initialize array to store re-sized mask
+    original_width = maskparams.width
+    original_height = maskparams.height
+    ratio_h = float(original_height) / float(target_height)
+    ratio_w = float(original_width) / float(target_width)
+    threshold = maskparams.threshold
+    channel = 1
 
-    mask_uint8 = (src_2d * 255).astype(np.uint8)
+    # Resize from original width/height to target width/height 
+    for y in range(target_height):
+        for x in range(target_width):
+            x0 = float(x) * ratio_w
+            y0 = float(y) * ratio_h
+            left = int(clip(math.floor(x0), 0.0, float(original_width - 1.0)))
+            top = int(clip(math.floor(y0), 0.0, float(original_height - 1.0)))
+            right = int(clip(math.ceil(x0), 0.0, float(original_width - 1.0)))
+            bottom = int(clip(math.ceil(y0), 0.0, float(original_height - 1.0)))
 
-    return cv2.resize(mask_uint8, (target_width, target_height), dst=mask_uint8, interpolation=cv2.INTER_LINEAR)
+            for c in range(channel):
+                # H, W, C ordering
+                # Note: lerp is shorthand for linear interpolation
+                left_top_val = float(src[top * (original_width * channel) + left * (channel) + c])
+                right_top_val = float(src[top * (original_width * channel) + right * (channel) + c])
+                left_bottom_val = float(src[bottom * (original_width * channel) + left * (channel) + c])
+                right_bottom_val = float(src[bottom * (original_width * channel) + right * (channel) + c])
+                top_lerp = left_top_val + (right_top_val - left_top_val) * (x0 - left)
+                bottom_lerp = left_bottom_val + (right_bottom_val - left_bottom_val) * (x0 - left)
+                lerp = top_lerp + (bottom_lerp - top_lerp) * (y0 - top)
+                if (lerp < threshold): # Binarize according to threshold
+                    dst[y,x] = 0
+                else:
+                    dst[y,x] = 255
+    return dst
+                
 
 def cb_newpad(decodebin, decoder_src_pad, data):
     print("In cb_newpad\n")

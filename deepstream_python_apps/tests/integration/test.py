@@ -24,11 +24,6 @@ from tests.testcommon.pipeline_fakesink_tracker import PipelineFakesinkTracker
 from tests.testcommon.tracker_utils import get_tracker_properties_from_config
 from tests.testcommon.utils import is_integrated_gpu
 
-# Import WSL detection from common module
-import sys
-sys.path.append('../../apps/')
-from common.platform_info import PlatformInfo
-
 VIDEO_PATH1 = "/opt/nvidia/deepstream/deepstream/samples/streams/sample_720p.h264"
 STANDARD_PROPERTIES1 = {
     "file-source": {
@@ -64,10 +59,6 @@ STANDARD_PROPERTIES_TRACKER1 = {
         "config-file-path", "ds_sgie2_config.txt"
     }
 }
-
-# Initialize platform info for WSL detection
-platform_info = PlatformInfo()
-
 STANDARD_CLASS_ID1 = {
     0: "vehicle",
     1: "person",
@@ -243,10 +234,6 @@ def test_pipeline2():
 
 
 def test_pipeline3():
-    # Skip test on WSL due to libjpeg.so segmentation fault
-    if platform_info.is_wsl():
-        pytest.skip("Skipping test_pipeline3 on WSL due to known issue in object encoding")
-
     ### INIT DATA
 
     # Creating the pipeline

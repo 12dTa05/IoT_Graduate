@@ -9,15 +9,16 @@ This guide provides resources for DeepStream application development in Python.
 * [Pipeline Construction](#pipeline_construction)
 * [MetaData Access](#metadata_access)
 * [Image Data Access](#imagedata_access)
+* [Custom Inference Output Parsing](apps/deepstream-ssd-parser/custom_parser_guide.md)
 * [FAQ and Troubleshooting](FAQ.md)
 
 <a name="prereqs"></a>
 ## Prerequisites
 
-* Ubuntu 24.04
-* [DeepStream SDK 8.0](https://developer.nvidia.com/deepstream-download) or later
-* Python 3.12
-* [Gst Python](https://gstreamer.freedesktop.org/modules/gst-python.html) v1.24.1
+* Ubuntu 22.04
+* [DeepStream SDK 7.1](https://developer.nvidia.com/deepstream-download) or later
+* Python 3.10
+* [Gst Python](https://gstreamer.freedesktop.org/modules/gst-python.html) v1.20.3
 
 Gst python should be already installed on Jetson.  
 If missing, install with the following steps:

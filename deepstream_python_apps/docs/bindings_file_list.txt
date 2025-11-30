@@ -10,5 +10,3 @@ bindschema.cpp
 bindtrackermeta.cpp
 utils.cpp
 custom_binding/bindcustom.cpp
-bindpreprocessmeta.cpp
-bindroimeta.cpp

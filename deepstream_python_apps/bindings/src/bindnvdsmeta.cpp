@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -83,12 +83,6 @@ namespace pydeepstream {
                        pydsdoc::nvmeta::MetaTypeDoc::NVDS_START_USER_META)
                 .value("NVDS_FORCE32_META", NVDS_FORCE32_META,
                        pydsdoc::nvmeta::MetaTypeDoc::NVDS_FORCE32_META)
-                .value("NVDS_PREPROCESS_BATCH_META", NVDS_PREPROCESS_BATCH_META,
-                       pydsdoc::nvmeta::MetaTypeDoc::NVDS_PREPROCESS_BATCH_META)
-                .value("NVDS_FRAME_META_NVDSANALYTICS", NVDS_FRAME_META_NVDSANALYTICS,
-                       pydsdoc::nvmeta::MetaTypeDoc::NVDS_FRAME_META_NVDSANALYTICS)
-                .value("NVDS_OBJ_META_NVDSANALYTICS", NVDS_OBJ_META_NVDSANALYTICS,
-                       pydsdoc::nvmeta::MetaTypeDoc::NVDS_OBJ_META_NVDSANALYTICS)
                 .export_values();
 
 
@@ -331,7 +325,7 @@ namespace pydeepstream {
                      pydsdoc::nvmeta::ObjectMetaDoc::cast)
 
                 .def_property("obj_label",
-                              STRING_CHAR_ARRAY(NvDsObjectMeta, obj_label, MAX_LABEL_SIZE))
+                              STRING_CHAR_ARRAY(NvDsObjectMeta, obj_label))
                 .def_readwrite("classifier_meta_list",
                                &NvDsObjectMeta::classifier_meta_list)
                 .def_readwrite("obj_user_meta_list",
@@ -396,7 +390,7 @@ namespace pydeepstream {
                 .def_readwrite("base_meta", &NvDsLabelInfo::base_meta)
                 .def_readwrite("num_classes", &NvDsLabelInfo::num_classes)
                 .def_property("result_label",
-                              STRING_CHAR_ARRAY(NvDsLabelInfo, result_label, MAX_LABEL_SIZE))
+                              STRING_CHAR_ARRAY(NvDsLabelInfo, result_label))
 
                 .def("cast",
                      [](void *data) {

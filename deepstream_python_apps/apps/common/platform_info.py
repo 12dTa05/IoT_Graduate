@@ -18,8 +18,8 @@
 import sys
 import platform
 from threading import Lock
-from cuda.bindings import runtime
-from cuda.bindings import driver
+from cuda import cudart
+from cuda import cuda
 
 guard_platform_info = Lock()
 
@@ -58,17 +58,17 @@ class PlatformInfo:
         with guard_platform_info:
             #Cuda initialize
             if not self.is_integrated_gpu_verified:
-                cuda_init_result, = driver.cuInit(0)
-                if  cuda_init_result == driver.CUresult.CUDA_SUCCESS:
+                cuda_init_result, = cuda.cuInit(0)
+                if  cuda_init_result == cuda.CUresult.CUDA_SUCCESS:
                     #Get cuda devices count
-                    device_count_result, num_devices = driver.cuDeviceGetCount()
-                    if device_count_result == driver.CUresult.CUDA_SUCCESS:
+                    device_count_result, num_devices = cuda.cuDeviceGetCount()
+                    if device_count_result == cuda.CUresult.CUDA_SUCCESS:
                         #If atleast one device is found, we can use the property from
                         #the first device
                         if num_devices >= 1:
                             #Get properties from first device
-                            property_result, properties = runtime.cudaGetDeviceProperties(0)
-                            if property_result == runtime.cudaError_t.cudaSuccess:
+                            property_result, properties = cudart.cudaGetDeviceProperties(0)
+                            if property_result == cuda.CUresult.CUDA_SUCCESS:
                                 print("Is it Integrated GPU? :", properties.integrated)
                                 self.is_integrated_gpu_system = properties.integrated
                                 self.is_integrated_gpu_verified = True
