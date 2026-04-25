@@ -479,6 +479,19 @@ class SpeedProbe:
         if self.snap_count[track_id] < 1 and image_b64 is not None:
             self.snap_count[track_id] += 1
 
+    def _cleanup_stale_tracks(self, active_track_ids: set, current_frame: int, ttl_frames: int = 150):
+        """Remove entries for tracks not seen in last ttl_frames frames."""
+        stale = [tid for tid in self.track_birth_frame
+                if tid not in active_track_ids
+                and current_frame - self.last_update_frame.get(tid, 0) > ttl_frames]
+        for tid in stale:
+            for d in [self.history_positions, self.last_speed_text, self.last_update_frame,
+                    self.last_alert_ts, self.snap_count, self.speed_history,
+                    self.vehicle_plates, self.plate_candidates, self.plate_locked,
+                    self.plate_detection_start_frame, self.plate_detection_attempts]:
+                d.pop(tid, None)
+            self.track_birth_frame.pop(tid, None)
+            self.last_area.pop(tid, None)
 
     # -------------------- main probe --------------------
     def osd_sink_pad_buffer_probe(self, pad, info, u_data):

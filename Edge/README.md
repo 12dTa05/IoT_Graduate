@@ -43,6 +43,118 @@ IoT_Graduate/
 
 ## 🎯 Cách sử dụng
 
+### 0. Nguồn RTSP (Camera / Máy tính khác)
+
+Hệ thống hỗ trợ **bất kỳ nguồn RTSP nào** — camera IP, NVR, OBS, FFmpeg, VLC, v.v.
+Chỉ cần thay `video.mp4` bằng URL RTSP tương ứng.
+
+#### Bước 1 – Kiểm tra kết nối RTSP
+```bash
+# Test xem RTSP có hoạt động không (cần gst-launch)
+gst-launch-1.0 uridecodebin uri="rtsp://192.168.1.100:8554/stream" ! autovideosink
+
+# Hoặc dùng ffplay
+ffplay rtsp://192.168.1.100:8554/stream
+```
+
+#### Bước 2 – Calibrate homography cho camera mới
+```bash
+# Lấy 1 frame để chọn 4 điểm ROI:
+ffmpeg -i rtsp://192.168.1.100:8554/stream -frames:v 1 frame_calib.jpg
+
+# Mở ảnh, chọn 4 góc vùng đo, sửa configs/points_rtsp.yml
+# SOURCE: 4 điểm pixel trên ảnh camera
+# TARGET: kích thước thực (mét) của vùng đó ngoài đường
+```
+
+Ví dụ `configs/points_rtsp.yml`:
+```yaml
+SOURCE:
+- [960,  400]   # top-left
+- [1280, 400]   # top-right
+- [1800, 900]   # bottom-right
+- [400,  900]   # bottom-left
+TARGET_WIDTH: 12    # 3 làn × 4m
+TARGET_HEIGHT: 30   # đoạn đo 30m
+TARGET:
+- [0, 0]
+- [12, 0]
+- [12, 30]
+- [0, 30]
+```
+
+#### Bước 3 – Chạy với RTSP
+
+**Display mode** (xem trực tiếp trên màn hình):
+```bash
+python3 main.py --backend python \
+  --source rtsp://192.168.1.100:8554/stream \
+  --mode display \
+  --homo configs/points_rtsp.yml
+```
+
+**File mode** (ghi ra file MP4):
+```bash
+python3 main.py --backend python \
+  --source rtsp://192.168.1.100:8554/stream \
+  --mode file \
+  --output output/result.mp4 \
+  --homo configs/points_rtsp.yml
+```
+
+**WebRTC mode** (stream lên browser):
+```bash
+# Terminal 1: khởi động signaling server
+python3 webrtc/signaling_server.py
+
+# Terminal 2: chạy pipeline
+python3 main.py --backend python \
+  --source rtsp://192.168.1.100:8554/stream \
+  --mode webrtc \
+  --server 192.168.1.200 --port 8080 --room cam1 \
+  --cfg configs/config_cam_rtsp.txt
+```
+
+**C++ backend** (hiệu năng cao hơn, có NVOF):
+```bash
+python3 main.py --backend cpp \
+  --source rtsp://192.168.1.100:8554/stream \
+  --mode display \
+  --homo configs/points_rtsp.yml
+```
+
+> **Lưu ý FPS**: Đặt `VIDEO_FPS` trong `config_cam_rtsp.txt` đúng với FPS thực của camera
+> (25 cho PAL, 30 cho NTSC, v.v.) để tốc độ được tính chính xác.
+
+---
+
+#### URL RTSP phổ biến theo thiết bị
+
+| Thiết bị | URL mẫu |
+|----------|---------|
+| Camera Hikvision | `rtsp://admin:password@192.168.1.100:554/Streaming/Channels/101` |
+| Camera Dahua | `rtsp://admin:password@192.168.1.100:554/cam/realmonitor?channel=1&subtype=0` |
+| OBS (stream từ PC) | `rtsp://192.168.1.200:8554/live` |
+| FFmpeg test stream | `ffmpeg -re -i video.mp4 -f rtsp rtsp://localhost:8554/test` |
+| VLC stream | `rtsp://192.168.1.200:8554/` |
+
+---
+
+#### Phát RTSP từ máy tính khác bằng FFmpeg
+
+```bash
+# Cài mediamtx (RTSP server nhẹ)
+wget https://github.com/bluenviron/mediamtx/releases/latest/download/mediamtx_linux_amd64.tar.gz
+tar xf mediamtx_linux_amd64.tar.gz && ./mediamtx &
+
+# Push video qua RTSP
+ffmpeg -re -stream_loop -1 -i video.mp4 \
+  -c:v libx264 -preset ultrafast -tune zerolatency \
+  -f rtsp rtsp://localhost:8554/stream
+```
+
+---
+
 ### 1. Python Backend (Flexible)
 
 ```bash

@@ -351,9 +351,11 @@ def run_display_mode_cpp(args) -> None:
 
 def run_file_mode_cpp(args) -> None:
     Gst.init(None)
-    if not os.path.exists(args.source):
-        print(f"ERROR: Input file not found: {args.source}", file=sys.stderr)
-        sys.exit(1)
+    # Chỉ kiểm tra nếu không phải là RTSP/HTTP/etc.
+    if not args.source.startswith(("rtsp://", "rtmp://", "http://", "file://")):
+        if not os.path.exists(args.source):
+            print(f"ERROR: Input file not found: {args.source}", file=sys.stderr)
+            sys.exit(1)
     pipeline, nvdsosd = build_pipeline_cpp(
         source_uri=args.source,
         sink_type="file",

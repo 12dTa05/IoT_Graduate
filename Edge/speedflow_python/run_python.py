@@ -114,34 +114,14 @@ def _run_loop_until_eos_or_error(pipeline: Gst.Pipeline) -> None:
 # ---------------------------------------------------------------------------
 
 def run_display_mode(args) -> None:
-    """Run pipeline in display (screen) mode."""
     Gst.init(None)
-
-    pipeline, nvdsosd = build_pipeline(
-        source_uri=args.source,
-        sink_type="display",
-        mux_width=args.width,
-        mux_height=args.height,
-    )
-
+    pipeline, nvdsosd = build_pipeline(...)
     _setup_probes(pipeline, nvdsosd, args.homo)
-
     ret = pipeline.set_state(Gst.State.PLAYING)
     if ret == Gst.StateChangeReturn.FAILURE:
         print("ERROR: Unable to set pipeline to PLAYING state", file=sys.stderr)
         sys.exit(1)
-
-    print(f"[Python Display Mode] Running with source: {args.source}")
-    print("Press Ctrl+C to stop…")
-
-    loop = GLib.MainLoop()
-    try:
-        loop.run()
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
-    finally:
-        pipeline.set_state(Gst.State.NULL)
-        print("Pipeline stopped")
+    _run_loop_until_eos_or_error(pipeline)  # ← dùng hàm chung
 
 
 # ---------------------------------------------------------------------------
@@ -152,9 +132,11 @@ def run_file_mode(args) -> None:
     """Run pipeline in file (MP4 output) mode."""
     Gst.init(None)
 
-    if not os.path.exists(args.source):
-        print(f"ERROR: Input file not found: {args.source}", file=sys.stderr)
-        sys.exit(1)
+    # Chỉ kiểm tra nếu không phải là RTSP/HTTP/etc.
+    if not args.source.startswith(("rtsp://", "rtmp://", "http://", "file://")):
+        if not os.path.exists(args.source):
+            print(f"ERROR: Input file not found: {args.source}", file=sys.stderr)
+            sys.exit(1)
 
     pipeline, nvdsosd = build_pipeline(
         source_uri=args.source,
