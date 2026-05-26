@@ -49,6 +49,45 @@ edges: dict[str, dict] = {}
 # clients: danh sách Browser WebSocket đang mở
 clients: list[web.WebSocketResponse] = []
 
+# server_channels: danh sách Server WebSocket (Central Monitor)
+server_channels: list[web.WebSocketResponse] = []
+
+# asyncio event loop (set by start_embedded; used by send_to_servers threads)
+_event_loop: asyncio.AbstractEventLoop | None = None
+
+
+# ---------------------------------------------------------------------------
+# Thread-safe send: daemon threads gọi hàm này để push dữ liệu đến Server
+# ---------------------------------------------------------------------------
+
+def send_to_servers(data: dict) -> None:
+    """
+    Gửi JSON đến tất cả Server WebSocket đang kết nối.
+
+    Thread-safe — có thể gọi từ bất kỳ thread nào (health_agent, zenoh_publisher).
+    Nếu không có Server nào đang kết nối, hàm trả về ngay (no-op).
+    """
+    global _event_loop
+    if not server_channels:
+        return
+    if _event_loop is None or _event_loop.is_closed():
+        return
+
+    payload = json.dumps(data, default=str)
+    dead: list[web.WebSocketResponse] = []
+
+    async def _push():
+        for ws in server_channels:
+            try:
+                await ws.send_str(payload)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            if ws in server_channels:
+                server_channels.remove(ws)
+
+    asyncio.run_coroutine_threadsafe(_push(), _event_loop)
+
 
 # ---------------------------------------------------------------------------
 # WebSocket Handler — Điểm vào chính
@@ -69,6 +108,8 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
 
     if role == "edge" and edge_id:
         await _handle_edge(ws, edge_id)
+    elif role == "server":
+        await _handle_server(ws)
     else:
         await _handle_browser(ws)
 
@@ -157,6 +198,31 @@ async def _handle_browser(ws: web.WebSocketResponse) -> None:
         if ws in clients:
             clients.remove(ws)
         logger.info("[BROWSER] Client #%d đã ngắt kết nối. Còn lại: %d", client_idx, len(clients))
+
+
+# ---------------------------------------------------------------------------
+# Server Handler
+# ---------------------------------------------------------------------------
+async def _handle_server(ws: web.WebSocketResponse) -> None:
+    """Xử lý kết nối từ Central Monitoring Server.
+
+    Server kết nối để nhận dữ liệu health + violation qua WebSocket.
+    Không tham gia WebRTC signaling — chỉ nhận JSON push.
+    """
+    server_channels.append(ws)
+    logger.info("[SERVER] Central Monitor kết nối. Tổng servers: %d", len(server_channels))
+
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                # Server có thể gửi command trong tương lai; bỏ qua hiện tại
+                pass
+            elif msg.type == WSMsgType.ERROR:
+                logger.error("[SERVER] WS error: %s", ws.exception())
+    finally:
+        if ws in server_channels:
+            server_channels.remove(ws)
+        logger.info("[SERVER] Central Monitor ngắt kết nối. Còn lại: %d", len(server_channels))
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +341,8 @@ async def start_embedded(
     Không block — trả về ngay, server chạy trong event loop hiện tại.
     Gọi: asyncio.create_task(start_embedded(host, port))
     """
+    global _event_loop
+    _event_loop = asyncio.get_running_loop()
     nonlocal_logger = logger_obj or logger
     app = create_app()
 

@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IoT Graduate — Central Monitor</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #0a0a0f;
+  color: #e0e0e0;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  overflow-x: hidden;
+}
+#toolbar {
+  display: flex; align-items: center; gap: 16px;
+  padding: 10px 20px;
+  background: #1a1a24;
+  border-bottom: 1px solid #2a2a3a;
+  position: sticky; top: 0; z-index: 100;
+}
+#toolbar h1 { font-size: 18px; font-weight: 600; color: #7c7cff; }
+#toolbar .badge {
+  font-size: 12px; padding: 2px 10px; border-radius: 10px;
+  background: #2a2a3a;
+}
+#toolbar .badge.online { color: #4caf50; background: #1a3a1a; }
+#toolbar .badge.offline { color: #f44336; background: #3a1a1a; }
+#status { font-size: 12px; color: #888; margin-left: auto; }
+#status.online { color: #4caf50; }
+#status.error { color: #f44336; }
+#main {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  padding: 16px;
+  height: calc(100vh - 52px);
+}
+.panel {
+  background: #14141e;
+  border-radius: 8px;
+  overflow-y: auto;
+}
+.panel h2 {
+  font-size: 14px; font-weight: 600;
+  padding: 12px 16px;
+  border-bottom: 1px solid #2a2a3a;
+  color: #7c7cff;
+  position: sticky; top: 0; background: #14141e; z-index: 10;
+}
+.panel-content { padding: 8px; }
+
+/* Edge cards */
+.edge-card {
+  background: #1a1a28;
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 8px;
+  border-left: 3px solid #4caf50;
+  transition: opacity 0.3s;
+}
+.edge-card.offline {
+  border-left-color: #555;
+  opacity: 0.5;
+}
+.edge-card .header {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 8px;
+}
+.edge-card .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  flex-shrink: 0;
+}
+.edge-card .dot.online { background: #4caf50; }
+.edge-card .dot.offline { background: #555; }
+.edge-card .node-id { font-weight: 600; font-size: 13px; }
+.edge-card .ip { font-size: 11px; color: #888; margin-left: auto; }
+.edge-card .metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, 80px);
+  gap: 4px;
+}
+.edge-card .metric {
+  font-size: 11px; color: #aaa;
+}
+.edge-card .metric .value { color: #e0e0e0; font-weight: 500; }
+.edge-card .fps-list { font-size: 11px; color: #888; margin-top: 6px; }
+.edge-card .fps-list span { margin-right: 8px; }
+
+/* Violation feed */
+.violation-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #1a1a28;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.violation-row:hover { background: #1a1a28; }
+.violation-row .time { color: #888; white-space: nowrap; min-width: 60px; }
+.violation-row .node { color: #7c7cff; min-width: 80px; }
+.violation-row .cam { color: #aaa; min-width: 60px; }
+.violation-row .plate { color: #ff9800; font-weight: 600; min-width: 80px; }
+.violation-row .speed { color: #f44336; font-weight: 600; min-width: 50px; }
+.violation-row .thumb {
+  width: 40px; height: 30px; border-radius: 4px;
+  object-fit: cover; cursor: pointer;
+  margin-left: auto;
+}
+.violation-row .thumb:hover { transform: scale(3); z-index: 100; position: relative; }
+
+/* Modal for full image */
+#modal-overlay {
+  display: none;
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.85);
+  z-index: 1000;
+  justify-content: center; align-items: center;
+}
+#modal-overlay.open { display: flex; }
+#modal-overlay img {
+  max-width: 90vw; max-height: 90vh;
+  border-radius: 8px;
+}
+#modal-overlay .close {
+  position: absolute; top: 20px; right: 30px;
+  font-size: 28px; color: #fff; cursor: pointer;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #0a0a0f; }
+::-webkit-scrollbar-thumb { background: #2a2a3a; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <h1>Central Monitor</h1>
+  <span class="badge" id="edge-count-badge">0 edges</span>
+  <span id="status">Connecting...</span>
+</div>
+
+<div id="main">
+  <div class="panel" id="cluster-panel">
+    <h2>Cluster Status</h2>
+    <div class="panel-content" id="edge-list"></div>
+  </div>
+  <div class="panel" id="violation-panel">
+    <h2>Violation Feed</h2>
+    <div class="panel-content" id="violation-list"></div>
+  </div>
+</div>
+
+<div id="modal-overlay" onclick="this.classList.remove('open')">
+  <span class="close">&times;</span>
+  <img id="modal-img" src="" alt="snapshot">
+</div>
+
+<script>
+// ── Configuration ──────────────────────────────────────────────
+const WS_URL = `ws://${location.host}/ws/server`;
+const EDGE_LIST_EL = document.getElementById('edge-list');
+const VIOLATION_LIST_EL = document.getElementById('violation-list');
+const STATUS_EL = document.getElementById('status');
+const EDGE_COUNT_BADGE = document.getElementById('edge-count-badge');
+const MODAL = document.getElementById('modal-overlay');
+const MODAL_IMG = document.getElementById('modal-img');
+
+// ── State ──────────────────────────────────────────────────────
+let edges = {};   // node_id → edge info
+
+// ── Format helpers ─────────────────────────────────────────────
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString();
+}
+
+function fmtPct(v) { return v != null ? `${v.toFixed(1)}%` : '--'; }
+function fmtTemp(v) { return v != null ? `${v.toFixed(1)}°C` : '--'; }
+
+// ── Render: Edge cards ─────────────────────────────────────────
+function renderEdges() {
+  const edgeArray = Object.values(edges);
+  EDGE_COUNT_BADGE.textContent = `${edgeArray.length} edges`;
+  const onlineCount = edgeArray.filter(e => e.online).length;
+  EDGE_COUNT_BADGE.className = `badge ${onlineCount > 0 ? 'online' : 'offline'}`;
+
+  if (edgeArray.length === 0) {
+    EDGE_LIST_EL.innerHTML = '<div style="color:#555;text-align:center;padding:40px;font-size:13px;">Waiting for edges to register...</div>';
+    return;
+  }
+
+  let html = '';
+  for (const edge of edgeArray) {
+    const h = edge.health || {};
+    const pipeline = h.pipeline || {};
+    const fps = pipeline.fps_per_camera || {};
+    const cams = pipeline.active_cameras || [];
+    const fpsStr = Object.entries(fps).map(([c, f]) => `${c}: ${f.toFixed(1)}`).join('  ');
+
+    html += `
+      <div class="edge-card ${edge.online ? '' : 'offline'}">
+        <div class="header">
+          <span class="dot ${edge.online ? 'online' : 'offline'}"></span>
+          <span class="node-id">${edge.node_id}</span>
+          <span class="ip">${edge.ip}:${edge.signaling_port}</span>
+        </div>
+        <div class="metrics">
+          <div class="metric">GPU <span class="value">${fmtPct(h.gpu_percent)}</span></div>
+          <div class="metric">CPU <span class="value">${fmtPct(h.cpu_percent)}</span></div>
+          <div class="metric">RAM <span class="value">${fmtPct(h.ram_percent)}</span></div>
+          <div class="metric">Temp <span class="value">${fmtTemp(h.gpu_temp_c)}</span></div>
+          <div class="metric">Load <span class="value">${h.load_score != null ? h.load_score.toFixed(1) : '--'}</span></div>
+          <div class="metric">Cams <span class="value">${cams.length}</span></div>
+        </div>
+        ${fpsStr ? `<div class="fps-list">${fpsStr}</div>` : ''}
+      </div>
+    `;
+  }
+  EDGE_LIST_EL.innerHTML = html;
+}
+
+// ── Render: Violations ─────────────────────────────────────────
+function renderViolations(violations) {
+  let html = '';
+  for (const v of violations) {
+    const ts = v.timestamp || v.ts || 0;
+    const snapFile = v.snapshot_file || '';
+    const snapUrl = snapFile ? `/api/snapshots/${v.node_id}/${snapFile.split('/').pop()}` : '';
+
+    html += `
+      <div class="violation-row">
+        <span class="time">${fmtTime(ts)}</span>
+        <span class="node">${v.node_id}</span>
+        <span class="cam">${v.camera_id}</span>
+        <span class="plate">${v.plate || v.license_plate || '?'}</span>
+        <span class="speed">${v.speed_kmh != null ? v.speed_kmh.toFixed(1) : '?'} km/h</span>
+        ${snapUrl ? `<img class="thumb" src="${snapUrl}" onclick="event.stopPropagation();openModal('${snapUrl}')">` : ''}
+      </div>
+    `;
+  }
+  if (!html) {
+    html = '<div style="color:#555;text-align:center;padding:40px;font-size:13px;">No violations yet</div>';
+  }
+  VIOLATION_LIST_EL.innerHTML = html;
+}
+
+// ── Modal ──────────────────────────────────────────────────────
+function openModal(url) {
+  MODAL_IMG.src = url;
+  MODAL.classList.add('open');
+}
+
+// ── WebSocket connection ───────────────────────────────────────
+let ws = null;
+let reconnectTimer = null;
+const violations = [];
+
+function connectWS() {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+
+  STATUS_EL.textContent = 'Connecting...';
+  STATUS_EL.className = '';
+
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    STATUS_EL.textContent = 'Connected';
+    STATUS_EL.className = 'online';
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      handleMessage(msg);
+    } catch(e) {
+      console.warn('[WS parse error]', e);
+    }
+  };
+
+  ws.onclose = () => {
+    STATUS_EL.textContent = 'Disconnected. Reconnecting...';
+    STATUS_EL.className = 'error';
+    reconnectTimer = setTimeout(connectWS, 3000);
+  };
+
+  ws.onerror = () => {};
+}
+
+function handleMessage(msg) {
+  switch (msg.type) {
+    case 'init':
+      for (const edge of msg.edges || []) {
+        edges[edge.node_id] = edge;
+      }
+      renderEdges();
+      break;
+
+    case 'edge_list':
+    case 'edge_registered':
+      edges[msg.node_id] = msg;
+      renderEdges();
+      break;
+
+    case 'edge_offline':
+      if (edges[msg.node_id]) {
+        edges[msg.node_id].online = false;
+      }
+      renderEdges();
+      break;
+
+    case 'registered':
+    case 'health_updated':
+      if (edges[msg.node_id]) {
+        edges[msg.node_id].health = msg;
+        edges[msg.node_id].online = true;
+        edges[msg.node_id].last_heartbeat = msg.timestamp || Date.now() / 1000;
+      }
+      renderEdges();
+      break;
+
+    case 'health_update':
+      if (edges[msg.node_id]) {
+        // Copy health fields from flat message
+        const edge = edges[msg.node_id];
+        edge.online = true;
+        edge.last_heartbeat = msg.timestamp || Date.now() / 1000;
+        edge.health = { ...msg };
+        delete edge.health.type;
+        delete edge.health.node_id;
+      }
+      renderEdges();
+      break;
+
+    case 'violation':
+      violations.unshift(msg);
+      if (violations.length > 100) violations.length = 100;
+      renderViolations(violations);
+      break;
+  }
+}
+
+// ── Start ──────────────────────────────────────────────────────
+connectWS();
+</script>
+</body>
+</html>

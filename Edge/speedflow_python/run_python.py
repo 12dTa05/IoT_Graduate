@@ -24,10 +24,6 @@ from . import settings as S
 from .settings import (
     CAMERAS_YML,
     NODE_ID,
-    MQTT_BROKER_HOST,
-    MQTT_BROKER_PORT,
-    MQTT_USER,
-    MQTT_PASS,
     SIGNALING_HOST,
     SIGNALING_PORT,
     MUX_WIDTH,
@@ -318,134 +314,51 @@ def run_python_mode(args) -> None:
     """Entry point called by main.py for the Python backend."""
     camera_manager = CameraManager(CAMERAS_YML)
 
-    # --- MQTT Command & Control ---
-    # All values loaded from Edge/.env via speedflow_python.settings
-    mqtt_sub = None
+    # --- Zenoh Command & Control ---
+    zenoh_sub = None
     try:
-        from .mqtt_subscriber import MQTTCommandSubscriber
-        node_id     = NODE_ID
-        broker_host = MQTT_BROKER_HOST
-        broker_port = MQTT_BROKER_PORT
-        mqtt_user   = MQTT_USER
-        mqtt_pass   = MQTT_PASS
-
-        mqtt_sub = MQTTCommandSubscriber(
+        from .zenoh_subscriber import ZenohCommandSubscriber
+        zenoh_sub = ZenohCommandSubscriber(
             camera_manager=camera_manager,
-            node_id=node_id,
-            broker_host=broker_host,
-            broker_port=broker_port,
-            username=mqtt_user,
-            password=mqtt_pass,
+            node_id=NODE_ID,
         )
-        mqtt_sub.start()
-        print(
-            f"[MQTT C2] Subscriber active. Node='{node_id}', "
-            f"Broker={broker_host}:{broker_port}, "
-            f"Topic=peers/control/{node_id}"
-        )
+        zenoh_sub.start()
+        print(f"[Zenoh C2] Subscriber active. Node='{NODE_ID}', Key=peers/control/{NODE_ID}")
     except ImportError:
         print(
-            "[MQTT C2] paho-mqtt not installed — MQTT control disabled. "
-            "Run: pip install paho-mqtt",
+            "[Zenoh C2] zenoh/msgpack not installed — control disabled. "
+            "Run: pip install zenoh msgpack",
             file=sys.stderr,
         )
     except Exception as exc:
-        print(f"[MQTT C2] Failed to start subscriber: {exc}", file=sys.stderr)
+        print(f"[Zenoh C2] Failed to start subscriber: {exc}", file=sys.stderr)
 
-    # --- P2P Peer Discovery ---
-    edge_cfg = {}        # safe default — populated if edge_node.yml exists
+    # --- P2P config (edge_node.yml) ---
+    edge_cfg = {}
     edge_node_yml = S.ROOT / "configs" / "edge_node.yml"
     try:
-        from .peer_discovery import PeerDiscovery
         if edge_node_yml.exists():
             with open(edge_node_yml, "r") as f:
                 edge_cfg = yaml.safe_load(f) or {}
-            static_peers = edge_cfg.get("peers", [])
-            mdns_cfg = edge_cfg.get("mdns", {})
-            discovery = PeerDiscovery(
-                static_peers=static_peers,
-                mdns_enabled=mdns_cfg.get("enabled", False),
-                service_type=mdns_cfg.get("service_type", "_iot_graduate._tcp.local."),
-            )
-            discovery.start()
-            print(f"[PeerDiscovery] Started. Static peers: {[p.node_id for p in discovery.get_peers()]}")
-        else:
-            discovery = None
-            print("[PeerDiscovery] edge_node.yml not found — no peer discovery.")
+            print("[P2P] edge_node.yml loaded.")
     except Exception as exc:
-        print(f"[PeerDiscovery] Failed: {exc}", file=sys.stderr)
-        discovery = None
-
-    # --- Embedded MQTT Broker (optional — runs on exactly one node) ---
-    broker_mgr = None
-    broker_cfg = edge_cfg.get("broker", {})
-    from .settings import BROKER_ENABLED, BROKER_PORT as _BROKER_PORT
-    if BROKER_ENABLED:
-        try:
-            from .broker_manager import BrokerManager
-            broker_mgr = BrokerManager(
-                port=_BROKER_PORT,
-                username=mqtt_user,
-                password=mqtt_pass,
-            )
-            broker_mgr.start()
-            print(f"[BrokerManager] Embedded Mosquitto started on port {_BROKER_PORT}.")
-        except Exception as exc:
-            print(f"[BrokerManager] Failed to start: {exc}", file=sys.stderr)
-            broker_mgr = None
-
-    # --- Health Agent (starts early so broker status reaches peers quickly) ---
-    health_agent = None
-    try:
-        import sys as _sys2
-        import importlib.util as _ilu
-        _ha_path = S.ROOT / "health_agent.py"
-        if _ha_path.exists():
-            _spec = _ilu.spec_from_file_location("health_agent", _ha_path)
-            _ha_mod = _ilu.module_from_spec(_spec)
-            _spec.loader.exec_module(_ha_mod)
-            health_agent = _ha_mod.HealthAgent(broker_manager=broker_mgr)
-            health_agent.start()
-            print(f"[HealthAgent] Started. Node='{node_id}'")
-    except Exception as exc:
-        print(f"[HealthAgent] Failed to start: {exc}", file=sys.stderr)
+        print(f"[P2P] Failed to load edge_node.yml: {exc}", file=sys.stderr)
 
     # --- P2P Peer Orchestrator ---
-    peer_orch = None
     try:
         from .peer_orchestrator import PeerOrchestrator
         p2p_cfg = edge_cfg.get("p2p", {})
-
-        # Extra reconnect callbacks — each MQTT client that needs to follow
-        # a broker failover registers here.
-        reconnect_callbacks = []
-        if health_agent is not None and hasattr(health_agent, "reconnect"):
-            reconnect_callbacks.append(health_agent.reconnect)
-        if mqtt_sub is not None and hasattr(mqtt_sub, "reconnect"):
-            reconnect_callbacks.append(mqtt_sub.reconnect)
-
         peer_orch = PeerOrchestrator(
-            node_id=node_id,
+            node_id=NODE_ID,
             cfg=p2p_cfg,
             camera_manager=camera_manager,
-            broker_host=broker_host,
-            broker_port=broker_port,
-            username=mqtt_user,
-            password=mqtt_pass,
-            broker_cfg=broker_cfg if broker_cfg else None,
-            broker_manager=broker_mgr,
-            extra_reconnect_callbacks=reconnect_callbacks,
         )
-        # Start orchestrator in a background thread (non-blocking)
         orch_thread = threading.Thread(target=peer_orch.start, daemon=True)
         orch_thread.start()
-        print(
-            f"[PeerOrch] Started. Node='{node_id}', "
-            f"Overload threshold={p2p_cfg.get('overload_threshold', 75.0)}%, "
-            f"BrokerWatcher={'ON' if broker_cfg else 'OFF'}"
-        )
+        print(f"[PeerOrch] Started. Node='{NODE_ID}', Overload threshold={p2p_cfg.get('overload_threshold', 75.0)}%")
     except Exception as exc:
         print(f"[PeerOrch] Failed to start: {exc}", file=sys.stderr)
+        peer_orch = None
 
     # --- Embedded Signaling Server (display/file modes — webrtc mode handles its own) ---
     sig_enabled = edge_cfg.get("signaling", {}).get("enabled", True)

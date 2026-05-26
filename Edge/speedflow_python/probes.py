@@ -114,7 +114,7 @@ class SpeedProbe:
         self.cooldown_s        = float(cooldown_s)
         self.snap_count        = defaultdict(int)
 
-        # publisher: MQTTPublisher object (có phương thức .put(data))
+        # publisher: ZenohPublisher object (có phương thức .put(data))
         # hoặc bất kỳ callable nào nhận dict (để tương thích ngược)
         self.publisher = None
 
@@ -235,7 +235,7 @@ class SpeedProbe:
         Gán publisher cho SpeedProbe.
 
         publisher có thể là:
-          - MQTTPublisher instance (có phương thức .put(data)) — khuyến nghị
+          - ZenohPublisher instance (có phương thức .put(data)) — khuyến nghị
           - Callable nhận dict (để tương thích ngược với WebRTC session)
         """
         self.publisher = publisher
@@ -379,7 +379,7 @@ class SpeedProbe:
                 "dedup_key":     f"{int(stid[1])}_{frame_iso_ts}",
             }
             try:
-                # Hỗ trợ cả MQTTPublisher.put() và callable trực tiếp
+                # Hỗ trợ cả ZenohPublisher.put() và callable trực tiếp
                 if hasattr(self.publisher, 'put'):
                     self.publisher.put(payload)   # non-blocking, ~0.1ms
                 else:

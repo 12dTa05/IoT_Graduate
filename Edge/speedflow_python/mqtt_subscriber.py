@@ -147,22 +147,6 @@ class MQTTCommandSubscriber:
         if self._thread:
             self._thread.join(timeout=5)
 
-    def reconnect(self, new_host: str, new_port: int) -> None:
-        """
-        Called by BrokerWatcher when the MQTT broker moves to a new host.
-        Updates broker coordinates and disconnects; _run_loop() will reconnect.
-        """
-        logger.info(
-            "[MQTT C2] Broker changed → %s:%d. Reconnecting...", new_host, new_port
-        )
-        self._broker_host = new_host
-        self._broker_port = new_port
-        if self._client:
-            try:
-                self._client.disconnect()
-            except Exception:
-                pass
-
     def publish_status(self, payload: dict) -> None:
         """Publish trạng thái/event từ Edge lên Broker."""
         if self._client:
