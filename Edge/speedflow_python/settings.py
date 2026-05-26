@@ -66,6 +66,13 @@ SIGNALING_HOST = _get("SIGNALING_HOST")
 SIGNALING_PORT = _get("SIGNALING_PORT", int)
 
 # -----------------------------------------------------------
+# Embedded MQTT Broker (Mosquitto)
+# -----------------------------------------------------------
+BROKER_ENABLED       = _get("BROKER_ENABLED").lower() in ("1", "true", "yes")
+BROKER_PORT          = _get("BROKER_PORT", int)
+BROKER_PENALTY_SCORE = _get("BROKER_PENALTY_SCORE", float)
+
+# -----------------------------------------------------------
 # Pipeline / Video
 # -----------------------------------------------------------
 VIDEO_FPS   = _get("VIDEO_FPS", float)
