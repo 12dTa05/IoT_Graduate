@@ -14,12 +14,10 @@ from .settings import (
     JPEG_QUALITY, SNAP_DIR, MAX_SNAPSHOT_PER_ID,
     MIN_WORLD_DISPL_M, MAX_ABS_KMH,
     BBOX_AREA_JUMP, MIN_DET_CONF, MEDIAN_WINDOW, LICENSE_PLATE_CLASS_IDS,
+    FPS_STATS_FILE, NODE_ID,
 )
 from .draw import add_polygon_display
 from .camera_config import CameraManager, CameraConfig
-
-# Đường dẫn file JSON chia sẻ FPS stats với health_agent
-FPS_STATS_FILE = os.environ.get("FPS_STATS_FILE", "/dev/shm/speedflow_fps.json")
 
 
 class CSVLogger:
@@ -105,7 +103,7 @@ class SpeedProbe:
         self.camera_manager = camera_manager
 
         # ID định danh node này — dùng trong payload MQTT để Deduplication
-        self._node_id = os.environ.get("NODE_ID", "jetson_default")
+        self._node_id = NODE_ID
 
         # Trạng thái theo key: stid = (source_id, track_id)
         self.history_positions = defaultdict(list)

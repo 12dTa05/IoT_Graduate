@@ -1,7 +1,6 @@
 # speedflow_python/common.py
 """
-Shared utilities used by both Python and C++ backends.
-Extracted to eliminate DRY violations across run_python.py and pipeline_cpp.py.
+Shared utilities for the Python backend pipeline.
 """
 import asyncio
 import json

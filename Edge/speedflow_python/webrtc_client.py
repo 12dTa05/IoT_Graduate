@@ -3,13 +3,14 @@
 webrtc_client.py — WebRTC Client cho Edge Node (Camera + AI Pipeline).
 
 Vị trí: Chạy trên mỗi Edge Node (Jetson).
-Vai trò: "Người gửi" (WebRTC Peer) — kết nối đến Master Signaling Server,
-         đăng ký định danh, và gửi luồng video WebRTC khi có Browser yêu cầu.
+Vai trò: "Người gửi" (WebRTC Peer) — kết nối đến signaling server embedded
+         trên chính Jetson này, đăng ký định danh, và gửi luồng video WebRTC
+         khi có Browser yêu cầu.
 
-Luồng hoạt động:
-  1. Kết nối WebSocket đến Master Signaling Server (ws://<master_ip>:8080/ws?role=edge&edge_id=<id>)
+Luồng hoạt động (P2P mode):
+  1. Kết nối WebSocket đến local signaling (ws://localhost:8080/ws?role=edge&edge_id=<id>)
   2. Gửi gói register để định danh: {"type":"register","role":"edge","edge_id":"<id>"}
-  3. Chờ Browser gửi SDP Offer (qua Master forward)
+  3. Chờ Browser gửi SDP Offer (qua local signaling forward)
   4. Tạo SDP Answer và gửi ngược lại
   5. Trao đổi ICE candidates
   6. Gửi video track qua WebRTC PeerConnection
@@ -23,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -38,11 +38,9 @@ logging.basicConfig(
 logger = logging.getLogger("webrtc_client")
 
 # ---------------------------------------------------------------------------
-# Cấu hình — lấy từ biến môi trường hoặc edge_node.yml
+# Cấu hình — từ Edge/.env qua settings
 # ---------------------------------------------------------------------------
-MASTER_HOST = os.environ.get("SIGNALING_HOST", "192.168.1.100")
-MASTER_PORT = int(os.environ.get("SIGNALING_PORT", "8080"))
-EDGE_ID     = os.environ.get("EDGE_ID", "jetson_A")
+from .settings import SIGNALING_HOST, SIGNALING_PORT, EDGE_ID
 
 # ---------------------------------------------------------------------------
 # WebRTC imports — chỉ import nếu dùng thực tế
@@ -69,19 +67,22 @@ class EdgeWebRTCClient:
     """
     WebRTC Client cho Edge Node.
 
-    Kết nối đến Master Signaling Server, đăng ký edge_id,
-    và xử lý các yêu cầu WebRTC từ Browser.
+    Kết nối đến signaling server chạy local trên cùng Edge Node,
+    đăng ký edge_id, và xử lý các yêu cầu WebRTC từ Browser.
+
+    Trong P2P mode, mỗi Edge Node chạy signaling server riêng (embedded).
+    Client connect đến localhost — không cần Master nữa.
     """
 
     def __init__(
         self,
-        master_host: str = MASTER_HOST,
-        master_port: int = MASTER_PORT,
+        signaling_host: str = SIGNALING_HOST,
+        signaling_port: int = SIGNALING_PORT,
         edge_id: str = EDGE_ID,
     ) -> None:
-        self._master_host = master_host
-        self._master_port = master_port
-        self._edge_id     = edge_id
+        self._signaling_host = signaling_host
+        self._signaling_port = signaling_port
+        self._edge_id        = edge_id
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._pc: Optional[RTCPeerConnection] = None
         self._running = False
@@ -91,8 +92,8 @@ class EdgeWebRTCClient:
     # ------------------------------------------------------------------
 
     async def connect(self) -> None:
-        """Kết nối đến Master Signaling Server và duy trì kết nối."""
-        uri = f"ws://{self._master_host}:{self._master_port}/ws?role=edge&edge_id={self._edge_id}"
+        """Kết nối đến Signaling Server local và duy trì kết nối."""
+        uri = f"ws://{self._signaling_host}:{self._signaling_port}/ws?role=edge&edge_id={self._edge_id}"
         self._running = True
 
         while self._running:
@@ -103,12 +104,12 @@ class EdgeWebRTCClient:
                     ping_timeout=10,
                 ) as websocket:
                     self._ws = websocket
-                    logger.info("[Edge] Đã kết nối đến Master Signaling: %s", uri)
+                    logger.info("[Edge] Connected to local signaling: %s", uri)
 
                     # Gửi gói định danh (register)
                     await self._register()
 
-                    # Lắng nghe thông điệp từ Master
+                    # Lắng nghe thông điệp từ signaling server
                     await self._message_loop(websocket)
 
             except websockets.ConnectionClosed as exc:
@@ -128,14 +129,14 @@ class EdgeWebRTCClient:
         if self._ws:
             await self._ws.close()
             self._ws = None
-        logger.info("[Edge] Đã ngắt kết nối khỏi Master Signaling.")
+        logger.info("[Edge] Disconnected from local signaling.")
 
     # ------------------------------------------------------------------
     # Internal — Signaling
     # ------------------------------------------------------------------
 
     async def _register(self) -> None:
-        """Gửi gói tin định danh đến Master Signaling Server."""
+        """Gửi gói tin định danh đến local Signaling Server."""
         if not self._ws:
             return
         register_msg = json.dumps({
@@ -147,7 +148,7 @@ class EdgeWebRTCClient:
         logger.info("[Edge] Đã gửi register: '%s'", self._edge_id)
 
     async def _message_loop(self, websocket) -> None:
-        """Vòng lặp xử lý thông điệp từ Master Signaling Server."""
+        """Vòng lặp xử lý thông điệp từ local Signaling Server."""
         async for raw in websocket:
             try:
                 msg = json.loads(raw)
@@ -292,20 +293,26 @@ class EdgeWebRTCClient:
 # ---------------------------------------------------------------------------
 
 def load_config_from_yml(yml_path: str) -> dict:
-    """Đọc cấu hình từ file edge_node.yml."""
+    """Read edge_node.yml — only node_id is taken from there; ports come from .env."""
     try:
         import yaml
         with open(yml_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
         return {
-            "master_host": cfg.get("signaling", {}).get("master_host", MASTER_HOST),
-            "master_port": int(cfg.get("signaling", {}).get("master_port", MASTER_PORT)),
+            "signaling_host": SIGNALING_HOST,
+            "signaling_port": SIGNALING_PORT,
             "edge_id": cfg.get("node_id", EDGE_ID),
         }
     except Exception:
         return {
-            "master_host": MASTER_HOST,
-            "master_port": MASTER_PORT,
+            "signaling_host": SIGNALING_HOST,
+            "signaling_port": SIGNALING_PORT,
+            "edge_id": EDGE_ID,
+        }
+    except Exception:
+        return {
+            "signaling_host": SIGNALING_HOST,
+            "signaling_port": SIGNALING_PORT,
             "edge_id": EDGE_ID,
         }
 
@@ -317,28 +324,30 @@ def load_config_from_yml(yml_path: str) -> dict:
 async def main() -> None:
     """Entry point cho Edge WebRTC Client."""
     logger.info("=" * 55)
-    logger.info("  Edge WebRTC Client — Multi-Edge")
+    logger.info("  Edge WebRTC Client — P2P Mode")
     logger.info("  Edge ID:   %s", EDGE_ID)
-    logger.info("  Master:    %s:%d", MASTER_HOST, MASTER_PORT)
     logger.info("=" * 55)
 
-    # Thử load từ edge_node.yml nếu có
-    config_dir = Path(__file__).parent.parent / "configs" / "edge_node.yml"
+    # Load edge_node.yml for node_id override
+    from .settings import ROOT
+    config_dir = ROOT / "configs" / "edge_node.yml"
     if config_dir.exists():
         cfg = load_config_from_yml(str(config_dir))
-        master_host = cfg["master_host"]
-        master_port = cfg["master_port"]
+        signaling_host = cfg["signaling_host"]
+        signaling_port = cfg["signaling_port"]
         edge_id = cfg["edge_id"]
         logger.info("  Loaded config from: %s", config_dir)
     else:
-        master_host = MASTER_HOST
-        master_port = MASTER_PORT
+        signaling_host = SIGNALING_HOST
+        signaling_port = SIGNALING_PORT
         edge_id = EDGE_ID
         logger.info("  Using env/fallback config.")
 
+    logger.info("  Signaling:  %s:%d", signaling_host, signaling_port)
+
     client = EdgeWebRTCClient(
-        master_host=master_host,
-        master_port=master_port,
+        signaling_host=signaling_host,
+        signaling_port=signaling_port,
         edge_id=edge_id,
     )
 

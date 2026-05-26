@@ -16,7 +16,7 @@ Thiết kế phi chặn (Non-blocking):
 
 Topics:
     traffic/events/{node_id}/{camera_id}  — vi phạm tốc độ, biển số
-    edge/status/{node_id}                 — trạng thái node (dùng health_agent)
+    peers/status/{node_id}                 — trạng thái node (dùng health_agent)
 
 Yêu cầu:
     pip install paho-mqtt
@@ -26,28 +26,28 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import queue
 import threading
 import time
 from typing import Any, Dict, Optional
 
+from .settings import MQTT_QUEUE_MAXSIZE
+
 logger = logging.getLogger(__name__)
 
-# Kích thước tối đa Queue.
-# ~1000 sự kiện × ~2KB mỗi sự kiện ≈ 2MB RAM tối đa khi mạng sập hoàn toàn.
-_QUEUE_MAXSIZE = int(os.environ.get("MQTT_QUEUE_MAXSIZE", "1000"))
+# Kích thước tối đa Queue — từ .env (MQTT_QUEUE_MAXSIZE)
+_QUEUE_MAXSIZE = MQTT_QUEUE_MAXSIZE
 
 
 class MQTTPublisher:
     """
-    Non-blocking MQTT Publisher dành cho GStreamer probe.
+    Non-blocking MQTT Publisher for GStreamer probes.
 
-    Cách dùng:
-        publisher = MQTTPublisher(node_id="jetson_A", broker_host="192.168.1.10")
+    Usage:
+        publisher = MQTTPublisher(node_id=NODE_ID, broker_host=MQTT_BROKER_HOST)
         publisher.start()
 
-        # Trong SpeedProbe (30fps callback — không được block):
+        # Inside SpeedProbe (30fps callback — must not block):
         publisher.put({"camera_id": "cam_01", "speed_kmh": 92.5, ...})
 
         publisher.stop()
@@ -56,8 +56,8 @@ class MQTTPublisher:
     def __init__(
         self,
         node_id: str,
-        broker_host: str = "localhost",
-        broker_port: int = 1883,
+        broker_host: str,
+        broker_port: int,
         username: Optional[str] = None,
         password: Optional[str] = None,
         tls_ca_cert: Optional[str] = None,

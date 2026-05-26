@@ -525,10 +525,6 @@ class MainWindow(QWidget):
         layout.addLayout(cfg_layout)
 
         backend_layout = QHBoxLayout()
-        backend_layout.addWidget(QLabel("Backend:"))
-        self.cb_backend = QComboBox()
-        self.cb_backend.addItems(["python", "cpp"])
-        backend_layout.addWidget(self.cb_backend)
         backend_layout.addStretch()
         layout.addLayout(backend_layout)
 
@@ -583,10 +579,9 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Đang chạy", "Pipeline đang chạy. Hãy Stop trước.")
             return
 
-        backend = self.cb_backend.currentText()
+        backend = "python"
         cmd_parts = [
             "python3", "main.py",
-            f"--backend {backend}",
             f"--source {uri}",
             f"--homo {homo}",
             f"--width {PROCESSING_WIDTH}",

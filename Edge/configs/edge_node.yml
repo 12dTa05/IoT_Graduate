@@ -1,22 +1,67 @@
-node_id: "jetson_A"             # Định danh duy nhất của node này
+# ============================================================
+# edge_node.yml — Peer Node Configuration (P2P Mode)
+# ============================================================
+node_id: "jetson_A"              # Unique ID — change per Jetson
 
 mqtt:
-  broker_host: "192.168.1.100"  # IP của Master PC / MQTT Broker
+  broker_host: "192.168.1.100"  # IP of the Jetson running Mosquitto
   broker_port: 1883
-  username: ""                  # Để trống nếu không dùng xác thực
+  username: ""
   password: ""
-  tls: false                    # Bật TLS khi deploy thực tế
-
-# Cấu hình WebRTC Signaling — Edge kết nối đến Master
-signaling:
-  master_host: "192.168.1.100"  # IP của Master PC (Signaling Server)
-  master_port: 8080             # Cổng WebSocket Signaling
-  enabled: true                 # Bật/tắt WebRTC streaming
+  tls: false
 
 pipeline:
-  target_fps: 25.0              # FPS kỳ vọng — dùng trong Load Score penalty
-  max_streams: 4                # Số camera tối đa node này có thể xử lý
+  target_fps: 25.0
+  max_streams: 4
 
 health_agent:
-  interval_s: 3.0               # Tần suất publish metrics lên MQTT
-  fps_stats_file: "/tmp/speedflow_fps.json"
+  interval_s: 2.0               # Was 3.0 — faster heartbeat for P2P peer detection
+  fps_stats_file: "/dev/shm/speedflow_fps.json"
+
+# Embedded WebRTC Signaling (each Jetson serves its own endpoint)
+signaling:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8080                    # Grid Monitor connects to: ws://<this_jetson_ip>:8080/ws
+
+# P2P Orchestration Parameters
+p2p:
+  overload_threshold: 75.0      # load_score above this triggers RFO
+  overload_duration_s: 10.0     # must be overloaded this long before RFO
+  cooldown_s: 45.0              # per-CAMERA cooldown between migrations
+  migration_timeout_s: 15.0     # wait for ADD_PROCESSING ack before rollback
+  heartbeat_timeout_s: 15.0     # peer declared OFFLINE after this silence
+  vote_window_s: 3.0            # proposal collection duration
+  failover_jitter_max_s: 2.0    # random delay before failover ADD (race prevention)
+
+  # epsilon-Constraint values (Pareto optimization)
+  eps_fps_strict: 18.0          # Tier 0 — strict FPS floor
+  eps_fps_tier1: 15.0           # Tier 1 relaxation
+  eps_fps_tier2: 12.0           # Tier 2 relaxation
+  eps_network_ms_strict: 50.0   # Tier 0 — RTSP RTT floor
+  eps_network_ms_tier1: 80.0    # Tier 1 relaxation
+  eps_streams_max: 4            # Hard capacity ceiling
+
+  # FPS prediction model — calibrate offline per Jetson model
+  # key = number of streams AFTER accepting the new camera
+  fps_model:
+    1: 24.5
+    2: 22.0
+    3: 18.5
+    4: 14.5
+
+# Static peer registry — PRIMARY discovery method
+peers:
+  - node_id: "jetson_B"
+    ip: "192.168.1.101"
+    signaling_port: 8080
+    max_streams: 4
+  - node_id: "jetson_C"
+    ip: "192.168.1.102"
+    signaling_port: 8080
+    max_streams: 4
+
+# mDNS discovery — OPTIONAL enhancement (requires: pip install zeroconf)
+mdns:
+  enabled: false                # Set true for zero-config lab deployments
+  service_type: "_iot_graduate._tcp.local."
