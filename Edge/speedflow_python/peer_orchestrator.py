@@ -17,6 +17,16 @@ Migration thực thi theo chiến lược Make-before-Break:
   3. Publish decision → winner tự ADD camera vào pipeline
   4. Winner publish peers/vote/ack/{cam} khi stream PLAYING
   5. Requester nhận ack → REMOVE camera khỏi pipeline của mình
+
+Embedded MQTT Broker Failover (BrokerWatcher):
+  - Mỗi node TCP-probe broker IP:port mỗi probe_interval_s giây
+  - Nếu dead_threshold_count lần liên tiếp thất bại → broker bị coi là DEAD
+  - Walk priority_order trong edge_node.yml (config file order):
+      * Bỏ qua node đã offline (heartbeat timeout)
+      * Nếu node này là candidate → khởi động BrokerManager
+      * Tất cả peers probe candidate:port tối đa candidate_timeout_s giây
+      * Nếu port mở → gọi on_broker_change(host, port) → reconnect tất cả clients
+      * Nếu port không mở → chuyển sang candidate tiếp theo
 """
 
 from __future__ import annotations
@@ -77,6 +87,9 @@ class PeerState:
     last_seen: float = field(default_factory=time.time)
     overload_since: Optional[float] = None
     penalty_until: float = 0.0
+    # True when this peer is currently running the embedded MQTT broker.
+    # Used by BrokerWatcher to track which node is the active broker.
+    is_broker: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +140,208 @@ class MigrationLogger:
 
 
 # ---------------------------------------------------------------------------
+# Broker Watcher
+# ---------------------------------------------------------------------------
+
+class BrokerWatcher:
+    """
+    Monitors the active MQTT broker via TCP probe; triggers failover when dead.
+
+    Algorithm:
+      1. Probe broker_host:broker_port every probe_interval_s.
+      2. After dead_threshold_count consecutive failures → broker declared DEAD.
+      3. Walk priority_order (config-file order):
+           a. Skip candidates whose heartbeat is older than heartbeat_timeout_s.
+           b. If THIS node is the next candidate → call on_become_broker().
+           c. All nodes probe candidate_host:broker_port for up to
+              candidate_timeout_s seconds.
+           d. First to respond → call on_broker_change(new_host, new_port)
+              on every node (each node has its own BrokerWatcher instance).
+           e. If still no response → move to the next candidate.
+      4. on_broker_change reconnects all MQTT clients transparently.
+
+    Thread-safe. All work happens in a single daemon thread.
+    """
+
+    def __init__(
+        self,
+        node_id: str,
+        broker_cfg: dict,
+        peers_snapshot_fn,          # callable() → Dict[str, PeerState]
+        on_broker_change,           # callable(host: str, port: int) → None
+        on_become_broker,           # callable() → None  (start BrokerManager)
+        heartbeat_timeout_s: float = 15.0,
+    ) -> None:
+        self._node_id            = node_id
+        self._priority_order: list[str] = broker_cfg.get("priority_order", [])
+        self._port: int          = int(broker_cfg.get("port", 1883))
+        self._probe_interval     = float(broker_cfg.get("probe_interval_s", 3.0))
+        self._dead_threshold     = int(broker_cfg.get("dead_threshold_count", 3))
+        self._candidate_timeout  = float(broker_cfg.get("candidate_timeout_s", 15.0))
+        self._heartbeat_timeout  = heartbeat_timeout_s
+
+        self._peers_snapshot     = peers_snapshot_fn
+        self._on_broker_change   = on_broker_change
+        self._on_become_broker   = on_become_broker
+
+        # Mutable state (only written from _watch_loop thread)
+        self._current_host: str  = ""   # set by caller via set_broker()
+        self._fail_count: int    = 0
+        self._in_failover: bool  = False
+
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def set_broker(self, host: str) -> None:
+        """Tell the watcher which host to probe (call before start())."""
+        self._current_host = host
+
+    def start(self) -> None:
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._watch_loop,
+            name="BrokerWatcher",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.info(
+            "[BrokerWatcher] Watching %s:%d (probe every %.1fs, threshold=%d)",
+            self._current_host, self._port,
+            self._probe_interval, self._dead_threshold,
+        )
+
+    def stop(self) -> None:
+        self._running = False
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _probe(self, host: str, port: int, timeout: float = 0.5) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def _watch_loop(self) -> None:
+        while self._running:
+            time.sleep(self._probe_interval)
+            if self._in_failover or not self._current_host:
+                continue
+
+            if self._probe(self._current_host, self._port):
+                self._fail_count = 0
+            else:
+                self._fail_count += 1
+                logger.warning(
+                    "[BrokerWatcher] Broker probe fail %d/%d (%s:%d)",
+                    self._fail_count, self._dead_threshold,
+                    self._current_host, self._port,
+                )
+                if self._fail_count >= self._dead_threshold:
+                    logger.error(
+                        "[BrokerWatcher] Broker DEAD at %s:%d. Starting failover...",
+                        self._current_host, self._port,
+                    )
+                    self._in_failover = True
+                    try:
+                        self._run_failover()
+                    finally:
+                        self._in_failover = False
+                        self._fail_count = 0
+
+    def _run_failover(self) -> None:
+        """Walk priority_order, promote the first reachable candidate."""
+        now = time.time()
+        peers = self._peers_snapshot()   # Dict[str, PeerState]
+
+        for candidate_id in self._priority_order:
+            # Resolve candidate IP from peers map
+            candidate_peer = peers.get(candidate_id)
+            if candidate_peer is None and candidate_id != self._node_id:
+                logger.warning(
+                    "[BrokerWatcher] Candidate '%s' unknown (not in peers map). Skipping.",
+                    candidate_id,
+                )
+                continue
+
+            # Skip candidates whose heartbeat has timed out (except self)
+            if candidate_id != self._node_id and candidate_peer is not None:
+                age = now - candidate_peer.last_seen
+                if age > self._heartbeat_timeout:
+                    logger.warning(
+                        "[BrokerWatcher] Candidate '%s' offline (last seen %.0fs ago). Skipping.",
+                        candidate_id, age,
+                    )
+                    continue
+
+            # Determine candidate's IP
+            # Self uses 127.0.0.1 to start, then all peers probe our real IP
+            # (peers know our IP via heartbeat sender address — but here we only
+            #  need our own loopback to verify mosquitto started)
+            if candidate_id == self._node_id:
+                candidate_ip = "127.0.0.1"
+                logger.info(
+                    "[BrokerWatcher] I am the next broker candidate ('%s'). Starting Mosquitto...",
+                    self._node_id,
+                )
+                try:
+                    self._on_become_broker()
+                except Exception as exc:
+                    logger.error(
+                        "[BrokerWatcher] Failed to start broker: %s. Trying next candidate.", exc,
+                    )
+                    continue
+            else:
+                # Derive IP from the peer's heartbeat source.
+                # health_agent publishes broker_host in the status payload;
+                # we use that field if present, else skip (no IP available).
+                candidate_ip = getattr(candidate_peer, "broker_host", None)
+                if not candidate_ip:
+                    logger.warning(
+                        "[BrokerWatcher] Candidate '%s' has no broker_host in heartbeat. Skipping.",
+                        candidate_id,
+                    )
+                    continue
+                logger.info(
+                    "[BrokerWatcher] Waiting for candidate '%s' (%s:%d) to start Mosquitto...",
+                    candidate_id, candidate_ip, self._port,
+                )
+
+            # Wait up to candidate_timeout_s for the port to open
+            deadline = time.monotonic() + self._candidate_timeout
+            ready = False
+            while time.monotonic() < deadline and self._running:
+                if self._probe(candidate_ip, self._port, timeout=1.0):
+                    ready = True
+                    break
+                time.sleep(1.0)
+
+            if ready:
+                logger.info(
+                    "[BrokerWatcher] New broker is '%s' (%s:%d). Reconnecting...",
+                    candidate_id, candidate_ip, self._port,
+                )
+                self._current_host = candidate_ip
+                try:
+                    self._on_broker_change(candidate_ip, self._port)
+                except Exception as exc:
+                    logger.error("[BrokerWatcher] on_broker_change error: %s", exc)
+                return  # Failover complete
+
+            logger.warning(
+                "[BrokerWatcher] Candidate '%s' did not open port in %.0fs. Trying next...",
+                candidate_id, self._candidate_timeout,
+            )
+
+        logger.critical(
+            "[BrokerWatcher] ALL candidates exhausted. No broker available. "
+            "Manual intervention required."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Peer Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -136,6 +351,11 @@ class PeerOrchestrator:
 
     PeerOrchestrator KHÔNG dùng lại MQTT client từ MQTTCommandSubscriber
     (paho-mqtt không thread-safe). Nó tạo một client riêng biệt.
+
+    Broker failover:
+      Nếu broker_cfg được truyền vào, PeerOrchestrator tạo một BrokerWatcher
+      để giám sát broker và tự động failover khi cần.
+      on_broker_change(host, port) được gọi trên mọi client cần reconnect.
     """
 
     def __init__(
@@ -148,7 +368,20 @@ class PeerOrchestrator:
         username: Optional[str] = None,
         password: Optional[str] = None,
         camera_configs_dir: Optional[Path] = None,
+        broker_cfg: Optional[dict] = None,
+        broker_manager=None,
+        extra_reconnect_callbacks: Optional[List] = None,
     ) -> None:
+        """
+        Args:
+            broker_cfg:  The `broker:` section from edge_node.yml. When provided,
+                         a BrokerWatcher is created and broker failover is active.
+            broker_manager: A BrokerManager instance (already started if this node
+                         is the initial broker). Used by BrokerWatcher to hand off
+                         broker responsibility via on_become_broker().
+            extra_reconnect_callbacks: Additional callables[(host, port) -> None]
+                         to invoke on broker failover (e.g. health_agent reconnect).
+        """
         self._node_id = node_id
         self._cfg = cfg
         self._camera_manager = camera_manager
@@ -156,6 +389,8 @@ class PeerOrchestrator:
         self._broker_port = broker_port
         self._username = username
         self._password = password
+        self._broker_manager = broker_manager
+        self._extra_reconnect_callbacks: List = extra_reconnect_callbacks or []
 
         # Trạng thái peers
         self._peers: Dict[str, PeerState] = {}
@@ -191,12 +426,25 @@ class PeerOrchestrator:
         # Thread pool for blocking I/O (RTT measurement) off the MQTT callback thread
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="PeerOrch-IO")
 
+        # BrokerWatcher — optional, created only when broker_cfg is provided
+        self._broker_watcher: Optional[BrokerWatcher] = None
+        if broker_cfg:
+            self._broker_watcher = BrokerWatcher(
+                node_id=node_id,
+                broker_cfg=broker_cfg,
+                peers_snapshot_fn=self._peers_snapshot,
+                on_broker_change=self._on_broker_change,
+                on_become_broker=self._on_become_broker,
+                heartbeat_timeout_s=float(cfg.get("heartbeat_timeout_s", 15.0)),
+            )
+            self._broker_watcher.set_broker(broker_host)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Khởi động MQTT client + decision thread."""
+        """Khởi động MQTT client + decision thread + BrokerWatcher."""
         import paho.mqtt.client as mqtt
 
         self._client = mqtt.Client(client_id=f"orch_{self._node_id}")
@@ -216,6 +464,9 @@ class PeerOrchestrator:
         )
         self._decision_thread.start()
 
+        if self._broker_watcher:
+            self._broker_watcher.start()
+
         logger.info(
             "[PeerOrch] Connecting to broker %s:%d ...",
             self._broker_host, self._broker_port,
@@ -231,6 +482,8 @@ class PeerOrchestrator:
     def stop(self) -> None:
         """Dừng orchestrator."""
         self._running = False
+        if self._broker_watcher:
+            self._broker_watcher.stop()
         if self._client:
             self._client.disconnect()
         # Cancel mọi vote timer đang chạy
@@ -238,6 +491,61 @@ class PeerOrchestrator:
             timer.cancel()
         self._vote_timers.clear()
         self._executor.shutdown(wait=False)
+
+    def register_reconnect_callback(self, cb) -> None:
+        """Register an additional callable(host, port) invoked on broker failover."""
+        self._extra_reconnect_callbacks.append(cb)
+
+    # ------------------------------------------------------------------
+    # Broker failover callbacks (called by BrokerWatcher)
+    # ------------------------------------------------------------------
+
+    def _peers_snapshot(self) -> Dict[str, "PeerState"]:
+        """Return a shallow copy of the current peers dict (thread-safe)."""
+        with self._lock:
+            return dict(self._peers)
+
+    def _on_broker_change(self, new_host: str, new_port: int) -> None:
+        """
+        Called by BrokerWatcher when a new broker is live.
+        Reconnects our own MQTT client and invokes all registered callbacks.
+        """
+        logger.info(
+            "[PeerOrch] Broker changed → %s:%d. Reconnecting MQTT client...",
+            new_host, new_port,
+        )
+        self._broker_host = new_host
+        self._broker_port = new_port
+
+        # Disconnect triggers loop_forever() to return → start() reconnects
+        if self._client:
+            try:
+                self._client.disconnect()
+            except Exception:
+                pass
+
+        # Notify other components (health_agent, mqtt_subscriber, etc.)
+        for cb in self._extra_reconnect_callbacks:
+            try:
+                cb(new_host, new_port)
+            except Exception as exc:
+                logger.warning("[PeerOrch] Reconnect callback error: %s", exc)
+
+    def _on_become_broker(self) -> None:
+        """
+        Called by BrokerWatcher when THIS node is the next broker candidate.
+        Starts BrokerManager if available.
+        """
+        if self._broker_manager is None:
+            from .broker_manager import BrokerManager
+            self._broker_manager = BrokerManager(port=self._broker_port)
+
+        if not self._broker_manager.is_running():
+            logger.info("[PeerOrch] Becoming the MQTT broker on port %d.", self._broker_port)
+            self._broker_manager.start()
+            self._self_state.is_broker = True
+        else:
+            logger.info("[PeerOrch] BrokerManager already running.")
 
     # ------------------------------------------------------------------
     # MQTT callbacks
@@ -303,6 +611,7 @@ class PeerOrchestrator:
             self._self_state.fps_per_camera = pipeline.get("fps_per_camera", {})
             self._self_state.active_cameras = pipeline.get("active_cameras", [])
             self._self_state.signaling_port = payload.get("signaling_port", 8080)
+            self._self_state.is_broker = bool(payload.get("is_broker", False))
             # Track overload onset
             if self._self_state.load_score > self._cfg.get("overload_threshold", 75.0):
                 if self._self_state.overload_since is None:
@@ -323,6 +632,9 @@ class PeerOrchestrator:
         peer.ram_percent = payload.get("ram_percent", 0.0)
         peer.gpu_temp_c = payload.get("gpu_temp_c", 0.0)
         peer.signaling_port = payload.get("signaling_port", 8080)
+        peer.is_broker = bool(payload.get("is_broker", False))
+        # broker_host lets BrokerWatcher resolve where to probe during failover
+        peer.broker_host = payload.get("broker_host", "")
 
         pipeline = payload.get("pipeline", {})
         peer.avg_fps = pipeline.get("avg_fps")
@@ -550,6 +862,14 @@ class PeerOrchestrator:
         with self._lock:
             current_streams = len(self._self_state.active_cameras)
             self_load = self._self_state.load_score
+            is_broker = self._self_state.is_broker
+
+        # ε0 — Broker protection: the broker node does not accept new streams.
+        # Its load_score is already elevated by broker_penalty, but we add an
+        # explicit guard so it never participates in camera auctions regardless
+        # of how the penalty is configured.
+        if is_broker:
+            return
 
         # ε1 — Capacity constraint
         if current_streams >= self._cfg.get("eps_streams_max", 4):
@@ -585,7 +905,9 @@ class PeerOrchestrator:
                 return
 
         # All constraints pass — compute F(x)
-        # F(x) = estimated load score after accepting this stream
+        # F(x) = estimated load score after accepting this stream.
+        # load_score already includes broker_penalty when is_broker=True,
+        # but we guard against that in ε0 above, so this is always non-broker load.
         f_x = self_load + (100.0 - self_load) * 0.25
 
         proposal = {

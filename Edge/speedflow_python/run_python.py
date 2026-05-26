@@ -376,10 +376,54 @@ def run_python_mode(args) -> None:
         print(f"[PeerDiscovery] Failed: {exc}", file=sys.stderr)
         discovery = None
 
+    # --- Embedded MQTT Broker (optional — runs on exactly one node) ---
+    broker_mgr = None
+    broker_cfg = edge_cfg.get("broker", {})
+    from .settings import BROKER_ENABLED, BROKER_PORT as _BROKER_PORT
+    if BROKER_ENABLED:
+        try:
+            from .broker_manager import BrokerManager
+            broker_mgr = BrokerManager(
+                port=_BROKER_PORT,
+                username=mqtt_user,
+                password=mqtt_pass,
+            )
+            broker_mgr.start()
+            print(f"[BrokerManager] Embedded Mosquitto started on port {_BROKER_PORT}.")
+        except Exception as exc:
+            print(f"[BrokerManager] Failed to start: {exc}", file=sys.stderr)
+            broker_mgr = None
+
+    # --- Health Agent (starts early so broker status reaches peers quickly) ---
+    health_agent = None
+    try:
+        import sys as _sys2
+        import importlib.util as _ilu
+        _ha_path = S.ROOT / "health_agent.py"
+        if _ha_path.exists():
+            _spec = _ilu.spec_from_file_location("health_agent", _ha_path)
+            _ha_mod = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_ha_mod)
+            health_agent = _ha_mod.HealthAgent(broker_manager=broker_mgr)
+            health_agent.start()
+            print(f"[HealthAgent] Started. Node='{node_id}'")
+    except Exception as exc:
+        print(f"[HealthAgent] Failed to start: {exc}", file=sys.stderr)
+
     # --- P2P Peer Orchestrator ---
+    peer_orch = None
     try:
         from .peer_orchestrator import PeerOrchestrator
         p2p_cfg = edge_cfg.get("p2p", {})
+
+        # Extra reconnect callbacks — each MQTT client that needs to follow
+        # a broker failover registers here.
+        reconnect_callbacks = []
+        if health_agent is not None and hasattr(health_agent, "reconnect"):
+            reconnect_callbacks.append(health_agent.reconnect)
+        if mqtt_sub is not None and hasattr(mqtt_sub, "reconnect"):
+            reconnect_callbacks.append(mqtt_sub.reconnect)
+
         peer_orch = PeerOrchestrator(
             node_id=node_id,
             cfg=p2p_cfg,
@@ -388,14 +432,20 @@ def run_python_mode(args) -> None:
             broker_port=broker_port,
             username=mqtt_user,
             password=mqtt_pass,
+            broker_cfg=broker_cfg if broker_cfg else None,
+            broker_manager=broker_mgr,
+            extra_reconnect_callbacks=reconnect_callbacks,
         )
-        # Start orchestrator trong thread riêng (không block)
+        # Start orchestrator in a background thread (non-blocking)
         orch_thread = threading.Thread(target=peer_orch.start, daemon=True)
         orch_thread.start()
-        print(f"[PeerOrch] Started. Node='{node_id}', Overload threshold={p2p_cfg.get('overload_threshold', 75.0)}%")
+        print(
+            f"[PeerOrch] Started. Node='{node_id}', "
+            f"Overload threshold={p2p_cfg.get('overload_threshold', 75.0)}%, "
+            f"BrokerWatcher={'ON' if broker_cfg else 'OFF'}"
+        )
     except Exception as exc:
         print(f"[PeerOrch] Failed to start: {exc}", file=sys.stderr)
-        peer_orch = None
 
     # --- Embedded Signaling Server (display/file modes — webrtc mode handles its own) ---
     sig_enabled = edge_cfg.get("signaling", {}).get("enabled", True)

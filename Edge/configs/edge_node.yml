@@ -65,3 +65,29 @@ peers:
 mdns:
   enabled: false                # Set true for zero-config lab deployments
   service_type: "_iot_graduate._tcp.local."
+
+# -----------------------------------------------------------------------
+# Embedded MQTT Broker (Mosquitto)
+# -----------------------------------------------------------------------
+# One node in the cluster runs Mosquitto.  All other nodes connect to it.
+# When the broker node dies, BrokerWatcher walks priority_order in order,
+# waiting broker.candidate_timeout_s for each candidate's port to respond.
+#
+# Rules:
+#   - Set enabled: true on exactly ONE node in the cluster.
+#   - priority_order must be identical on every node (kept in sync manually).
+#   - The broker node gets +penalty_score added to its load_score so it is
+#     deprioritized from receiving extra camera streams.
+#   - Mosquitto must be installed: sudo apt install mosquitto
+# -----------------------------------------------------------------------
+broker:
+  enabled: true                 # true = this node starts Mosquitto on startup
+  port: 1883
+  probe_interval_s: 3.0         # how often to TCP-probe the active broker
+  dead_threshold_count: 3       # consecutive probe failures → broker declared dead
+  candidate_timeout_s: 15.0     # wait per candidate node during failover chain
+  penalty_score: 20.0           # extra load_score added to whichever node is broker
+  priority_order:               # failover chain, top = highest priority
+    - jetson_A
+    - jetson_B
+    - jetson_C
