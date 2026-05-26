@@ -8,7 +8,7 @@ All other modules import constants from here — never call
 os.environ directly with hardcoded fallback strings.
 
 Usage:
-    from .settings import MQTT_BROKER_HOST, CAMERAS_YML, ...
+    from .settings import CAMERAS_YML, ...
 """
 
 import os
@@ -44,13 +44,9 @@ NODE_ID        = _get("NODE_ID")
 EDGE_ID        = _get("EDGE_ID")
 
 # -----------------------------------------------------------
-# MQTT
+# Zenoh (P2P peer mode — no broker needed)
 # -----------------------------------------------------------
-MQTT_BROKER_HOST  = _get("MQTT_BROKER_HOST")
-MQTT_BROKER_PORT  = _get("MQTT_BROKER_PORT", int)
-MQTT_USER         = os.environ.get("MQTT_USER") or None   # optional
-MQTT_PASS         = os.environ.get("MQTT_PASS") or None   # optional
-MQTT_QUEUE_MAXSIZE = _get("MQTT_QUEUE_MAXSIZE", int)
+ZENOH_QUEUE_MAXSIZE = _get("ZENOH_QUEUE_MAXSIZE", int)
 
 # -----------------------------------------------------------
 # Health Agent
@@ -64,13 +60,6 @@ FPS_STATS_FILE   = _get("FPS_STATS_FILE")
 # -----------------------------------------------------------
 SIGNALING_HOST = _get("SIGNALING_HOST")
 SIGNALING_PORT = _get("SIGNALING_PORT", int)
-
-# -----------------------------------------------------------
-# Embedded MQTT Broker (Mosquitto)
-# -----------------------------------------------------------
-BROKER_ENABLED       = _get("BROKER_ENABLED").lower() in ("1", "true", "yes")
-BROKER_PORT          = _get("BROKER_PORT", int)
-BROKER_PENALTY_SCORE = _get("BROKER_PENALTY_SCORE", float)
 
 # -----------------------------------------------------------
 # Pipeline / Video
