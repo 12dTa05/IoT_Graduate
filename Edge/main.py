@@ -35,11 +35,6 @@ Examples:
         choices=["display", "file", "webrtc"],
         help="Output mode: display (screen), file (MP4), or webrtc (browser stream)",
     )
-    parser.add_argument(
-        "--homo",
-        default="configs/points_1.yml",
-        help="Homography points YAML file",
-    )
     parser.add_argument("--width",  type=int, default=MUX_WIDTH,  help="Streammux width")
     parser.add_argument("--height", type=int, default=MUX_HEIGHT, help="Streammux height")
     parser.add_argument("--output", help="Output file path (file mode only)")

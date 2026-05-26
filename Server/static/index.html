@@ -298,8 +298,22 @@ function handleMessage(msg) {
       break;
 
     case 'edge_list':
+      // Full edge list refresh (response to list_edges request)
+      edges = {};
+      for (const edge of msg.edges || []) {
+        edges[edge.node_id] = edge;
+      }
+      renderEdges();
+      break;
+
     case 'edge_registered':
-      edges[msg.node_id] = msg;
+      // Merge registration info without overwriting existing health data
+      if (!edges[msg.node_id]) {
+        edges[msg.node_id] = { node_id: msg.node_id, online: true, health: {} };
+      }
+      edges[msg.node_id].ip = msg.ip || edges[msg.node_id].ip;
+      edges[msg.node_id].signaling_port = msg.signaling_port || edges[msg.node_id].signaling_port;
+      edges[msg.node_id].online = true;
       renderEdges();
       break;
 
@@ -310,25 +324,19 @@ function handleMessage(msg) {
       renderEdges();
       break;
 
-    case 'registered':
-    case 'health_updated':
-      if (edges[msg.node_id]) {
-        edges[msg.node_id].health = msg;
-        edges[msg.node_id].online = true;
-        edges[msg.node_id].last_heartbeat = msg.timestamp || Date.now() / 1000;
-      }
-      renderEdges();
-      break;
-
     case 'health_update':
-      if (edges[msg.node_id]) {
-        // Copy health fields from flat message
+      if (!edges[msg.node_id]) {
+        edges[msg.node_id] = { node_id: msg.node_id, online: true, health: {} };
+      }
+      {
         const edge = edges[msg.node_id];
         edge.online = true;
         edge.last_heartbeat = msg.timestamp || Date.now() / 1000;
-        edge.health = { ...msg };
-        delete edge.health.type;
-        delete edge.health.node_id;
+        // Extract health fields (everything except type/node_id)
+        const health = { ...msg };
+        delete health.type;
+        delete health.node_id;
+        edge.health = health;
       }
       renderEdges();
       break;

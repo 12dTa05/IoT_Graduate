@@ -45,7 +45,25 @@ class ViolationStore:
         """
         node_id = record.get("node_id", "unknown")
         camera_id = record.get("camera_id", "unknown")
-        ts = record.get("timestamp", time.time())
+
+        # SpeedProbe sends "ts" (ISO string); health_agent sends "timestamp" (float).
+        # Normalise to a Unix float so we can derive the date and filename.
+        ts_raw = record.get("timestamp") or record.get("ts")
+        if ts_raw is None:
+            ts = time.time()
+        elif isinstance(ts_raw, str):
+            try:
+                import datetime
+                ts = datetime.datetime.fromisoformat(ts_raw).timestamp()
+            except ValueError:
+                ts = time.time()
+        else:
+            ts = float(ts_raw)
+
+        # Store the normalised float timestamp so query() sorting works correctly
+        if "timestamp" not in record:
+            record["timestamp"] = ts
+
         date_str = time.strftime("%Y-%m-%d", time.localtime(ts))
 
         node_dir = self._root / date_str / node_id

@@ -226,6 +226,7 @@ class HealthAgent:
                 load_score = _compute_load_score(metrics, fps_stats)
 
                 payload = {
+                    "type":          "health",
                     "node_id":       NODE_ID,
                     "timestamp":     time.time(),
                     "load_score":    load_score,
@@ -259,10 +260,10 @@ class HealthAgent:
                 if self._pub:
                     self._pub.put(msgpack.packb(payload, use_bin_type=True))
 
-                # Push to Central Monitor Server (nếu có kết nối)
+                # Push to Central Monitor Server (qua MonitorClient)
                 try:
-                    from speedflow_python.signaling import send_to_servers
-                    send_to_servers(payload)
+                    from speedflow_python.monitor_client import send_to_monitor
+                    send_to_monitor(payload)
                 except ImportError:
                     pass
 

@@ -1,37 +1,26 @@
 # ============================================================
-# edge_node.yml — Peer Node Configuration (P2P Mode)
+# edge_node.yml — P2P Orchestration Parameters only
+#
+# All scalar settings (node_id, fps, max_streams, signaling,
+# health interval, etc.) live in Edge/.env — not here.
+# This file holds only the structured P2P tuning that cannot
+# be expressed as flat key=value pairs.
 # ============================================================
-node_id: "jetson_A"              # Unique ID — primarily from .env
 
-pipeline:
-  target_fps: 25.0
-  max_streams: 4
-
-health_agent:
-  interval_s: 2.0               # Was 3.0 — faster heartbeat for P2P peer detection
-  fps_stats_file: "/dev/shm/speedflow_fps.json"
-
-# Embedded WebRTC Signaling (each Jetson serves its own endpoint)
-signaling:
-  enabled: true
-  host: "0.0.0.0"
-  port: 8080                    # Grid Monitor connects to: ws://<this_jetson_ip>:8080/ws
-
-# P2P Orchestration Parameters
 p2p:
   overload_threshold: 75.0      # load_score above this triggers RFO
   overload_duration_s: 10.0     # must be overloaded this long before RFO
-  cooldown_s: 45.0              # per-CAMERA cooldown between migrations
-  migration_timeout_s: 15.0     # wait for ADD_PROCESSING ack before rollback
+  cooldown_s: 45.0              # per-camera cooldown between migrations
+  migration_timeout_s: 15.0     # wait for ADD ack before rollback
   heartbeat_timeout_s: 15.0     # peer declared OFFLINE after this silence
   vote_window_s: 3.0            # proposal collection duration
   failover_jitter_max_s: 2.0    # random delay before failover ADD (race prevention)
 
-  # epsilon-Constraint values (Pareto optimization)
+  # epsilon-Constraint tiers (Pareto optimization)
   eps_fps_strict: 18.0          # Tier 0 — strict FPS floor
   eps_fps_tier1: 15.0           # Tier 1 relaxation
   eps_fps_tier2: 12.0           # Tier 2 relaxation
-  eps_network_ms_strict: 50.0   # Tier 0 — RTSP RTT floor
+  eps_network_ms_strict: 50.0   # Tier 0 — RTSP RTT ceiling
   eps_network_ms_tier1: 80.0    # Tier 1 relaxation
   eps_streams_max: 4            # Hard capacity ceiling
 
@@ -41,4 +30,8 @@ p2p:
     1: 24.5
     2: 22.0
     3: 18.5
-     4: 14.5
+    4: 14.5
+
+# Signaling section kept for opt-out only — all values come from .env
+signaling:
+  enabled: true

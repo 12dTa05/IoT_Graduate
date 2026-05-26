@@ -516,14 +516,6 @@ class MainWindow(QWidget):
         src_layout.addWidget(self.combo_run_source)
         layout.addLayout(src_layout)
 
-        cfg_layout = QHBoxLayout()
-        cfg_layout.addWidget(QLabel("Homography YAML:"))
-        self.le_homo = QLineEdit(os.path.join(os.getcwd(), "configs", "points_1.yml"))
-        self.btn_browse_homo = QPushButton("Browse...")
-        cfg_layout.addWidget(self.le_homo)
-        cfg_layout.addWidget(self.btn_browse_homo)
-        layout.addLayout(cfg_layout)
-
         backend_layout = QHBoxLayout()
         backend_layout.addStretch()
         layout.addLayout(backend_layout)
@@ -545,7 +537,6 @@ class MainWindow(QWidget):
 
         self.proc: Optional[QProcess] = None
 
-        self.btn_browse_homo.clicked.connect(self.on_browse_homo)
         self.btn_run_display.clicked.connect(lambda: self.run_pipeline("display"))
         self.btn_run_mp4.clicked.connect(lambda: self.run_pipeline("file"))
         self.btn_run_rtsp.clicked.connect(lambda: self.run_pipeline("rtsp"))
@@ -556,34 +547,19 @@ class MainWindow(QWidget):
         for uri in self.sources.keys():
             self.combo_run_source.addItem(uri)
 
-    def on_browse_homo(self):
-        default_dir = os.path.join(os.getcwd(), "configs")
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Chọn file YAML", default_dir, "YAML (*.yml *.yaml)"
-        )
-        if path:
-            self.le_homo.setText(path)
-
     def run_pipeline(self, mode: str):
         uri = self.combo_run_source.currentText()
         if not uri:
             QMessageBox.warning(self, "Chưa chọn nguồn", "Hãy chọn một nguồn trong danh sách.")
             return
 
-        homo = self.le_homo.text().strip()
-        if not os.path.exists(homo):
-            QMessageBox.warning(self, "Thiếu YAML", f"File homography không tồn tại: {homo}")
-            return
-
         if self.proc and self.proc.state() == QProcess.Running:
             QMessageBox.warning(self, "Đang chạy", "Pipeline đang chạy. Hãy Stop trước.")
             return
 
-        backend = "python"
         cmd_parts = [
             "python3", "main.py",
             f"--source {uri}",
-            f"--homo {homo}",
             f"--width {PROCESSING_WIDTH}",
             f"--height {PROCESSING_HEIGHT}"
         ]
