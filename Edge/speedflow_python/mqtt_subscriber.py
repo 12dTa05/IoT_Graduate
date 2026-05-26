@@ -7,7 +7,7 @@ MQTT Command & Control Subscriber cho Worker Node (Jetson Edge).
 Thay thế kiến trúc REST API, giúp Master ra lệnh xuyên tường lửa/NAT.
 
 Topic lắng nghe:
-    edge/control/{node_id}
+    peers/control/{node_id}
 
 Định dạng lệnh ADD (JSON):
     {
@@ -61,10 +61,10 @@ logger = logging.getLogger(__name__)
 
 class MQTTCommandSubscriber:
     """
-    Subscribe vào topic MQTT để nhận lệnh điều khiển từ Master Orchestrator.
+    Subscribe vào topic MQTT để nhận lệnh điều khiển từ Peer Orchestrator.
 
-    Lệnh được nhận trên topic: `edge/control/{node_id}`
-    Phản hồi trạng thái được gửi về: `edge/status/{node_id}`
+    Lệnh được nhận trên topic: `peers/control/{node_id}`
+    Phản hồi trạng thái được gửi về: `peers/status/{node_id}`
 
     Thread-safety:
         Khi nhận lệnh, không gọi pipeline trực tiếp. Chỉ push StreamDelta
@@ -76,8 +76,8 @@ class MQTTCommandSubscriber:
         self,
         camera_manager: CameraManager,
         node_id: str,
-        broker_host: str = "localhost",
-        broker_port: int = 1883,
+        broker_host: str,
+        broker_port: int,
         username: Optional[str] = None,
         password: Optional[str] = None,
         # TLS (tuỳ chọn): truyền đường dẫn file cert
@@ -97,8 +97,8 @@ class MQTTCommandSubscriber:
         self._tls_keyfile = tls_keyfile
         self._keepalive = keepalive
 
-        self._control_topic = f"edge/control/{node_id}"
-        self._status_topic = f"edge/status/{node_id}"
+        self._control_topic = f"peers/control/{node_id}"
+        self._status_topic = f"peers/status/{node_id}"
         self._client = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
@@ -308,6 +308,29 @@ class MQTTCommandSubscriber:
                 "camera_id": cam_id,
                 "source_id": source_id,
             })
+
+            # NEW: P2P vote ack — delay 3s to let GLib idle_add process the stream
+            # before the requester removes it from its own pipeline (Make-before-Break).
+            if self._client:
+                _client_ref = self._client
+                _cam_id = cam_id
+                _node_id = self._node_id
+                def _send_ack():
+                    import time as _time
+                    _time.sleep(3.0)  # grace period for GLib to start the stream
+                    try:
+                        _client_ref.publish(
+                            f"peers/vote/ack/{_cam_id}",
+                            json.dumps({
+                                "node_id": _node_id,
+                                "camera_id": _cam_id,
+                                "event": "PLAYING",
+                            }),
+                            qos=1,
+                        )
+                    except Exception:
+                        pass
+                threading.Thread(target=_send_ack, daemon=True).start()
 
         except KeyError as exc:
             logger.error("[MQTT C2] ADD command missing required field: %s", exc)

@@ -3,18 +3,18 @@ services:
     image: bluenviron/mediamtx:latest
     container_name: rtsp_server
     ports:
-      - "8554:8554"  # Port RTSP cho Jetson
-      - "8888:8888"  # Port HLS (để xem trên Web nếu cần)
+      - "${RTSP_PORT}:8554"
+      - "${HLS_PORT}:8888"
     restart: unless-stopped
+
   cam1:
     build: .
     container_name: cam1
     depends_on:
       - rtsp_server
     environment:
-      - VIDEO_FILE=/videos/sample.mp4
-      - RTSP_URL=rtsp://rtsp_server:8554/cam1
+      - VIDEO_FILE=${CAM1_VIDEO_FILE}
+      - RTSP_URL=${CAM1_RTSP_URL}
     volumes:
       - ./videos:/videos
     restart: unless-stopped
-

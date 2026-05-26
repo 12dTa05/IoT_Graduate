@@ -8,6 +8,7 @@ import sys
 import os
 import asyncio
 import time
+import threading
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -15,12 +16,25 @@ from gi.repository import Gst, GLib
 
 from .core_pipeline import build_pipeline, dynamic_add_stream, dynamic_remove_stream
 from .camera_config import CameraManager
-from .settings import CAMERAS_YML
 from .probes import SpeedProbe, ROIFilterProbe
 from .plate_preprocessor import PlatePreprocessorProbe
 from .config_txt import load_kv_txt
 from .common import WebRTCSession
 from . import settings as S
+from .settings import (
+    CAMERAS_YML,
+    NODE_ID,
+    MQTT_BROKER_HOST,
+    MQTT_BROKER_PORT,
+    MQTT_USER,
+    MQTT_PASS,
+    SIGNALING_HOST,
+    SIGNALING_PORT,
+    MUX_WIDTH,
+    MUX_HEIGHT,
+)
+
+import yaml
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +248,14 @@ def run_file_mode(args, camera_manager: CameraManager) -> None:
 async def run_webrtc_mode_async(args, camera_manager: CameraManager) -> None:
     configs = list(camera_manager.configs.values())
 
+    # --- Start embedded signaling server trong cùng event loop ---
+    try:
+        from .signaling import start_embedded
+        asyncio.create_task(start_embedded(SIGNALING_HOST, SIGNALING_PORT))
+        print(f"[Signaling] Embedded server started on {SIGNALING_HOST}:{SIGNALING_PORT}")
+    except Exception as exc:
+        print(f"[Signaling] Failed to start: {exc}", file=sys.stderr)
+
     ret_build = build_pipeline(
         camera_configs=configs,
         sink_type="webrtc",
@@ -297,22 +319,15 @@ def run_python_mode(args) -> None:
     camera_manager = CameraManager(CAMERAS_YML)
 
     # --- MQTT Command & Control ---
-    # Thay thế REST API bằng MQTT subscriber để nhận lệnh ADD/REMOVE từ Master.
-    # Kiến trúc này cho phép hoạt động qua tường lửa/NAT mà không cần mở cổng HTTP.
-    # Cấu hình qua biến môi trường:
-    #   NODE_ID           — định danh node này (mặc định: "jetson_default")
-    #   MQTT_BROKER_HOST  — IP/hostname của MQTT Broker (mặc định: "localhost")
-    #   MQTT_BROKER_PORT  — cổng Broker (mặc định: 1883)
-    #   MQTT_USER         — username (tuỳ chọn, dùng khi Broker bật xác thực)
-    #   MQTT_PASS         — password (tuỳ chọn)
+    # All values loaded from Edge/.env via speedflow_python.settings
     mqtt_sub = None
     try:
         from .mqtt_subscriber import MQTTCommandSubscriber
-        node_id       = os.environ.get("NODE_ID", "jetson_default")
-        broker_host   = os.environ.get("MQTT_BROKER_HOST", "localhost")
-        broker_port   = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
-        mqtt_user     = os.environ.get("MQTT_USER", None)
-        mqtt_pass     = os.environ.get("MQTT_PASS", None)
+        node_id     = NODE_ID
+        broker_host = MQTT_BROKER_HOST
+        broker_port = MQTT_BROKER_PORT
+        mqtt_user   = MQTT_USER
+        mqtt_pass   = MQTT_PASS
 
         mqtt_sub = MQTTCommandSubscriber(
             camera_manager=camera_manager,
@@ -326,7 +341,7 @@ def run_python_mode(args) -> None:
         print(
             f"[MQTT C2] Subscriber active. Node='{node_id}', "
             f"Broker={broker_host}:{broker_port}, "
-            f"Topic=edge/control/{node_id}"
+            f"Topic=peers/control/{node_id}"
         )
     except ImportError:
         print(
@@ -336,6 +351,67 @@ def run_python_mode(args) -> None:
         )
     except Exception as exc:
         print(f"[MQTT C2] Failed to start subscriber: {exc}", file=sys.stderr)
+
+    # --- P2P Peer Discovery ---
+    edge_cfg = {}        # safe default — populated if edge_node.yml exists
+    edge_node_yml = S.ROOT / "configs" / "edge_node.yml"
+    try:
+        from .peer_discovery import PeerDiscovery
+        if edge_node_yml.exists():
+            with open(edge_node_yml, "r") as f:
+                edge_cfg = yaml.safe_load(f) or {}
+            static_peers = edge_cfg.get("peers", [])
+            mdns_cfg = edge_cfg.get("mdns", {})
+            discovery = PeerDiscovery(
+                static_peers=static_peers,
+                mdns_enabled=mdns_cfg.get("enabled", False),
+                service_type=mdns_cfg.get("service_type", "_iot_graduate._tcp.local."),
+            )
+            discovery.start()
+            print(f"[PeerDiscovery] Started. Static peers: {[p.node_id for p in discovery.get_peers()]}")
+        else:
+            discovery = None
+            print("[PeerDiscovery] edge_node.yml not found — no peer discovery.")
+    except Exception as exc:
+        print(f"[PeerDiscovery] Failed: {exc}", file=sys.stderr)
+        discovery = None
+
+    # --- P2P Peer Orchestrator ---
+    try:
+        from .peer_orchestrator import PeerOrchestrator
+        p2p_cfg = edge_cfg.get("p2p", {})
+        peer_orch = PeerOrchestrator(
+            node_id=node_id,
+            cfg=p2p_cfg,
+            camera_manager=camera_manager,
+            broker_host=broker_host,
+            broker_port=broker_port,
+            username=mqtt_user,
+            password=mqtt_pass,
+        )
+        # Start orchestrator trong thread riêng (không block)
+        orch_thread = threading.Thread(target=peer_orch.start, daemon=True)
+        orch_thread.start()
+        print(f"[PeerOrch] Started. Node='{node_id}', Overload threshold={p2p_cfg.get('overload_threshold', 75.0)}%")
+    except Exception as exc:
+        print(f"[PeerOrch] Failed to start: {exc}", file=sys.stderr)
+        peer_orch = None
+
+    # --- Embedded Signaling Server (display/file modes — webrtc mode handles its own) ---
+    sig_enabled = edge_cfg.get("signaling", {}).get("enabled", True)
+    if sig_enabled and args.mode in ("display", "file"):
+        sig_host = SIGNALING_HOST
+        sig_port = SIGNALING_PORT
+        # display/file mode: GLib main loop, cần asyncio event loop riêng
+        def _run_signaling():
+            import asyncio as _asyncio
+            from .signaling import start_embedded
+            _loop = _asyncio.new_event_loop()
+            _asyncio.set_event_loop(_loop)
+            _loop.run_until_complete(start_embedded(sig_host, sig_port, logger_obj=None))
+            _loop.run_forever()
+        threading.Thread(target=_run_signaling, daemon=True).start()
+        print(f"[Signaling] Embedded server started on {sig_host}:{sig_port}")
 
     if args.mode == "display":
         run_display_mode(args, camera_manager)

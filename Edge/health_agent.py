@@ -2,47 +2,36 @@
 """
 Edge/health_agent.py
 
-Health Agent — Thu thập & Publish thông số phần cứng lên MQTT Broker.
+Health Agent — Collect hardware metrics and publish to MQTT broker.
 
-Chạy như một process độc lập (không phải submodule của speedflow_python)
-hoặc import trực tiếp và chạy trong thread riêng.
-
-Chức năng:
-  - Thu thập GPU%, CPU%, RAM%, Nhiệt độ, Công suất từ Jetson (via jtop)
-  - Lấy FPS thực tế của pipeline từ shared file (được SpeedProbe ghi ra)
-  - Tính Load Score tổng hợp có Penalty cho FPS thấp / Latency cao
-  - Publish định kỳ lên MQTT topic: edge/status/{node_id}
-
-Công thức Load Score:
-    base  = 0.5 * GPU_% + 0.3 * CPU_% + 0.2 * RAM_%
-    penalty = max(0, (TARGET_FPS - avg_fps) / TARGET_FPS * 30)   # tối đa +30 điểm
-    Load_Score = min(100, base + penalty)
-
-Yêu cầu:
-    pip install jetson-stats paho-mqtt
-
-Biến môi trường:
-    NODE_ID           — ID định danh node (mặc định: hostname)
-    MQTT_BROKER_HOST  — địa chỉ Broker (mặc định: localhost)
-    MQTT_BROKER_PORT  — cổng Broker (mặc định: 1883)
-    MQTT_USER         — username (tuỳ chọn)
-    MQTT_PASS         — password (tuỳ chọn)
-    HEALTH_INTERVAL   — khoảng thời gian publish (giây, mặc định: 3)
-    TARGET_FPS        — FPS kỳ vọng của pipeline (mặc định: 25)
-    FPS_STATS_FILE    — đường dẫn file JSON chứa FPS từ SpeedProbe
-                        (mặc định: /tmp/speedflow_fps.json)
+Reads all configuration from Edge/.env via speedflow_python.settings.
+No default values in this file — all values must be set in .env.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
-import socket
 import sys
 import time
 import threading
+from pathlib import Path
 from typing import Dict, Optional
+
+# Load settings from .env (must run from Edge/ or have Edge/ in path)
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+from speedflow_python.settings import (
+    NODE_ID,
+    MQTT_BROKER_HOST   as BROKER_HOST,
+    MQTT_BROKER_PORT   as BROKER_PORT,
+    MQTT_USER,
+    MQTT_PASS,
+    HEALTH_INTERVAL,
+    TARGET_FPS,
+    FPS_STATS_FILE,
+    SIGNALING_PORT,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,20 +40,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("health_agent")
 
-# ---------------------------------------------------------------------------
-# Cấu hình qua biến môi trường
-# ---------------------------------------------------------------------------
-
-NODE_ID          = os.environ.get("NODE_ID", socket.gethostname())
-BROKER_HOST      = os.environ.get("MQTT_BROKER_HOST", "localhost")
-BROKER_PORT      = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
-MQTT_USER        = os.environ.get("MQTT_USER", None)
-MQTT_PASS        = os.environ.get("MQTT_PASS", None)
-HEALTH_INTERVAL  = float(os.environ.get("HEALTH_INTERVAL", "3"))
-TARGET_FPS       = float(os.environ.get("TARGET_FPS", "25"))
-FPS_STATS_FILE   = os.environ.get("FPS_STATS_FILE", "/dev/shm/speedflow_fps.json")
-
-STATUS_TOPIC     = f"edge/status/{NODE_ID}"
+STATUS_TOPIC = f"peers/status/{NODE_ID}"
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +247,7 @@ class HealthAgent:
                     "ram_percent":   metrics["ram_percent"],
                     "gpu_temp_c":    metrics["gpu_temp_c"],
                     "power_mw":      metrics["power_mw"],
+                    "signaling_port": SIGNALING_PORT,
                     "pipeline": {
                         "fps_per_camera": fps_stats,
                         "avg_fps": round(

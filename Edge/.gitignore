@@ -1,9 +1,10 @@
 # Model files
 *.onnx
 *.pt
+*.engine
 
 # Python cache
-speedflow/__pycache__/
+speedflow_python/__pycache__/
 __pycache__/
 *.pyc
 *.pyo
@@ -13,11 +14,14 @@ __pycache__/
 .vscode/
 
 # Logs and outputs
-logs
-logs/*.csv
-outputs
+logs/
+output/
 *.log
 *.mp4
 
-.vscode
-.agent
+# Environment — do NOT commit secrets
+.env
+
+# Compiled C extensions
+*.so
+*.o
