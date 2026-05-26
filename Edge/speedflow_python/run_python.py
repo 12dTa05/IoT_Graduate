@@ -7,7 +7,6 @@ Hỗ trợ Multi-Stream Dynamic.
 import sys
 import os
 import asyncio
-import time
 import threading
 
 import gi
@@ -18,7 +17,6 @@ from .core_pipeline import build_pipeline, dynamic_add_stream, dynamic_remove_st
 from .camera_config import CameraManager
 from .probes import SpeedProbe, ROIFilterProbe
 from .plate_preprocessor import PlatePreprocessorProbe
-from .config_txt import load_kv_txt
 from .common import WebRTCSession
 from . import settings as S
 from .settings import (
@@ -28,6 +26,7 @@ from .settings import (
     SIGNALING_PORT,
     MUX_WIDTH,
     MUX_HEIGHT,
+    MONITOR_URL,
 )
 
 import yaml
@@ -375,6 +374,19 @@ def run_python_mode(args) -> None:
             _loop.run_forever()
         threading.Thread(target=_run_signaling, daemon=True).start()
         print(f"[Signaling] Embedded server started on {sig_host}:{sig_port}")
+
+    # --- MonitorClient: persistent WS connection to Central Monitor Server ---
+    if MONITOR_URL:
+        try:
+            from .monitor_client import MonitorClient, set_default_client
+            client = MonitorClient(MONITOR_URL, NODE_ID, SIGNALING_PORT)
+            client.start()
+            set_default_client(client)
+            print(f"[MonitorClient] Connected to {MONITOR_URL} (node={NODE_ID}, port={SIGNALING_PORT})")
+        except Exception as exc:
+            print(f"[MonitorClient] Failed to start: {exc}", file=sys.stderr)
+    else:
+        print("[MonitorClient] MONITOR_URL not set — central monitoring disabled")
 
     if args.mode == "display":
         run_display_mode(args, camera_manager)

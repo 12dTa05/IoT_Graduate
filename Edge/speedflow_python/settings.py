@@ -38,6 +38,11 @@ def _get(key: str, cast=str):
     return cast(_require(key))
 
 # -----------------------------------------------------------
+# Central Monitoring Server
+# -----------------------------------------------------------
+MONITOR_URL = os.environ.get("MONITOR_URL", "").strip()   # empty → disabled
+
+# -----------------------------------------------------------
 # Node identity
 # -----------------------------------------------------------
 NODE_ID        = _get("NODE_ID")
@@ -78,7 +83,6 @@ LICENSE_PLATE_CLASS_IDS = {0}
 # Stored as Path objects; absolute only where system requires it
 # -----------------------------------------------------------
 CAMERAS_YML     = ROOT / _get("CAMERAS_YML")
-HOMO_YML        = ROOT / _get("HOMO_YML")
 INFER_CONFIG    = ROOT / _get("INFER_CONFIG")
 SGIE_CONFIG     = ROOT / _get("SGIE_CONFIG")
 LPR_CONFIG      = ROOT / _get("LPR_CONFIG")

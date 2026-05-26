@@ -1,8 +1,8 @@
 """
 Server/edge_registry.py — Tracks registered Edge nodes + live health state.
 
-Each Edge registers via POST /api/register on startup.
-Health updates arrive via WebRTC data channel from the Edge.
+Each Edge registers implicitly by opening a WebSocket to /ws/edge on startup.
+Health updates arrive via the same WebSocket (type: "health" messages).
 A background watchdog marks nodes offline after 15s of no heartbeat.
 
 Events emitted via `on_change` callback:
@@ -77,7 +77,9 @@ class EdgeRegistry:
             return
         info.online = True
         info.last_heartbeat = time.time()
-        info.health = payload
+        # Store health fields only (strip message routing keys)
+        health = {k: v for k, v in payload.items() if k not in ("type", "node_id")}
+        info.health = health
         self._emit("health_updated", node_id)
 
     def mark_offline(self, node_id: str) -> None:

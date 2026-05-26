@@ -148,10 +148,10 @@ class ZenohPublisher:
             pub.put(payload)
             self._sent_count += 1
 
-        # Push overspeed events to Central Monitor Server (nếu có kết nối)
+        # Push overspeed events to Central Monitor Server (qua MonitorClient)
         if data.get("type") == "overspeed":
             try:
-                from .signaling import send_to_servers
-                send_to_servers(data)
+                from .monitor_client import send_to_monitor
+                send_to_monitor(data)
             except ImportError:
                 pass
