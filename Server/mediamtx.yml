@@ -1,0 +1,33 @@
+# MediaMTX — Centralized RTSP→WebRTC relay for IoT Graduate
+#
+# Edge nodes push RTSP streams here.
+# Browser clients consume via WebRTC (WHEP protocol).
+
+# ── Logging ──────────────────────────────────────────────────
+logLevel: info
+logDestinations: [stdout]
+
+# ── RTSP server (receives push from Edge nodes) ─────────────
+rtsp: yes
+rtspAddress: :8554
+protocols: [tcp]
+
+# ── WebRTC server (serves to browser via WHEP) ──────────────
+webrtc: yes
+webrtcAddress: :8889
+
+# ── API server (query active streams) ───────────────────────
+api: yes
+apiAddress: :9997
+
+# ── HLS (optional fallback for older browsers) ──────────────
+hls: no
+
+# ── RTMP (not needed) ───────────────────────────────────────
+rtmp: no
+
+# ── Stream paths ────────────────────────────────────────────
+# Accept any stream path pushed by Edge nodes (e.g., /jetson_A, /jetson_B)
+paths:
+  all_others:
+    source: publisher

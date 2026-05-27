@@ -17,5 +17,4 @@ class PeerInfo:
     """Minimal peer information — kept for backward compat imports."""
     node_id: str
     ip: str
-    signaling_port: int = 8080
     max_streams: int = 4

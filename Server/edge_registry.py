@@ -25,10 +25,9 @@ WATCHDOG_INTERVAL = 5.0
 
 
 class EdgeInfo:
-    def __init__(self, node_id: str, ip: str, signaling_port: int) -> None:
+    def __init__(self, node_id: str, ip: str) -> None:
         self.node_id = node_id
         self.ip = ip
-        self.signaling_port = signaling_port
         self.online = True
         self.last_heartbeat = time.time()
         self.health: Dict[str, Any] = {}
@@ -38,7 +37,6 @@ class EdgeInfo:
         return {
             "node_id": self.node_id,
             "ip": self.ip,
-            "signaling_port": self.signaling_port,
             "online": self.online,
             "registered_at": self.registered_at,
             "last_heartbeat": self.last_heartbeat,
@@ -55,18 +53,17 @@ class EdgeRegistry:
     # Public API
     # ------------------------------------------------------------------
 
-    def register(self, node_id: str, ip: str, signaling_port: int) -> bool:
+    def register(self, node_id: str, ip: str) -> bool:
         """Register or update an Edge. Returns True if newly registered."""
         existing = self._edges.get(node_id)
         if existing:
             existing.ip = ip
-            existing.signaling_port = signaling_port
             existing.online = True
             existing.last_heartbeat = time.time()
-            logger.info("[Registry] Edge '%s' re-registered at %s:%d", node_id, ip, signaling_port)
+            logger.info("[Registry] Edge '%s' re-registered at %s", node_id, ip)
             return False
-        self._edges[node_id] = EdgeInfo(node_id, ip, signaling_port)
-        logger.info("[Registry] Edge '%s' registered at %s:%d", node_id, ip, signaling_port)
+        self._edges[node_id] = EdgeInfo(node_id, ip)
+        logger.info("[Registry] Edge '%s' registered at %s", node_id, ip)
         self._emit("registered", node_id)
         return True
 

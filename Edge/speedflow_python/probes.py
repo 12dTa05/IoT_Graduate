@@ -102,7 +102,7 @@ class SpeedProbe:
     def __init__(self, camera_manager: CameraManager, cooldown_s: float = 2.5):
         self.camera_manager = camera_manager
 
-        # ID định danh node này — dùng trong payload MQTT để Deduplication
+        # ID định danh node này — dùng trong payload Zenoh để Deduplication
         self._node_id = NODE_ID
 
         # Trạng thái theo key: stid = (source_id, track_id)
@@ -192,7 +192,7 @@ class SpeedProbe:
     def _fps_writer_loop(self) -> None:
         """
         Ghi FPS stats ra file JSON mỗi 2 giây.
-        health_agent.py đọc file này để báo cáo lên MQTT.
+        health_agent.py đọc file này để báo cáo lên Zenoh / Central Monitor.
         """
         while self._fps_writer_running:
             time.sleep(2.0)
@@ -236,7 +236,7 @@ class SpeedProbe:
 
         publisher có thể là:
           - ZenohPublisher instance (có phương thức .put(data)) — khuyến nghị
-          - Callable nhận dict (để tương thích ngược với WebRTC session)
+          - Callable nhận dict (backward compat)
         """
         self.publisher = publisher
 

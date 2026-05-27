@@ -13,6 +13,7 @@ Architecture:
   - EdgeRegistry tracks all connected Edges + live health
   - ViolationStore persists records to local filesystem
   - /ws/server pushes live events to browser dashboard clients
+  - MediaMTX handles RTSP→WebRTC relay (separate container)
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
+import aiohttp
 from aiohttp import web, WSMsgType
 
 # ---------------------------------------------------------------------------
@@ -157,13 +159,25 @@ async def handle_health_check(request: web.Request) -> web.Response:
     })
 
 
+async def handle_streams(request: web.Request) -> web.Response:
+    """Proxy to MediaMTX API — list active RTSP streams."""
+    mtx_api = os.getenv("MEDIAMTX_API", "http://localhost:9997")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{mtx_api}/v3/paths/list") as resp:
+                data = await resp.json()
+                return web.json_response(data)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=502)
+
+
 # ---------------------------------------------------------------------------
 # /ws/edge — Inbound WebSocket from Edge nodes
 # ---------------------------------------------------------------------------
 
 async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
     """
-    GET /ws/edge?node_id=jetson_A&signaling_port=8080
+    GET /ws/edge?node_id=jetson_A
 
     Edge nodes open this WebSocket on boot and push health + violation data.
     Registration is implicit: connecting == registering.
@@ -173,8 +187,8 @@ async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
     broadcast = _make_broadcast(state)
 
     node_id = request.query.get("node_id", "").strip()
-    ip = request.remote or ""
-    signaling_port = int(request.query.get("signaling_port", "8080"))
+    advertise_ip = request.query.get("advertise_ip", "").strip()
+    ip = advertise_ip or request.remote or ""
 
     if not node_id:
         return web.Response(text="node_id query param required", status=400)
@@ -183,7 +197,7 @@ async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
     await ws.prepare(request)
 
     # Register (or re-register) the Edge
-    state.registry.register(node_id, ip, signaling_port)
+    state.registry.register(node_id, ip)
 
     # Track the live WS — replace before closing old so the old handler's
     # finally block sees it's no longer current and skips mark_offline.
@@ -192,14 +206,13 @@ async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
     if old_ws and not old_ws.closed:
         await old_ws.close()
 
-    logger.info("[EDGE-WS] '%s' connected (%s:%d). Edges online: %d",
-                node_id, ip, signaling_port, len(state.edge_ws))
+    logger.info("[EDGE-WS] '%s' connected (%s). Edges online: %d",
+                node_id, ip, len(state.edge_ws))
 
     broadcast({
         "type": "edge_registered",
         "node_id": node_id,
         "ip": ip,
-        "signaling_port": signaling_port,
     })
 
     try:
@@ -339,6 +352,7 @@ def create_app() -> web.Application:
     app.router.add_get("/static/{filename}", serve_static)
     app.router.add_get("/api/edges", handle_edges)
     app.router.add_get("/api/violations", handle_violations)
+    app.router.add_get("/api/streams", handle_streams)
     app.router.add_get("/api/snapshots/{node_id}/{filename}", handle_snapshot)
     app.router.add_get("/ws/edge", handle_ws_edge)
     app.router.add_get("/ws/server", handle_ws_server)

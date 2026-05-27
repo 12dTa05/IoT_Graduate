@@ -29,12 +29,18 @@ body {
 #status { font-size: 12px; color: #888; margin-left: auto; }
 #status.online { color: #4caf50; }
 #status.error { color: #f44336; }
+
+/* ── 3-column layout ────────────────────────────────────── */
 #main {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-  padding: 16px;
+  grid-template-columns: 3fr 2fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 12px;
+  padding: 12px;
   height: calc(100vh - 52px);
+}
+#video-panel {
+  grid-row: 1 / 3;
 }
 .panel {
   background: #14141e;
@@ -43,14 +49,49 @@ body {
 }
 .panel h2 {
   font-size: 14px; font-weight: 600;
-  padding: 12px 16px;
+  padding: 10px 16px;
   border-bottom: 1px solid #2a2a3a;
   color: #7c7cff;
   position: sticky; top: 0; background: #14141e; z-index: 10;
 }
 .panel-content { padding: 8px; }
 
-/* Edge cards */
+/* ── Video grid ─────────────────────────────────────────── */
+#video-grid {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  height: calc(100% - 42px);
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
+}
+#video-grid.cols-2 { grid-template-columns: 1fr 1fr; }
+#video-grid.cols-3 { grid-template-columns: 1fr 1fr 1fr; }
+.video-cell {
+  background: #000;
+  border-radius: 6px;
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.video-cell video {
+  width: 100%; height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+.video-cell .label {
+  position: absolute; top: 6px; left: 8px;
+  font-size: 11px; font-weight: 600;
+  color: #fff; background: rgba(0,0,0,0.6);
+  padding: 2px 8px; border-radius: 4px;
+}
+.video-cell .no-stream {
+  color: #555; font-size: 13px;
+}
+
+/* ── Edge cards ─────────────────────────────────────────── */
 .edge-card {
   background: #1a1a28;
   border-radius: 6px;
@@ -87,7 +128,7 @@ body {
 .edge-card .fps-list { font-size: 11px; color: #888; margin-top: 6px; }
 .edge-card .fps-list span { margin-right: 8px; }
 
-/* Violation feed */
+/* ── Violation feed ─────────────────────────────────────── */
 .violation-row {
   display: flex; align-items: center; gap: 10px;
   padding: 8px 12px;
@@ -109,7 +150,7 @@ body {
 }
 .violation-row .thumb:hover { transform: scale(3); z-index: 100; position: relative; }
 
-/* Modal for full image */
+/* ── Modal ──────────────────────────────────────────────── */
 #modal-overlay {
   display: none;
   position: fixed; top: 0; left: 0; right: 0; bottom: 0;
@@ -138,10 +179,17 @@ body {
 <div id="toolbar">
   <h1>Central Monitor</h1>
   <span class="badge" id="edge-count-badge">0 edges</span>
+  <span class="badge" id="stream-count-badge" style="color:#4fc3f7;background:#1a2a3a;">0 streams</span>
   <span id="status">Connecting...</span>
 </div>
 
 <div id="main">
+  <div class="panel" id="video-panel">
+    <h2>Live Video</h2>
+    <div id="video-grid">
+      <div class="video-cell"><span class="no-stream">No streams available</span></div>
+    </div>
+  </div>
   <div class="panel" id="cluster-panel">
     <h2>Cluster Status</h2>
     <div class="panel-content" id="edge-list"></div>
@@ -160,24 +208,214 @@ body {
 <script>
 // ── Configuration ──────────────────────────────────────────────
 const WS_URL = `ws://${location.host}/ws/server`;
+const STREAMS_API = '/api/streams';
+const MEDIAMTX_WEBRTC_URL = '%%MEDIAMTX_WEBRTC_URL%%';
+
 const EDGE_LIST_EL = document.getElementById('edge-list');
 const VIOLATION_LIST_EL = document.getElementById('violation-list');
 const STATUS_EL = document.getElementById('status');
 const EDGE_COUNT_BADGE = document.getElementById('edge-count-badge');
+const STREAM_COUNT_BADGE = document.getElementById('stream-count-badge');
+const VIDEO_GRID = document.getElementById('video-grid');
 const MODAL = document.getElementById('modal-overlay');
 const MODAL_IMG = document.getElementById('modal-img');
 
 // ── State ──────────────────────────────────────────────────────
-let edges = {};   // node_id → edge info
+let edges = {};           // node_id → edge info
+const violations = [];
+let activeStreams = {};    // stream_name → { pc, video }
+let streamPollTimer = null;
+let mediamtxBaseUrl = '';  // resolved at init
 
 // ── Format helpers ─────────────────────────────────────────────
 function fmtTime(ts) {
   const d = new Date(ts * 1000);
   return d.toLocaleTimeString();
 }
-
 function fmtPct(v) { return v != null ? `${v.toFixed(1)}%` : '--'; }
-function fmtTemp(v) { return v != null ? `${v.toFixed(1)}°C` : '--'; }
+function fmtTemp(v) { return v != null ? `${v.toFixed(1)}\u00B0C` : '--'; }
+
+// ── Resolve MediaMTX WebRTC base URL ───────────────────────────
+async function resolveMediaMTXUrl() {
+  // Try server .env value first (injected as template or fetched)
+  try {
+    const resp = await fetch('/api/streams');
+    if (resp.ok) {
+      // If the API is reachable, MediaMTX is running on the same host
+      // Use the page's hostname with MediaMTX WebRTC port
+      mediamtxBaseUrl = `http://${location.hostname}:8889`;
+      return;
+    }
+  } catch(e) {}
+  mediamtxBaseUrl = `http://${location.hostname}:8889`;
+}
+
+// ── WHEP Player ────────────────────────────────────────────────
+async function startWhepPlayer(streamName, videoEl) {
+  const whepUrl = `${mediamtxBaseUrl}/${streamName}/whep`;
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+  });
+
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+
+  pc.ontrack = (evt) => {
+    if (evt.track.kind === 'video') {
+      videoEl.srcObject = evt.streams[0];
+    }
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  // Wait for ICE gathering to complete (or timeout)
+  await new Promise((resolve) => {
+    if (pc.iceGatheringState === 'complete') { resolve(); return; }
+    const check = () => {
+      if (pc.iceGatheringState === 'complete') {
+        pc.removeEventListener('icegatheringstatechange', check);
+        resolve();
+      }
+    };
+    pc.addEventListener('icegatheringstatechange', check);
+    setTimeout(resolve, 2000);
+  });
+
+  try {
+    const resp = await fetch(whepUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/sdp' },
+      body: pc.localDescription.sdp,
+    });
+    if (!resp.ok) {
+      console.warn(`[WHEP] ${streamName}: HTTP ${resp.status}`);
+      pc.close();
+      return null;
+    }
+    const answerSdp = await resp.text();
+    await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+  } catch(e) {
+    console.warn(`[WHEP] ${streamName}: ${e}`);
+    pc.close();
+    return null;
+  }
+
+  return pc;
+}
+
+// ── Stream Discovery + Video Grid ──────────────────────────────
+async function pollStreams() {
+  let streamNames = [];
+  try {
+    const resp = await fetch(STREAMS_API);
+    if (resp.ok) {
+      const data = await resp.json();
+      const items = data.items || [];
+      streamNames = items
+        .filter(p => p.readers != null || p.source != null)
+        .map(p => p.name);
+      // Also include streams that have a source (publisher connected)
+      if (streamNames.length === 0) {
+        streamNames = items
+          .filter(p => p.source && p.source.type === 'rtspSession')
+          .map(p => p.name);
+      }
+    }
+  } catch(e) {}
+
+  // Also create players for online edge node_ids even if not yet in MediaMTX
+  const onlineNodeIds = Object.values(edges)
+    .filter(e => e.online)
+    .map(e => e.node_id);
+
+  // Merge: prefer discovered streams, add online nodes that might not have shown up yet
+  const allStreams = new Set([...streamNames, ...onlineNodeIds]);
+
+  STREAM_COUNT_BADGE.textContent = `${allStreams.size} streams`;
+
+  // Determine removed streams
+  for (const name of Object.keys(activeStreams)) {
+    if (!allStreams.has(name)) {
+      const info = activeStreams[name];
+      if (info.pc) info.pc.close();
+      delete activeStreams[name];
+    }
+  }
+
+  // Add new streams
+  for (const name of allStreams) {
+    if (!activeStreams[name]) {
+      activeStreams[name] = { pc: null, video: null, connecting: false };
+    }
+  }
+
+  renderVideoGrid();
+}
+
+function renderVideoGrid() {
+  const names = Object.keys(activeStreams).sort();
+  const n = names.length;
+
+  if (n === 0) {
+    VIDEO_GRID.innerHTML = '<div class="video-cell"><span class="no-stream">No streams available</span></div>';
+    VIDEO_GRID.className = '';
+    return;
+  }
+
+  // Grid sizing
+  if (n <= 1) VIDEO_GRID.className = '';
+  else if (n <= 4) VIDEO_GRID.className = 'cols-2';
+  else VIDEO_GRID.className = 'cols-3';
+
+  // Rebuild grid if structure changed
+  const currentIds = Array.from(VIDEO_GRID.querySelectorAll('.video-cell'))
+    .map(el => el.dataset.stream);
+  const needsRebuild = names.length !== currentIds.length || names.some((n, i) => n !== currentIds[i]);
+
+  if (needsRebuild) {
+    VIDEO_GRID.innerHTML = '';
+    for (const name of names) {
+      const cell = document.createElement('div');
+      cell.className = 'video-cell';
+      cell.dataset.stream = name;
+
+      const video = document.createElement('video');
+      video.autoplay = true;
+      video.playsInline = true;
+      video.muted = true;
+      cell.appendChild(video);
+
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = name;
+      cell.appendChild(label);
+
+      VIDEO_GRID.appendChild(cell);
+      activeStreams[name].video = video;
+    }
+  }
+
+  // Start WHEP connections for streams not yet connected
+  for (const name of names) {
+    const info = activeStreams[name];
+    if (!info.pc && !info.connecting && info.video) {
+      info.connecting = true;
+      startWhepPlayer(name, info.video).then(pc => {
+        info.pc = pc;
+        info.connecting = false;
+        if (!pc) {
+          // Retry after delay
+          setTimeout(() => {
+            if (activeStreams[name] && !activeStreams[name].pc) {
+              activeStreams[name].connecting = false;
+            }
+          }, 5000);
+        }
+      });
+    }
+  }
+}
 
 // ── Render: Edge cards ─────────────────────────────────────────
 function renderEdges() {
@@ -204,7 +442,7 @@ function renderEdges() {
         <div class="header">
           <span class="dot ${edge.online ? 'online' : 'offline'}"></span>
           <span class="node-id">${edge.node_id}</span>
-          <span class="ip">${edge.ip}:${edge.signaling_port}</span>
+          <span class="ip">${edge.ip}</span>
         </div>
         <div class="metrics">
           <div class="metric">GPU <span class="value">${fmtPct(h.gpu_percent)}</span></div>
@@ -222,7 +460,7 @@ function renderEdges() {
 }
 
 // ── Render: Violations ─────────────────────────────────────────
-function renderViolations(violations) {
+function renderViolations() {
   let html = '';
   for (const v of violations) {
     const ts = v.timestamp || v.ts || 0;
@@ -255,7 +493,6 @@ function openModal(url) {
 // ── WebSocket connection ───────────────────────────────────────
 let ws = null;
 let reconnectTimer = null;
-const violations = [];
 
 function connectWS() {
   if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -295,10 +532,10 @@ function handleMessage(msg) {
         edges[edge.node_id] = edge;
       }
       renderEdges();
+      pollStreams();
       break;
 
     case 'edge_list':
-      // Full edge list refresh (response to list_edges request)
       edges = {};
       for (const edge of msg.edges || []) {
         edges[edge.node_id] = edge;
@@ -307,14 +544,14 @@ function handleMessage(msg) {
       break;
 
     case 'edge_registered':
-      // Merge registration info without overwriting existing health data
       if (!edges[msg.node_id]) {
         edges[msg.node_id] = { node_id: msg.node_id, online: true, health: {} };
       }
       edges[msg.node_id].ip = msg.ip || edges[msg.node_id].ip;
-      edges[msg.node_id].signaling_port = msg.signaling_port || edges[msg.node_id].signaling_port;
       edges[msg.node_id].online = true;
       renderEdges();
+      // Trigger stream discovery when new edge registers
+      pollStreams();
       break;
 
     case 'edge_offline':
@@ -322,6 +559,7 @@ function handleMessage(msg) {
         edges[msg.node_id].online = false;
       }
       renderEdges();
+      pollStreams();
       break;
 
     case 'health_update':
@@ -332,7 +570,6 @@ function handleMessage(msg) {
         const edge = edges[msg.node_id];
         edge.online = true;
         edge.last_heartbeat = msg.timestamp || Date.now() / 1000;
-        // Extract health fields (everything except type/node_id)
         const health = { ...msg };
         delete health.type;
         delete health.node_id;
@@ -344,13 +581,18 @@ function handleMessage(msg) {
     case 'violation':
       violations.unshift(msg);
       if (violations.length > 100) violations.length = 100;
-      renderViolations(violations);
+      renderViolations();
       break;
   }
 }
 
 // ── Start ──────────────────────────────────────────────────────
-connectWS();
+(async () => {
+  await resolveMediaMTXUrl();
+  connectWS();
+  // Poll for streams every 5 seconds
+  streamPollTimer = setInterval(pollStreams, 5000);
+})();
 </script>
 </body>
 </html>

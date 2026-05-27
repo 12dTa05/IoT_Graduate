@@ -70,7 +70,6 @@ class PeerState:
     fps_per_camera: Dict[str, float] = field(default_factory=dict)
     active_cameras: List[str] = field(default_factory=list)
     max_streams: int = 4
-    signaling_port: int = 8080
     last_seen: float = field(default_factory=time.time)
     overload_since: Optional[float] = None
     penalty_until: float = 0.0
@@ -177,7 +176,7 @@ class PeerOrchestrator:
         self._running = False
         self._decision_thread: Optional[threading.Thread] = None
 
-        # Thread pool for blocking I/O (RTT measurement) off the MQTT callback thread
+        # Thread pool for blocking I/O (RTT measurement) off the Zenoh callback thread
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="PeerOrch-IO")
 
     # ------------------------------------------------------------------
@@ -274,7 +273,6 @@ class PeerOrchestrator:
             self._self_state.avg_fps = pipeline.get("avg_fps")
             self._self_state.fps_per_camera = pipeline.get("fps_per_camera", {})
             self._self_state.active_cameras = pipeline.get("active_cameras", [])
-            self._self_state.signaling_port = payload.get("signaling_port", 8080)
             # Track overload onset
             if self._self_state.load_score > self._cfg.get("overload_threshold", 75.0):
                 if self._self_state.overload_since is None:
@@ -294,7 +292,6 @@ class PeerOrchestrator:
         peer.cpu_percent = payload.get("cpu_percent", 0.0)
         peer.ram_percent = payload.get("ram_percent", 0.0)
         peer.gpu_temp_c = payload.get("gpu_temp_c", 0.0)
-        peer.signaling_port = payload.get("signaling_port", 8080)
 
         pipeline = payload.get("pipeline", {})
         peer.avg_fps = pipeline.get("avg_fps")
