@@ -176,6 +176,9 @@ class PeerOrchestrator:
         self._running = False
         self._decision_thread: Optional[threading.Thread] = None
 
+        # Track peers already reported offline (no cameras) to avoid log spam
+        self._notified_offline: set = set()
+
         # Thread pool for blocking I/O (RTT measurement) off the Zenoh callback thread
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="PeerOrch-IO")
 
@@ -283,8 +286,10 @@ class PeerOrchestrator:
 
         # Cập nhật trạng thái peer khác
         with self._lock:
-            if node_id not in self._peers:
+            is_new = node_id not in self._peers
+            if is_new:
                 self._peers[node_id] = PeerState(node_id=node_id)
+                logger.info("[PeerOrch] Discovered peer '%s' via Zenoh", node_id)
             peer = self._peers[node_id]
 
         peer.load_score = payload.get("load_score", 0.0)
@@ -345,13 +350,19 @@ class PeerOrchestrator:
                         "[PeerOrch] Peer '%s' OFFLINE with %d cameras! Triggering failover...",
                         node_id, len(orphans),
                     )
+                    self._notified_offline.discard(node_id)
                     threading.Thread(
                         target=self._leaderless_failover,
                         args=(node_id, orphans),
                         daemon=True,
                     ).start()
                 else:
-                    logger.warning("[PeerOrch] Peer '%s' OFFLINE (no cameras).", node_id)
+                    if node_id not in self._notified_offline:
+                        logger.warning("[PeerOrch] Peer '%s' OFFLINE (no cameras).", node_id)
+                        self._notified_offline.add(node_id)
+            else:
+                # Peer is alive — clear the notified flag so we log again if it goes offline
+                self._notified_offline.discard(node_id)
 
     def _check_self_overload(self) -> None:
         """

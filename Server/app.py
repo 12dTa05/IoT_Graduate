@@ -1,21 +1,3 @@
-"""
-Server/app.py — Central Monitoring Server.
-
-Entry point for the Central Monitoring dashboard.
-
-Usage:
-    python -m Server.app          # as package (recommended)
-    python Server/app.py          # standalone also works
-
-Architecture:
-  - aiohttp web server with REST API + WebSocket push
-  - /ws/edge accepts inbound WebSocket connections FROM each Edge
-  - EdgeRegistry tracks all connected Edges + live health
-  - ViolationStore persists records to local filesystem
-  - /ws/server pushes live events to browser dashboard clients
-  - MediaMTX handles RTSP→WebRTC relay (separate container)
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -30,9 +12,6 @@ from typing import Any, Dict, List
 import aiohttp
 from aiohttp import web, WSMsgType
 
-# ---------------------------------------------------------------------------
-# Path setup — allows both `python Server/app.py` and `python -m Server.app`
-# ---------------------------------------------------------------------------
 _SERVER_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SERVER_DIR.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -42,44 +21,27 @@ from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=_SERVER_DIR / ".env", override=False)
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s %(name)s — %(message)s",
+    format="[%(asctime)s] %(levelname)s %(name)s \u2014 %(message)s",
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("server_app")
 
-# ---------------------------------------------------------------------------
-# Local imports
-# ---------------------------------------------------------------------------
-from Server.edge_registry import EdgeRegistry     # noqa: E402
-from Server.violation_store import ViolationStore  # noqa: E402
+from Server.edge_registry import EdgeRegistry
+from Server.violation_store import ViolationStore
 
-
-# ---------------------------------------------------------------------------
-# App State
-# ---------------------------------------------------------------------------
 
 class ServerState:
-    """Shared mutable state for the server application."""
-
     def __init__(self) -> None:
         self.registry: EdgeRegistry = None
-        self.edge_ws: Dict[str, web.WebSocketResponse] = {}   # node_id → Edge WS
+        self.edge_ws: Dict[str, web.WebSocketResponse] = {}
         self.browser_ws: List[web.WebSocketResponse] = []
         self.store: ViolationStore = None
+        self.http_session: aiohttp.ClientSession = None
 
-
-# ---------------------------------------------------------------------------
-# WebSocket broadcast to browsers
-# ---------------------------------------------------------------------------
 
 def _make_broadcast(state: ServerState):
-    """Return a fire-and-forget broadcast function for the asyncio event loop."""
-
     async def _send_all(payload: str) -> None:
         dead: List[web.WebSocketResponse] = []
         for ws in list(state.browser_ws):
@@ -98,15 +60,20 @@ def _make_broadcast(state: ServerState):
     return broadcast
 
 
-# ---------------------------------------------------------------------------
-# Routes — static / REST
-# ---------------------------------------------------------------------------
-
 async def index(request: web.Request) -> web.Response:
     html_path = _SERVER_DIR / "static" / "index.html"
     if not html_path.exists():
         return web.Response(text="Dashboard not found", status=404)
-    return web.FileResponse(html_path)
+
+    html = html_path.read_text(encoding="utf-8")
+    config_json = json.dumps({
+        "MEDIAMTX_API": os.getenv("MEDIAMTX_API", "http://localhost:9997"),
+        "MEDIAMTX_WEBRTC_URL": os.getenv("MEDIAMTX_WEBRTC_URL", ""),
+        "WS_URL": f"ws://{request.host}/ws/server",
+    })
+    html = html.replace("<!-- SERVER_CONFIG -->",
+                        f'<script id="server-config" type="application/json">{config_json}</script>')
+    return web.Response(text=html, content_type="text/html", charset="utf-8")
 
 
 async def serve_static(request: web.Request) -> web.Response:
@@ -122,6 +89,11 @@ async def handle_edges(request: web.Request) -> web.Response:
     return web.json_response(state.registry.get_all())
 
 
+async def handle_clusters(request: web.Request) -> web.Response:
+    state: ServerState = request.app["state"]
+    return web.json_response(state.registry.get_clusters())
+
+
 async def handle_violations(request: web.Request) -> web.Response:
     state: ServerState = request.app["state"]
     node_id = request.query.get("node_id") or None
@@ -130,13 +102,24 @@ async def handle_violations(request: web.Request) -> web.Response:
         limit = int(request.query.get("limit", "50"))
     except ValueError:
         limit = 50
-    results = state.store.query(node_id=node_id, date=date, limit=limit)
+    try:
+        page = int(request.query.get("page", "0"))
+    except ValueError:
+        page = 0
+    offset = page * limit
+    results = state.store.query(node_id=node_id, date=date, limit=limit, offset=offset)
     return web.json_response(results)
 
 
 async def handle_snapshot(request: web.Request) -> web.Response:
     node_id = request.match_info["node_id"]
     filename = request.match_info["filename"]
+
+    if "/" in node_id or "\\" in node_id or ".." in node_id:
+        return web.Response(text="Invalid node_id", status=400)
+    if "/" in filename or "\\" in filename or ".." in filename:
+        return web.Response(text="Invalid filename", status=400)
+
     data_dir = _SERVER_DIR / os.getenv("DATA_DIR", "violations")
     if not data_dir.exists():
         return web.Response(text="No data", status=404)
@@ -160,29 +143,17 @@ async def handle_health_check(request: web.Request) -> web.Response:
 
 
 async def handle_streams(request: web.Request) -> web.Response:
-    """Proxy to MediaMTX API — list active RTSP streams."""
     mtx_api = os.getenv("MEDIAMTX_API", "http://localhost:9997")
+    state: ServerState = request.app["state"]
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{mtx_api}/v3/paths/list") as resp:
-                data = await resp.json()
-                return web.json_response(data)
+        async with state.http_session.get(f"{mtx_api}/v3/paths/list") as resp:
+            data = await resp.json()
+            return web.json_response(data)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=502)
 
 
-# ---------------------------------------------------------------------------
-# /ws/edge — Inbound WebSocket from Edge nodes
-# ---------------------------------------------------------------------------
-
 async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
-    """
-    GET /ws/edge?node_id=jetson_A
-
-    Edge nodes open this WebSocket on boot and push health + violation data.
-    Registration is implicit: connecting == registering.
-    The Edge's IP is obtained from the connection itself (request.remote).
-    """
     state: ServerState = request.app["state"]
     broadcast = _make_broadcast(state)
 
@@ -196,11 +167,8 @@ async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(heartbeat=15.0)
     await ws.prepare(request)
 
-    # Register (or re-register) the Edge
     state.registry.register(node_id, ip)
 
-    # Track the live WS — replace before closing old so the old handler's
-    # finally block sees it's no longer current and skips mark_offline.
     old_ws = state.edge_ws.get(node_id)
     state.edge_ws[node_id] = ws
     if old_ws and not old_ws.closed:
@@ -228,8 +196,6 @@ async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
             elif msg.type == WSMsgType.ERROR:
                 logger.warning("[EDGE-WS] '%s' WS error: %s", node_id, ws.exception())
     finally:
-        # Clean up — only if this WS is still the active one for this node_id.
-        # If the Edge reconnected, a new WS replaced us; don't mark offline.
         is_current = state.edge_ws.get(node_id) is ws
         if is_current:
             state.edge_ws.pop(node_id, None)
@@ -246,31 +212,23 @@ async def _process_edge_message(
     node_id: str,
     data: Dict[str, Any],
 ) -> None:
-    """Route an incoming Edge message to the right handler."""
     msg_type = data.get("type", "")
 
     if msg_type == "health":
         state.registry.update_health(node_id, data)
-        # Build broadcast payload — override type/node_id from data
         health_msg = {**data, "type": "health_update", "node_id": node_id}
         broadcast(health_msg)
 
     elif msg_type in ("violation", "overspeed"):
-        # Copy before save() — save() mutates the dict (pops snapshot_b64)
         record = {**data, "type": "violation", "node_id": node_id}
         if "image_b64" in record:
             record["snapshot_b64"] = record.pop("image_b64")
-        state.store.save(record)
-        # Broadcast to browsers — override type, put node_id first
+        asyncio.create_task(state.store.save_async(record))
         violation_msg = {**data, "type": "violation", "node_id": node_id}
-        violation_msg.pop("snapshot_b64", None)  # don't send b64 to browsers
+        violation_msg.pop("snapshot_b64", None)
         violation_msg.pop("image_b64", None)
         broadcast(violation_msg)
 
-
-# ---------------------------------------------------------------------------
-# /ws/server — Browser WebSocket for live push events
-# ---------------------------------------------------------------------------
 
 async def handle_ws_server(request: web.Request) -> web.WebSocketResponse:
     state: ServerState = request.app["state"]
@@ -285,6 +243,7 @@ async def handle_ws_server(request: web.Request) -> web.WebSocketResponse:
         await ws.send_str(json.dumps({
             "type": "init",
             "edges": state.registry.get_all(),
+            "clusters": state.registry.get_clusters(),
         }))
     except Exception:
         pass
@@ -299,6 +258,8 @@ async def handle_ws_server(request: web.Request) -> web.WebSocketResponse:
                             "type": "edge_list",
                             "edges": state.registry.get_all(),
                         }))
+                    elif data.get("action") == "ping":
+                        pass
                 except json.JSONDecodeError:
                     pass
             elif msg.type == WSMsgType.ERROR:
@@ -311,20 +272,12 @@ async def handle_ws_server(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
-# ---------------------------------------------------------------------------
-# App Factory
-# ---------------------------------------------------------------------------
-
 def create_app() -> web.Application:
     state = ServerState()
     data_dir = os.getenv("DATA_DIR", "violations")
     state.store = ViolationStore(_SERVER_DIR / data_dir)
 
     def on_registry_change(event: str, node_id: str) -> None:
-        # Only broadcast events not already handled by explicit broadcasts
-        # in handle_ws_edge / _process_edge_message.
-        # "offline" comes from the watchdog timer — needs broadcasting here.
-        # "registered" / "health_updated" are already broadcast with full data.
         if event == "offline":
             broadcast = _make_broadcast(state)
             broadcast({"type": "edge_offline", "node_id": node_id})
@@ -335,22 +288,25 @@ def create_app() -> web.Application:
     app["state"] = state
 
     async def on_startup(app: web.Application) -> None:
+        state.http_session = aiohttp.ClientSession()
         state.registry.start_watchdog()
-        logger.info("[Server] Watchdog started")
+        logger.info("[Server] Watchdog started, HTTP session created")
 
     async def on_shutdown(app: web.Application) -> None:
+        if state.http_session and not state.http_session.closed:
+            await state.http_session.close()
         for node_id, ws in list(state.edge_ws.items()):
             if not ws.closed:
                 await ws.close()
-        logger.info("[Server] All Edge connections closed")
+        logger.info("[Server] All connections closed")
 
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
-    # Routes
     app.router.add_get("/", index)
     app.router.add_get("/static/{filename}", serve_static)
     app.router.add_get("/api/edges", handle_edges)
+    app.router.add_get("/api/clusters", handle_clusters)
     app.router.add_get("/api/violations", handle_violations)
     app.router.add_get("/api/streams", handle_streams)
     app.router.add_get("/api/snapshots/{node_id}/{filename}", handle_snapshot)
@@ -361,18 +317,14 @@ def create_app() -> web.Application:
     return app
 
 
-# ---------------------------------------------------------------------------
-# Entry Point
-# ---------------------------------------------------------------------------
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="IoT Graduate — Central Monitoring Server")
+    parser = argparse.ArgumentParser(description="IoT Graduate \u2014 Central Monitoring Server")
     parser.add_argument("--host", default=os.getenv("SERVER_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.getenv("SERVER_PORT", "9090")))
     args = parser.parse_args()
 
     logger.info("=" * 55)
-    logger.info("  IoT Graduate — Central Monitoring Server")
+    logger.info("  IoT Graduate \u2014 Central Monitoring Server")
     logger.info("  Dashboard: http://%s:%d", args.host, args.port)
     logger.info("  Health:    http://%s:%d/health", args.host, args.port)
     logger.info("  Data dir:  %s", os.getenv("DATA_DIR", "violations"))

@@ -109,8 +109,12 @@ class MonitorClient:
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
-        """Connect → drain queue → reconnect on failure."""
-        # Import websocket-client here (lightweight, stdlib-compatible)
+        """Connect → drain queue → reconnect on failure.
+
+        Uses WebSocketApp which handles PING/PONG on its own internal
+        recv thread, avoiding thread-safety issues with concurrent
+        recv()/send() on a plain WebSocket object.
+        """
         try:
             import websocket  # websocket-client package
         except ImportError:
@@ -123,16 +127,60 @@ class MonitorClient:
         delay_idx = 0
 
         while self._running:
-            ws = None
+            self._ws_app = None
+            self._ws_connected = threading.Event()
+            self._ws_closed = threading.Event()
+            app_thread = None
+
             try:
                 logger.info("[MonitorClient] Connecting to %s", self._ws_url)
-                ws = websocket.WebSocket()
-                ws.settimeout(5)
-                ws.connect(self._ws_url)
-                logger.info("[MonitorClient] Connected")
-                delay_idx = 0  # reset backoff
 
-                self._drain_loop(ws)
+                def on_open(wsapp):
+                    logger.info("[MonitorClient] Connected")
+                    self._ws_connected.set()
+
+                def on_message(wsapp, message):
+                    pass  # ignore server→edge text frames
+
+                def on_error(wsapp, error):
+                    logger.warning("[MonitorClient] WS error: %s", error)
+
+                def on_close(wsapp, close_status, close_msg):
+                    logger.warning("[MonitorClient] WS closed: status=%s msg=%s", close_status, close_msg)
+                    self._ws_closed.set()
+
+                def on_ping(wsapp, data):
+                    pass  # WebSocketApp auto-sends PONG
+
+                app = websocket.WebSocketApp(
+                    self._ws_url,
+                    on_open=on_open,
+                    on_message=on_message,
+                    on_error=on_error,
+                    on_close=on_close,
+                    on_ping=on_ping,
+                )
+                self._ws_app = app
+
+                # Run WebSocketApp in a background thread — it handles
+                # recv + PING/PONG internally.
+                app_thread = threading.Thread(
+                    target=lambda: app.run_forever(
+                        ping_interval=0,
+                        ping_timeout=None,
+                    ),
+                    name=f"MonitorClient-ws-{self._node_id}",
+                    daemon=True,
+                )
+                app_thread.start()
+
+                # Wait for connection
+                if not self._ws_connected.wait(timeout=10):
+                    logger.warning("[MonitorClient] Connection timeout")
+                    continue
+
+                delay_idx = 0  # reset backoff
+                self._drain_loop_app(app)
 
             except Exception as exc:
                 delay = _RECONNECT_DELAYS[min(delay_idx, len(_RECONNECT_DELAYS) - 1)]
@@ -141,40 +189,35 @@ class MonitorClient:
                     exc, delay,
                 )
                 delay_idx += 1
-                # Sleep in short steps so stop() is responsive
                 for _ in range(int(delay * 10)):
                     if not self._running:
                         break
                     time.sleep(0.1)
             finally:
-                if ws:
+                if self._ws_app:
                     try:
-                        ws.close()
+                        self._ws_app.close()
                     except Exception:
                         pass
+                if app_thread:
+                    app_thread.join(timeout=5)
 
-    def _drain_loop(self, ws) -> None:
-        """Send queued messages until disconnect or stop."""
-        while self._running:
+    def _drain_loop_app(self, app) -> None:
+        """Send queued messages via WebSocketApp until disconnect or stop."""
+        while self._running and not self._ws_closed.is_set():
             try:
                 payload = self._queue.get(timeout=2.0)
             except queue.Empty:
-                # Send a ping to detect broken connections
-                try:
-                    ws.ping()
-                except Exception:
-                    break
                 continue
 
             if payload is None:
                 break  # stop sentinel
 
             try:
-                ws.send(payload)
+                app.send(payload)
                 self._sent_count += 1
             except Exception as exc:
                 logger.warning("[MonitorClient] Send failed: %s", exc)
-                # Put the failed message back for retry on reconnect
                 try:
                     self._queue.put_nowait(payload)
                 except queue.Full:

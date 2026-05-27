@@ -15,13 +15,20 @@ protocols: [tcp]
 # ── WebRTC server (serves to browser via WHEP) ──────────────
 webrtc: yes
 webrtcAddress: :8889
+# CRITICAL: tells MediaMTX to include the public IP in ICE candidates
+# Without this, ICE candidates only contain Docker/private IPs and
+# external browsers cannot connect via WebRTC.
+webrtcICEHostNAT1To1IPs: ["116.118.9.125"]
 
 # ── API server (query active streams) ───────────────────────
 api: yes
 apiAddress: :9997
 
-# ── HLS (optional fallback for older browsers) ──────────────
-hls: no
+# ── HLS (low-latency fallback for browsers where WebRTC fails)
+hls: yes
+hlsAddress: :8888
+hlsSegmentCount: 3
+hlsSegmentDuration: 500ms
 
 # ── RTMP (not needed) ───────────────────────────────────────
 rtmp: no

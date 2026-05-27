@@ -7,8 +7,8 @@ services:
     restart: unless-stopped
     volumes:
       - ./mediamtx.yml:/mediamtx.yml
+    # mediamtx is a static binary with no shell/curl/wget/nc inside.
+    # Use NONE to disable the broken healthcheck; the service is
+    # confirmed working via the host-side API at port 9997.
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9997/v3/paths/list"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
+      disable: true

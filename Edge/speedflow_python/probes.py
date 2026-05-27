@@ -222,7 +222,7 @@ class SpeedProbe:
         if speed_kmh <= 0 or speed_kmh > MAX_ABS_KMH:
             return False
 
-        if area_start > 0 and area_end / area_start > BBOX_AREA_JUMP:
+        if area_start is not None and area_start > 0 and area_end / area_start > BBOX_AREA_JUMP:
             return False
 
         if det_conf is not None and det_conf < MIN_DET_CONF:
@@ -394,16 +394,47 @@ class SpeedProbe:
         if current_time - self.last_cleanup_time < 30.0:  # Cleanup every 30s
             return
         self.last_cleanup_time = current_time
-        
+
+        # Collect ALL known stids from every tracking dict.
+        all_stids = set()
+        all_stids.update(self.history_positions.keys())
+        all_stids.update(self.track_birth_frame.keys())
+        all_stids.update(self.last_area.keys())
+        all_stids.update(self.last_speed_text.keys())
+        all_stids.update(self.plate_locked.keys())
+
+        # Use last_alert_ts for recently alerted objects, otherwise
+        # check if the object has any position history that was recently
+        # active (proxy: if it has history entries, it was recently updated).
+        # For objects never alerted, they're stale if not in current frame.
+        # Since we don't have a per-stid "last seen" timestamp, use a
+        # simple heuristic: purge stids with no history (already consumed)
+        # or whose alert timestamp is old.
+        stale_cutoff = current_time - 60.0
         stale_keys = []
-        for stid, last_ts in list(self.last_alert_ts.items()): # Use alert ts or update frame roughly
-            # Not 100% accurate TTL based on frames, but good enough for memory leak fix
-            pass # We'll do it cleanly based on active trackers if possible, or just TTL
-            
-        # Time-based cleanup
-        for stid, last_f in list(self.last_update_frame.items()):
-            # Nếu track không cập nhật gì thêm sau 1 thời gian dài
-            pass 
+        for stid in all_stids:
+            last_alert = self.last_alert_ts.get(stid, 0.0)
+            has_history = stid in self.history_positions and len(self.history_positions[stid]) > 0
+            # Keep if recently alerted or still has active history
+            if last_alert > stale_cutoff:
+                continue
+            if has_history:
+                continue
+            stale_keys.append(stid)
+
+        for stid in stale_keys:
+            self.history_positions.pop(stid, None)
+            self.last_speed_text.pop(stid, None)
+            self.last_update_frame.pop(stid, None)
+            self.last_alert_ts.pop(stid, None)
+            self.snap_count.pop(stid, None)
+            self.speed_history.pop(stid, None)
+            self.track_birth_frame.pop(stid, None)
+            self.last_area.pop(stid, None)
+            self.plate_detection_start_frame.pop(stid, None)
+            self.plate_candidates.pop(stid, None)
+            self.plate_locked.pop(stid, None)
+            self.plate_detection_attempts.pop(stid, None)
 
     def osd_sink_pad_buffer_probe(self, pad, info, u_data):
         gst_buffer = info.get_buffer()
@@ -582,7 +613,9 @@ class SpeedProbe:
                 # Ở đây vẽ màu xanh lá (Green)
                 add_polygon_display(batch_meta, frame_meta, cam_cfg.source_points, color=(0.0, 1.0, 0.0, 1.0))
 
-            
+            # Periodic cleanup of stale tracking data
+            self._periodic_cleanup(time.time())
+
             l_frame = l_frame.next
             
         return Gst.PadProbeReturn.OK

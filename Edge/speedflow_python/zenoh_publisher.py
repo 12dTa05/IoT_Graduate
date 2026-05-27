@@ -50,8 +50,8 @@ class ZenohPublisher:
         self._node_id = node_id
 
         self._queue: queue.Queue[Optional[Dict[str, Any]]] = queue.Queue(maxsize=ZENOH_QUEUE_MAXSIZE)
-        self._session: Optional[zenoh.Session] = None
-        self._publisher = None
+        self._session = None
+        self._publishers: Dict[str, Any] = {}   # cache: key_expr → publisher
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._sent_count = 0
@@ -81,8 +81,12 @@ class ZenohPublisher:
         self._queue.put(None)
         if self._thread:
             self._thread.join(timeout=10)
-        if self._publisher:
-            self._publisher.undeclare()
+        for pub in self._publishers.values():
+            try:
+                pub.undeclare()
+            except Exception:
+                pass
+        self._publishers.clear()
         if self._session:
             self._session.close()
         logger.info(
@@ -143,15 +147,10 @@ class ZenohPublisher:
         key = f"traffic/events/{self._node_id}/{camera_id}"
         payload = msgpack.packb(data, use_bin_type=True)
         if self._session:
-            # Declare on first use — Zenoh caches declared publishers internally
-            pub = self._session.declare_publisher(key)
+            # Reuse declared publishers to avoid resource leak
+            pub = self._publishers.get(key)
+            if pub is None:
+                pub = self._session.declare_publisher(key)
+                self._publishers[key] = pub
             pub.put(payload)
             self._sent_count += 1
-
-        # Push overspeed events to Central Monitor Server (qua MonitorClient)
-        if data.get("type") == "overspeed":
-            try:
-                from .monitor_client import send_to_monitor
-                send_to_monitor(data)
-            except ImportError:
-                pass
