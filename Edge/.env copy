@@ -1,0 +1,82 @@
+# =============================================================
+# Edge/.env — Single source of truth for all Edge Node config
+# Copy this file and fill in values for each Jetson deployment
+# Do NOT commit secrets to version control
+# =============================================================
+
+# -----------------------------------------------------------
+# Node identity
+# -----------------------------------------------------------
+# CHANGE PER JETSON: jetson_A for .20, jetson_B for .21
+NODE_ID=jetson_A
+
+# -----------------------------------------------------------
+# Zenoh (P2P peer mode — no broker needed)
+# -----------------------------------------------------------
+ZENOH_QUEUE_MAXSIZE=1000
+
+# -----------------------------------------------------------
+# Health Agent
+# -----------------------------------------------------------
+HEALTH_INTERVAL=2.0
+TARGET_FPS=25.0
+FPS_STATS_FILE=/dev/shm/speedflow_fps.json
+
+# -----------------------------------------------------------
+# Central Monitoring Server (set to empty to disable)
+# -----------------------------------------------------------
+MONITOR_URL=http://116.118.9.125:9090
+
+# -----------------------------------------------------------
+# RTSP Push (Centralized Streaming to MediaMTX on Server)
+# -----------------------------------------------------------
+# CHANGE PER JETSON: use node_id as stream path
+RTSP_PUSH_URL=rtsp://116.118.9.125:8554/jetson_A
+RTSP_PUSH_BITRATE=4000000
+
+# CHANGE PER JETSON: jetson_A for .20, jetson_B for .21
+EDGE_ID=jetson_A
+
+# Advertised LAN IP (sent to Server so dashboard shows the correct address
+# instead of the NAT gateway's public IP from request.remote)
+# CHANGE PER JETSON: 192.168.212.20 for Jetson A, 192.168.212.21 for Jetson B
+ADVERTISE_IP=192.168.212.20
+
+# -----------------------------------------------------------
+# Pipeline / Video
+# -----------------------------------------------------------
+VIDEO_FPS=25.0
+GPU_ID=0
+MAX_STREAMS=4
+MUX_WIDTH=1920
+MUX_HEIGHT=1080
+
+# -----------------------------------------------------------
+# AI / DeepStream paths (relative to Edge/)
+# -----------------------------------------------------------
+INFER_CONFIG=configs/config_infer_primary_yolo11.txt
+SGIE_CONFIG=configs/config_infer_secondary_lpd.txt
+LPR_CONFIG=configs/config_infer_secondary_lpr.txt
+ANALYTICS_CFG=configs/config_nvdsanalytics.txt
+TRACKER_CFG=configs/config_tracker_NvDCF_perf.yml
+TRACKER_LPD_CFG=configs/config_tracker_lpd.yml
+CAMERAS_YML=configs/cameras.yml
+
+# DeepStream tracker library (absolute — system install path)
+TRACKER_LIB=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so
+
+# -----------------------------------------------------------
+# Detection / Speed thresholds
+# -----------------------------------------------------------
+SPEED_LIMIT_KMH=80.0
+JPEG_QUALITY=100
+MAX_SNAPSHOT_PER_ID=1
+MIN_WORLD_DISPL_M=0.5
+MAX_ABS_KMH=160.0
+BBOX_AREA_JUMP=2.5
+MIN_DET_CONF=0.45
+MEDIAN_WINDOW=5
+
+# Output paths (relative to Edge/)
+SPEED_LOG=logs/speed_log.csv
+SNAP_DIR=logs/overspeed_snaps
