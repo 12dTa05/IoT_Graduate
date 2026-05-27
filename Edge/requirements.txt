@@ -6,14 +6,6 @@ PyQt5
 watchdog>=3.0.0
 python-dotenv>=1.0.0
 
-# -----------------------------------------------------------
-# Zenoh P2P — install from Eclipse's own package index:
-#   pip install zenoh msgpack \
-#     -i https://download.eclipse.org/zenoh/zenoh-python/releases/
-# -----------------------------------------------------------
-zenoh>=1.3.0
-msgpack>=1.1.0
-
 # WS Client for MonitorClient (daemon thread → synchronous)
 websocket-client>=1.6.0
 
