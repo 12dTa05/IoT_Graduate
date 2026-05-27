@@ -135,8 +135,9 @@ class PlatePreprocessorProbe:
                 l_frame = l_frame.next
 
         except Exception as e:
-            # Never break the pipeline on preprocessing errors
-            print(f"[PlatePreprocessorProbe] Error: {e}")
+            msg = str(e)
+            if "RGBA/RGB" not in msg:
+                print(f"[PlatePreprocessorProbe] Error: {e}")
 
 
         return Gst.PadProbeReturn.OK

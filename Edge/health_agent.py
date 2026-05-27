@@ -30,6 +30,8 @@ from speedflow_python.settings import (
     HEALTH_INTERVAL,
     TARGET_FPS,
     FPS_STATS_FILE,
+    MONITOR_URL,
+    ADVERTISE_IP,
 )
 
 logging.basicConfig(
@@ -78,41 +80,22 @@ def _collect_jetson_metrics() -> Dict:
     Trả về dict với các key chuẩn hoá.
 
     Fallback sang psutil nếu không chạy trên Jetson thật (phục vụ dev/test).
+
+    NOTE: Do NOT open a new jtop() context here — use the persistent
+    session held by HealthAgent._jtop to avoid socket/fd exhaustion.
+    This function is only used as a one-shot fallback during init.
     """
-    try:
-        from jtop import jtop
-        with jtop() as jetson:
-            stats = jetson.stats
-            # jetson.stats là dict chứa tất cả chỉ số Jetson
-            gpu_pct  = float(stats.get("GPU", 0))
-            cpu_pct  = float(stats.get("CPU", 0))         # average across all cores
-            ram_pct  = float(jetson.memory["RAM"]["used"] /
-                             jetson.memory["RAM"]["tot"] * 100)
-            temp_c   = float(stats.get("Temp GPU", stats.get("Temp AO", 0)))
-            power_mw = float(stats.get("Power TOT", stats.get("Power SYS", 0)))
-
-            return {
-                "gpu_percent": round(gpu_pct, 1),
-                "cpu_percent": round(cpu_pct, 1),
-                "ram_percent": round(ram_pct, 1),
-                "gpu_temp_c":  round(temp_c, 1),
-                "power_mw":    round(power_mw, 0),
-                "source": "jtop",
-            }
-    except ImportError:
-        logger.debug("jetson-stats not installed, falling back to psutil.")
-    except Exception as exc:
-        logger.debug("jtop error: %s — falling back to psutil.", exc)
-
-    # --- Fallback: psutil (cho môi trường dev không phải Jetson) ---
+    # --- Fallback: psutil (non-blocking, no interval sleep) ---
     try:
         import psutil
-        cpu_pct = psutil.cpu_percent(interval=0.5)
-        ram     = psutil.virtual_memory()
+        # interval=None: non-blocking, returns value since last call.
+        # Call virtual_memory() inside a local scope — no fd leak.
+        cpu_pct = psutil.cpu_percent(interval=None)
+        ram_pct = psutil.virtual_memory().percent
         return {
             "gpu_percent": 0.0,   # psutil không đo được GPU
             "cpu_percent": round(cpu_pct, 1),
-            "ram_percent": round(ram.percent, 1),
+            "ram_percent": round(ram_pct, 1),
             "gpu_temp_c":  0.0,
             "power_mw":    0.0,
             "source": "psutil",
@@ -169,7 +152,11 @@ def _compute_load_score(metrics: Dict, fps_stats: Dict) -> float:
 class HealthAgent:
     """
     Collect metrics and publish periodically via Zenoh (peer mode).
-    Runs in a daemon thread.
+    Runs a daemon thread with a persistent jtop session to avoid
+    socket/fd exhaustion from opening a new jtop() context each cycle.
+
+    When run as a standalone process, opens its own MonitorClient
+    WebSocket to push health payloads to the Central Monitor Server.
     """
 
     def __init__(self) -> None:
@@ -177,9 +164,22 @@ class HealthAgent:
         self._thread: Optional[threading.Thread] = None
         self._session = None
         self._pub = None
+        self._jtop = None          # persistent jtop session
+        self._monitor_client = None  # own WS client when run standalone
 
     def start(self) -> None:
         """Start agent in daemon thread."""
+        # Open own MonitorClient if running standalone
+        if MONITOR_URL:
+            try:
+                from speedflow_python.monitor_client import MonitorClient, set_default_client
+                self._monitor_client = MonitorClient(MONITOR_URL, NODE_ID, ADVERTISE_IP)
+                self._monitor_client.start()
+                set_default_client(self._monitor_client)
+                logger.info("[HealthAgent] MonitorClient started → %s", MONITOR_URL)
+            except Exception as exc:
+                logger.warning("[HealthAgent] MonitorClient failed to start: %s", exc)
+
         self._running = True
         self._thread = threading.Thread(
             target=self._run,
@@ -194,6 +194,17 @@ class HealthAgent:
 
     def stop(self) -> None:
         self._running = False
+        if self._jtop is not None:
+            try:
+                self._jtop.close()
+            except Exception:
+                pass
+            self._jtop = None
+        if self._monitor_client is not None:
+            try:
+                self._monitor_client.stop()
+            except Exception:
+                pass
         if self._session:
             try:
                 self._session.close()
@@ -201,16 +212,91 @@ class HealthAgent:
                 pass
 
     def _connect_zenoh(self):
-        """Open Zenoh session and declare publisher."""
+        """Open Zenoh session, declare publisher, subscribe to traffic events."""
         import zenoh
         try:
             session = make_session()
             pub = session.declare_publisher(f"peers/status/{NODE_ID}")
+
+            # Subscribe to overspeed events from the pipeline process and
+            # forward them to the Central Monitor Server via MonitorClient.
+            # This avoids having two MonitorClient WS connections for the
+            # same node_id (which causes a reconnect loop on the Server).
+            session.declare_subscriber(
+                f"traffic/events/{NODE_ID}/**",
+                self._on_traffic_event,
+            )
+
             logger.info("[HealthAgent] Zenoh session opened (peer mode).")
             return session, pub
         except Exception as exc:
             logger.error("[HealthAgent] Cannot open Zenoh session: %s", exc)
             return None, None
+
+    def _on_traffic_event(self, sample) -> None:
+        """Forward overspeed events from pipeline → Central Monitor."""
+        try:
+            payload = msgpack.unpackb(sample.payload.to_bytes(), raw=False)
+            if payload.get("type") == "overspeed":
+                from speedflow_python.monitor_client import send_to_monitor
+                send_to_monitor(payload)
+        except Exception as exc:
+            logger.debug("[HealthAgent] Traffic event forward error: %s", exc)
+
+    def _open_jtop(self):
+        """Try to open a persistent jtop session; return it or None."""
+        try:
+            from jtop import jtop as JTop
+            j = JTop()
+            j.start()
+            logger.info("[HealthAgent] jtop session opened (persistent).")
+            return j
+        except Exception as exc:
+            logger.debug("[HealthAgent] jtop unavailable: %s — using psutil.", exc)
+            return None
+
+    def _collect_metrics(self) -> Dict:
+        """Read metrics from persistent jtop session or fall back to psutil."""
+        if self._jtop is not None:
+            try:
+                stats    = self._jtop.stats
+                mem      = self._jtop.memory
+                temp     = self._jtop.temperature
+                power    = self._jtop.power
+
+                gpu_pct  = float(stats.get("GPU", 0))
+
+                # CPU: stats has CPU1..CPU12, not a single "CPU" key.
+                # Compute average from j.cpu['total']['idle'].
+                cpu_total = self._jtop.cpu.get("total", {})
+                cpu_idle  = cpu_total.get("idle", 100.0)
+                cpu_pct   = 100.0 - cpu_idle
+
+                ram_pct  = float(mem["RAM"]["used"] / mem["RAM"]["tot"] * 100)
+
+                # Temperature: use 'gpu' sensor if online, else 'tj' (junction)
+                gpu_temp_info = temp.get("gpu", {})
+                if gpu_temp_info.get("online", False) and gpu_temp_info.get("temp", -256) > -100:
+                    temp_c = float(gpu_temp_info["temp"])
+                else:
+                    tj_info = temp.get("tj", {})
+                    temp_c = float(tj_info.get("temp", 0))
+
+                # Power: total power in mW
+                power_mw = float(power.get("tot", {}).get("power", 0))
+
+                return {
+                    "gpu_percent": round(gpu_pct, 1),
+                    "cpu_percent": round(cpu_pct, 1),
+                    "ram_percent": round(ram_pct, 1),
+                    "gpu_temp_c":  round(temp_c, 1),
+                    "power_mw":    round(power_mw, 0),
+                    "source": "jtop",
+                }
+            except Exception as exc:
+                logger.debug("[HealthAgent] jtop read error: %s — falling back.", exc)
+
+        return _collect_jetson_metrics()
 
     def _run(self) -> None:
         """Main loop — collect and publish periodically."""
@@ -218,10 +304,19 @@ class HealthAgent:
         if not self._session:
             logger.error("[HealthAgent] Zenoh unavailable. Running in log-only mode.")
 
+        self._jtop = self._open_jtop()
+
+        # Pre-warm psutil cpu_percent (first call always returns 0.0)
+        try:
+            import psutil
+            psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
+
         while self._running:
             try:
-                metrics   = _collect_jetson_metrics()
-                fps_stats = _read_fps_stats()
+                metrics    = self._collect_metrics()
+                fps_stats  = _read_fps_stats()
                 load_score = _compute_load_score(metrics, fps_stats)
 
                 payload = {

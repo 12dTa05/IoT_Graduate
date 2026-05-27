@@ -246,27 +246,102 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager) -> None:
         print("ERROR: --rtsp-push-url or RTSP_PUSH_URL required", file=sys.stderr)
         sys.exit(1)
 
-    ret_build = build_pipeline(
-        camera_configs=configs,
-        sink_type="rtsp_push",
-        mux_width=args.width,
-        mux_height=args.height,
-        rtsp_push_url=rtsp_url,
-        bitrate=S.RTSP_PUSH_BITRATE,
-    )
-    pipeline, nvdsosd, streammux, source_bins = ret_build
-    tiler = pipeline.get_by_name("tiler")
+    # Guard against two instances of this process publishing to the same path.
+    # A second instance would cause MediaMTX to kick the first (overridePublisher)
+    # leading to an endless reconnect loop and GLib-GIO-CRITICAL socket errors.
+    _PID_FILE = S.ROOT / "run_python.pid"
+    _my_pid = os.getpid()
+    if _PID_FILE.exists():
+        try:
+            _old_pid = int(_PID_FILE.read_text().strip())
+            if _old_pid != _my_pid:
+                # Check if that process is actually alive
+                try:
+                    os.kill(_old_pid, 0)  # signal 0 = existence check
+                    print(
+                        f"WARNING: Another pipeline process (PID {_old_pid}) is already running. "
+                        f"Two publishers to the same RTSP path will conflict. "
+                        f"Kill the old process first: kill {_old_pid}",
+                        file=sys.stderr,
+                    )
+                except OSError:
+                    pass  # old process is dead — stale PID file, safe to continue
+        except ValueError:
+            pass
+    _PID_FILE.write_text(str(_my_pid))
 
-    _setup_probes(pipeline, nvdsosd, camera_manager)
-    _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
+    import atexit
+    atexit.register(lambda: _PID_FILE.unlink(missing_ok=True))
 
-    ret = pipeline.set_state(Gst.State.PLAYING)
-    if ret == Gst.StateChangeReturn.FAILURE:
-        print("ERROR: Unable to set pipeline to PLAYING state", file=sys.stderr)
-        sys.exit(1)
+    _RESTART_DELAYS = [5, 10, 20, 30]
+    restart_idx = 0
 
-    print(f"[RTSP Push] Streaming to {rtsp_url}")
-    _run_loop_until_eos_or_error(pipeline, camera_manager)
+    while True:
+        ret_build = build_pipeline(
+            camera_configs=camera_manager.get_enabled_configs(),
+            sink_type="rtsp_push",
+            mux_width=args.width,
+            mux_height=args.height,
+            rtsp_push_url=rtsp_url,
+            bitrate=S.RTSP_PUSH_BITRATE,
+        )
+        pipeline, nvdsosd, streammux, source_bins = ret_build
+        tiler = pipeline.get_by_name("tiler")
+
+        _setup_probes(pipeline, nvdsosd, camera_manager)
+        _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
+
+        ret = pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            print("ERROR: Unable to set pipeline to PLAYING state", file=sys.stderr)
+            delay = _RESTART_DELAYS[min(restart_idx, len(_RESTART_DELAYS) - 1)]
+            print(f"[RTSP Push] Retrying in {delay}s...")
+            restart_idx += 1
+            import time as _time; _time.sleep(delay)
+            continue
+
+        restart_idx = 0  # reset backoff on successful start
+        print(f"[RTSP Push] Streaming to {rtsp_url}")
+
+        loop = GLib.MainLoop()
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        _error_flag = [False]
+
+        def on_message(bus, message):
+            t = message.type
+            if t == Gst.MessageType.ERROR:
+                err, debug = message.parse_error()
+                print(f"ERROR from {message.src.get_name()}: {err}", file=sys.stderr)
+                if debug:
+                    print(f"DEBUG INFO: {debug}", file=sys.stderr)
+                _error_flag[0] = True
+                loop.quit()
+            elif t == Gst.MessageType.EOS:
+                print("EOS received — processing complete")
+                loop.quit()
+
+        bus.connect("message", on_message)
+
+        try:
+            loop.run()
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+            pipeline.set_state(Gst.State.NULL)
+            print("Pipeline stopped")
+            return
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+            print("Pipeline stopped")
+
+        if _error_flag[0]:
+            delay = _RESTART_DELAYS[min(restart_idx, len(_RESTART_DELAYS) - 1)]
+            print(f"[RTSP Push] RTSP error — reconnecting in {delay}s...", file=sys.stderr)
+            restart_idx += 1
+            import time as _time; _time.sleep(delay)
+        else:
+            # Clean EOS or intentional stop — do not restart
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -323,18 +398,13 @@ def run_python_mode(args) -> None:
         print(f"[PeerOrch] Failed to start: {exc}", file=sys.stderr)
         peer_orch = None
 
-    # --- MonitorClient: persistent WS connection to Central Monitor Server ---
-    if MONITOR_URL:
-        try:
-            from .monitor_client import MonitorClient, set_default_client
-            client = MonitorClient(MONITOR_URL, NODE_ID, ADVERTISE_IP)
-            client.start()
-            set_default_client(client)
-            print(f"[MonitorClient] Connected to {MONITOR_URL} (node={NODE_ID})")
-        except Exception as exc:
-            print(f"[MonitorClient] Failed to start: {exc}", file=sys.stderr)
-    else:
-        print("[MonitorClient] MONITOR_URL not set — central monitoring disabled")
+    # --- MonitorClient ---
+    # NOTE: MonitorClient is NOT started here. The standalone health_agent.py
+    # process owns the single WS connection to the Server (per node_id).
+    # Starting a second MonitorClient here would cause a reconnect loop
+    # because the Server replaces the old WS for the same node_id.
+    # Overspeed events from ZenohPublisher are forwarded via Zenoh →
+    # health_agent picks them up and relays to the Server.
 
     if args.mode == "display":
         run_display_mode(args, camera_manager)
