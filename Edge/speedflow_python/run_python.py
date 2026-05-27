@@ -6,7 +6,6 @@ Hỗ trợ Multi-Stream Dynamic.
 """
 import sys
 import os
-import asyncio
 import threading
 
 import gi
@@ -17,13 +16,11 @@ from .core_pipeline import build_pipeline, dynamic_add_stream, dynamic_remove_st
 from .camera_config import CameraManager
 from .probes import SpeedProbe, ROIFilterProbe
 from .plate_preprocessor import PlatePreprocessorProbe
-from .common import WebRTCSession
 from . import settings as S
 from .settings import (
     CAMERAS_YML,
     NODE_ID,
-    SIGNALING_HOST,
-    SIGNALING_PORT,
+    ADVERTISE_IP,
     MUX_WIDTH,
     MUX_HEIGHT,
     MONITOR_URL,
@@ -240,69 +237,36 @@ def run_file_mode(args, camera_manager: CameraManager) -> None:
     _run_loop_until_eos_or_error(pipeline, camera_manager)
 
 
-async def run_webrtc_mode_async(args, camera_manager: CameraManager) -> None:
-    configs = list(camera_manager.configs.values())
+def run_rtsp_push_mode(args, camera_manager: CameraManager) -> None:
+    Gst.init(None)
+    configs = camera_manager.get_enabled_configs()
 
-    # --- Start embedded signaling server trong cùng event loop ---
-    try:
-        from .signaling import start_embedded
-        asyncio.create_task(start_embedded(SIGNALING_HOST, SIGNALING_PORT))
-        print(f"[Signaling] Embedded server started on {SIGNALING_HOST}:{SIGNALING_PORT}")
-    except Exception as exc:
-        print(f"[Signaling] Failed to start: {exc}", file=sys.stderr)
+    rtsp_url = args.rtsp_push_url or S.RTSP_PUSH_URL
+    if not rtsp_url:
+        print("ERROR: --rtsp-push-url or RTSP_PUSH_URL required", file=sys.stderr)
+        sys.exit(1)
 
     ret_build = build_pipeline(
         camera_configs=configs,
-        sink_type="webrtc",
+        sink_type="rtsp_push",
         mux_width=args.width,
         mux_height=args.height,
+        rtsp_push_url=rtsp_url,
+        bitrate=S.RTSP_PUSH_BITRATE,
     )
-    pipeline, nvdsosd, streammux, source_bins, webrtc_elem = ret_build
+    pipeline, nvdsosd, streammux, source_bins = ret_build
     tiler = pipeline.get_by_name("tiler")
 
-    probe = _setup_probes(pipeline, nvdsosd, camera_manager)
+    _setup_probes(pipeline, nvdsosd, camera_manager)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
-    ws_uri = f"ws://{args.server}:{args.port}/ws?room={args.room}&role=pub"
-    session = WebRTCSession(webrtc_elem, ws_uri)
-    probe.set_publisher(session.send_json_threadsafe)
+    ret = pipeline.set_state(Gst.State.PLAYING)
+    if ret == Gst.StateChangeReturn.FAILURE:
+        print("ERROR: Unable to set pipeline to PLAYING state", file=sys.stderr)
+        sys.exit(1)
 
-    pipeline.set_state(Gst.State.PLAYING)
-    print(f"[Python WebRTC Mode] Pipeline running")
-    print(f"[Python WebRTC Mode] Room: {args.room}")
-    print(f"[Python WebRTC Mode] View stream at: http://{args.server}:{args.port}/")
-
-    await asyncio.sleep(1.5)
-    await session.connect()
-
-    loop = GLib.MainLoop()
-    bus = pipeline.get_bus()
-    bus.add_signal_watch()
-
-    def on_message(bus, message):
-        t = message.type
-        if t == Gst.MessageType.ERROR:
-            loop.quit()
-        elif t == Gst.MessageType.EOS:
-            loop.quit()
-
-    bus.connect("message", on_message)
-
-    try:
-        running_loop = asyncio.get_running_loop()
-        await running_loop.run_in_executor(None, loop.run)
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
-    finally:
-        session.close()
-        camera_manager.stop()
-        pipeline.set_state(Gst.State.NULL)
-        print("Pipeline stopped")
-
-
-def run_webrtc_mode(args, camera_manager: CameraManager) -> None:
-    Gst.init(None)
-    asyncio.run(run_webrtc_mode_async(args, camera_manager))
+    print(f"[RTSP Push] Streaming to {rtsp_url}")
+    _run_loop_until_eos_or_error(pipeline, camera_manager)
 
 
 # ---------------------------------------------------------------------------
@@ -359,30 +323,14 @@ def run_python_mode(args) -> None:
         print(f"[PeerOrch] Failed to start: {exc}", file=sys.stderr)
         peer_orch = None
 
-    # --- Embedded Signaling Server (display/file modes — webrtc mode handles its own) ---
-    sig_enabled = edge_cfg.get("signaling", {}).get("enabled", True)
-    if sig_enabled and args.mode in ("display", "file"):
-        sig_host = SIGNALING_HOST
-        sig_port = SIGNALING_PORT
-        # display/file mode: GLib main loop, cần asyncio event loop riêng
-        def _run_signaling():
-            import asyncio as _asyncio
-            from .signaling import start_embedded
-            _loop = _asyncio.new_event_loop()
-            _asyncio.set_event_loop(_loop)
-            _loop.run_until_complete(start_embedded(sig_host, sig_port, logger_obj=None))
-            _loop.run_forever()
-        threading.Thread(target=_run_signaling, daemon=True).start()
-        print(f"[Signaling] Embedded server started on {sig_host}:{sig_port}")
-
     # --- MonitorClient: persistent WS connection to Central Monitor Server ---
     if MONITOR_URL:
         try:
             from .monitor_client import MonitorClient, set_default_client
-            client = MonitorClient(MONITOR_URL, NODE_ID, SIGNALING_PORT)
+            client = MonitorClient(MONITOR_URL, NODE_ID, ADVERTISE_IP)
             client.start()
             set_default_client(client)
-            print(f"[MonitorClient] Connected to {MONITOR_URL} (node={NODE_ID}, port={SIGNALING_PORT})")
+            print(f"[MonitorClient] Connected to {MONITOR_URL} (node={NODE_ID})")
         except Exception as exc:
             print(f"[MonitorClient] Failed to start: {exc}", file=sys.stderr)
     else:
@@ -392,7 +340,7 @@ def run_python_mode(args) -> None:
         run_display_mode(args, camera_manager)
     elif args.mode == "file":
         run_file_mode(args, camera_manager)
-    elif args.mode == "webrtc":
-        run_webrtc_mode(args, camera_manager)
+    elif args.mode == "rtsp_push":
+        run_rtsp_push_mode(args, camera_manager)
     else:
         raise ValueError(f"Unknown mode: '{args.mode}'")

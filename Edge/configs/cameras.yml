@@ -1,6 +1,13 @@
 # ============================================================
 # cameras.yml — Cấu hình đa camera cho hệ thống Multi-Stream
 # ============================================================
+# WARNING: This file lives on EACH Jetson and must be customized
+# per device. Update the RTSP URIs below to point to the cameras
+# physically connected to THIS Jetson.
+#
+#   Jetson A (192.168.212.20) → enable cam_01, cam_02
+#   Jetson B (192.168.212.21) → enable cam_03, cam_04
+#
 # Để thêm camera: copy block cam_XX, đặt enabled: true
 # Để tắt camera:  đặt enabled: false (KHÔNG xóa, hệ thống sẽ xóa luồng động)
 # Khi file này được lưu, hệ thống sẽ tự phát hiện thay đổi (<10ms qua inotify)

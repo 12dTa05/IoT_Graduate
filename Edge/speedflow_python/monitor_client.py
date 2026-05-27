@@ -6,7 +6,7 @@ data is pushed from daemon threads via a thread-safe `send()` method.
 Reconnects automatically with exponential backoff.
 
 Usage:
-    client = MonitorClient(server_url, node_id, signaling_port)
+    client = MonitorClient(server_url, node_id)
     client.start()
 
     # From any thread:
@@ -35,7 +35,7 @@ class MonitorClient:
     Persistent outbound WebSocket client to the Central Monitoring Server.
 
     Runs a daemon thread that:
-      1. Connects to ws://<server>/ws/edge?node_id=<node_id>&signaling_port=<port>
+      1. Connects to ws://<server>/ws/edge?node_id=<node_id>
       2. Sends queued messages as JSON text frames
       3. Reconnects on disconnect with exponential backoff
 
@@ -46,13 +46,13 @@ class MonitorClient:
         self,
         server_url: str,
         node_id: str,
-        signaling_port: int,
+        advertise_ip: str = "",
     ) -> None:
         base = server_url.rstrip("/").replace("http://", "ws://").replace("https://", "wss://")
         self._ws_url = (
             f"{base}/ws/edge"
             f"?node_id={node_id}"
-            f"&signaling_port={signaling_port}"
+            f"&advertise_ip={advertise_ip}"
         )
         self._node_id = node_id
 

@@ -9,9 +9,9 @@ Kiến trúc:
                                                                           │
                                ┌──────────────────────────────────────────┘
                                │
-                    sink_type == "display":   nvmultistreamtiler → OSD → EGL sink
-                    sink_type == "file":      OSD → nvstreamdemux → N × encoder → filesink
-                    sink_type == "webrtc":    nvmultistreamtiler → OSD → webrtcbin
+                    sink_type == "display":     nvmultistreamtiler → OSD → EGL sink
+                    sink_type == "file":        OSD → nvstreamdemux → N × encoder → filesink
+                    sink_type == "rtsp_push":   nvmultistreamtiler → OSD → H264 enc → rtspclientsink
 """
 import logging
 import os
@@ -168,7 +168,7 @@ def build_pipeline(
     analytics.set_property("config-file", analytics_config)
 
     # ── Xác định chiến lược hiển thị / ghi file ──────────────────────────────
-    is_tiled = (sink_type in ["display", "webrtc"])
+    is_tiled = (sink_type in ["display", "rtsp_push"])
 
     # ── Tiler (chỉ tạo nếu cần ghép lưới) ────────────────────────────────────
     if is_tiled:
@@ -215,33 +215,22 @@ def build_pipeline(
         sink.set_property("max-lateness", -1)
         sink_elements = [conv, conv_caps, eglT, sink]
 
-    elif sink_type == "webrtc":
+    elif sink_type == "rtsp_push":
         conv = make_element("conv", "nvvideoconvert")
         enc = make_element("enc", "nvv4l2h264enc")
         enc.set_property("insert-sps-pps", True)
         enc.set_property("iframeinterval", 30)
-        enc.set_property("bitrate", 6_000_000)
+        enc.set_property("bitrate", kwargs.get("bitrate", 4_000_000))
         try:
             enc.set_property("maxperf-enable", True)
         except (TypeError, Exception):
             pass
         parse = make_element("parse", "h264parse")
-        pay = make_element("pay", "rtph264pay")
-        pay.set_property("pt", 96)
-        pay.set_property("config-interval", 1)
-        rtp_caps = make_element("rtp_caps", "capsfilter")
-        rtp_caps.set_property(
-            "caps",
-            Gst.Caps.from_string(
-                "application/x-rtp,media=video,encoding-name=H264,"
-                "payload=96,clock-rate=90000"
-            ),
-        )
-        webrtc_elem = make_element("webrtc", "webrtcbin")
-        webrtc_elem.set_property(
-            "stun-server", "stun://stun.l.google.com:19302"
-        )
-        sink_elements = [conv, enc, parse, pay, rtp_caps, webrtc_elem]
+        sink = make_element("rtsp_push_sink", "rtspclientsink")
+        sink.set_property("location", kwargs["rtsp_push_url"])
+        sink.set_property("protocols", "tcp")
+        sink.set_property("latency", 0)
+        sink_elements = [conv, enc, parse, sink]
 
     elif sink_type == "file":
         # ── Demuxer ──
@@ -311,14 +300,9 @@ def build_pipeline(
         conv, conv_caps, eglT, sink = sink_elements
         gst_link(nvdsosd, conv, conv_caps, eglT, sink)
 
-    elif sink_type == "webrtc":
-        conv, enc, parse, pay, rtp_caps, webrtc_elem = sink_elements
-        gst_link(nvdsosd, conv, enc, parse, pay, rtp_caps)
-        srcpad = rtp_caps.get_static_pad("src")
-        sinkpad = webrtc_elem.get_request_pad("sink_%u")
-        res = srcpad.link(sinkpad)
-        if res != Gst.PadLinkReturn.OK:
-            raise RuntimeError(f"Failed to link RTP → webrtcbin: {res}")
+    elif sink_type == "rtsp_push":
+        conv, enc, parse, sink = sink_elements
+        gst_link(nvdsosd, conv, enc, parse, sink)
 
     elif sink_type == "file":
         # Nối OSD vào Demux
@@ -345,8 +329,6 @@ def build_pipeline(
         n_cameras, sink_type,
     )
 
-    if sink_type == "webrtc":
-        return pipeline, nvdsosd, streammux, source_bins, webrtc_elem
     return pipeline, nvdsosd, streammux, source_bins
 
 

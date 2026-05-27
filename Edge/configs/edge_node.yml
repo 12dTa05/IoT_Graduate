@@ -32,6 +32,3 @@ p2p:
     3: 18.5
     4: 14.5
 
-# Signaling section kept for opt-out only — all values come from .env
-signaling:
-  enabled: true

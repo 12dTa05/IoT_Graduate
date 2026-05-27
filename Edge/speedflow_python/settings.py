@@ -61,10 +61,15 @@ TARGET_FPS       = _get("TARGET_FPS", float)
 FPS_STATS_FILE   = _get("FPS_STATS_FILE")
 
 # -----------------------------------------------------------
-# Signaling
+# RTSP Push (Centralized Streaming to Server)
 # -----------------------------------------------------------
-SIGNALING_HOST = _get("SIGNALING_HOST")
-SIGNALING_PORT = _get("SIGNALING_PORT", int)
+RTSP_PUSH_URL     = os.environ.get("RTSP_PUSH_URL", "").strip()
+RTSP_PUSH_BITRATE = int(os.environ.get("RTSP_PUSH_BITRATE", "4000000"))
+
+# -----------------------------------------------------------
+# Network identity
+# -----------------------------------------------------------
+ADVERTISE_IP = os.environ.get("ADVERTISE_IP", "").strip()
 
 # -----------------------------------------------------------
 # Pipeline / Video

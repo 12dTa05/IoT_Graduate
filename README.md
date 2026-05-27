@@ -1,6 +1,10 @@
-# IoT_Graduate — P2P Multi‑Edge Traffic Monitoring System
+# IoT_Graduate — Centralized Video Streaming Multi‑Edge Traffic Monitoring System
 
-A distributed real‑time traffic monitoring system that runs **AI (NVIDIA DeepStream)** on multiple Jetson Edge nodes to measure vehicle speed, detect vehicles, and read license plates. Edge nodes are **fully decentralized P2P** over **Eclipse Zenoh** (peer mode, UDP multicast scouting) with a **Central Monitoring Server** for aggregation and visualization.
+A distributed real‑time traffic monitoring system that runs **AI (NVIDIA DeepStream)** on multiple Jetson Edge nodes to measure vehicle speed, detect vehicles, and read license plates.
+
+**Video architecture**: Each Edge pushes a single RTSP stream to a central **MediaMTX** server which relays it to browsers via **WebRTC (WHEP)** — no direct browser-to-Edge connections.
+
+**Control plane**: Edge nodes communicate over **Eclipse Zenoh** (peer mode, UDP multicast scouting) for P2P load balancing, with a **Central Monitoring Server** for aggregation and visualization.
 
 ## Key Innovation: P2P Load Balancing
 
@@ -15,25 +19,24 @@ Each Jetson runs an independent **PeerOrchestrator** instance that communicates 
 | Component | Description |
 |---|---|
 | **Camera** (`Camera/`) | Docker‑based RTSP camera simulator using MediaMTX. Loops video files as RTSP streams. |
-| **Edge** (`Edge/`) | Jetson AI processing node. Runs DeepStream pipelines for speed, LPR, and overspeed alerts. Each node has an embedded PeerOrchestrator, signaling server (WebRTC), and health agent. |
-| **Server** (`Server/`) | Central Monitoring Server. Accepts WebSocket connections from each Edge to receive health metrics and violation events. Serves a live dashboard. |
+| **Edge** (`Edge/`) | Jetson AI processing node. Runs DeepStream pipelines for speed, LPR, and overspeed alerts. Each node has a PeerOrchestrator, health agent, and RTSP push to central MediaMTX. |
+| **Server** (`Server/`) | Central Monitoring Server + MediaMTX. Accepts WebSocket connections from each Edge for health/violation data, serves a live dashboard, and relays RTSP streams to browsers via WebRTC. |
 
 ### Edge Node Internals
 
 | Module | Role |
 |---|---|
-| `main.py` | Entry point — parses `--mode` / `--source` / `--width` / `--height` args and calls `run_python_mode` |
+| `main.py` | Entry point — parses `--mode` / `--rtsp-push-url` / `--width` / `--height` args and calls `run_python_mode` |
 | `speedflow_python/settings.py` | Loads all config from `Edge/.env` (single source of truth) |
-| `speedflow_python/run_python.py` | Pipeline runner — wires Zenoh, PeerOrchestrator, signaling, probes, and MonitorClient |
+| `speedflow_python/run_python.py` | Pipeline runner — wires Zenoh, PeerOrchestrator, probes, and MonitorClient |
 | `speedflow_python/peer_orchestrator.py` | P2P brain — ε‑constraint voting, Make‑before‑Break migration, failover |
 | `speedflow_python/peer_discovery.py` | No-op shim (Zenoh scouting handles peer discovery) |
-| `speedflow_python/signaling.py` | Embedded WebRTC signaling server (one per Jetson); browser ↔ Edge SDP/ICE relay |
-| `speedflow_python/grid_monitor/index.html` | Browser‑based grid monitor; connects to any signaling server |
+| `speedflow_python/core_pipeline.py` | DeepStream pipeline builder — supports `display`, `file`, `rtsp_push` sink types |
 | `speedflow_python/probes.py` | GStreamer pad probes — ROI filter, speed calc, FPS stats |
-| `speedflow_python/zenoh_publisher.py` | Publishes speed events and overspeed alerts via Zenoh + forwards overspeed to MonitorClient |
+| `speedflow_python/zenoh_publisher.py` | Publishes speed events and overspeed alerts via Zenoh + forwards to MonitorClient |
 | `speedflow_python/zenoh_subscriber.py` | Handles `peers/control/{node_id}` commands (ADD/REMOVE stream) |
 | `speedflow_python/zenoh_session.py` | Zenoh session factory (peer mode config) |
-| `speedflow_python/monitor_client.py` | Outbound WebSocket client to Central Monitor; daemon thread with auto-reconnect + module-level `send_to_monitor()` |
+| `speedflow_python/monitor_client.py` | Outbound WebSocket client to Central Monitor; daemon thread with auto-reconnect |
 | `health_agent.py` | Jetson metrics collector (GPU, CPU, temp, FPS) → `peers/status/{node_id}` + MonitorClient |
 
 ### Server Internals
@@ -43,7 +46,8 @@ Each Jetson runs an independent **PeerOrchestrator** instance that communicates 
 | `app.py` | aiohttp server with REST API + WebSocket push to browsers |
 | `edge_registry.py` | Tracks all registered Edges with live health state; heartbeat watchdog |
 | `violation_store.py` | Persists violations as JSONL + snapshot images |
-| `static/index.html` | Single‑page dashboard with cluster status + violation feed |
+| `static/index.html` | Single‑page dashboard with live video grid + cluster status + violation feed |
+| `mediamtx.yml` / `docker-compose.media.yml` | MediaMTX config: RTSP on :8554, WebRTC on :8889, API on :9997 |
 
 ## Architecture
 
@@ -59,21 +63,28 @@ Each Jetson runs an independent **PeerOrchestrator** instance that communicates 
 ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
 │  Jetson A     │  │  Jetson B     │  │  Jetson C     │
 │  PeerOrch     │◄─┤  PeerOrch     │◄─┤  PeerOrch     │
-│  Signaling    │  │  Signaling    │  │  Signaling    │
 │  Pipeline     │  │  Pipeline     │  │  Pipeline     │
 │  HealthAgent  │  │  HealthAgent  │  │  HealthAgent  │
 └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
         │                 │                 │
-        │  ① WebSocket to Server/ws/edge   │
-        │     (data channel: health + violations)
+        │  ① RTSP push    │                 │
+        │   rtsp://SERVER:8554/<node_id>    │
         ▼                 ▼                 ▼
 ┌───────────────────────────────────────────────────────────────────┐
+│                MediaMTX (bluenviron/mediamtx)                     │
+│    RTSP → WebRTC relay on VPS (116.118.9.125)                    │
+│    Ports: :8554 (RTSP), :8889 (WHEP), :9997 (API)               │
+└──────────────────────────┬────────────────────────────────────────┘
+                           │
+                           │  ② WHEP (WebRTC) stream
+                           ▼
+┌───────────────────────────────────────────────────────────────────┐
 │                Central Monitoring Server (Server/)                │
-│    http://SERVER_HOST:9090                                        │
+│    http://116.118.9.125:9090                                      │
 │                                                                   │
 │  ┌────────────────────┐  ┌──────────────────────┐                │
-│  │   EdgeRegistry     │  │   ViolationStore     │                │
-│  │  (live edge state) │  │  (JSONL + images)    │                │
+│  │   EdgeRegistry      │  │   ViolationStore     │                │
+│  │  (live edge state)  │  │  (JSONL + images)    │                │
 │  └────────┬───────────┘  └──────────┬───────────┘                │
 │           │                        │                            │
 │           └──────────┬─────────────┘                            │
@@ -84,25 +95,26 @@ Each Jetson runs an independent **PeerOrchestrator** instance that communicates 
 │             │  (live push)    │                                 │
 │             └────────┬────────┘                                 │
 └──────────────────────┼──────────────────────────────────────────┘
-                            │
-                            ▼
-                    ┌────────────────┐
-                    │  Dashboard     │
-                    │  (index.html)  │
-                    │  Cluster +     │
-                    │  Violations    │
-                    └────────────────┘
-
-  Video flow (Browser ↔ Edge, direct WebRTC):
-       Browser ─── ws://<edge_ip>:8080/ws?role=browser ──► Edge
-                        WebRTC video stream ◄──── Edge Pipeline
+                       │
+                       ▼
+               ┌────────────────┐
+               │  Dashboard     │
+               │  (index.html)  │
+               │  Video Grid +  │
+               │  Cluster +     │
+               │  Violations    │
+               └────────────────┘
 ```
 
 ## Data Flows
 
+### Edge → MediaMTX (RTSP video push)
+
+Each Edge opens a single RTSP push connection to `rtsp://SERVER_IP:8554/<node_id>` using `rtspclientsink`. The tiled DeepStream output (all cameras merged into one grid) is encoded as H.264 and pushed over TCP.
+
 ### Edge → Server (WebSocket data channel)
 
-1. **Connection**: Edge boots → opens persistent WebSocket to `ws://SERVER:PORT/ws/edge?node_id=...&signaling_port=...` (implicit registration)
+1. **Connection**: Edge boots → opens persistent WebSocket to `ws://SERVER:PORT/ws/edge?node_id=...` (implicit registration)
 2. **Health**: Every `HEALTH_INTERVAL` seconds, `health_agent.py` pushes `{"type":"health", gpu%, cpu%, ...}` via `MonitorClient`
 3. **Violations**: On overspeed, `zenoh_publisher.py` pushes `{"type":"overspeed", camera_id, plate, speed, image_b64, ...}` via `MonitorClient`
 
@@ -110,20 +122,35 @@ Each Jetson runs an independent **PeerOrchestrator** instance that communicates 
 
 All P2P coordination (status, voting, control, failover) uses Zenoh — see [Zenoh Key Expressions](#zenoh-key-expressions).
 
-### Browser ↔ Edge (WebRTC video)
+### Browser → Dashboard (WebRTC video via MediaMTX WHEP)
 
-The browser connects directly to each Edge's signaling server (`ws://<edge_ip>:8080/ws?role=browser`) to request the video stream via WebRTC. The Server does **not** relay video.
+The browser connects to `http://SERVER_IP:8889/<node_id>/whep` using the native WHEP (WebRTC-HTTP Egress Protocol). MediaMTX handles the SDP offer/answer and ICE negotiation. The Server does **not** relay video — it only pushes health/violation data over WebSocket.
 
 ## Prerequisites
 
 - **Camera node**: Docker & Docker Compose
 - **Edge nodes**: NVIDIA Jetson (Orin/NX/Nano) with JetPack 6.x and DeepStream SDK 7.x
-- **Server**: Any machine with Python 3.8+ (can be a laptop or VM)
+- **Server**: Any machine with Python 3.8+ (VPS recommended for public access)
 - **Python**: 3.8+ on all nodes
 
 ## Quick Start
 
-### 1. Camera Node — RTSP simulator
+### 1. VPS — Start MediaMTX + Central Server
+
+```bash
+cd Server
+
+# Start MediaMTX (RTSP → WebRTC relay)
+docker compose -f docker-compose.media.yml up -d
+
+# Start Central Monitoring Server
+pip install -r requirements.txt
+python3 app.py --port 9090
+
+# Dashboard: http://<SERVER_IP>:9090
+```
+
+### 2. Camera Node — RTSP simulator
 
 ```bash
 cd Camera
@@ -140,7 +167,7 @@ docker compose up -d
 #   ...
 ```
 
-### 2. Edge Node — Configure `.env`
+### 3. Edge Node — Configure `.env`
 
 ```bash
 cd Edge
@@ -151,51 +178,43 @@ Edit `Edge/.env`:
 
 ```ini
 NODE_ID=jetson_A
-SIGNALING_PORT=8080
 MAX_STREAMS=4
 
+# RTSP push destination (MediaMTX on VPS)
+RTSP_PUSH_URL=rtsp://SERVER_IP:8554/jetson_A
+RTSP_PUSH_BITRATE=4000000
+
 # Central Monitor (set to your Server IP)
-MONITOR_URL=http://192.168.1.200:9090
+MONITOR_URL=http://SERVER_IP:9090
+
+# Your LAN IP (for Server to display the correct address)
+ADVERTISE_IP=192.168.1.200
 ```
 
-### 3. Edge Node — Launch
+### 4. Edge Node — Launch
 
 ```bash
 cd Edge
 ./setup_system.sh             # system deps (first time only)
 pip3 install -r requirements.txt
 
-# Display mode (HDMI out) — uses cameras.yml sources:
+# RTSP Push mode (stream to central MediaMTX):
+python3 main.py --mode rtsp_push
+
+# Display mode (HDMI out):
 python3 main.py --mode display
 
-# Specify a single RTSP source directly:
-python3 main.py --source rtsp://<CAMERA_IP>:8554/cam_01 --mode display
-
 # File mode (save to MP4):
-python3 main.py --source rtsp://<CAMERA_IP>:8554/cam_01 --mode file --output result.mp4
-
-# WebRTC mode (browser stream via signaling server):
-python3 main.py --mode webrtc
-```
-
-### 4. Central Monitoring Server — Launch
-
-```bash
-cd Server
-pip install -r requirements.txt
-python3 app.py --port 9090
-
-# Dashboard: http://localhost:9090
+python3 main.py --mode file --output result.mp4
 ```
 
 ### 5. Dashboard — Browser
 
 Open [http://<SERVER_IP>:9090](http://<SERVER_IP>:9090). The dashboard shows:
 
+- **Live Video panel**: auto-discovered WebRTC streams from each Edge (WHEP player)
 - **Cluster Status panel**: live edge cards with GPU%, CPU%, RAM%, temp, load score, FPS per camera
 - **Violation Feed panel**: live violations sorted newest-first with plate, speed, and snapshot thumbnails
-
-For direct camera streams (video), open [http://<JETSON_IP>:8080](http://<JETSON_IP>:8080) to view the per-Jetson grid monitor.
 
 ## REST API
 
@@ -205,6 +224,7 @@ For direct camera streams (video), open [http://<JETSON_IP>:8080](http://<JETSON
 | `/health` | GET | Server health check |
 | `/api/edges` | GET | All registered edges with live health |
 | `/api/violations` | GET | Query violations `?node_id=&date=&limit=` |
+| `/api/streams` | GET | Proxy to MediaMTX — list active RTSP streams |
 | `/api/snapshots/{node}/{file}` | GET | Serve snapshot image |
 | `/ws/edge` | WebSocket | Edge inbound data channel (implicit registration + health + violations) |
 | `/ws/server` | WebSocket | Browser push channel (health updates + violations) |
@@ -264,30 +284,34 @@ IoT_Graduate/
 │   │   ├── labels_lpr.txt              # License plate reader class labels
 │   │   └── labels_YOLO.txt             # YOLO detector class labels
 │   └── speedflow_python/
+│       ├── __init__.py
 │       ├── settings.py
-│       ├── core_pipeline.py
-│       ├── run_python.py           # Full pipeline runner + MonitorClient
+│       ├── common.py               # GStreamer helpers (make_element, gst_link)
+│       ├── core_pipeline.py        # DeepStream pipeline builder
+│       ├── run_python.py           # Pipeline runner + Zenoh + MonitorClient
 │       ├── peer_orchestrator.py    # P2P load balancing
 │       ├── peer_discovery.py
-│       ├── signaling.py            # WebRTC signaling (browser ↔ Edge)
-│       ├── grid_monitor/
-│       │   └── index.html
-│       ├── probes.py
+│       ├── probes.py               # GStreamer pad probes
+│       ├── plate_preprocessor.py
+│       ├── camera_config.py
+│       ├── analytics.py
+│       ├── draw.py
+│       ├── io_utils.py
 │       ├── zenoh_publisher.py
 │       ├── zenoh_subscriber.py
 │       ├── zenoh_session.py
-│       ├── monitor_client.py          # WS client → Central Monitor
-│       ├── camera_config.py
-│       ├── common.py
+│       ├── monitor_client.py       # WS client → Central Monitor
 │       └── ...
-├── Server/                         # Central Monitoring Server
-│   ├── .env                        # SERVER_HOST, SERVER_PORT, DATA_DIR
+├── Server/                         # Central Monitoring Server + MediaMTX
+│   ├── .env                        # SERVER_HOST, SERVER_PORT, DATA_DIR, MEDIAMTX_API
 │   ├── requirements.txt
 │   ├── app.py                      # aiohttp server + REST API + WS push
 │   ├── edge_registry.py            # Edge state tracker + heartbeat watchdog
 │   ├── violation_store.py          # JSONL + image file persist
+│   ├── mediamtx.yml                # MediaMTX config
+│   ├── docker-compose.media.yml    # Docker for MediaMTX
 │   ├── static/
-│   │   └── index.html              # Dashboard SPA
+│   │   └── index.html              # Dashboard SPA (WHEP video grid)
 │   └── violations/                 # Runtime data (gitignored)
 └── README.md
 ```

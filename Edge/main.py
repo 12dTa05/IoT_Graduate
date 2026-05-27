@@ -18,9 +18,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 main.py --source rtsp://192.168.1.155:8554/cam1 --mode display
   python3 main.py --mode display            # uses cameras.yml sources
-  python3 main.py --mode webrtc
+  python3 main.py --mode rtsp_push          # push to MediaMTX via RTSP
+  python3 main.py --mode rtsp_push --rtsp-push-url rtsp://server:8554/jetson_A
 """,
     )
 
@@ -32,12 +32,17 @@ Examples:
     parser.add_argument(
         "--mode",
         required=True,
-        choices=["display", "file", "webrtc"],
-        help="Output mode: display (screen), file (MP4), or webrtc (browser stream)",
+        choices=["display", "file", "rtsp_push"],
+        help="Output mode: display (screen), file (MP4), or rtsp_push (centralized streaming)",
     )
     parser.add_argument("--width",  type=int, default=MUX_WIDTH,  help="Streammux width")
     parser.add_argument("--height", type=int, default=MUX_HEIGHT, help="Streammux height")
     parser.add_argument("--output", help="Output file path (file mode only)")
+    parser.add_argument(
+        "--rtsp-push-url",
+        default="",
+        help="RTSP push destination URL (overrides RTSP_PUSH_URL env var)",
+    )
 
     args = parser.parse_args()
 

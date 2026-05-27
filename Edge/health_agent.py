@@ -30,7 +30,6 @@ from speedflow_python.settings import (
     HEALTH_INTERVAL,
     TARGET_FPS,
     FPS_STATS_FILE,
-    SIGNALING_PORT,
 )
 
 logging.basicConfig(
@@ -235,7 +234,6 @@ class HealthAgent:
                     "ram_percent":   metrics["ram_percent"],
                     "gpu_temp_c":    metrics["gpu_temp_c"],
                     "power_mw":      metrics["power_mw"],
-                    "signaling_port": SIGNALING_PORT,
                     "pipeline": {
                         "fps_per_camera": fps_stats,
                         "avg_fps": round(
