@@ -805,10 +805,21 @@ class PeerOrchestrator:
                     logger.error("[Failover] No config for '%s'. Skipping.", camera_id)
                     continue
 
+                # Verify the camera RTSP source is reachable before adding.
+                # If the source is hosted on the dead node, it's unreachable.
+                cam_uri = cam_config.get("uri", "")
+                rtt = self._measure_rtt(cam_uri)
+                if rtt is None:
+                    logger.warning(
+                        "[Failover] Camera '%s' source unreachable (%s). Skipping.",
+                        camera_id, cam_uri,
+                    )
+                    continue
+
                 add_cmd = {**cam_config, "cmd": "ADD"}
                 self._pubs["control"].put(msgpack.packb(add_cmd, use_bin_type=True))
                 self_accepted += 1
-                logger.info("[Failover] Rescue ADD sent: '%s' → me", camera_id)
+                logger.info("[Failover] Rescue ADD sent: '%s' → me (rtt=%.0fms)", camera_id, rtt)
 
                 self._migration_log.log(
                     dead_node_id, self._node_id, camera_id,

@@ -427,9 +427,36 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager) -> None:
             t = message.type
             if t == Gst.MessageType.ERROR:
                 err, debug = message.parse_error()
-                print(f"ERROR from {message.src.get_name()}: {err}", file=sys.stderr)
+                src_name = message.src.get_name()
+                print(f"ERROR from {src_name}: {err}", file=sys.stderr)
                 if debug:
                     print(f"DEBUG INFO: {debug}", file=sys.stderr)
+
+                # If the error comes from a dynamically-added source bin,
+                # remove just that stream instead of killing the whole pipeline.
+                # Source bins are named "src-<camera_id>" by _make_source_bin.
+                if src_name.startswith("src-") or src_name == "source":
+                    cam_id = None
+                    # Walk up from the error element to find the source bin
+                    elem = message.src
+                    while elem is not None:
+                        n = elem.get_name()
+                        if n.startswith("src-"):
+                            cam_id = n[4:]  # strip "src-" prefix
+                            break
+                        elem = elem.get_parent()
+                    if cam_id and cam_id in source_bins:
+                        print(f"[Pipeline] Removing failed source '{cam_id}'", file=sys.stderr)
+                        sid = None
+                        for cfg in camera_manager.get_enabled_configs():
+                            if cfg.camera_id == cam_id:
+                                sid = cfg.source_id
+                                break
+                        if sid is not None:
+                            current_n = streammux.get_property("batch-size")
+                            dynamic_remove_stream(pipeline, streammux, cam_id, sid, tiler, source_bins, current_n)
+                        return  # don't quit the pipeline
+
                 _error_flag[0] = True
                 loop.quit()
             elif t == Gst.MessageType.EOS:
