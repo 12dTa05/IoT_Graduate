@@ -8,7 +8,7 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from aiohttp import web, WSMsgType
@@ -45,9 +45,18 @@ class ServerState:
         self._watchdog_task: asyncio.Task = None
 
     def broadcast(self, msg: Dict[str, Any]) -> None:
-        """BUG-06: single reusable broadcast method — no closure per connection."""
+        """Queue a JSON push to all connected browsers.
+
+        BUG-F fix: create_task() raises RuntimeError when called outside a
+        running event loop (e.g. tests, CLI tools).  Guard explicitly so
+        callers in non-async contexts get a warning instead of a crash.
+        """
         payload = json.dumps(msg, default=str)
-        asyncio.create_task(self._send_all(payload))
+        try:
+            asyncio.get_running_loop()
+            asyncio.create_task(self._send_all(payload))
+        except RuntimeError:
+            logger.warning("[ServerState] broadcast() called outside event loop — message dropped")
 
     async def _send_all(self, payload: str) -> None:
         dead: List[web.WebSocketResponse] = []
@@ -68,7 +77,7 @@ async def index(request: web.Request) -> web.Response:
 
     html = html_path.read_text(encoding="utf-8")
     config_json = json.dumps({
-        "MEDIAMTX_API": os.getenv("MEDIAMTX_API", "http://localhost:9997"),
+        "MEDIAMTX_API": "/api/streams",  # always use the server-side proxy
         "MEDIAMTX_WEBRTC_URL": os.getenv("MEDIAMTX_WEBRTC_URL", ""),
         "WS_URL": f"ws://{request.host}/ws/server",
     })
@@ -188,12 +197,17 @@ async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(heartbeat=15.0)
     await ws.prepare(request)
 
-    state.registry.register(node_id, ip)
-
-    old_ws = state.edge_ws.get(node_id)
-    state.edge_ws[node_id] = ws
+    # BUG-C/D fix: close the old WebSocket BEFORE registering the new one.
+    # Closing first ensures the old connection's finally-block (mark_offline)
+    # runs and completes before register() sets online=True.  This prevents
+    # the race where the old WS's finally fires after the new registration,
+    # re-marking a freshly connected edge as offline.
+    old_ws = state.edge_ws.pop(node_id, None)
     if old_ws and not old_ws.closed:
         await old_ws.close()
+
+    state.registry.register(node_id, ip)
+    state.edge_ws[node_id] = ws
 
     logger.info("[EDGE-WS] '%s' connected (%s). Edges online: %d",
                 node_id, ip, len(state.edge_ws))

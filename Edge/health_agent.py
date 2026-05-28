@@ -330,6 +330,12 @@ class HealthAgent:
                 fps_stats  = _read_fps_stats()
                 load_score = _compute_load_score(metrics, fps_stats)
 
+                # BUG-I fix: exclude 0-fps cameras from avg_fps, matching the
+                # exclusion applied in _compute_load_score() so the reported
+                # avg_fps is consistent with the load_score value.
+                active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
+                avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
+
                 payload = {
                     "type":          "health",
                     "node_id":       NODE_ID,
@@ -342,9 +348,7 @@ class HealthAgent:
                     "power_mw":      metrics["power_mw"],
                     "pipeline": {
                         "fps_per_camera": fps_stats,
-                        "avg_fps": round(
-                            sum(fps_stats.values()) / len(fps_stats), 1
-                        ) if fps_stats else None,
+                        "avg_fps":        avg_fps,
                         "active_cameras": list(fps_stats.keys()),
                     },
                 }

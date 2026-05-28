@@ -63,8 +63,11 @@ class MonitorClient:
         self._running = False
         self._sent_count = 0
         self._drop_count = 0
-        self._send_lock = threading.Lock()
-        # BUG-09: use a lock-protected property for stop() to read drop count safely
+        # BUG-B fix: a single stats lock is sufficient.  The old _send_lock
+        # existed only to serialise the get_nowait/put_nowait eviction pair,
+        # but queue.Queue's internal lock already makes each operation atomic.
+        # Having two locks acquired in different orders in different call sites
+        # created a lock-ordering inversion risk.
         self._stats_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -106,14 +109,17 @@ class MonitorClient:
         try:
             self._queue.put_nowait(payload)
         except queue.Full:
-            with self._send_lock:
-                try:
-                    self._queue.get_nowait()
-                    self._queue.put_nowait(payload)
-                    with self._stats_lock:
-                        self._drop_count += 1
-                except queue.Empty:
-                    pass
+            # Evict the oldest message to make room.  queue.Queue.get_nowait()
+            # and put_nowait() are each individually atomic; if another thread
+            # evicts between our get and put we may still see Full — catch it
+            # and simply discard the new payload rather than blocking.
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait(payload)
+            except (queue.Empty, queue.Full):
+                pass
+            with self._stats_lock:
+                self._drop_count += 1
 
     # ------------------------------------------------------------------
     # Internal — connection loop (runs in daemon thread)
@@ -250,6 +256,13 @@ _default_client: Optional[MonitorClient] = None
 
 def set_default_client(client: MonitorClient) -> None:
     global _default_client
+    # BUG-E fix: stop the previous client before replacing it so its daemon
+    # thread and WebSocket connection are not leaked.
+    if _default_client is not None and _default_client is not client:
+        try:
+            _default_client.stop()
+        except Exception:
+            pass
     _default_client = client
 
 
