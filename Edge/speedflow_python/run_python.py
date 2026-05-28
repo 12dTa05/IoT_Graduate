@@ -329,6 +329,10 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager) -> None:
             print("\nInterrupted by user")
             return
         finally:
+            # BUG-16: stop the camera manager before tearing down the pipeline
+            # so its callbacks (on_add/on_remove) are unregistered and stale
+            # source_id mappings don't accumulate across restarts.
+            camera_manager.stop()
             pipeline.set_state(Gst.State.NULL)
             print("Pipeline stopped")
 

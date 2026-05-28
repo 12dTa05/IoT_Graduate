@@ -12,13 +12,13 @@
 # Để tắt camera:  đặt enabled: false (KHÔNG xóa, hệ thống sẽ xóa luồng động)
 # Khi file này được lưu, hệ thống sẽ tự phát hiện thay đổi (<10ms qua inotify)
 # ============================================================
-max_streams: 4
+max_streams: 8
 
 # Chế độ hiển thị lưới (chỉ áp dụng khi output mode = display)
 # auto: tự tính rows/cols dựa trên số camera đang bật
 # fixed: dùng giá trị rows/cols bên dưới
 tiler_mode: auto
-tiler_rows: 2
+tiler_rows: 4
 tiler_cols: 2
 
 cameras:
@@ -67,7 +67,7 @@ cameras:
   cam_03:
     camera_id: "cam_03"
     source_id: 2
-    uri: "rtsp://192.168.212.21:8554/cam1"
+    uri: "rtsp://192.168.212.21:8554/cam3"
     enabled: false
     name: "Camera 03 - Giao lộ Đông"
     fps: 25.0
@@ -88,7 +88,7 @@ cameras:
   cam_04:
     camera_id: "cam_04"
     source_id: 3
-    uri: "rtsp://192.168.212.21:8554/cam2"
+    uri: "rtsp://192.168.212.21:8554/cam4"
     enabled: false
     name: "Camera 04 - Dự phòng"
     fps: 25.0
@@ -105,3 +105,45 @@ cameras:
     output:
       record: true
       record_path: "output/cam_04.mp4"
+
+  cam_05:
+    camera_id: "cam_05"
+    source_id: 4
+    uri: "rtsp://192.168.212.21:8554/cam5"
+    enabled: false
+    name: "Camera 04 - Dự phòng"
+    fps: 25.0
+    speed_limit_kmh: 80.0
+    homography:
+      source_points:
+        - [1896, 813]
+        - [288, 818]
+        - [632, 218]
+        - [1240, 224]
+      target_width: 18
+      target_height: 50
+    roi_polygon: [1896, 813, 288, 818, 632, 218, 1240, 224]
+    output:
+      record: true
+      record_path: "output/cam_05.mp4"
+
+  cam_06:
+    camera_id: "cam_06"
+    source_id: 5
+    uri: "rtsp://192.168.212.21:8554/cam6"
+    enabled: false
+    name: "Camera 04 - Dự phòng"
+    fps: 25.0
+    speed_limit_kmh: 80.0
+    homography:
+      source_points:
+        - [1896, 813]
+        - [288, 818]
+        - [632, 218]
+        - [1240, 224]
+      target_width: 18
+      target_height: 50
+    roi_polygon: [1896, 813, 288, 818, 632, 218, 1240, 224]
+    output:
+      record: true
+      record_path: "output/cam_06.mp4"

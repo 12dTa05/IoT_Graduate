@@ -133,8 +133,14 @@ def _compute_load_score(metrics: Dict, fps_stats: Dict) -> float:
     )
 
     # Tính avg_fps từ tất cả camera đang chạy
-    if fps_stats:
-        avg_fps = sum(fps_stats.values()) / len(fps_stats)
+    # BUG-10: exclude cameras reporting 0.0 fps (stalled but not yet removed)
+    # so a single hung camera doesn't permanently max out the penalty term.
+    active_fps = [v for v in fps_stats.values() if v > 0.0]
+    if active_fps:
+        avg_fps = sum(active_fps) / len(active_fps)
+    elif fps_stats:
+        # All cameras are at 0 fps — pipeline is truly stalled, apply full penalty
+        avg_fps = 0.0
     else:
         avg_fps = TARGET_FPS  # Không có dữ liệu → không phạt
 
@@ -263,6 +269,11 @@ class HealthAgent:
                 mem      = self._jtop.memory
                 temp     = self._jtop.temperature
                 power    = self._jtop.power
+
+                # BUG-17: jtop.stats returns None until the first collection
+                # interval completes. Guard explicitly before calling .get().
+                if stats is None or mem is None:
+                    raise ValueError("jtop not ready yet")
 
                 gpu_pct  = float(stats.get("GPU", 0))
 

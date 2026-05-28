@@ -30,10 +30,9 @@ Each Jetson runs an independent **PeerOrchestrator** instance that communicates 
 | `speedflow_python/settings.py` | Loads all config from `Edge/.env` (single source of truth) |
 | `speedflow_python/run_python.py` | Pipeline runner — wires Zenoh, PeerOrchestrator, probes, and MonitorClient |
 | `speedflow_python/peer_orchestrator.py` | P2P brain — ε‑constraint voting, Make‑before‑Break migration, failover |
-| `speedflow_python/peer_discovery.py` | No-op shim (Zenoh scouting handles peer discovery) |
 | `speedflow_python/core_pipeline.py` | DeepStream pipeline builder — supports `display`, `file`, `rtsp_push` sink types |
 | `speedflow_python/probes.py` | GStreamer pad probes — ROI filter, speed calc, FPS stats |
-| `speedflow_python/zenoh_publisher.py` | Publishes speed events and overspeed alerts via Zenoh + forwards to MonitorClient |
+| `speedflow_python/zenoh_publisher.py` | Publishes speed events and overspeed alerts via Zenoh |
 | `speedflow_python/zenoh_subscriber.py` | Handles `peers/control/{node_id}` commands (ADD/REMOVE stream) |
 | `speedflow_python/zenoh_session.py` | Zenoh session factory (peer mode config) |
 | `speedflow_python/monitor_client.py` | Outbound WebSocket client to Central Monitor; daemon thread with auto-reconnect |
@@ -43,10 +42,10 @@ Each Jetson runs an independent **PeerOrchestrator** instance that communicates 
 
 | Module | Role |
 |---|---|
-| `app.py` | aiohttp server with REST API + WebSocket push to browsers |
-| `edge_registry.py` | Tracks all registered Edges with live health state; heartbeat watchdog |
-| `violation_store.py` | Persists violations as JSONL + snapshot images |
-| `static/index.html` | Single‑page dashboard with live video grid + cluster status + violation feed |
+| `app.py` | aiohttp server with REST API + WebSocket push to browsers. Uses `SO_REUSEADDR` for crash-safe restarts. |
+| `edge_registry.py` | Tracks all registered Edges with live health state; heartbeat watchdog (15s timeout, 5s check interval) |
+| `violation_store.py` | Persists violations as JSONL + snapshot images (async save via aiofiles) |
+| `static/index.html` | Single‑page dashboard with live video grid + cluster status + violation feed. Discovers streams from both edge health data and MediaMTX API. |
 | `mediamtx.yml` / `docker-compose.media.yml` | MediaMTX config: RTSP on :8554, WebRTC on :8889, API on :9997 |
 
 ## Architecture
@@ -114,9 +113,20 @@ Each Edge opens a single RTSP push connection to `rtsp://SERVER_IP:8554/<node_id
 
 ### Edge → Server (WebSocket data channel)
 
-1. **Connection**: Edge boots → opens persistent WebSocket to `ws://SERVER:PORT/ws/edge?node_id=...` (implicit registration)
-2. **Health**: Every `HEALTH_INTERVAL` seconds, `health_agent.py` pushes `{"type":"health", gpu%, cpu%, ...}` via `MonitorClient`
-3. **Violations**: On overspeed, `zenoh_publisher.py` pushes `{"type":"overspeed", camera_id, plate, speed, image_b64, ...}` via `MonitorClient`
+The Edge runs **two separate processes** — `health_agent.py` and `main.py --mode rtsp_push`:
+
+1. **`health_agent.py`** (standalone daemon): Opens a persistent WebSocket to
+   `ws://SERVER:PORT/ws/edge?node_id=<NODE_ID>&advertise_ip=<LAN_IP>` (implicit
+   registration). Pushes health metrics every `HEALTH_INTERVAL` seconds.
+   Also subscribes to Zenoh `traffic/events/{NODE_ID}/**` and forwards overspeed
+   events to the Server via the same WebSocket.
+
+2. **`main.py --mode rtsp_push`** (pipeline): Does **not** create its own WebSocket
+   connection — it publishes overspeed events via Zenoh, which `health_agent.py`
+   picks up and forwards. This avoids duplicate WS connections for the same node_id.
+
+   A PID file (`run_python.pid`) prevents two instances from running simultaneously
+   (which would cause MediaMTX publisher conflicts).
 
 ### Edge ↔ Edge (Zenoh peer mode)
 
@@ -125,6 +135,10 @@ All P2P coordination (status, voting, control, failover) uses Zenoh — see [Zen
 ### Browser → Dashboard (WebRTC video via MediaMTX WHEP)
 
 The browser connects to `http://SERVER_IP:8889/<node_id>/whep` using the native WHEP (WebRTC-HTTP Egress Protocol). MediaMTX handles the SDP offer/answer and ICE negotiation. The Server does **not** relay video — it only pushes health/violation data over WebSocket.
+
+The dashboard discovers active streams from **both**:
+- MediaMTX API (`/api/streams`) — lists all RTSP sessions currently active
+- Edge health data (`pipeline.active_cameras`) — bridges the gap before FPS stats are available
 
 ## Prerequisites
 
@@ -150,6 +164,11 @@ python3 app.py --port 9090
 # Dashboard: http://<SERVER_IP>:9090
 ```
 
+The Server uses `SO_REUSEADDR` on the TCP socket to survive rapid restarts
+without hitting "address already in use". A systemd service file is provided
+at `/etc/systemd/system/monitor-server.service` with `Restart=always` and
+`RestartSec=10` for production deployments.
+
 ### 2. Camera Node — RTSP simulator
 
 ```bash
@@ -171,7 +190,7 @@ docker compose up -d
 
 ```bash
 cd Edge
-cp .env .env.bak       # keep the original
+cp .env.example .env
 ```
 
 Edit `Edge/.env`:
@@ -191,30 +210,36 @@ MONITOR_URL=http://SERVER_IP:9090
 ADVERTISE_IP=192.168.1.200
 ```
 
-### 4. Edge Node — Launch
+### 4. Edge Node — Launch (Two Processes)
+
+The Edge requires **two separate processes** — one for data connection and one for video:
 
 ```bash
 cd Edge
 ./setup_system.sh             # system deps (first time only)
 pip3 install -r requirements.txt
 
-# RTSP Push mode (stream to central MediaMTX):
+# 1. Start health agent (WebSocket + Zenoh + metrics)
+python3 health_agent.py &
+
+# 2. Start DeepStream pipeline (RTSP push to MediaMTX)
 python3 main.py --mode rtsp_push
-
-# Display mode (HDMI out):
-python3 main.py --mode display
-
-# File mode (save to MP4):
-python3 main.py --mode file --output result.mp4
 ```
+
+> **Note**: `main.py` does NOT connect to the Server directly. It publishes overspeed
+> events over Zenoh; `health_agent.py` subscribes and forwards them. This avoids
+> duplicate WebSocket connections for the same node_id.
 
 ### 5. Dashboard — Browser
 
 Open [http://<SERVER_IP>:9090](http://<SERVER_IP>:9090). The dashboard shows:
 
-- **Live Video panel**: auto-discovered WebRTC streams from each Edge (WHEP player)
-- **Cluster Status panel**: live edge cards with GPU%, CPU%, RAM%, temp, load score, FPS per camera
-- **Violation Feed panel**: live violations sorted newest-first with plate, speed, and snapshot thumbnails
+- **Live Video panel**: auto-discovered WebRTC streams from each Edge (WHEP player).
+  Streams appear from both MediaMTX API data and edge health `active_cameras`.
+- **Cluster Status panel**: live edge cards with GPU%, CPU%, RAM%, temp, load score,
+  FPS per camera (DOM-diff updated to avoid flicker).
+- **Violation Feed panel**: live violations sorted newest-first with plate, speed,
+  snapshot thumbnails, and filters by node/date.
 
 ## REST API
 
@@ -223,9 +248,10 @@ Open [http://<SERVER_IP>:9090](http://<SERVER_IP>:9090). The dashboard shows:
 | `/` | GET | Dashboard HTML |
 | `/health` | GET | Server health check |
 | `/api/edges` | GET | All registered edges with live health |
-| `/api/violations` | GET | Query violations `?node_id=&date=&limit=` |
+| `/api/clusters` | GET | Edges grouped by cluster (IP subnet) |
+| `/api/violations` | GET | Query violations `?node_id=&date=&limit=&page=` |
 | `/api/streams` | GET | Proxy to MediaMTX — list active RTSP streams |
-| `/api/snapshots/{node}/{file}` | GET | Serve snapshot image |
+| `/api/snapshots/{node}/{file}` | GET | Serve snapshot image (path traversal safe) |
 | `/ws/edge` | WebSocket | Edge inbound data channel (implicit registration + health + violations) |
 | `/ws/server` | WebSocket | Browser push channel (health updates + violations) |
 
@@ -239,7 +265,7 @@ Open [http://<SERVER_IP>:9090](http://<SERVER_IP>:9090). The dashboard shows:
 | `peers/vote/decision` | `peer_orchestrator.py` | winner + requester | msgpack — winner node_id, cam_config |
 | `peers/vote/ack/{cam_id}` | `zenoh_subscriber.py` | requester | msgpack — stream is PLAYING |
 | `peers/control/{node_id}` | `peer_orchestrator.py` | `zenoh_subscriber.py` | msgpack — ADD / REMOVE / STATUS |
-| `traffic/events/{node_id}/{cam_id}` | `zenoh_publisher.py` | any consumer | msgpack — speed event per vehicle |
+| `traffic/events/{node_id}/{cam_id}` | `zenoh_publisher.py` | `health_agent.py` | msgpack — speed event per vehicle |
 
 ## P2P Load Balancing Details
 
@@ -249,7 +275,7 @@ The PeerOrchestrator implements a **Pareto ε‑constraint** voting protocol:
 2. **RFO trigger** — if `load_score > overload_threshold` for `overload_duration_s` seconds, the node selects its worst camera and publishes an RFO to `peers/vote/request` with tiered constraints.
 3. **Proposal window** — peers with available capacity bid via `peers/vote/proposal`. Window closes after `vote_window_s` seconds.
 4. **Winner selection** — proposals are filtered through ε‑constraint tiers (strict FPS floor → tier 1 → tier 2 → network latency). From the surviving set, the proposal with lowest composite score wins.
-5. **Make‑before‑Break** — winner receives an ADD command on `peers/control/{node_id}`, starts the stream, and publishes `peers/vote/ack/{cam}`. The RFO sender waits for this ack before removing the camera.
+5. **Make‑before‑Break** — winner receives an ADD command on `peers/control/{node_id}`, starts the stream, and publishes `peers/vote/ack/{cam}`. The RFO sender waits for this ack before removing the camera. A cooldown is set on the requester side immediately on election publish to prevent duplicate RFOs.
 6. **Failover** — if a peer's heartbeat stops for `heartbeat_timeout_s`, each surviving peer runs consistent‑hash on that peer's camera list and rescues orphaned streams.
 7. **Cooldown** — per‑camera cooldown prevents thrashing.
 
@@ -290,7 +316,6 @@ IoT_Graduate/
 │       ├── core_pipeline.py        # DeepStream pipeline builder
 │       ├── run_python.py           # Pipeline runner + Zenoh + MonitorClient
 │       ├── peer_orchestrator.py    # P2P load balancing
-│       ├── peer_discovery.py
 │       ├── probes.py               # GStreamer pad probes
 │       ├── plate_preprocessor.py
 │       ├── camera_config.py
@@ -305,13 +330,13 @@ IoT_Graduate/
 ├── Server/                         # Central Monitoring Server + MediaMTX
 │   ├── .env                        # SERVER_HOST, SERVER_PORT, DATA_DIR, MEDIAMTX_API
 │   ├── requirements.txt
-│   ├── app.py                      # aiohttp server + REST API + WS push
+│   ├── app.py                      # aiohttp server + REST API + WS push (SO_REUSEADDR)
 │   ├── edge_registry.py            # Edge state tracker + heartbeat watchdog
 │   ├── violation_store.py          # JSONL + image file persist
-│   ├── mediamtx.yml                # MediaMTX config
+│   ├── mediamtx.yml                # MediaMTX config (ICE NAT fix, HLS)
 │   ├── docker-compose.media.yml    # Docker for MediaMTX
 │   ├── static/
-│   │   └── index.html              # Dashboard SPA (WHEP video grid)
+│   │   └── index.html              # Dashboard SPA (WHEP video grid, clusters, violations)
 │   └── violations/                 # Runtime data (gitignored)
 └── README.md
 ```

@@ -40,25 +40,25 @@ class ServerState:
         self.browser_ws: List[web.WebSocketResponse] = []
         self.store: ViolationStore = None
         self.http_session: aiohttp.ClientSession = None
+        # BUG-05: keep a strong reference to the watchdog task so the GC
+        # cannot collect it while it is still pending.
+        self._watchdog_task: asyncio.Task = None
 
+    def broadcast(self, msg: Dict[str, Any]) -> None:
+        """BUG-06: single reusable broadcast method — no closure per connection."""
+        payload = json.dumps(msg, default=str)
+        asyncio.create_task(self._send_all(payload))
 
-def _make_broadcast(state: ServerState):
-    async def _send_all(payload: str) -> None:
+    async def _send_all(self, payload: str) -> None:
         dead: List[web.WebSocketResponse] = []
-        for ws in list(state.browser_ws):
+        for ws in list(self.browser_ws):
             try:
                 await ws.send_str(payload)
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            if ws in state.browser_ws:
-                state.browser_ws.remove(ws)
-
-    def broadcast(msg: Dict[str, Any]) -> None:
-        payload = json.dumps(msg, default=str)
-        asyncio.create_task(_send_all(payload))
-
-    return broadcast
+            if ws in self.browser_ws:
+                self.browser_ws.remove(ws)
 
 
 async def index(request: web.Request) -> web.Response:
@@ -78,11 +78,22 @@ async def index(request: web.Request) -> web.Response:
 
 
 async def serve_static(request: web.Request) -> web.Response:
+    # BUG-03/12: Validate filename to prevent path traversal (../app.py etc.)
+    from pathlib import PurePath
     filename = request.match_info["filename"]
+    if PurePath(filename).name != filename:
+        return web.Response(text="Invalid filename", status=400)
     filepath = _SERVER_DIR / "static" / filename
-    if not filepath.exists() or not filepath.is_file():
+    # Resolve symlinks and ensure the result is still inside static/
+    static_root = (_SERVER_DIR / "static").resolve()
+    try:
+        resolved = filepath.resolve()
+        resolved.relative_to(static_root)  # raises ValueError if outside
+    except (ValueError, OSError):
         return web.Response(text="Not found", status=404)
-    return web.FileResponse(filepath)
+    if not resolved.exists() or not resolved.is_file():
+        return web.Response(text="Not found", status=404)
+    return web.FileResponse(resolved)
 
 
 async def handle_edges(request: web.Request) -> web.Response:
@@ -125,13 +136,22 @@ async def handle_snapshot(request: web.Request) -> web.Response:
     data_dir = _SERVER_DIR / os.getenv("DATA_DIR", "violations")
     if not data_dir.exists():
         return web.Response(text="No data", status=404)
-    for date_dir in sorted(data_dir.iterdir(), reverse=True):
-        if not date_dir.is_dir():
-            continue
-        snap_path = date_dir / node_id / filename
-        if snap_path.exists() and snap_path.is_file():
-            return web.FileResponse(snap_path)
-    return web.Response(text="Snapshot not found", status=404)
+
+    # BUG-08: use asyncio.to_thread to avoid blocking the event loop while
+    # iterating potentially hundreds of date directories synchronously.
+    def _find_snapshot() -> Optional[Path]:
+        for date_dir in sorted(data_dir.iterdir(), reverse=True):
+            if not date_dir.is_dir():
+                continue
+            snap_path = date_dir / node_id / filename
+            if snap_path.exists() and snap_path.is_file():
+                return snap_path
+        return None
+
+    snap_path = await asyncio.to_thread(_find_snapshot)
+    if snap_path is None:
+        return web.Response(text="Snapshot not found", status=404)
+    return web.FileResponse(snap_path)
 
 
 async def handle_health_check(request: web.Request) -> web.Response:
@@ -157,7 +177,6 @@ async def handle_streams(request: web.Request) -> web.Response:
 
 async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
     state: ServerState = request.app["state"]
-    broadcast = _make_broadcast(state)
 
     node_id = request.query.get("node_id", "").strip()
     advertise_ip = request.query.get("advertise_ip", "").strip()
@@ -179,7 +198,7 @@ async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
     logger.info("[EDGE-WS] '%s' connected (%s). Edges online: %d",
                 node_id, ip, len(state.edge_ws))
 
-    broadcast({
+    state.broadcast({
         "type": "edge_registered",
         "node_id": node_id,
         "ip": ip,
@@ -190,7 +209,7 @@ async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
             if msg.type == WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
-                    await _process_edge_message(state, broadcast, node_id, data)
+                    await _process_edge_message(state, node_id, data)
                 except json.JSONDecodeError:
                     pass
                 except Exception as exc:
@@ -210,7 +229,6 @@ async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
 
 async def _process_edge_message(
     state: ServerState,
-    broadcast,
     node_id: str,
     data: Dict[str, Any],
 ) -> None:
@@ -219,7 +237,7 @@ async def _process_edge_message(
     if msg_type == "health":
         state.registry.update_health(node_id, data)
         health_msg = {**data, "type": "health_update", "node_id": node_id}
-        broadcast(health_msg)
+        state.broadcast(health_msg)
 
     elif msg_type in ("violation", "overspeed"):
         record = {**data, "type": "violation", "node_id": node_id}
@@ -227,7 +245,7 @@ async def _process_edge_message(
             record["snapshot_b64"] = record.pop("image_b64")
         asyncio.create_task(state.store.save_async(record))
         violation_msg = {k: v for k, v in record.items() if k != "snapshot_b64"}
-        broadcast(violation_msg)
+        state.broadcast(violation_msg)
 
 
 async def handle_ws_server(request: web.Request) -> web.WebSocketResponse:
@@ -279,8 +297,7 @@ def create_app() -> web.Application:
 
     def on_registry_change(event: str, node_id: str) -> None:
         if event == "offline":
-            broadcast = _make_broadcast(state)
-            broadcast({"type": "edge_offline", "node_id": node_id})
+            state.broadcast({"type": "edge_offline", "node_id": node_id})
 
     state.registry = EdgeRegistry(on_change=on_registry_change)
 
@@ -289,10 +306,13 @@ def create_app() -> web.Application:
 
     async def on_startup(app: web.Application) -> None:
         state.http_session = aiohttp.ClientSession()
-        state.registry.start_watchdog()
+        # BUG-05: store the task reference so GC cannot collect a pending task
+        state._watchdog_task = state.registry.start_watchdog()
         logger.info("[Server] Watchdog started, HTTP session created")
 
     async def on_shutdown(app: web.Application) -> None:
+        if state._watchdog_task and not state._watchdog_task.done():
+            state._watchdog_task.cancel()
         if state.http_session and not state.http_session.closed:
             await state.http_session.close()
         for node_id, ws in list(state.edge_ws.items()):
