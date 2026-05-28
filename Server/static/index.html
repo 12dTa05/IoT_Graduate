@@ -1109,14 +1109,14 @@ async function pollStreams() {
 
     // Merge with known streams from cluster edges
     const cluster = getCurrentCluster();
-    if (!cluster) return;
-
-    const edgeStreams = getStreamNamesForCluster(cluster.edges);
+    const edgeStreams = cluster ? getStreamNamesForCluster(cluster.edges) : [];
     const allStreams = new Set([...mediaMtxStreamNames, ...edgeStreams]);
 
-    // Update grid if new streams appear
+    // Update grid if streams changed (new appear or existing disappear)
     const existingNames = Object.keys(streamStates);
-    const needsUpdate = [...allStreams].some(n => !existingNames.includes(n));
+    const needsUpdate =
+      [...allStreams].some(n => !existingNames.includes(n)) ||
+      existingNames.some(n => !allStreams.has(n));
 
     if (needsUpdate) renderVideoGrid();
   } catch(e) {}
