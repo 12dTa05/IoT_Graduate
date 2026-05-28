@@ -249,8 +249,30 @@ def _health_push_loop(peer_orch=None) -> None:
     import time as _time
     from pathlib import Path as _Path
     import msgpack as _msgpack
+    import yaml as _yaml
 
     _fps_file = _Path(FPS_STATS_FILE)
+
+    # Load camera configs once so peers know the original URIs for failover
+    _cam_configs = {}
+    try:
+        with open(CAMERAS_YML, "r", encoding="utf-8") as f:
+            raw = _yaml.safe_load(f)
+        for cam_id, cfg in raw.get("cameras", {}).items():
+            if cfg and cfg.get("enabled", True):
+                _cam_configs[cam_id] = {
+                    "camera_id": cam_id,
+                    "source_id": int(cfg.get("source_id", 0)),
+                    "uri": cfg.get("uri", ""),
+                    "name": cfg.get("name", cam_id),
+                    "fps": float(cfg.get("fps", 25.0)),
+                    "speed_limit_kmh": float(cfg.get("speed_limit_kmh", 80.0)),
+                    "homography": cfg.get("homography", {}),
+                    "roi_polygon": cfg.get("roi_polygon", []),
+                    "output": cfg.get("output", {}),
+                }
+    except Exception:
+        pass
 
     # Open persistent jtop session for Jetson GPU/CPU/RAM metrics
     _jtop = None
@@ -335,6 +357,7 @@ def _health_push_loop(peer_orch=None) -> None:
                     "fps_per_camera": fps,
                     "avg_fps": avg_fps,
                     "active_cameras": list(fps.keys()),
+                    "camera_configs": _cam_configs,
                 },
             }
 

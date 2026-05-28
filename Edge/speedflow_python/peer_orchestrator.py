@@ -69,6 +69,7 @@ class PeerState:
     avg_fps: Optional[float] = None
     fps_per_camera: Dict[str, float] = field(default_factory=dict)
     active_cameras: List[str] = field(default_factory=list)
+    camera_configs: Dict[str, dict] = field(default_factory=dict)
     max_streams: int = 8
     last_seen: float = field(default_factory=time.time)
     overload_since: Optional[float] = None
@@ -323,6 +324,7 @@ class PeerOrchestrator:
             peer.avg_fps = pipeline.get("avg_fps")
             peer.fps_per_camera = pipeline.get("fps_per_camera", {})
             peer.active_cameras = pipeline.get("active_cameras", [])
+            peer.camera_configs = pipeline.get("camera_configs", peer.camera_configs)
             peer.last_seen = time.time()
 
             # Track overload onset
@@ -745,6 +747,12 @@ class PeerOrchestrator:
         now = time.time()
         timeout = cfg.get("heartbeat_timeout_s", 15.0)
 
+        # Get camera configs from the dead peer's last heartbeat.
+        # These contain the ORIGINAL URIs (e.g. on the dead node's subnet).
+        with self._lock:
+            dead_peer = self._peers.get(dead_node_id)
+            peer_cam_configs = dead_peer.camera_configs if dead_peer else {}
+
         with self._lock:
             # Build alive candidate list — includes self so this node can rescue too
             self_streams = len(self._self_state.active_cameras)
@@ -800,7 +808,9 @@ class PeerOrchestrator:
                     )
                     continue
 
-                cam_config = self._get_camera_config(camera_id)
+                # Use camera config from the dead peer's heartbeat (original URIs),
+                # fall back to local cameras.yml only if peer didn't share configs.
+                cam_config = peer_cam_configs.get(camera_id) or self._get_camera_config(camera_id)
                 if cam_config is None:
                     logger.error("[Failover] No config for '%s'. Skipping.", camera_id)
                     continue
