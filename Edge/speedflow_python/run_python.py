@@ -24,6 +24,9 @@ from .settings import (
     MUX_WIDTH,
     MUX_HEIGHT,
     MONITOR_URL,
+    FPS_STATS_FILE,
+    TARGET_FPS,
+    HEALTH_INTERVAL,
 )
 
 import yaml
@@ -237,6 +240,107 @@ def run_file_mode(args, camera_manager: CameraManager) -> None:
     _run_loop_until_eos_or_error(pipeline, camera_manager)
 
 
+# ---------------------------------------------------------------------------
+# Health push — periodic metrics to Monitor Server via MonitorClient
+# ---------------------------------------------------------------------------
+
+def _health_push_loop() -> None:
+    import json as _json
+    from pathlib import Path as _Path
+
+    _fps_file = _Path(FPS_STATS_FILE)
+
+    # Open persistent jtop session for Jetson GPU/CPU/RAM metrics
+    _jtop = None
+    try:
+        from jtop import jtop as _JTop
+        _jtop = _JTop()
+        _jtop.start()
+    except Exception:
+        pass
+
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+
+    while True:
+        try:
+            cpu = 0.0
+            ram = 0.0
+            gpu = 0.0
+
+            if _jtop is not None:
+                try:
+                    stats = _jtop.stats
+                    mem = _jtop.memory
+                    cpu_vals = [v for k, v in stats.items() if k.startswith("CPU")]
+                    cpu = sum(cpu_vals) / len(cpu_vals) if cpu_vals else 0.0
+                    if mem and "RAM" in mem:
+                        ram = float(mem["RAM"]["used"] / mem["RAM"]["tot"] * 100)
+                    if stats:
+                        gpu = float(stats.get("GPU", 0))
+                except Exception:
+                    pass
+
+            temp_c = 0.0
+            if _jtop is not None:
+                try:
+                    temp = _jtop.temperature
+                    gpu_temp = temp.get("gpu", {})
+                    if gpu_temp.get("online", False) and gpu_temp.get("temp", -256) > -100:
+                        temp_c = float(gpu_temp["temp"])
+                    else:
+                        tj_temp = temp.get("tj", {})
+                        temp_c = float(tj_temp.get("temp", 0))
+                except Exception:
+                    pass
+
+            if psutil is not None and _jtop is None:
+                cpu = psutil.cpu_percent(interval=None)
+                ram = psutil.virtual_memory().percent
+
+            fps = {}
+            try:
+                raw = _fps_file.read_text()
+                data = _json.loads(raw)
+                fps = {k: v for k, v in data.items() if not k.startswith("_")}
+            except (FileNotFoundError, _json.JSONDecodeError):
+                pass
+
+            active = [v for v in fps.values() if v > 0.0]
+            avg_fps = round(sum(active) / len(active), 1) if active else None
+
+            base = 0.5 * gpu + 0.3 * cpu + 0.2 * ram
+            target_fps = float(TARGET_FPS)
+            if active:
+                drop = max(0.0, target_fps - avg_fps)
+                penalty = (drop / target_fps) * 30.0
+            else:
+                penalty = 0.0
+            load_score = round(min(100.0, base + penalty), 1)
+
+            from speedflow_python.monitor_client import send_to_monitor
+            send_to_monitor({
+                "type": "health",
+                "node_id": NODE_ID,
+                "timestamp": __import__("time").time(),
+                "load_score": load_score,
+                "gpu_percent": gpu,
+                "cpu_percent": cpu,
+                "ram_percent": ram,
+                "gpu_temp_c": temp_c,
+                "pipeline": {
+                    "fps_per_camera": fps,
+                    "avg_fps": avg_fps,
+                    "active_cameras": list(fps.keys()),
+                },
+            })
+        except Exception:
+            pass
+        __import__("time").sleep(HEALTH_INTERVAL)
+
+
 def run_rtsp_push_mode(args, camera_manager: CameraManager) -> None:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
@@ -272,6 +376,11 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager) -> None:
 
     import atexit
     atexit.register(lambda: _PID_FILE.unlink(missing_ok=True))
+
+    # Start health push thread (periodic GPU/CPU/RAM/FPS → Monitor Server)
+    _health_thread = threading.Thread(target=_health_push_loop, daemon=True)
+    _health_thread.start()
+    print("[HealthPush] Started (periodic metrics → Monitor Server)")
 
     _RESTART_DELAYS = [5, 10, 20, 30]
     restart_idx = 0
@@ -400,13 +509,13 @@ def run_python_mode(args) -> None:
         print(f"[PeerOrch] Failed to start: {exc}", file=sys.stderr)
         peer_orch = None
 
-    # --- MonitorClient ---
-    # NOTE: MonitorClient is NOT started here. The standalone health_agent.py
-    # process owns the single WS connection to the Server (per node_id).
-    # Starting a second MonitorClient here would cause a reconnect loop
-    # because the Server replaces the old WS for the same node_id.
-    # Overspeed events from ZenohPublisher are forwarded via Zenoh →
-    # health_agent picks them up and relays to the Server.
+    # --- MonitorClient (edge registration + health push) ---
+    if MONITOR_URL:
+        from speedflow_python.monitor_client import MonitorClient, set_default_client
+        _client = MonitorClient(MONITOR_URL, NODE_ID, ADVERTISE_IP)
+        _client.start()
+        set_default_client(_client)
+        print(f"[MonitorClient] Started → {MONITOR_URL}")
 
     if args.mode == "display":
         run_display_mode(args, camera_manager)
