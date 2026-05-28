@@ -20,7 +20,3 @@ output/
 
 # Environment — do NOT commit secrets
 .env
-
-# Compiled C extensions
-*.so
-*.o
