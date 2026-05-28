@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -115,9 +116,10 @@ async def handle_snapshot(request: web.Request) -> web.Response:
     node_id = request.match_info["node_id"]
     filename = request.match_info["filename"]
 
-    if "/" in node_id or "\\" in node_id or ".." in node_id:
+    from pathlib import PurePath
+    if PurePath(node_id).name != node_id:
         return web.Response(text="Invalid node_id", status=400)
-    if "/" in filename or "\\" in filename or ".." in filename:
+    if PurePath(filename).name != filename:
         return web.Response(text="Invalid filename", status=400)
 
     data_dir = _SERVER_DIR / os.getenv("DATA_DIR", "violations")
@@ -224,9 +226,7 @@ async def _process_edge_message(
         if "image_b64" in record:
             record["snapshot_b64"] = record.pop("image_b64")
         asyncio.create_task(state.store.save_async(record))
-        violation_msg = {**data, "type": "violation", "node_id": node_id}
-        violation_msg.pop("snapshot_b64", None)
-        violation_msg.pop("image_b64", None)
+        violation_msg = {k: v for k, v in record.items() if k != "snapshot_b64"}
         broadcast(violation_msg)
 
 
@@ -331,7 +331,25 @@ def main() -> None:
     logger.info("=" * 55)
 
     app = create_app()
-    web.run_app(app, host=args.host, port=args.port)
+
+    async def _start() -> None:
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, args.host, args.port, reuse_address=True)
+        await site.start()
+        logger.info("Server listening on %s:%d (SO_REUSEADDR)", args.host, args.port)
+
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop_event.set)
+        await stop_event.wait()
+        await runner.cleanup()
+
+    try:
+        asyncio.run(_start())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

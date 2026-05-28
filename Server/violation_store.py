@@ -46,6 +46,7 @@ class ViolationStore:
         jsonl_path = node_dir / "violations.jsonl"
         snapshot_path: Optional[Path] = None
 
+        record = dict(record)
         snapshot_b64 = record.pop("snapshot_b64", None)
         if snapshot_b64:
             ts_ms = int(ts * 1000)
@@ -92,6 +93,7 @@ class ViolationStore:
         jsonl_path = node_dir / "violations.jsonl"
         snapshot_path: Optional[Path] = None
 
+        record = dict(record)
         snapshot_b64 = record.pop("snapshot_b64", None)
         if snapshot_b64:
             ts_ms = int(ts * 1000)

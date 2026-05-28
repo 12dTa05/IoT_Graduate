@@ -61,6 +61,7 @@ class MonitorClient:
         self._running = False
         self._sent_count = 0
         self._drop_count = 0
+        self._send_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -97,12 +98,13 @@ class MonitorClient:
         try:
             self._queue.put_nowait(payload)
         except queue.Full:
-            try:
-                self._queue.get_nowait()
-                self._queue.put_nowait(payload)
-                self._drop_count += 1
-            except queue.Empty:
-                pass
+            with self._send_lock:
+                try:
+                    self._queue.get_nowait()
+                    self._queue.put_nowait(payload)
+                    self._drop_count += 1
+                except queue.Empty:
+                    pass
 
     # ------------------------------------------------------------------
     # Internal — connection loop (runs in daemon thread)

@@ -96,7 +96,7 @@ class EdgeRegistry:
             clusters[cid].append(info.to_dict())
         return clusters
 
-    def get_cluster(self) -> List[str]:
+    def get_online_node_ids(self) -> List[str]:
         return [info.node_id for info in self._edges.values() if info.online]
 
     async def _watchdog_loop(self) -> None:

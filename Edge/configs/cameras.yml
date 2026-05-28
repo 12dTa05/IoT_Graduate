@@ -48,7 +48,7 @@ cameras:
     source_id: 1
     uri: "rtsp://192.168.212.20:8554/cam2"
     enabled: true
-    name: "Camera 02 - Điểm đo phía Nam"
+    name: "Camera02 - Điểm đo phía Nam"
     fps: 25.0
     speed_limit_kmh: 80.0
     homography:

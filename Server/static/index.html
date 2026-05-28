@@ -357,6 +357,7 @@ const violations = [];     // newest first, max 200
 const streamStates = {};   // streamName -> { pc, video, cell, connecting, reconnectTimer, statsTimer, bitrate }
 
 let clusters = [];         // [{ id, edges: [...] }]
+let mediaMtxStreamNames = [];  // stream names from MediaMTX (pollStreams)
 let currentClusterIdx = 0;
 let streamPollTimer = null;
 let ws = null;
@@ -599,6 +600,12 @@ function renderVideoGrid() {
   let streamNames = [];
   if (cluster) {
     streamNames = getStreamNamesForCluster(cluster.edges);
+  }
+  // Also include streams discovered from MediaMTX (RTSP push)
+  for (const name of mediaMtxStreamNames) {
+    if (!streamNames.includes(name)) {
+      streamNames.push(name);
+    }
   }
 
   // Clean up streams not in current cluster
@@ -854,7 +861,7 @@ function switchCluster(delta) {
   const current = getCurrentCluster();
   if (current) {
     const currentStreams = getStreamNamesForCluster(current.edges);
-    for (const name of currentStreams) {
+    for (const name of [...currentStreams, ...mediaMtxStreamNames]) {
       cleanupStream(name);
       delete streamStates[name];
     }
@@ -1080,18 +1087,16 @@ async function pollStreams() {
     if (!resp.ok) return;
     const data = await resp.json();
     const items = data.items || [];
-    const activeNames = new Set(
-      items
-        .filter(p => p.source && p.source.type === 'rtspSession')
-        .map(p => p.name)
-    );
+    mediaMtxStreamNames = items
+      .filter(p => p.source && p.source.type === 'rtspSession')
+      .map(p => p.name);
 
     // Merge with known streams from cluster edges
     const cluster = getCurrentCluster();
     if (!cluster) return;
 
     const edgeStreams = getStreamNamesForCluster(cluster.edges);
-    const allStreams = new Set([...activeNames, ...edgeStreams]);
+    const allStreams = new Set([...mediaMtxStreamNames, ...edgeStreams]);
 
     // Update grid if new streams appear
     const existingNames = Object.keys(streamStates);

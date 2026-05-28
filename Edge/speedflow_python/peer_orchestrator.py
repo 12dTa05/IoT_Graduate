@@ -179,6 +179,9 @@ class PeerOrchestrator:
         # Track peers already reported offline (no cameras) to avoid log spam
         self._notified_offline: set = set()
 
+        # Stop event for cleanly blocking start()
+        self._stop_event = threading.Event()
+
         # Thread pool for blocking I/O (RTT measurement) off the Zenoh callback thread
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="PeerOrch-IO")
 
@@ -217,11 +220,12 @@ class PeerOrchestrator:
         self._decision_thread.start()
 
         # Park — Zenoh peer mode needs no blocking loop
-        threading.Event().wait()
+        self._stop_event.wait()
 
     def stop(self) -> None:
         """Stop orchestrator."""
         self._running = False
+        self._stop_event.set()
         if self._session:
             self._session.close()
         for timer in self._vote_timers.values():
@@ -492,6 +496,7 @@ class PeerOrchestrator:
         }
 
         self._pubs["vote_decision"].put(msgpack.packb(decision, use_bin_type=True))
+        self._cam_cooldown[camera_id] = time.time()
         logger.info(
             "[PeerOrch] Election won by '%s' for '%s' (score=%.1f, fps_pred=%.1f)",
             winner["bidder"], camera_id, winner["score"], winner.get("fps_predicted", 0),
