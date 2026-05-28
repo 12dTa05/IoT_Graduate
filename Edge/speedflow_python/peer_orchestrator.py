@@ -338,6 +338,7 @@ class PeerOrchestrator:
 
     def _decision_loop(self) -> None:
         """Vòng lặp chính — kiểm tra overload + OFFLINE peers."""
+        logger.info("[PeerOrch] Decision loop started (interval=1s).")
         while self._running:
             time.sleep(1.0)
             try:
@@ -360,7 +361,8 @@ class PeerOrchestrator:
         for node_id, peer in to_check:
             if node_id == self._node_id:
                 continue
-            if now - peer.last_seen > timeout:
+            silent_s = now - peer.last_seen
+            if silent_s > timeout:
                 if peer.active_cameras:
                     orphans = list(peer.active_cameras)
                     # Prevent re-triggering

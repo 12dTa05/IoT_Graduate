@@ -45,9 +45,11 @@ class ZenohCommandSubscriber:
         self,
         camera_manager: CameraManager,
         node_id: str,
+        session=None,
     ) -> None:
         self._camera_manager = camera_manager
         self._node_id = node_id
+        self._external_session = session
 
         self._control_key = f"peers/control/{node_id}"
         self._status_key = f"peers/status/{node_id}"
@@ -61,9 +63,13 @@ class ZenohCommandSubscriber:
 
     def start(self) -> None:
         """Open Zenoh session and subscribe to control key."""
-        import zenoh
-        self._session = make_session()
-        logger.info("[Zenoh C2] Session opened (peer mode).")
+        if self._external_session is not None:
+            self._session = self._external_session
+            logger.info("[Zenoh C2] Using shared Zenoh session.")
+        else:
+            import zenoh
+            self._session = make_session()
+            logger.info("[Zenoh C2] Session opened (peer mode).")
 
         self._subscriber = self._session.declare_subscriber(
             self._control_key,

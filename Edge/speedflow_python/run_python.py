@@ -469,13 +469,44 @@ def run_python_mode(args) -> None:
     """Entry point called by main.py for the Python backend."""
     camera_manager = CameraManager(CAMERAS_YML)
 
-    # --- Zenoh Command & Control ---
+    # --- P2P config (edge_node.yml) ---
+    edge_cfg = {}
+    edge_node_yml = S.ROOT / "configs" / "edge_node.yml"
+    try:
+        if edge_node_yml.exists():
+            with open(edge_node_yml, "r") as f:
+                edge_cfg = yaml.safe_load(f) or {}
+            print("[P2P] edge_node.yml loaded.")
+    except Exception as exc:
+        print(f"[P2P] Failed to load edge_node.yml: {exc}", file=sys.stderr)
+
+    # --- P2P Peer Orchestrator (single Zenoh session for ALL P2P traffic) ---
+    peer_orch = None
+    try:
+        from .peer_orchestrator import PeerOrchestrator
+        p2p_cfg = edge_cfg.get("p2p", {})
+        peer_orch = PeerOrchestrator(
+            node_id=NODE_ID,
+            cfg=p2p_cfg,
+            camera_manager=camera_manager,
+        )
+        orch_thread = threading.Thread(target=peer_orch.start, daemon=True)
+        orch_thread.start()
+        peer_orch._ready_event.wait(timeout=5)
+        print(f"[PeerOrch] Started. Node='{NODE_ID}', Overload threshold={p2p_cfg.get('overload_threshold', 75.0)}%")
+    except Exception as exc:
+        print(f"[PeerOrch] Failed to start: {exc}", file=sys.stderr)
+        peer_orch = None
+
+    # --- Zenoh Command & Control (shares PeerOrchestrator's Zenoh session) ---
     zenoh_sub = None
     try:
         from .zenoh_subscriber import ZenohCommandSubscriber
+        shared_session = peer_orch._session if peer_orch else None
         zenoh_sub = ZenohCommandSubscriber(
             camera_manager=camera_manager,
             node_id=NODE_ID,
+            session=shared_session,
         )
         zenoh_sub.start()
         print(f"[Zenoh C2] Subscriber active. Node='{NODE_ID}', Key=peers/control/{NODE_ID}")
@@ -488,33 +519,6 @@ def run_python_mode(args) -> None:
     except Exception as exc:
         print(f"[Zenoh C2] Failed to start subscriber: {exc}", file=sys.stderr)
 
-    # --- P2P config (edge_node.yml) ---
-    edge_cfg = {}
-    edge_node_yml = S.ROOT / "configs" / "edge_node.yml"
-    try:
-        if edge_node_yml.exists():
-            with open(edge_node_yml, "r") as f:
-                edge_cfg = yaml.safe_load(f) or {}
-            print("[P2P] edge_node.yml loaded.")
-    except Exception as exc:
-        print(f"[P2P] Failed to load edge_node.yml: {exc}", file=sys.stderr)
-
-    # --- P2P Peer Orchestrator ---
-    try:
-        from .peer_orchestrator import PeerOrchestrator
-        p2p_cfg = edge_cfg.get("p2p", {})
-        peer_orch = PeerOrchestrator(
-            node_id=NODE_ID,
-            cfg=p2p_cfg,
-            camera_manager=camera_manager,
-        )
-        orch_thread = threading.Thread(target=peer_orch.start, daemon=True)
-        orch_thread.start()
-        print(f"[PeerOrch] Started. Node='{NODE_ID}', Overload threshold={p2p_cfg.get('overload_threshold', 75.0)}%")
-    except Exception as exc:
-        print(f"[PeerOrch] Failed to start: {exc}", file=sys.stderr)
-        peer_orch = None
-
     # --- MonitorClient (edge registration + health push) ---
     if MONITOR_URL:
         from speedflow_python.monitor_client import MonitorClient, set_default_client
@@ -524,10 +528,6 @@ def run_python_mode(args) -> None:
         print(f"[MonitorClient] Started → {MONITOR_URL}")
 
     # --- Health Push (periodic metrics → Dashboard + Zenoh) ---
-    # Wait for PeerOrchestrator Zenoh session to be ready so health data
-    # flows through a single shared session (avoids multi-session routing issues).
-    if peer_orch is not None:
-        peer_orch._ready_event.wait(timeout=5)
     _health_thread = threading.Thread(
         target=_health_push_loop, args=(peer_orch,), daemon=True,
     )
