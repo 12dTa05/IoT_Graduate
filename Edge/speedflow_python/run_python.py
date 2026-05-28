@@ -422,6 +422,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager) -> None:
         bus = pipeline.get_bus()
         bus.add_signal_watch()
         _error_flag = [False]
+        _removing = set()  # guard against double-remove from multiple error msgs
 
         def on_message(bus, message):
             t = message.type
@@ -432,30 +433,29 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager) -> None:
                 if debug:
                     print(f"DEBUG INFO: {debug}", file=sys.stderr)
 
-                # If the error comes from a dynamically-added source bin,
-                # remove just that stream instead of killing the whole pipeline.
-                # Source bins are named "src-<camera_id>" by _make_source_bin.
-                if src_name.startswith("src-") or src_name == "source":
-                    cam_id = None
-                    # Walk up from the error element to find the source bin
-                    elem = message.src
-                    while elem is not None:
-                        n = elem.get_name()
-                        if n.startswith("src-"):
-                            cam_id = n[4:]  # strip "src-" prefix
+                # If the error comes from a source bin, remove just that
+                # stream instead of killing the whole pipeline.
+                cam_id = None
+                elem = message.src
+                while elem is not None:
+                    n = elem.get_name()
+                    if n.startswith("src-"):
+                        cam_id = n[4:]
+                        break
+                    elem = elem.get_parent()
+
+                if cam_id and cam_id in source_bins and cam_id not in _removing:
+                    _removing.add(cam_id)
+                    print(f"[Pipeline] Removing failed source '{cam_id}'", file=sys.stderr)
+                    sid = None
+                    for cfg in camera_manager.get_enabled_configs():
+                        if cfg.camera_id == cam_id:
+                            sid = cfg.source_id
                             break
-                        elem = elem.get_parent()
-                    if cam_id and cam_id in source_bins:
-                        print(f"[Pipeline] Removing failed source '{cam_id}'", file=sys.stderr)
-                        sid = None
-                        for cfg in camera_manager.get_enabled_configs():
-                            if cfg.camera_id == cam_id:
-                                sid = cfg.source_id
-                                break
-                        if sid is not None:
-                            current_n = streammux.get_property("batch-size")
-                            dynamic_remove_stream(pipeline, streammux, cam_id, sid, tiler, source_bins, current_n)
-                        return  # don't quit the pipeline
+                    if sid is not None:
+                        current_n = streammux.get_property("batch-size")
+                        dynamic_remove_stream(pipeline, streammux, cam_id, sid, tiler, source_bins, current_n)
+                    return  # don't quit the pipeline
 
                 _error_flag[0] = True
                 loop.quit()

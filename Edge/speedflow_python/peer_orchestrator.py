@@ -833,22 +833,32 @@ class PeerOrchestrator:
 
     def _measure_rtt(self, rtsp_uri: str) -> Optional[float]:
         """
-        Đo RTT đến camera RTSP origin bằng TCP connect.
+        Verify an RTSP stream is reachable AND the path exists.
 
-        Args:
-            rtsp_uri: e.g. "rtsp://192.168.1.155:8554/cam1"
-
-        Returns:
-            RTT in milliseconds, hoặc None nếu không reachable.
+        Sends an RTSP DESCRIBE request.  Returns RTT in ms on success
+        (any 2xx response), or None if the host is down or the path
+        does not exist (4xx).
         """
         try:
             parsed = urllib.parse.urlparse(rtsp_uri)
             host = parsed.hostname
             port = parsed.port or 554
             t0 = time.monotonic()
-            with socket.create_connection((host, port), timeout=0.1):
-                pass
-            return (time.monotonic() - t0) * 1000.0
+            with socket.create_connection((host, port), timeout=0.5) as sock:
+                # Send a minimal RTSP DESCRIBE to check if the path exists
+                req = (
+                    f"DESCRIBE {rtsp_uri} RTSP/1.0\r\n"
+                    f"CSeq: 1\r\n"
+                    f"Accept: application/sdp\r\n"
+                    f"\r\n"
+                )
+                sock.sendall(req.encode())
+                resp = sock.recv(512).decode(errors="ignore")
+                rtt = (time.monotonic() - t0) * 1000.0
+                # Accept any 2xx response; reject 404/401/etc.
+                if resp.startswith("RTSP/1.0 2"):
+                    return rtt
+                return None
         except Exception:
             return None
 
