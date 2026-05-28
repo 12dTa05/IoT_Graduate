@@ -244,9 +244,11 @@ def run_file_mode(args, camera_manager: CameraManager) -> None:
 # Health push — periodic metrics to Monitor Server via MonitorClient
 # ---------------------------------------------------------------------------
 
-def _health_push_loop() -> None:
+def _health_push_loop(peer_orch=None) -> None:
     import json as _json
+    import time as _time
     from pathlib import Path as _Path
+    import msgpack as _msgpack
 
     _fps_file = _Path(FPS_STATS_FILE)
 
@@ -320,11 +322,10 @@ def _health_push_loop() -> None:
                 penalty = 0.0
             load_score = round(min(100.0, base + penalty), 1)
 
-            from speedflow_python.monitor_client import send_to_monitor
-            send_to_monitor({
+            payload = {
                 "type": "health",
                 "node_id": NODE_ID,
-                "timestamp": __import__("time").time(),
+                "timestamp": _time.time(),
                 "load_score": load_score,
                 "gpu_percent": gpu,
                 "cpu_percent": cpu,
@@ -335,10 +336,20 @@ def _health_push_loop() -> None:
                     "avg_fps": avg_fps,
                     "active_cameras": list(fps.keys()),
                 },
-            })
+            }
+
+            # Push to Dashboard via WebSocket
+            from speedflow_python.monitor_client import send_to_monitor
+            send_to_monitor(payload)
+
+            # Publish to Zenoh via PeerOrchestrator's session so peers
+            # see active_cameras (uses single shared Zenoh session).
+            if peer_orch is not None:
+                peer_orch.publish_status(_msgpack.packb(payload, use_bin_type=True))
+
         except Exception:
             pass
-        __import__("time").sleep(HEALTH_INTERVAL)
+        _time.sleep(HEALTH_INTERVAL)
 
 
 def run_rtsp_push_mode(args, camera_manager: CameraManager) -> None:
@@ -376,11 +387,6 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager) -> None:
 
     import atexit
     atexit.register(lambda: _PID_FILE.unlink(missing_ok=True))
-
-    # Start health push thread (periodic GPU/CPU/RAM/FPS → Monitor Server)
-    _health_thread = threading.Thread(target=_health_push_loop, daemon=True)
-    _health_thread.start()
-    print("[HealthPush] Started (periodic metrics → Monitor Server)")
 
     _RESTART_DELAYS = [5, 10, 20, 30]
     restart_idx = 0
@@ -516,6 +522,17 @@ def run_python_mode(args) -> None:
         _client.start()
         set_default_client(_client)
         print(f"[MonitorClient] Started → {MONITOR_URL}")
+
+    # --- Health Push (periodic metrics → Dashboard + Zenoh) ---
+    # Wait for PeerOrchestrator Zenoh session to be ready so health data
+    # flows through a single shared session (avoids multi-session routing issues).
+    if peer_orch is not None:
+        peer_orch._ready_event.wait(timeout=5)
+    _health_thread = threading.Thread(
+        target=_health_push_loop, args=(peer_orch,), daemon=True,
+    )
+    _health_thread.start()
+    print("[HealthPush] Started (metrics → Dashboard + Zenoh)")
 
     if args.mode == "display":
         run_display_mode(args, camera_manager)

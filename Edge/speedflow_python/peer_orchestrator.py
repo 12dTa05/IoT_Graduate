@@ -69,7 +69,7 @@ class PeerState:
     avg_fps: Optional[float] = None
     fps_per_camera: Dict[str, float] = field(default_factory=dict)
     active_cameras: List[str] = field(default_factory=list)
-    max_streams: int = 4
+    max_streams: int = 8
     last_seen: float = field(default_factory=time.time)
     overload_since: Optional[float] = None
     penalty_until: float = 0.0
@@ -181,6 +181,8 @@ class PeerOrchestrator:
 
         # Stop event for cleanly blocking start()
         self._stop_event = threading.Event()
+        # Signaled once Zenoh session and publishers are ready
+        self._ready_event = threading.Event()
 
         # Thread pool for blocking I/O (RTT measurement) off the Zenoh callback thread
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="PeerOrch-IO")
@@ -202,6 +204,7 @@ class PeerOrchestrator:
         logger.info("[PeerOrch] Zenoh session opened (peer mode).")
 
         # Declare publishers once
+        self._pubs["status"]        = self._session.declare_publisher(f"peers/status/{self._node_id}")
         self._pubs["vote_request"]  = self._session.declare_publisher("peers/vote/request")
         self._pubs["vote_proposal"] = self._session.declare_publisher("peers/vote/proposal")
         self._pubs["vote_decision"] = self._session.declare_publisher("peers/vote/decision")
@@ -216,6 +219,7 @@ class PeerOrchestrator:
         logger.info("[PeerOrch] Subscribed to: peers/status/**, peers/vote/*, peers/vote/ack/**")
 
         self._running = True
+        self._ready_event.set()
 
         self._decision_thread = threading.Thread(
             target=self._decision_loop,
@@ -226,6 +230,12 @@ class PeerOrchestrator:
 
         # Park — Zenoh peer mode needs no blocking loop
         self._stop_event.wait()
+
+    def publish_status(self, payload: bytes) -> None:
+        """Publish health status on peers/status/<node_id> (called by health push loop)."""
+        pub = self._pubs.get("status")
+        if pub:
+            pub.put(payload)
 
     def stop(self) -> None:
         """Stop orchestrator."""
@@ -329,7 +339,7 @@ class PeerOrchestrator:
     def _decision_loop(self) -> None:
         """Vòng lặp chính — kiểm tra overload + OFFLINE peers."""
         while self._running:
-            time.sleep(2.0)
+            time.sleep(1.0)
             try:
                 self._check_offline_peers()
                 self._check_self_overload()
@@ -751,6 +761,11 @@ class PeerOrchestrator:
         # failover loop so we don't exceed eps_streams_max across iterations.
         self_accepted = 0
 
+        # Single jitter sleep BEFORE the loop to avoid race conditions with
+        # other peers, without accumulating delay per camera.
+        jitter = random.uniform(0, cfg.get("failover_jitter_max_s", 2.0))
+        time.sleep(jitter)
+
         for camera_id in orphaned_cameras:
             if not alive_peers:
                 logger.error("[Failover] No alive peers to rescue '%s'", camera_id)
@@ -762,16 +777,12 @@ class PeerOrchestrator:
                 # Re-check capacity including cameras accepted earlier in this loop
                 with self._lock:
                     current_streams = len(self._self_state.active_cameras)
-                if current_streams + self_accepted >= self._cfg.get("eps_streams_max", 4):
+                if current_streams + self_accepted >= self._cfg.get("eps_streams_max", 8):
                     logger.warning(
                         "[Failover] Cannot rescue '%s': at stream capacity (%d). Skipping.",
                         camera_id, current_streams + self_accepted,
                     )
                     continue
-
-                # Jitter để tránh race
-                jitter = random.uniform(0, cfg.get("failover_jitter_max_s", 2.0))
-                time.sleep(jitter)
 
                 # Double-check: camera đã được rescue bởi peer khác chưa?
                 with self._lock:

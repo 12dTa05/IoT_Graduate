@@ -12,7 +12,7 @@ p2p:
   overload_duration_s: 10.0     # must be overloaded this long before RFO
   cooldown_s: 45.0              # per-camera cooldown between migrations
   migration_timeout_s: 15.0     # wait for ADD ack before rollback
-  heartbeat_timeout_s: 15.0     # peer declared OFFLINE after this silence
+  heartbeat_timeout_s: 6.0      # peer declared OFFLINE after this silence
   vote_window_s: 3.0            # proposal collection duration
   failover_jitter_max_s: 2.0    # random delay before failover ADD (race prevention)
 
@@ -22,7 +22,7 @@ p2p:
   eps_fps_tier2: 12.0           # Tier 2 relaxation
   eps_network_ms_strict: 50.0   # Tier 0 — RTSP RTT ceiling
   eps_network_ms_tier1: 80.0    # Tier 1 relaxation
-  eps_streams_max: 4            # Hard capacity ceiling
+  eps_streams_max: 8            # Hard capacity ceiling (matches cameras.yml max_streams)
 
   # FPS prediction model — calibrate offline per Jetson model
   # key = number of streams AFTER accepting the new camera
