@@ -97,6 +97,7 @@ class EdgeRegistry:
         return clusters
 
     def get_online_node_ids(self) -> List[str]:
+        """Return node_ids of all currently-online edges."""
         return [info.node_id for info in self._edges.values() if info.online]
 
     async def _watchdog_loop(self) -> None:

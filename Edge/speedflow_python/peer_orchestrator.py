@@ -185,6 +185,11 @@ class PeerOrchestrator:
         # Thread pool for blocking I/O (RTT measurement) off the Zenoh callback thread
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="PeerOrch-IO")
 
+        # BUG-15: Cache cameras.yml to avoid repeated disk reads on every vote.
+        # Reset to None to force reload only if the file changes (not implemented
+        # here — a future improvement could use inotify or mtime check).
+        self._cameras_cache: Optional[dict] = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -289,6 +294,8 @@ class PeerOrchestrator:
             return
 
         # Cập nhật trạng thái peer khác
+        # BUG-04: update ALL mutable fields inside the lock to prevent torn
+        # reads from _decision_loop running on a separate thread.
         with self._lock:
             is_new = node_id not in self._peers
             if is_new:
@@ -296,24 +303,24 @@ class PeerOrchestrator:
                 logger.info("[PeerOrch] Discovered peer '%s' via Zenoh", node_id)
             peer = self._peers[node_id]
 
-        peer.load_score = payload.get("load_score", 0.0)
-        peer.gpu_percent = payload.get("gpu_percent", 0.0)
-        peer.cpu_percent = payload.get("cpu_percent", 0.0)
-        peer.ram_percent = payload.get("ram_percent", 0.0)
-        peer.gpu_temp_c = payload.get("gpu_temp_c", 0.0)
+            peer.load_score = payload.get("load_score", 0.0)
+            peer.gpu_percent = payload.get("gpu_percent", 0.0)
+            peer.cpu_percent = payload.get("cpu_percent", 0.0)
+            peer.ram_percent = payload.get("ram_percent", 0.0)
+            peer.gpu_temp_c = payload.get("gpu_temp_c", 0.0)
 
-        pipeline = payload.get("pipeline", {})
-        peer.avg_fps = pipeline.get("avg_fps")
-        peer.fps_per_camera = pipeline.get("fps_per_camera", {})
-        peer.active_cameras = pipeline.get("active_cameras", [])
-        peer.last_seen = time.time()
+            pipeline = payload.get("pipeline", {})
+            peer.avg_fps = pipeline.get("avg_fps")
+            peer.fps_per_camera = pipeline.get("fps_per_camera", {})
+            peer.active_cameras = pipeline.get("active_cameras", [])
+            peer.last_seen = time.time()
 
-        # Track overload onset
-        if peer.load_score > self._cfg.get("overload_threshold", 75.0):
-            if peer.overload_since is None:
-                peer.overload_since = time.time()
-        else:
-            peer.overload_since = None
+            # Track overload onset
+            if peer.load_score > self._cfg.get("overload_threshold", 75.0):
+                if peer.overload_since is None:
+                    peer.overload_since = time.time()
+            else:
+                peer.overload_since = None
 
     # ------------------------------------------------------------------
     # Decision loop (chạy mỗi 2s)
@@ -740,6 +747,10 @@ class PeerOrchestrator:
                 and len(peer.active_cameras) < peer.max_streams
             ] + ([self._node_id] if self_eligible else []))
 
+        # BUG-11: Track how many cameras this node has accepted during this
+        # failover loop so we don't exceed eps_streams_max across iterations.
+        self_accepted = 0
+
         for camera_id in orphaned_cameras:
             if not alive_peers:
                 logger.error("[Failover] No alive peers to rescue '%s'", camera_id)
@@ -748,6 +759,16 @@ class PeerOrchestrator:
             winner = self._consistent_hash(camera_id, alive_peers)
 
             if winner == self._node_id:
+                # Re-check capacity including cameras accepted earlier in this loop
+                with self._lock:
+                    current_streams = len(self._self_state.active_cameras)
+                if current_streams + self_accepted >= self._cfg.get("eps_streams_max", 4):
+                    logger.warning(
+                        "[Failover] Cannot rescue '%s': at stream capacity (%d). Skipping.",
+                        camera_id, current_streams + self_accepted,
+                    )
+                    continue
+
                 # Jitter để tránh race
                 jitter = random.uniform(0, cfg.get("failover_jitter_max_s", 2.0))
                 time.sleep(jitter)
@@ -773,6 +794,7 @@ class PeerOrchestrator:
 
                 add_cmd = {**cam_config, "cmd": "ADD"}
                 self._pubs["control"].put(msgpack.packb(add_cmd, use_bin_type=True))
+                self_accepted += 1
                 logger.info("[Failover] Rescue ADD sent: '%s' → me", camera_id)
 
                 self._migration_log.log(
@@ -810,14 +832,18 @@ class PeerOrchestrator:
         """
         Đọc cấu hình camera từ cameras.yml.
 
-        Copy từ MasterOrchestrator._get_camera_config() (master_orchestrator.py:604).
+        BUG-15: Cache the parsed YAML in memory after the first read so that
+        repeated calls (from _evaluate_and_bid, _close_vote_window, failover)
+        do not hit disk every time.
         """
         try:
             import yaml
-            yml_path = self._camera_configs_dir / "cameras.yml"
-            with open(yml_path, "r", encoding="utf-8") as f:
-                raw = yaml.safe_load(f)
-            cameras = raw.get("cameras", {})
+            if self._cameras_cache is None:
+                yml_path = self._camera_configs_dir / "cameras.yml"
+                with open(yml_path, "r", encoding="utf-8") as f:
+                    raw = yaml.safe_load(f)
+                self._cameras_cache = raw.get("cameras", {})
+            cameras = self._cameras_cache
             cfg = cameras.get(camera_id)
             if not cfg:
                 return None

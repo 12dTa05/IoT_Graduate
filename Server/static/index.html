@@ -807,8 +807,11 @@ function updateSidebarCard(card, edge) {
     if (entries.length > 0) {
       fpsEl.innerHTML = entries
         .map(([cam, f]) => {
+          // BUG-14: pct was computed but never used in the output string.
+          // Use it to colour the FPS value: red < 15fps, yellow < 25fps, green otherwise.
           const pct = Math.min(100, (f / targetFps) * 100);
-          return `<span>${escHtml(cam)}: <strong>${f.toFixed(1)}</strong> fps</span>`;
+          const colour = pct < 50 ? '#e74c3c' : pct < 83 ? '#f39c12' : '#2ecc71';
+          return `<span>${escHtml(cam)}: <strong style="color:${colour}">${f.toFixed(1)}</strong> fps</span>`;
         })
         .join('');
     } else {
@@ -886,7 +889,16 @@ function renderViolations() {
   for (const v of violations) {
     const ts = v.timestamp || v.ts || 0;
     const snapFile = v.snapshot_file || '';
-    const snapUrl = snapFile ? `/api/snapshots/${v.node_id}/${snapFile.split('/').pop()}` : '';
+    // BUG-13: snapshot_file is a relative path like "2026-05-28/edge01/cam_123.jpg".
+    // Preserve the date directory component — the server's handle_snapshot
+    // matches on {node_id}/{filename} and searches all date dirs, so we only
+    // need to strip the leading date segment but keep node_id in the URL.
+    // URL pattern: /api/snapshots/{node_id}/{filename}
+    // snapshot_file format: {date}/{node_id}/{filename}
+    const snapParts = snapFile ? snapFile.split('/') : [];
+    const snapUrl = snapParts.length >= 3
+      ? `/api/snapshots/${encodeURIComponent(snapParts[1])}/${encodeURIComponent(snapParts.slice(2).join('/'))}`
+      : (snapParts.length === 1 ? `/api/snapshots/${encodeURIComponent(v.node_id)}/${encodeURIComponent(snapParts[0])}` : '');
 
     html += `
       <div class="violation-card" data-snap="${escAttr(snapUrl)}" title="${escAttr(fmtTime(ts))} - ${escAttr(v.node_id)}">
@@ -987,7 +999,11 @@ function connectWS() {
     reconnectTimer = setTimeout(connectWS, 3000);
   };
 
-  ws.onerror = () => {};
+  ws.onerror = () => {
+    // BUG-19: clear the ping timer on error so it doesn't leak when
+    // onerror fires without a subsequent onclose (e.g. manual ws.close()).
+    if (wsPingTimer) { clearInterval(wsPingTimer); wsPingTimer = null; }
+  };
 }
 
 function handleWSMessage(msg) {

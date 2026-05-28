@@ -23,6 +23,7 @@ import logging
 import queue
 import threading
 import time
+import urllib.parse
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("monitor_client")
@@ -49,10 +50,11 @@ class MonitorClient:
         advertise_ip: str = "",
     ) -> None:
         base = server_url.rstrip("/").replace("http://", "ws://").replace("https://", "wss://")
+        # BUG-18: URL-encode node_id and advertise_ip to handle special chars
         self._ws_url = (
             f"{base}/ws/edge"
-            f"?node_id={node_id}"
-            f"&advertise_ip={advertise_ip}"
+            f"?node_id={urllib.parse.quote(node_id, safe='')}"
+            f"&advertise_ip={urllib.parse.quote(advertise_ip, safe='')}"
         )
         self._node_id = node_id
 
@@ -62,6 +64,8 @@ class MonitorClient:
         self._sent_count = 0
         self._drop_count = 0
         self._send_lock = threading.Lock()
+        # BUG-09: use a lock-protected property for stop() to read drop count safely
+        self._stats_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -82,9 +86,13 @@ class MonitorClient:
         self._queue.put(None)  # sentinel to unblock
         if self._thread:
             self._thread.join(timeout=5)
+        # BUG-09: read counters under lock so we see the final value
+        with self._stats_lock:
+            sent = self._sent_count
+            dropped = self._drop_count
         logger.info(
             "[MonitorClient] Stopped. Sent=%d, Dropped=%d",
-            self._sent_count, self._drop_count,
+            sent, dropped,
         )
 
     def send(self, data: Dict[str, Any]) -> None:
@@ -102,7 +110,8 @@ class MonitorClient:
                 try:
                     self._queue.get_nowait()
                     self._queue.put_nowait(payload)
-                    self._drop_count += 1
+                    with self._stats_lock:
+                        self._drop_count += 1
                 except queue.Empty:
                     pass
 
@@ -177,8 +186,12 @@ class MonitorClient:
                 app_thread.start()
 
                 # Wait for connection
+                # BUG-01: explicitly close the app before continuing so the
+                # background run_forever() thread is unblocked and the WS is
+                # not left dangling. The finally block will join app_thread.
                 if not self._ws_connected.wait(timeout=10):
                     logger.warning("[MonitorClient] Connection timeout")
+                    app.close()   # signal run_forever() to exit
                     continue
 
                 delay_idx = 0  # reset backoff
@@ -217,7 +230,8 @@ class MonitorClient:
 
             try:
                 app.send(payload)
-                self._sent_count += 1
+                with self._stats_lock:
+                    self._sent_count += 1
             except Exception as exc:
                 logger.warning("[MonitorClient] Send failed: %s", exc)
                 try:

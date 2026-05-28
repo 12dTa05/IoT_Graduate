@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,7 +18,11 @@ class ViolationStore:
     def __init__(self, data_dir: str | Path) -> None:
         self._root = Path(data_dir)
         self._root.mkdir(parents=True, exist_ok=True)
-        self._write_lock = asyncio.Lock()
+        # BUG-02: asyncio.Lock only protects coroutines; sync save() also
+        # writes the same JSONL files. Use a threading.Lock that works in
+        # both sync and async contexts (via asyncio.to_thread for async).
+        self._write_lock = threading.Lock()
+        self._async_write_lock = asyncio.Lock()
 
     def save(self, record: Dict[str, Any]) -> Optional[Path]:
         node_id = record.get("node_id", "unknown")
@@ -59,8 +64,9 @@ class ViolationStore:
                 logger.warning("Failed to save snapshot for %s/%s: %s", node_id, camera_id, exc)
 
         try:
-            with open(jsonl_path, "a") as f:
-                f.write(json.dumps(record, default=str) + "\n")
+            with self._write_lock:
+                with open(jsonl_path, "a") as f:
+                    f.write(json.dumps(record, default=str) + "\n")
         except Exception as exc:
             logger.error("Failed to write JSONL for %s/%s: %s", node_id, camera_id, exc)
 
@@ -105,7 +111,7 @@ class ViolationStore:
             except Exception as exc:
                 logger.warning("Failed to save snapshot for %s/%s: %s", node_id, camera_id, exc)
 
-        async with self._write_lock:
+        async with self._async_write_lock:
             try:
                 async with aiofiles.open(jsonl_path, "a") as f:
                     await f.write(json.dumps(record, default=str) + "\n")

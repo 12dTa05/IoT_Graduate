@@ -411,8 +411,15 @@ class SpeedProbe:
         # simple heuristic: purge stids with no history (already consumed)
         # or whose alert timestamp is old.
         stale_cutoff = current_time - 60.0
-        stale_keys = [stid for stid in all_stids
-                      if self.last_alert_ts.get(stid, 0.0) <= stale_cutoff]
+        # BUG-07: the last commit dropped the has_history guard, causing actively-
+        # tracked vehicles (history accumulating, not yet alerted) to be purged
+        # mid-track. Restore it: keep stids that still have position history,
+        # regardless of whether they have triggered an alert recently.
+        stale_keys = [
+            stid for stid in all_stids
+            if self.last_alert_ts.get(stid, 0.0) <= stale_cutoff
+            and not (stid in self.history_positions and len(self.history_positions[stid]) > 0)
+        ]
 
         for stid in stale_keys:
             self.history_positions.pop(stid, None)
