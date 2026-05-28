@@ -327,8 +327,6 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager) -> None:
             loop.run()
         except KeyboardInterrupt:
             print("\nInterrupted by user")
-            pipeline.set_state(Gst.State.NULL)
-            print("Pipeline stopped")
             return
         finally:
             pipeline.set_state(Gst.State.NULL)

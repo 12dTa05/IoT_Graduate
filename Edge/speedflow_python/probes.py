@@ -411,16 +411,8 @@ class SpeedProbe:
         # simple heuristic: purge stids with no history (already consumed)
         # or whose alert timestamp is old.
         stale_cutoff = current_time - 60.0
-        stale_keys = []
-        for stid in all_stids:
-            last_alert = self.last_alert_ts.get(stid, 0.0)
-            has_history = stid in self.history_positions and len(self.history_positions[stid]) > 0
-            # Keep if recently alerted or still has active history
-            if last_alert > stale_cutoff:
-                continue
-            if has_history:
-                continue
-            stale_keys.append(stid)
+        stale_keys = [stid for stid in all_stids
+                      if self.last_alert_ts.get(stid, 0.0) <= stale_cutoff]
 
         for stid in stale_keys:
             self.history_positions.pop(stid, None)
