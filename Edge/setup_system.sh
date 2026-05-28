@@ -133,44 +133,6 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────
-# 3b. Build custom LPR parser library
-# ──────────────────────────────────────────────────────────────
-LPR_PARSER_DIR="$SCRIPT_DIR/configs/nvinfer_custom_lpr_parser"
-if [ -f "$LPR_PARSER_DIR/Makefile" ]; then
-    info "Building LPR custom parser library…"
-    make -C "$LPR_PARSER_DIR" clean all
-    if [ -f "$LPR_PARSER_DIR/libnvdsinfer_custom_impl_lpr.so" ]; then
-        ok "libnvdsinfer_custom_impl_lpr.so built"
-    else
-        die "Failed to build LPR parser library"
-    fi
-else
-    warn "LPR parser source not found at $LPR_PARSER_DIR"
-fi
-
-# ──────────────────────────────────────────────────────────────
-# 3c. Build TensorRT engine files (if missing)
-# ──────────────────────────────────────────────────────────────
-MODELS_DIR="$SCRIPT_DIR/models"
-if [ -d "$MODELS_DIR" ]; then
-    MISSING_ENGINES=0
-    for onnx in "$MODELS_DIR"/*.onnx; do
-        [ -f "$onnx" ] || continue
-        engine="${onnx%.onnx}.engine"
-        if [ ! -f "$engine" ]; then
-            MISSING_ENGINES=1
-            info "TensorRT engine missing: $(basename "$engine")"
-        fi
-    done
-    if [ "$MISSING_ENGINES" -eq 1 ]; then
-        warn "Some .engine files are missing. They will be auto-generated"
-        warn "on first pipeline run (may take several minutes)."
-    else
-        ok "All TensorRT engine files present"
-    fi
-fi
-
-# ──────────────────────────────────────────────────────────────
 # 4. Python dependencies
 # ──────────────────────────────────────────────────────────────
 info "Installing Python packages…"
