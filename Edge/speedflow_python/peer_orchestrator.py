@@ -180,6 +180,10 @@ class PeerOrchestrator:
         # Track peers already reported offline (no cameras) to avoid log spam
         self._notified_offline: set = set()
 
+        # Cameras rescued via failover: camera_id → original_owner_node_id
+        # Used to return cameras when the original owner comes back online.
+        self._rescued_cameras: Dict[str, str] = {}
+
         # Stop event for cleanly blocking start()
         self._stop_event = threading.Event()
         # Signaled once Zenoh session and publishers are ready
@@ -339,12 +343,13 @@ class PeerOrchestrator:
     # ------------------------------------------------------------------
 
     def _decision_loop(self) -> None:
-        """Vòng lặp chính — kiểm tra overload + OFFLINE peers."""
+        """Vòng lặp chính — kiểm tra overload + OFFLINE peers + rebalance."""
         logger.info("[PeerOrch] Decision loop started (interval=1s).")
         while self._running:
             time.sleep(1.0)
             try:
                 self._check_offline_peers()
+                self._check_rebalance()
                 self._check_self_overload()
             except Exception as exc:
                 logger.error("[PeerOrch] Decision loop error: %s", exc)
@@ -388,6 +393,47 @@ class PeerOrchestrator:
             else:
                 # Peer is alive — clear the notified flag so we log again if it goes offline
                 self._notified_offline.discard(node_id)
+
+    def _check_rebalance(self) -> None:
+        """
+        Return rescued cameras when their original owner comes back online.
+
+        If peer X died and we rescued cam_01, cam_02, and then X restarts
+        and reports cam_01, cam_02 in its active_cameras, we remove our
+        rescued copies to avoid duplicate streams.
+        """
+        if not self._rescued_cameras:
+            return
+
+        now = time.time()
+        timeout = self._cfg.get("heartbeat_timeout_s", 15.0)
+        to_return: List[str] = []
+
+        with self._lock:
+            for camera_id, original_owner in list(self._rescued_cameras.items()):
+                peer = self._peers.get(original_owner)
+                if peer is None:
+                    continue
+                # Owner is back online AND is running this camera again
+                if (now - peer.last_seen <= timeout
+                        and camera_id in peer.active_cameras):
+                    to_return.append(camera_id)
+
+        for camera_id in to_return:
+            original_owner = self._rescued_cameras.pop(camera_id, None)
+            if original_owner is None:
+                continue
+            remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
+            self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
+            logger.info(
+                "[Rebalance] Returning '%s' to original owner '%s'. REMOVE sent.",
+                camera_id, original_owner,
+            )
+            self._migration_log.log(
+                self._node_id, original_owner, camera_id,
+                "rebalance_return", self._self_state.load_score, self._self_state.avg_fps,
+                0.0, "RETURNED",
+            )
 
     def _check_self_overload(self) -> None:
         """
@@ -829,6 +875,7 @@ class PeerOrchestrator:
                 add_cmd = {**cam_config, "cmd": "ADD"}
                 self._pubs["control"].put(msgpack.packb(add_cmd, use_bin_type=True))
                 self_accepted += 1
+                self._rescued_cameras[camera_id] = dead_node_id
                 logger.info("[Failover] Rescue ADD sent: '%s' → me (rtt=%.0fms)", camera_id, rtt)
 
                 self._migration_log.log(
