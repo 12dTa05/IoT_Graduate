@@ -321,7 +321,9 @@ class SpeedProbe:
     def _calculate_plate_quality(self, bbox, confidence):
         conf_score = confidence * 70.0
         area = bbox['width'] * bbox['height']
-        area_score = min(20.0, max(0.0, (area - 4000) / 12000 * 20))
+        # Area thresholds scaled from 1920×1080 → 1280×720 (factor 0.6667² ≈ 0.444):
+        # old: (area - 4000) / 12000  →  new: (area - 1778) / 5333
+        area_score = min(20.0, max(0.0, (area - 1778) / 5333 * 20))
         aspect = bbox['width'] / max(1.0, bbox['height'])
         
         if aspect >= 1.8:
@@ -637,6 +639,10 @@ class SpeedProbe:
                         final_display = plate_text
                 
                 obj_meta.text_params.display_text = final_display
+                # Set font size explicitly — nvdsosd default is 12pt which is
+                # too large for 1280×720. Use 6pt (half the default).
+                obj_meta.text_params.font_params.font_size = 6
+                obj_meta.text_params.font_params.font_name = "Serif"
                 self.last_area[stid] = area_now
 
             # Draw ROI box (Vùng giám sát - Red)
