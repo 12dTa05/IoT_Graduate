@@ -131,7 +131,12 @@ class SpeedProbe:
             pass
 
         # License plate tracking
-        self.PLATE_DETECTION_FRAMES = 5
+        # SGIE (LPD) runs every (interval+1)=4 frames (interval=3 in config).
+        # We want ~5 SGIE inference passes in the collection window, so:
+        #   PLATE_DETECTION_FRAMES = 5 SGIE runs × 4 raw frames/run = 20 raw frames.
+        # The old value of 5 raw frames gave only 1-2 SGIE runs — not enough
+        # candidates to reliably select the best plate text.
+        self.PLATE_DETECTION_FRAMES = 20   # raw frames; covers ~5 SGIE passes
         self.plate_detection_start_frame = {}
         self.plate_candidates = defaultdict(list)
         self.plate_locked = {}
@@ -262,6 +267,11 @@ class SpeedProbe:
 
     @staticmethod
     def _extract_lpr_text(obj_meta):
+        """Extract LPR text from NvDsClassifierMeta attached by SGIE2 (gie-unique-id=3).
+
+        Tries result_label first (most DeepStream versions), then falls back to
+        result_class_label which some older pyds bindings expose instead.
+        """
         try:
             class_meta_list = obj_meta.classifier_meta_list
             while class_meta_list is not None:
@@ -270,8 +280,15 @@ class SpeedProbe:
                     label_info_list = class_meta.label_info_list
                     if label_info_list is not None:
                         label_info = pyds.NvDsLabelInfo.cast(label_info_list.data)
-                        if label_info and label_info.result_label:
-                            return label_info.result_label
+                        if label_info:
+                            # Try result_label (DeepStream 6.x+)
+                            text = getattr(label_info, 'result_label', None)
+                            if text:
+                                return text
+                            # Fallback: result_class_label (older pyds)
+                            text = getattr(label_info, 'result_class_label', None)
+                            if text:
+                                return text
                 class_meta_list = class_meta_list.next
             return None
         except Exception:
@@ -520,6 +537,7 @@ class SpeedProbe:
                     frames_in_window = frame_number - self.plate_detection_start_frame[stid]
                     
                     if frames_in_window < self.PLATE_DETECTION_FRAMES:
+                        # Still inside the collection window — accumulate candidates
                         plate_text = self._extract_lpr_text(plate_info['obj_meta'])
                         if plate_text:
                             quality = self._calculate_plate_quality(plate_info['bbox'], plate_info['conf'])
@@ -530,7 +548,9 @@ class SpeedProbe:
                                 'quality': quality,
                                 'frame': frame_number
                             })
-                    elif frames_in_window == self.PLATE_DETECTION_FRAMES:
+                    else:
+                        # Window has closed (>= threshold).  Use >= not == so we never
+                        # skip this branch when a detection frame is missed mid-window.
                         candidates = self.plate_candidates[stid]
                         best_plate_text = self._select_best_plate_from_candidates(candidates)
                         if best_plate_text:
@@ -538,9 +558,11 @@ class SpeedProbe:
                         else:
                             self.plate_detection_attempts[stid] += 1
                             if self.plate_detection_attempts[stid] < 3:
+                                # Retry: open a fresh window from now
                                 self.plate_detection_start_frame[stid] = frame_number
                                 self.plate_candidates[stid] = []
                             else:
+                                # Give up after 3 attempts — mark as no plate
                                 self.plate_locked[stid] = None
             
             # Pass 3: Speed & Display

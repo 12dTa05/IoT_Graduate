@@ -1,3 +1,23 @@
+# ── Logging ──────────────────────────────────────────────────
+logLevel: error
+logDestinations: [stdout]
+
+# ── RTSP server ──────────────────────────────────────────────
+rtsp: yes
+rtspAddress: :8554
+# TCP avoids UDP fragmentation loss on congested LAN
+protocols: [tcp]
+
+# ── Disable unused protocols to save overhead ────────────────
+rtmp: no
+hls: no
+webrtc: no
+api: no
+
+# ── Stream paths ─────────────────────────────────────────────
 paths:
-  live:
+  all_others:
     source: publisher
+    # Drop frames when the Jetson reader is slow instead of buffering
+    # indefinitely — prevents unbounded memory growth
+    readBufferCount: 512

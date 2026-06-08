@@ -10,7 +10,11 @@ logDestinations: [stdout]
 # ── RTSP server (receives push from Edge nodes) ─────────────
 rtsp: yes
 rtspAddress: :8554
+# TCP only — avoids UDP packet loss on the WAN link from Jetson→VPS
 protocols: [tcp]
+# Larger read buffer absorbs WAN jitter without dropping frames.
+# 2048 packets × ~1400 bytes ≈ ~2.8 MB buffer per stream
+readBufferCount: 2048
 
 # ── WebRTC server (serves to browser via WHEP) ──────────────
 webrtc: yes
@@ -27,6 +31,7 @@ apiAddress: :9997
 # ── HLS (low-latency fallback for browsers where WebRTC fails)
 hls: yes
 hlsAddress: :8888
+# 3 segments × 500ms = 1.5s DVR window — minimal latency
 hlsSegmentCount: 3
 hlsSegmentDuration: 500ms
 
@@ -38,3 +43,6 @@ rtmp: no
 paths:
   all_others:
     source: publisher
+    # If the Edge disconnects, wait up to 10s before dropping WebRTC viewers.
+    # This absorbs brief WAN hiccups without forcing browser reconnects.
+    sourceOnDemandCloseAfter: 10s
