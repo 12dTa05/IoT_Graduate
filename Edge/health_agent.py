@@ -112,43 +112,100 @@ def _collect_jetson_metrics() -> Dict:
         }
 
 
-def _compute_load_score(metrics: Dict, fps_stats: Dict) -> float:
+def _load_edge_node_cfg() -> dict:
     """
-    Tính Load Score tổng hợp từ thông số phần cứng và FPS pipeline.
+    Read edge_node.yml once.  Returns the full parsed dict, or {} on error.
+    The health agent is also started standalone (no GStreamer), so we cannot
+    assume the speedflow_python settings module has loaded edge_node.yml.
+    """
+    try:
+        import yaml
+        yml_path = Path(__file__).resolve().parent / "configs" / "edge_node.yml"
+        with open(yml_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as exc:
+        logger.debug("[HealthAgent] edge_node.yml load error: %s", exc)
+        return {}
 
-    Công thức:
-        base    = 0.5 * GPU_% + 0.3 * CPU_% + 0.2 * RAM_%
-        penalty = max(0, (TARGET_FPS - avg_fps) / TARGET_FPS * 30)
+
+# Load once at module import — used by _compute_load_score
+_EDGE_CFG: dict = _load_edge_node_cfg()
+
+
+def _select_omega(metrics: dict, n_active_cameras: int) -> tuple:
+    """
+    Select adaptive ω weight triple (w_gpu, w_cpu, w_ram) based on context.
+
+    Presets (from edge_node.yml load_score section):
+      thermal   — when gpu_temp_c ≥ thermal_threshold_c
+      bandwidth — when active camera count ≥ stream_bandwidth_threshold
+      normal    — default
+
+    Returns (w_gpu, w_cpu, w_ram, preset_name) so the preset can be logged
+    and included in the heartbeat payload.
+    """
+    ls_cfg = _EDGE_CFG.get("load_score", {})
+
+    thermal_thresh = float(ls_cfg.get("thermal_threshold_c", 75.0))
+    bw_thresh      = int(ls_cfg.get("stream_bandwidth_threshold", 3))
+
+    w_normal    = ls_cfg.get("weights_normal",    [0.5, 0.3, 0.2])
+    w_thermal   = ls_cfg.get("weights_thermal",   [0.3, 0.2, 0.5])
+    w_bandwidth = ls_cfg.get("weights_bandwidth", [0.2, 0.5, 0.3])
+
+    gpu_temp = metrics.get("gpu_temp_c", 0.0)
+
+    if gpu_temp >= thermal_thresh:
+        w = w_thermal
+        preset = "thermal"
+    elif n_active_cameras >= bw_thresh:
+        w = w_bandwidth
+        preset = "bandwidth"
+    else:
+        w = w_normal
+        preset = "normal"
+
+    return float(w[0]), float(w[1]), float(w[2]), preset
+
+
+def _compute_load_score(metrics: dict, fps_stats: dict) -> tuple:
+    """
+    Compute load score with adaptive ω weights.
+
+    Formula:
+        base    = w_gpu * GPU_% + w_cpu * CPU_% + w_ram * RAM_%
+        penalty = max(0, (TARGET_FPS - avg_fps) / TARGET_FPS * fps_penalty_max)
         score   = min(100, base + penalty)
 
-    Ý nghĩa Penalty:
-        - Nếu FPS = 25 (target) → penalty = 0
-        - Nếu FPS = 12 (drop 50%) → penalty = +15 điểm
-        - Nếu FPS = 0 (pipeline ngừng) → penalty = +30 điểm (tối đa)
+    Returns (score: float, preset: str) where preset is the weight regime name.
+    The preset is included in the heartbeat so peers can see which regime each
+    node is operating in — this is the paper's "WAN context adaptation".
     """
+    ls_cfg = _EDGE_CFG.get("load_score", {})
+    fps_penalty_max = float(ls_cfg.get("fps_penalty_max", 30.0))
+
+    n_active = len([v for v in fps_stats.values() if v > 0.0])
+    w_gpu, w_cpu, w_ram, preset = _select_omega(metrics, n_active)
+
     base = (
-        0.5 * metrics["gpu_percent"] +
-        0.3 * metrics["cpu_percent"] +
-        0.2 * metrics["ram_percent"]
+        w_gpu * metrics["gpu_percent"] +
+        w_cpu * metrics["cpu_percent"] +
+        w_ram * metrics["ram_percent"]
     )
 
-    # Tính avg_fps từ tất cả camera đang chạy
-    # BUG-10: exclude cameras reporting 0.0 fps (stalled but not yet removed)
-    # so a single hung camera doesn't permanently max out the penalty term.
-    active_fps = [v for v in fps_stats.values() if v > 0.0]
-    if active_fps:
-        avg_fps = sum(active_fps) / len(active_fps)
+    active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
+    if active_fps_vals:
+        avg_fps = sum(active_fps_vals) / len(active_fps_vals)
     elif fps_stats:
-        # All cameras are at 0 fps — pipeline is truly stalled, apply full penalty
         avg_fps = 0.0
     else:
-        avg_fps = TARGET_FPS  # Không có dữ liệu → không phạt
+        avg_fps = TARGET_FPS   # no data → no penalty
 
     fps_drop = max(0.0, TARGET_FPS - avg_fps)
-    penalty = (fps_drop / TARGET_FPS) * 30.0  # tối đa +30 điểm
+    penalty  = (fps_drop / TARGET_FPS) * fps_penalty_max
 
     score = min(100.0, base + penalty)
-    return round(score, 1)
+    return round(score, 1), preset
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +229,8 @@ class HealthAgent:
         self._pub = None
         self._jtop = None          # persistent jtop session
         self._monitor_client = None  # own WS client when run standalone
+        # One-shot warmup_ms set by run_python.py after pipeline PLAYING
+        self._warmup_ms: Optional[float] = None
 
     def start(self) -> None:
         """Start agent in daemon thread."""
@@ -340,7 +399,7 @@ class HealthAgent:
 
                 metrics    = self._collect_metrics()
                 fps_stats  = _read_fps_stats()
-                load_score = _compute_load_score(metrics, fps_stats)
+                load_score, omega_preset = _compute_load_score(metrics, fps_stats)
 
                 # BUG-I fix: exclude 0-fps cameras from avg_fps, matching the
                 # exclusion applied in _compute_load_score() so the reported
@@ -348,11 +407,18 @@ class HealthAgent:
                 active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
                 avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
 
+                # Consume one-shot warmup_ms written by run_python.py after
+                # pipeline.set_state(PLAYING).  Reset after reading so it
+                # only appears in the first heartbeat following a cold start.
+                warmup_ms = self._warmup_ms
+                self._warmup_ms = None
+
                 payload = {
                     "type":          "health",
                     "node_id":       NODE_ID,
                     "timestamp":     time.time(),
                     "load_score":    load_score,
+                    "omega_preset":  omega_preset,   # adaptive weight regime name
                     "gpu_percent":   metrics["gpu_percent"],
                     "cpu_percent":   metrics["cpu_percent"],
                     "ram_percent":   metrics["ram_percent"],
@@ -365,10 +431,13 @@ class HealthAgent:
                     },
                 }
 
+                if warmup_ms is not None:
+                    payload["warmup_ms"] = warmup_ms
+
                 logger.info(
-                    "LoadScore=%.1f | GPU=%.1f%% CPU=%.1f%% RAM=%.1f%% "
+                    "LoadScore=%.1f [%s] | GPU=%.1f%% CPU=%.1f%% RAM=%.1f%% "
                     "Temp=%.1f°C Power=%.0fmW | FPS=%s",
-                    load_score,
+                    load_score, omega_preset,
                     metrics["gpu_percent"],
                     metrics["cpu_percent"],
                     metrics["ram_percent"],

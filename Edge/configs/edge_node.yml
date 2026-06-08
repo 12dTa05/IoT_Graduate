@@ -32,3 +32,47 @@ p2p:
     3: 18.5
     4: 14.5
 
+  # ---------------------------------------------------------------------------
+  # Multi-level offload (Levels 1–3 from the paper)
+  # offload_level: 0 = disabled (current behaviour)
+  #                1 = Level 1  full-stream RTSP migration (existing)
+  #                2 = Level 2  vehicle-crop offload
+  #                3 = Level 3  plate-crop offload
+  # The orchestrator escalates automatically: 3 → 2 → 1.
+  # Set offload_level: 0 to keep the system running exactly as before.
+  # ---------------------------------------------------------------------------
+  offload_level: 0
+
+  # Load thresholds that trigger each escalation step
+  offload_level3_threshold: 65.0   # ≥ this load → try plate-crop offload first
+  offload_level2_threshold: 75.0   # ≥ this load → escalate to vehicle-crop offload
+  offload_level1_threshold: 85.0   # ≥ this load → escalate to full stream migration
+
+  # Cooldown between level changes for the same camera (seconds)
+  offload_level_cooldown_s: 20.0
+
+  # TensorRT engine paths used by the offload receiver (Level 2 + 3)
+  lpr_engine_path: "models/lpr.engine"
+  lpd_engine_path: "models/lpd.engine"
+
+# ---------------------------------------------------------------------------
+# Load-score adaptive ω weights
+# Three presets; the health agent selects based on runtime context.
+#
+#   normal   — default balanced weights
+#   thermal  — shift weight to hardware-overload term when GPU is hot
+#   bandwidth— shift weight to CPU/throughput term when running many cameras
+#
+# weight order: [w_gpu, w_cpu, w_ram]  (must sum to 1.0)
+# ---------------------------------------------------------------------------
+load_score:
+  thermal_threshold_c: 75.0       # gpu_temp_c ≥ this → use thermal preset
+  stream_bandwidth_threshold: 3   # active_cameras ≥ this → use bandwidth preset
+
+  weights_normal:    [0.5, 0.3, 0.2]
+  weights_thermal:   [0.3, 0.2, 0.5]
+  weights_bandwidth: [0.2, 0.5, 0.3]
+
+  # FPS-drop penalty cap (additive points on top of weighted hardware score)
+  fps_penalty_max: 30.0
+
