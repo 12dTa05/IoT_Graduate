@@ -173,8 +173,11 @@ def build_pipeline(
     # ── Tiler (chỉ tạo nếu cần ghép lưới) ────────────────────────────────────
     if is_tiled:
         tiler = make_element("tiler", "nvmultistreamtiler")
-        # Sử dụng max_streams để cố định lưới (tránh VIC scaling error khi thay đổi động)
-        rows, cols = compute_tiler_layout(max_streams)
+        # Grid is computed from the INITIAL camera count so it looks square.
+        # It must NOT change while the pipeline is running — resizing rows/cols
+        # on a live tiler causes a VIC scaling crash on Jetson.  Dynamic add/remove
+        # reuses the existing slots without touching the grid dimensions.
+        rows, cols = compute_tiler_layout(n_cameras)
         tiler.set_property("rows", int(rows))
         tiler.set_property("columns", int(cols))
         tiler.set_property("width", mux_width)
