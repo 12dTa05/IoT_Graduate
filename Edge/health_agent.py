@@ -324,8 +324,20 @@ class HealthAgent:
         except Exception:
             pass
 
+        _zenoh_retry_interval = 30.0  # seconds between Zenoh reconnect attempts
+        _last_zenoh_attempt = time.time()
+
         while self._running:
             try:
+                # Periodically retry Zenoh if the session is not established
+                if self._session is None:
+                    if time.time() - _last_zenoh_attempt >= _zenoh_retry_interval:
+                        logger.info("[HealthAgent] Retrying Zenoh connection...")
+                        self._session, self._pub = self._connect_zenoh()
+                        _last_zenoh_attempt = time.time()
+                        if self._session:
+                            logger.info("[HealthAgent] Zenoh reconnected successfully.")
+
                 metrics    = self._collect_metrics()
                 fps_stats  = _read_fps_stats()
                 load_score = _compute_load_score(metrics, fps_stats)

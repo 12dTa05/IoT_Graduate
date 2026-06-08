@@ -76,10 +76,12 @@ async def index(request: web.Request) -> web.Response:
         return web.Response(text="Dashboard not found", status=404)
 
     html = html_path.read_text(encoding="utf-8")
+    # Derive WS scheme from the request scheme so WSS works behind TLS.
+    ws_scheme = "wss" if request.secure else "ws"
     config_json = json.dumps({
         "MEDIAMTX_API": "/api/streams",  # always use the server-side proxy
         "MEDIAMTX_WEBRTC_URL": os.getenv("MEDIAMTX_WEBRTC_URL", ""),
-        "WS_URL": f"ws://{request.host}/ws/server",
+        "WS_URL": f"{ws_scheme}://{request.host}/ws/server",
     })
     html = html.replace("<!-- SERVER_CONFIG -->",
                         f'<script id="server-config" type="application/json">{config_json}</script>')

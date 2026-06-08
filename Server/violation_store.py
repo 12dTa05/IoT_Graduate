@@ -45,7 +45,7 @@ class ViolationStore:
         date_str = time.strftime("%Y-%m-%d", time.localtime(ts))
 
         node_dir = self._root / date_str / node_id
-        node_dir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(node_dir.mkdir, parents=True, exist_ok=True)
 
         jsonl_path = node_dir / "violations.jsonl"
         snapshot_path: Optional[Path] = None

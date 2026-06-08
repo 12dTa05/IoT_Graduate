@@ -409,10 +409,9 @@ function getStreamNamesForCluster(clusterEdges) {
   const names = [];
   for (const edge of clusterEdges) {
     if (!edge.online) continue;
-    const pipeline = (edge.health || {}).pipeline || {};
-    if (pipeline.active_cameras && pipeline.active_cameras.length > 0) {
-      names.push(edge.node_id);
-    }
+    // One box per edge node: stream name = node_id (e.g. "jetson_A").
+    // The Jetson pushes its analyzed composite stream under that key.
+    names.push(edge.node_id);
   }
   return names;
 }
@@ -594,13 +593,12 @@ function renderVideoGrid() {
   const cluster = getCurrentCluster();
   let streamNames = [];
   if (cluster) {
+    // Only show one video box per registered edge node.
+    // Raw per-camera streams (cam_01, cam_02, …) pushed by zenoh_gateway
+    // are intentionally excluded — they are intermediate streams, not the
+    // analyzed output. The edge node pushes its analyzed stream under its
+    // own node_id (e.g. "jetson_A").
     streamNames = getStreamNamesForCluster(cluster.edges);
-  }
-  // Also include streams discovered from MediaMTX (RTSP push)
-  for (const name of mediaMtxStreamNames) {
-    if (!streamNames.includes(name)) {
-      streamNames.push(name);
-    }
   }
 
   // Clean up streams not in current cluster
@@ -656,7 +654,15 @@ function renderVideoGrid() {
 
       const label = document.createElement('div');
       label.className = 'label';
-      label.textContent = name;
+      label.dataset.nodeId = name;
+      // Show node_id + active camera count if known
+      const edgeInfo = edges[name];
+      const activeCams = edgeInfo && edgeInfo.health && edgeInfo.health.pipeline
+        ? (edgeInfo.health.pipeline.active_cameras || [])
+        : [];
+      label.textContent = activeCams.length > 0
+        ? `${name} (${activeCams.join(', ')})`
+        : name;
       cell.appendChild(label);
 
       const bitrateBadge = document.createElement('div');
@@ -1062,6 +1068,14 @@ function handleWSMessage(msg) {
         delete health.type;
         delete health.node_id;
         edge.health = health;
+        // Refresh the video cell label to show updated active cameras
+        const labelEl = VIDEO_GRID.querySelector(`[data-node-id="${msg.node_id}"]`);
+        if (labelEl) {
+          const activeCams = (health.pipeline && health.pipeline.active_cameras) || [];
+          labelEl.textContent = activeCams.length > 0
+            ? `${msg.node_id} (${activeCams.join(', ')})`
+            : msg.node_id;
+        }
         // In-place sidebar update for current cluster
         const cluster = getCurrentCluster();
         if (cluster && cluster.edges.some(e => e.node_id === msg.node_id)) {
@@ -1098,20 +1112,20 @@ async function pollStreams() {
     if (!resp.ok) return;
     const data = await resp.json();
     const items = data.items || [];
+    // Track all live MediaMTX stream names for availability checks,
+    // but do NOT add them to the video grid — only edge node_id streams
+    // (from getStreamNamesForCluster) are displayed.
     mediaMtxStreamNames = items
       .filter(p => p.source && p.source.type === 'rtspSession')
       .map(p => p.name);
 
-    // Merge with known streams from cluster edges
+    // Re-render grid only if the set of edge-derived stream names changed
     const cluster = getCurrentCluster();
     const edgeStreams = cluster ? getStreamNamesForCluster(cluster.edges) : [];
-    const allStreams = new Set([...mediaMtxStreamNames, ...edgeStreams]);
-
-    // Update grid if streams changed (new appear or existing disappear)
     const existingNames = Object.keys(streamStates);
     const needsUpdate =
-      [...allStreams].some(n => !existingNames.includes(n)) ||
-      existingNames.some(n => !allStreams.has(n));
+      edgeStreams.some(n => !existingNames.includes(n)) ||
+      existingNames.some(n => !edgeStreams.includes(n));
 
     if (needsUpdate) renderVideoGrid();
   } catch(e) {}

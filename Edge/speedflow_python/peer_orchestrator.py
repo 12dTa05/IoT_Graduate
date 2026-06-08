@@ -184,6 +184,9 @@ class PeerOrchestrator:
         # Used to return cameras when the original owner comes back online.
         self._rescued_cameras: Dict[str, str] = {}
 
+        # Penalty timestamp for this node itself (set on migration timeout rollback)
+        self._self_penalty_until: float = 0.0
+
         # Stop event for cleanly blocking start()
         self._stop_event = threading.Event()
         # Signaled once Zenoh session and publishers are ready
@@ -627,12 +630,10 @@ class PeerOrchestrator:
         if time.time() - last_mig < self._cfg.get("cooldown_s", 45.0):
             return
 
-        # ε5 — Penalty check
+        # ε5 — Penalty check (applied when this node previously caused a migration timeout)
         now = time.time()
-        with self._lock:
-            peer_self = self._peers.get(self._node_id)
-            if peer_self and now < peer_self.penalty_until:
-                return
+        if now < self._self_penalty_until:
+            return
 
         # All constraints pass — compute F(x)
         # F(x) = estimated load score after accepting this stream
@@ -716,14 +717,19 @@ class PeerOrchestrator:
             self._pending_acks.pop(camera_id, None)
 
         if not confirmed:
-            # Timeout — rollback
+            # Timeout — rollback: penalise the winner so we don't pick it again soon
             logger.error(
                 "[PeerOrch] TIMEOUT (%ds) waiting for ack from '%s' for '%s'. Rolling back.",
                 int(timeout), winner_node, camera_id,
             )
-            with self._lock:
-                if winner_node in self._peers:
-                    self._peers[winner_node].penalty_until = time.time() + self._cfg.get("cooldown_s", 45.0) * 2
+            penalty_until = time.time() + self._cfg.get("cooldown_s", 45.0) * 2
+            if winner_node == self._node_id:
+                # The winner is ourselves — set our own penalty field
+                self._self_penalty_until = penalty_until
+            else:
+                with self._lock:
+                    if winner_node in self._peers:
+                        self._peers[winner_node].penalty_until = penalty_until
             self._migration_log.log(
                 self._node_id, winner_node, camera_id,
                 "timeout", trigger_load, trigger_fps,
@@ -793,13 +799,12 @@ class PeerOrchestrator:
         now = time.time()
         timeout = cfg.get("heartbeat_timeout_s", 15.0)
 
-        # Get camera configs from the dead peer's last heartbeat.
-        # These contain the ORIGINAL URIs (e.g. on the dead node's subnet).
+        # Read dead peer's camera configs AND build alive_peers in a single lock
+        # acquisition to prevent torn reads between the two operations.
         with self._lock:
             dead_peer = self._peers.get(dead_node_id)
             peer_cam_configs = dead_peer.camera_configs if dead_peer else {}
 
-        with self._lock:
             # Build alive candidate list — includes self so this node can rescue too
             self_streams = len(self._self_state.active_cameras)
             self_eligible = (
