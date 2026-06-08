@@ -86,7 +86,7 @@ class MigrationLogger:
     HEADER = [
         "timestamp_iso", "from_node", "to_node", "camera_id",
         "trigger_reason", "trigger_load", "trigger_fps",
-        "migration_time_ms", "result",
+        "migration_time_ms", "result", "blind_spot_ms",
     ]
 
     def __init__(self, log_file: Path) -> None:
@@ -106,6 +106,7 @@ class MigrationLogger:
         trigger_fps: Optional[float],
         migration_time_ms: float,
         result: str,
+        blind_spot_ms: Optional[float] = None,
     ) -> None:
         row = [
             time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -115,6 +116,7 @@ class MigrationLogger:
             round(trigger_fps, 1) if trigger_fps is not None else "",
             round(migration_time_ms, 0),
             result,
+            round(blind_spot_ms, 0) if blind_spot_ms is not None else "",
         ]
         try:
             with open(self._path, "a", newline="", encoding="utf-8") as f:
@@ -187,6 +189,26 @@ class PeerOrchestrator:
         # Penalty timestamp for this node itself (set on migration timeout rollback)
         self._self_penalty_until: float = 0.0
 
+        # -----------------------------------------------------------------------
+        # Offload level table — shared with SpeedProbe (read from probe thread).
+        # Maps camera_id → offload level (0=none, 1=stream, 2=vehicle, 3=plate).
+        # Written only by the decision loop; read-only from the probe.
+        # Protected by _offload_lock (separate from _lock to avoid deadlock with
+        # the Zenoh callback thread which holds _lock).
+        # -----------------------------------------------------------------------
+        self._offload_table: Dict[str, int] = {}
+        self._offload_lock = threading.RLock()
+
+        # Per-camera timestamp of the last offload-level change (for cooldown)
+        self._offload_level_changed_at: Dict[str, float] = {}
+
+        # Target peer for each camera's offload (camera_id → node_id or "")
+        self._offload_targets: Dict[str, str] = {}
+
+        # Step-7: migration-complete timestamps for Δτ computation
+        # camera_id → unix timestamp when REMOVE was confirmed sent
+        self._migration_complete_ts: Dict[str, float] = {}
+
         # Stop event for cleanly blocking start()
         self._stop_event = threading.Event()
         # Signaled once Zenoh session and publishers are ready
@@ -244,6 +266,40 @@ class PeerOrchestrator:
         pub = self._pubs.get("status")
         if pub:
             pub.put(payload)
+
+    def get_offload_level(self, camera_id: str) -> int:
+        """
+        Return the current offload level for camera_id (0–3).
+        Called from SpeedProbe on every frame — must be lock-free fast.
+        Uses a separate RLock from the main _lock to avoid priority inversion
+        with the Zenoh callback thread.
+        """
+        with self._offload_lock:
+            return self._offload_table.get(camera_id, 0)
+
+    def get_offload_target(self, camera_id: str) -> str:
+        """Return the node_id of the offload peer for camera_id, or '' if none."""
+        with self._offload_lock:
+            return self._offload_targets.get(camera_id, "")
+
+    def set_offload_level(self, camera_id: str, level: int, target_node: str = "") -> None:
+        """
+        Set the offload level for camera_id.  Called only from the decision loop.
+        level 0 = local processing (clear offload)
+        level 3 = plate crop → peer
+        level 2 = vehicle crop → peer
+        level 1 = full stream migration (handled by existing RFO path)
+        """
+        with self._offload_lock:
+            old = self._offload_table.get(camera_id, 0)
+            self._offload_table[camera_id] = level
+            self._offload_targets[camera_id] = target_node
+            self._offload_level_changed_at[camera_id] = time.time()
+        if old != level:
+            logger.info(
+                "[PeerOrch] Offload level %d→%d for '%s' (target='%s')",
+                old, level, camera_id, target_node,
+            )
 
     def stop(self) -> None:
         """Stop orchestrator."""
@@ -440,38 +496,137 @@ class PeerOrchestrator:
 
     def _check_self_overload(self) -> None:
         """
-        Kiểm tra node này có quá tải không.
-        Nếu overload kéo dài hơn overload_duration_s → publish RFO.
-        """
-        cfg = self._cfg
-        now = time.time()
-        state = self._self_state
+        Checks if this node is overloaded and selects the cheapest offload
+        level first (3 → 2 → 1) before escalating.
 
-        # Cooldown tổng thể: bỏ qua nếu vừa migration xong (30s global)
-        # (cooldown per-camera được check trong _close_vote_window)
+        Level 3 (plate-crop offload) is tried when load ≥ level3_threshold.
+        Level 2 (vehicle-crop offload) escalates if load ≥ level2_threshold.
+        Level 1 (full-stream migration, existing RFO path) is the last resort.
+
+        All thresholds are read from edge_node.yml p2p section.
+        """
+        cfg   = self._cfg
+        now   = time.time()
+        state = self._self_state
 
         if state.overload_since is None:
             return
         if now - state.overload_since < cfg.get("overload_duration_s", 10.0):
             return
 
-        # Chọn camera để offload
+        load          = state.load_score
+        thr3          = cfg.get("offload_level3_threshold", 65.0)
+        thr2          = cfg.get("offload_level2_threshold", 75.0)
+        thr1          = cfg.get("offload_level1_threshold", 85.0)
+        level_cd      = cfg.get("offload_level_cooldown_s", 20.0)
+        global_offload = cfg.get("offload_level", 0)
+
+        # If offload is disabled in config, fall straight through to Level 1
+        if global_offload == 0:
+            self._trigger_level1_if_due(state, now, cfg)
+            return
+
         cam_to_offload = self._pick_camera_to_offload(state)
         if not cam_to_offload:
             return
 
-        # Check per-camera cooldown
+        # Check level-change cooldown for this camera
+        last_change = self._offload_level_changed_at.get(cam_to_offload, 0.0)
+        if now - last_change < level_cd:
+            return
+
+        current_level = self.get_offload_level(cam_to_offload)
+        best_peer     = self._pick_best_peer()
+
+        # Escalation ladder: 3 → 2 → 1
+        if load >= thr1 and global_offload >= 1:
+            # Full stream migration (Level 1) — existing RFO path
+            logger.warning(
+                "[PeerOrch] Load=%.1f ≥ L1 threshold=%.1f. Escalating to "
+                "Level 1 stream migration for '%s'.",
+                load, thr1, cam_to_offload,
+            )
+            self.set_offload_level(cam_to_offload, 0)   # clear fine-grained offload
+            last_mig = self._cam_cooldown.get(cam_to_offload, 0.0)
+            trigger  = "fps_drop" if (state.avg_fps and
+                                      state.avg_fps < cfg.get("eps_fps_strict", 18.0)
+                                      ) else "load_score"
+            if now - last_mig >= cfg.get("cooldown_s", 45.0):
+                logger.warning("[PeerOrch] RFO trigger: %s reason=%s", cam_to_offload, trigger)
+                self._trigger_rfo(cam_to_offload, relaxation_tier=0)
+
+        elif load >= thr2 and global_offload >= 2 and best_peer:
+            if current_level != 2:
+                logger.warning(
+                    "[PeerOrch] Load=%.1f ≥ L2 threshold=%.1f. "
+                    "Level 2 vehicle-crop offload for '%s' → '%s'.",
+                    load, thr2, cam_to_offload, best_peer,
+                )
+                self.set_offload_level(cam_to_offload, 2, target_node=best_peer)
+
+        elif load >= thr3 and global_offload >= 3 and best_peer:
+            if current_level != 3:
+                logger.warning(
+                    "[PeerOrch] Load=%.1f ≥ L3 threshold=%.1f. "
+                    "Level 3 plate-crop offload for '%s' → '%s'.",
+                    load, thr3, cam_to_offload, best_peer,
+                )
+                self.set_offload_level(cam_to_offload, 3, target_node=best_peer)
+
+        else:
+            # Load dropped below all thresholds — clear fine-grained offload
+            if current_level in (2, 3):
+                logger.info(
+                    "[PeerOrch] Load=%.1f below thresholds. Clearing offload for '%s'.",
+                    load, cam_to_offload,
+                )
+                self.set_offload_level(cam_to_offload, 0)
+
+    def _trigger_level1_if_due(self, state, now: float, cfg: dict) -> None:
+        """Legacy Level-1 overload trigger (existing behaviour, unchanged)."""
+        cam_to_offload = self._pick_camera_to_offload(state)
+        if not cam_to_offload:
+            return
         last_mig = self._cam_cooldown.get(cam_to_offload, 0.0)
         if now - last_mig < cfg.get("cooldown_s", 45.0):
             return
-
-        trigger_reason = "fps_drop" if (state.avg_fps and state.avg_fps < cfg.get("eps_fps_strict", 18.0)) else "load_score"
+        trigger_reason = (
+            "fps_drop"
+            if (state.avg_fps and state.avg_fps < cfg.get("eps_fps_strict", 18.0))
+            else "load_score"
+        )
         logger.warning(
             "[PeerOrch] OVERLOADED (%.1f%%, FPS=%s). Triggering RFO for '%s' (reason: %s)",
             state.load_score, state.avg_fps, cam_to_offload, trigger_reason,
         )
-
         self._trigger_rfo(cam_to_offload, relaxation_tier=0)
+
+    def _pick_best_peer(self) -> Optional[str]:
+        """
+        Return the node_id of the alive peer with the lowest load score,
+        subject to not being at stream capacity and not being in cooldown.
+        Returns None if no suitable peer is found.
+        """
+        now     = time.time()
+        timeout = self._cfg.get("heartbeat_timeout_s", 15.0)
+        best_id : Optional[str] = None
+        best_load = float("inf")
+
+        with self._lock:
+            for nid, peer in self._peers.items():
+                if nid == self._node_id:
+                    continue
+                if now - peer.last_seen > timeout:
+                    continue
+                if len(peer.active_cameras) >= peer.max_streams:
+                    continue
+                if now < peer.penalty_until:
+                    continue
+                if peer.load_score < best_load:
+                    best_load = peer.load_score
+                    best_id   = nid
+
+        return best_id
 
     # ------------------------------------------------------------------
     # Voting — Requester side
@@ -749,11 +904,21 @@ class PeerOrchestrator:
         self._cam_cooldown[camera_id] = time.time()
 
         elapsed_ms = time.time() * 1000 - start_ms
+        # Δτ: time from migration complete to first valid speed on the new node.
+        # The SpeedProbe on winner_node will update _first_valid_speed_ts once
+        # it produces its first valid measurement; that timestamp is compared
+        # against the local time here to get the Application Blind-spot duration.
+        # We record the migration-complete timestamp; blind_spot_ms is computed
+        # once the winner's first heartbeat confirms active FPS on this camera.
         self._migration_log.log(
             self._node_id, winner_node, camera_id,
             "overload", trigger_load, trigger_fps,
             elapsed_ms, "SUCCESS",
+            blind_spot_ms=None,   # filled in by _update_blind_spot() when known
         )
+        # Store migration-complete timestamp so _update_blind_spot can reference it
+        self._migration_complete_ts[camera_id] = time.time()
+
         logger.info(
             "[PeerOrch] Migration DONE in %.0fms: '%s' → %s",
             elapsed_ms, camera_id, winner_node,

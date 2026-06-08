@@ -6,6 +6,8 @@ Hỗ trợ Multi-Stream Dynamic.
 """
 import sys
 import os
+import logging
+import time
 import threading
 
 import gi
@@ -31,15 +33,22 @@ from .settings import (
 
 import yaml
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Shared probe setup
 # ---------------------------------------------------------------------------
 
-def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element, camera_manager: CameraManager) -> SpeedProbe:
+def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
+                  camera_manager: CameraManager,
+                  peer_orch=None,
+                  offload_pub=None) -> SpeedProbe:
     """
     Attach ROI filter, plate preprocessor, and speed probe to *pipeline*.
     Returns the SpeedProbe instance.
+
+    peer_orch:   PeerOrchestrator — lets the probe query offload levels.
+    offload_pub: OffloadPublisher — lets the probe send crops to peers.
     """
     # 1. ROI filter
     analytics = pipeline.get_by_name("analytics")
@@ -72,8 +81,10 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element, camera_manager: 
             )
             print("[Plate Preprocessor] Enabled")
 
-    # 3. Speed + LPR probe
-    probe = SpeedProbe(camera_manager)
+    # 3. Speed + LPR probe (pass peer_orch so it can query offload levels)
+    probe = SpeedProbe(camera_manager, peer_orch=peer_orch)
+    if offload_pub is not None:
+        probe.set_offload_publisher(offload_pub)
 
     tiler = pipeline.get_by_name("tiler")
     if tiler:
@@ -192,7 +203,7 @@ def _run_loop_until_eos_or_error(
 # Modes
 # ---------------------------------------------------------------------------
 
-def run_display_mode(args, camera_manager: CameraManager) -> None:
+def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None) -> None:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
@@ -205,18 +216,22 @@ def run_display_mode(args, camera_manager: CameraManager) -> None:
     pipeline, nvdsosd, streammux, source_bins = ret_build
     tiler = pipeline.get_by_name("tiler")
 
-    _setup_probes(pipeline, nvdsosd, camera_manager)
+    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
+    t0_playing = time.monotonic()
     ret = pipeline.set_state(Gst.State.PLAYING)
     if ret == Gst.StateChangeReturn.FAILURE:
         print("ERROR: Unable to set pipeline to PLAYING state", file=sys.stderr)
         sys.exit(1)
+    warmup_ms = (time.monotonic() - t0_playing) * 1000.0
+    probe.record_warmup_ms(warmup_ms)
+    logger.info("[Display] Pipeline PLAYING after %.0f ms (warmup)", warmup_ms)
 
     _run_loop_until_eos_or_error(pipeline, camera_manager)
 
 
-def run_file_mode(args, camera_manager: CameraManager) -> None:
+def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None) -> None:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
@@ -228,7 +243,7 @@ def run_file_mode(args, camera_manager: CameraManager) -> None:
     )
     pipeline, nvdsosd, streammux, source_bins = ret_build
 
-    _setup_probes(pipeline, nvdsosd, camera_manager)
+    _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, None)
 
     print(f"[Python File Mode] Processing multi-streams to output files...")
@@ -378,7 +393,7 @@ def _health_push_loop(peer_orch=None) -> None:
         _time.sleep(HEALTH_INTERVAL)
 
 
-def run_rtsp_push_mode(args, camera_manager: CameraManager) -> None:
+def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None) -> None:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
@@ -429,7 +444,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager) -> None:
         pipeline, nvdsosd, streammux, source_bins = ret_build
         tiler = pipeline.get_by_name("tiler")
 
-        _setup_probes(pipeline, nvdsosd, camera_manager)
+        _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub)
         _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
         ret = pipeline.set_state(Gst.State.PLAYING)
@@ -572,6 +587,39 @@ def run_python_mode(args) -> None:
     except Exception as exc:
         print(f"[Zenoh C2] Failed to start subscriber: {exc}", file=sys.stderr)
 
+    # --- Offload Publisher + Receiver (Level 2/3 crop offload) ---
+    offload_pub = None
+    offload_rcv = None
+    p2p_cfg     = edge_cfg.get("p2p", {})
+    if p2p_cfg.get("offload_level", 0) > 0 and peer_orch is not None:
+        try:
+            from .offload_publisher import OffloadPublisher
+            from .offload_receiver  import OffloadReceiver
+
+            offload_pub = OffloadPublisher(
+                node_id=NODE_ID,
+                session=peer_orch._session,
+            )
+            offload_pub.start()
+            print("[OffloadPub] Started.")
+
+            lpr_path    = S.ROOT / p2p_cfg.get("lpr_engine_path", "models/lpr.engine")
+            lpd_path    = S.ROOT / p2p_cfg.get("lpd_engine_path", "models/lpd.engine")
+            labels_path = S.ROOT / "configs" / "labels_lpr.txt"
+
+            offload_rcv = OffloadReceiver(
+                node_id=NODE_ID,
+                session=peer_orch._session,
+                lpr_engine_path=str(lpr_path),
+                lpd_engine_path=str(lpd_path),
+                labels_path=str(labels_path),
+            )
+            offload_rcv.start()
+            print("[OffloadRcv] Started.")
+
+        except Exception as exc:
+            print(f"[OffloadPub/Rcv] Failed to start: {exc}", file=sys.stderr)
+
     # --- MonitorClient (edge registration + health push) ---
     if MONITOR_URL:
         from speedflow_python.monitor_client import MonitorClient, set_default_client
@@ -587,11 +635,12 @@ def run_python_mode(args) -> None:
     _health_thread.start()
     print("[HealthPush] Started (metrics → Dashboard + Zenoh)")
 
+    # Run pipeline — offload_pub reference passed so SpeedProbe can use it
     if args.mode == "display":
-        run_display_mode(args, camera_manager)
+        probe = run_display_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub)
     elif args.mode == "file":
-        run_file_mode(args, camera_manager)
+        probe = run_file_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub)
     elif args.mode == "rtsp_push":
-        run_rtsp_push_mode(args, camera_manager)
+        probe = run_rtsp_push_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub)
     else:
         raise ValueError(f"Unknown mode: '{args.mode}'")

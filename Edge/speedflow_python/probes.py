@@ -18,10 +18,11 @@ Performance changes vs the original:
 import base64
 import json
 import os
+import queue
 import time
 import threading
 from collections import defaultdict, deque
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import gi
@@ -134,9 +135,13 @@ class SpeedProbe:
       • Speed, validation, median, plate quality, center distance: all C.
     """
 
-    def __init__(self, camera_manager: CameraManager, cooldown_s: float = 2.5):
+    def __init__(self, camera_manager: CameraManager, cooldown_s: float = 2.5,
+                 peer_orch=None):
         self.camera_manager = camera_manager
         self._node_id       = NODE_ID
+        # PeerOrchestrator reference — used to query offload level per camera.
+        # None means all cameras run local inference (default / backward-compat).
+        self._peer_orch = peer_orch
 
         # Per-track state  (stid = (source_id, track_id))
         self.history_positions  = defaultdict(deque)   # world-Y history
@@ -150,7 +155,9 @@ class SpeedProbe:
         self.last_area          = {}
 
         # Zenoh publisher (set externally via set_publisher)
-        self.publisher = None
+        self.publisher     = None
+        # OffloadPublisher for Level 2/3 crop sending (set via set_offload_publisher)
+        self._offload_pub  = None
 
         try:
             os.makedirs(str(SNAP_DIR), exist_ok=True)
@@ -165,6 +172,25 @@ class SpeedProbe:
         self.plate_detection_attempts    = defaultdict(int)
 
         self.last_cleanup_time = time.time()
+
+        # ── Step-3: warmup timing ──────────────────────────────────────────
+        # Set once by run_python.py after pipeline.set_state(PLAYING).
+        # health_agent reads it on the next heartbeat cycle.
+        self._warmup_ms: Optional[float] = None
+
+        # ── Step-7: Δτ measurement ─────────────────────────────────────────
+        # Records wall-clock time of the FIRST valid speed measurement per
+        # camera after it was added (used to compute Application Blind-spot).
+        # Key: camera_id (str), Value: unix timestamp (float)
+        self._first_valid_speed_ts: dict = {}
+
+        # ── Offload result injector ────────────────────────────────────────
+        # offload_receiver.py feeds decoded plate results into this queue.
+        # Drained at the top of every osd_sink_pad_buffer_probe call so results
+        # appear in the OSD overlay on the next frame after they arrive.
+        # Queue is thread-safe; maxsize prevents unbounded growth if results
+        # arrive faster than frames.
+        self._offload_result_q: queue.Queue = queue.Queue(maxsize=256)
 
         # FPS counter — sliding 1-second window per camera_id
         self._fps_timestamps: Dict[str, deque] = defaultdict(
@@ -185,6 +211,32 @@ class SpeedProbe:
 
     def set_publisher(self, publisher) -> None:
         self.publisher = publisher
+
+    def record_warmup_ms(self, warmup_ms: float) -> None:
+        """
+        Called by run_python.py immediately after pipeline.set_state(PLAYING).
+        The value is forwarded to the health_agent on the next heartbeat so it
+        appears in the peers/status heartbeat as 'warmup_ms' (paper §D_setup).
+        """
+        self._warmup_ms = warmup_ms
+
+    def set_offload_publisher(self, pub) -> None:
+        """
+        Set the OffloadPublisher instance used for Level 2/3 crop sending.
+        Called by run_python_mode after the orchestrator and publisher are ready.
+        """
+        self._offload_pub = pub
+
+    def inject_offload_result(self, result: dict) -> None:
+        """
+        Thread-safe entry point for OffloadReceiver to push decoded plate text
+        back into this probe.  Called from the offload receiver worker thread.
+        result: {stid, camera_id, frame_no, plate_text, confidence, ts}
+        """
+        try:
+            self._offload_result_q.put_nowait(result)
+        except queue.Full:
+            pass   # discard stale result — next frame will get a fresher one
 
     # ------------------------------------------------------------------
     # FPS counter
@@ -412,6 +464,18 @@ class SpeedProbe:
         _NTP_UNIX_OFFSET_NS = 2_208_988_800 * 1_000_000_000
         _MIN_VALID_UNIX_NS  = 946_684_800   * 1_000_000_000
 
+        # ── Drain offload results from peer receiver ───────────────────────
+        # Must happen before the frame loop so results land in OSD this frame.
+        while True:
+            try:
+                res    = self._offload_result_q.get_nowait()
+                stid_r = tuple(res.get("stid", []))
+                text_r = res.get("plate_text", "")
+                if stid_r and text_r:
+                    self.plate_locked[stid_r] = text_r
+            except queue.Empty:
+                break
+
         while l_frame:
             frame_meta   = pyds.NvDsFrameMeta.cast(l_frame.data)
             frame_number = frame_meta.frame_num
@@ -421,6 +485,14 @@ class SpeedProbe:
             if not cam_cfg:
                 l_frame = l_frame.next
                 continue
+
+            # ── Offload level for this camera ──────────────────────────────
+            # 0 = local, 2 = vehicle crops → peer, 3 = plate crops → peer
+            offload_level  = 0
+            offload_target = ""
+            if self._peer_orch is not None:
+                offload_level  = self._peer_orch.get_offload_level(cam_cfg.camera_id)
+                offload_target = self._peer_orch.get_offload_target(cam_cfg.camera_id)
 
             # ── Timestamp ─────────────────────────────────────────────────
             ts_ns = getattr(frame_meta, "ntp_timestamp", 0)
@@ -489,54 +561,110 @@ class SpeedProbe:
             else:
                 y_world_by_tid = {}
 
-            # ── Pass 2: License plate accumulation ────────────────────────
-            for plate_info in plates_in_frame:
-                vehicle_id = self._associate_plate_to_vehicle(
-                    plate_info["bbox"], vehicles_in_frame
-                )
-                if vehicle_id is None:
-                    continue
-
-                stid = (source_id, vehicle_id)
-                if stid in self.plate_locked:
-                    continue
-
-                if stid not in self.plate_detection_start_frame:
-                    self.plate_detection_start_frame[stid] = frame_number
-
-                frames_in_window = (frame_number
-                                    - self.plate_detection_start_frame[stid])
-
-                if frames_in_window < self.PLATE_DETECTION_FRAMES:
-                    plate_text = self._extract_lpr_text(plate_info["obj_meta"])
-                    if plate_text:
-                        bb = plate_info["bbox"]
-                        quality = sf.plate_quality(
-                            bb["width"], bb["height"], plate_info["conf"]
-                        )
-                        self.plate_candidates[stid].append({
-                            "text":    plate_text,
-                            "conf":    plate_info["conf"],
-                            "bbox":    bb,
-                            "quality": quality,
-                            "frame":   frame_number,
-                        })
-                else:
-                    best = self._select_best_plate_from_candidates(
-                        self.plate_candidates[stid]
+            # ── Pass 2: License plate accumulation or Level-3 offload ────────
+            # Level 3: plate crops are sent to the peer; local accumulation skipped.
+            if offload_level == 3 and self._offload_pub is not None and offload_target:
+                for plate_info in plates_in_frame:
+                    vehicle_id = self._associate_plate_to_vehicle(
+                        plate_info["bbox"], vehicles_in_frame
                     )
-                    if best:
-                        self.plate_locked[stid] = best
+                    if vehicle_id is None:
+                        continue
+                    stid = (source_id, vehicle_id)
+                    if stid in self.plate_locked:
+                        continue
+                    try:
+                        frame_bgr_off = self._frame_bgr_from_gst_buffer(gst_buffer, frame_meta)
+                        if frame_bgr_off is not None:
+                            bb = plate_info["bbox"]
+                            px = max(0, int(bb["left"]))
+                            py = max(0, int(bb["top"]))
+                            pw = max(1, int(bb["width"]))
+                            ph = max(1, int(bb["height"]))
+                            plate_crop = frame_bgr_off[py:py+ph, px:px+pw]
+                            if plate_crop.size > 0:
+                                self._offload_pub.put_plate(
+                                    target_node=offload_target,
+                                    stid=stid,
+                                    camera_id=cam_cfg.camera_id,
+                                    frame_no=frame_number,
+                                    crop_bgr=plate_crop,
+                                    confidence=plate_info.get("conf", 0.0),
+                                )
+                    except Exception:
+                        pass
+
+            else:
+                # Normal local plate accumulation
+                for plate_info in plates_in_frame:
+                    vehicle_id = self._associate_plate_to_vehicle(
+                        plate_info["bbox"], vehicles_in_frame
+                    )
+                    if vehicle_id is None:
+                        continue
+
+                    stid = (source_id, vehicle_id)
+                    if stid in self.plate_locked:
+                        continue
+
+                    if stid not in self.plate_detection_start_frame:
+                        self.plate_detection_start_frame[stid] = frame_number
+
+                    frames_in_window = (frame_number
+                                        - self.plate_detection_start_frame[stid])
+
+                    if frames_in_window < self.PLATE_DETECTION_FRAMES:
+                        plate_text = self._extract_lpr_text(plate_info["obj_meta"])
+                        if plate_text:
+                            bb = plate_info["bbox"]
+                            quality = sf.plate_quality(
+                                bb["width"], bb["height"], plate_info["conf"]
+                            )
+                            self.plate_candidates[stid].append({
+                                "text":    plate_text,
+                                "conf":    plate_info["conf"],
+                                "bbox":    bb,
+                                "quality": quality,
+                                "frame":   frame_number,
+                            })
                     else:
-                        self.plate_detection_attempts[stid] += 1
-                        if self.plate_detection_attempts[stid] < 3:
-                            self.plate_detection_start_frame[stid] = frame_number
-                            self.plate_candidates[stid] = []
+                        best = self._select_best_plate_from_candidates(
+                            self.plate_candidates[stid]
+                        )
+                        if best:
+                            self.plate_locked[stid] = best
                         else:
-                            self.plate_locked[stid] = None
+                            self.plate_detection_attempts[stid] += 1
+                            if self.plate_detection_attempts[stid] < 3:
+                                self.plate_detection_start_frame[stid] = frame_number
+                                self.plate_candidates[stid] = []
+                            else:
+                                self.plate_locked[stid] = None
 
             # ── Pass 3: Speed & OSD display ───────────────────────────────
             fps_int = int(cam_cfg.fps)
+
+            # Level 2: send full vehicle crops to peer; skip local speed/plate display
+            if offload_level == 2 and self._offload_pub is not None and offload_target:
+                try:
+                    frame_bgr_l2 = self._frame_bgr_from_gst_buffer(gst_buffer, frame_meta)
+                    if frame_bgr_l2 is not None:
+                        for tid, veh_info in vehicles_in_frame.items():
+                            stid = (source_id, tid)
+                            veh_crop = self._crop_bbox(frame_bgr_l2, veh_info["obj_meta"])
+                            if veh_crop is not None and veh_crop.size > 0:
+                                self._offload_pub.put_vehicle(
+                                    target_node=offload_target,
+                                    stid=stid,
+                                    camera_id=cam_cfg.camera_id,
+                                    frame_no=frame_number,
+                                    crop_bgr=veh_crop,
+                                    bbox_world_y=y_world_by_tid.get(tid, 0.0),
+                                )
+                except Exception:
+                    pass
+                l_frame = l_frame.next
+                continue   # skip local speed compute for this frame
 
             for tid, veh_info in vehicles_in_frame.items():
                 stid     = (source_id, tid)
@@ -598,6 +726,10 @@ class SpeedProbe:
                             display_text                     = f"{int(speed_smooth)} km/h"
                             self.last_speed_text[stid]       = display_text
                             self.last_update_frame[stid]     = frame_number
+
+                            # ── Step-7: Δτ — record first valid speed ──
+                            if cam_cfg.camera_id not in self._first_valid_speed_ts:
+                                self._first_valid_speed_ts[cam_cfg.camera_id] = time.time()
 
                             if speed_smooth >= cam_cfg.speed_limit_kmh:
                                 crop = None
