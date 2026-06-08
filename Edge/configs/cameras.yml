@@ -11,6 +11,10 @@
 # Để thêm camera: copy block cam_XX, đặt enabled: true
 # Để tắt camera:  đặt enabled: false (KHÔNG xóa, hệ thống sẽ xóa luồng động)
 # Khi file này được lưu, hệ thống sẽ tự phát hiện thay đổi (<10ms qua inotify)
+#
+# NOTE: source_points and roi_polygon are in MUX resolution (1280×720).
+# If MUX_WIDTH/MUX_HEIGHT changes, scale all coordinates by the new ratio.
+# Original 1920×1080 coords scaled by 1280/1920=0.6667, 720/1080=0.6667.
 # ============================================================
 max_streams: 8
 
@@ -32,13 +36,13 @@ cameras:
     speed_limit_kmh: 80.0
     homography:
       source_points:
-        - [1896, 813]
-        - [288, 818]
-        - [632, 218]
-        - [1240, 224]
-      target_width: 18
-      target_height: 50
-    roi_polygon: [1896, 813, 288, 818, 632, 218, 1240, 224]
+        - [1264, 542]
+        - [192,  545]
+        - [421,  145]
+        - [827,  149]
+      target_width: 15
+      target_height: 35
+    roi_polygon: [1264, 542, 192, 545, 421, 145, 827, 149]
     output:
       record: true
       record_path: "output/cam_01.mp4"
@@ -53,13 +57,13 @@ cameras:
     speed_limit_kmh: 80.0
     homography:
       source_points:
-        - [1896, 813]
-        - [288, 818]
-        - [632, 218]
-        - [1240, 224]
-      target_width: 18
-      target_height: 50
-    roi_polygon: [1896, 813, 288, 818, 632, 218, 1240, 224]
+        - [1264, 542]
+        - [192,  545]
+        - [421,  145]
+        - [827,  149]
+      target_width: 15
+      target_height: 35
+    roi_polygon: [1264, 542, 192, 545, 421, 145, 827, 149]
     output:
       record: true
       record_path: "output/cam_02.mp4"
@@ -74,13 +78,13 @@ cameras:
     speed_limit_kmh: 80.0
     homography:
       source_points:
-        - [1896, 813]
-        - [288, 818]
-        - [632, 218]
-        - [1240, 224]
-      target_width: 18
-      target_height: 50
-    roi_polygon: [1896, 813, 288, 818, 632, 218, 1240, 224]
+        - [1264, 542]
+        - [192,  545]
+        - [421,  145]
+        - [827,  149]
+      target_width: 15
+      target_height: 35
+    roi_polygon: [1264, 542, 192, 545, 421, 145, 827, 149]
     output:
       record: false
       record_path: "output/cam_03.mp4"
@@ -95,13 +99,13 @@ cameras:
     speed_limit_kmh: 80.0
     homography:
       source_points:
-        - [1896, 813]
-        - [288, 818]
-        - [632, 218]
-        - [1240, 224]
-      target_width: 18
-      target_height: 50
-    roi_polygon: [1896, 813, 288, 818, 632, 218, 1240, 224]
+        - [1264, 542]
+        - [192,  545]
+        - [421,  145]
+        - [827,  149]
+      target_width: 15
+      target_height: 35
+    roi_polygon: [1264, 542, 192, 545, 421, 145, 827, 149]
     output:
       record: true
       record_path: "output/cam_04.mp4"
@@ -116,13 +120,13 @@ cameras:
   #   speed_limit_kmh: 80.0
   #   homography:
   #     source_points:
-  #       - [1896, 813]
-  #       - [288, 818]
-  #       - [632, 218]
-  #       - [1240, 224]
+  #       - [1264, 542]
+  #       - [192,  545]
+  #       - [421,  145]
+  #       - [827,  149]
   #     target_width: 18
   #     target_height: 50
-  #   roi_polygon: [1896, 813, 288, 818, 632, 218, 1240, 224]
+  #   roi_polygon: [1264, 542, 192, 545, 421, 145, 827, 149]
   #   output:
   #     record: true
   #     record_path: "output/cam_05.mp4"
@@ -137,13 +141,14 @@ cameras:
   #   speed_limit_kmh: 80.0
   #   homography:
   #     source_points:
-  #       - [1896, 813]
-  #       - [288, 818]
-  #       - [632, 218]
-  #       - [1240, 224]
+  #       - [1264, 542]
+  #       - [192,  545]
+  #       - [421,  145]
+  #       - [827,  149]
   #     target_width: 18
   #     target_height: 50
-  #   roi_polygon: [1896, 813, 288, 818, 632, 218, 1240, 224]
+  #   roi_polygon: [1264, 542, 192, 545, 421, 145, 827, 149]
   #   output:
   #     record: true
   #     record_path: "output/cam_06.mp4"
+
