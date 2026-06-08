@@ -106,7 +106,10 @@ class SpeedProbe:
         self._node_id = NODE_ID
 
         # Trạng thái theo key: stid = (source_id, track_id)
-        self.history_positions = defaultdict(list)
+        # history_positions stores world-Y coordinates as a deque (O(1) popleft)
+        # The maxlen is not fixed at init since it depends on per-camera FPS;
+        # we use an unbounded deque and trim manually in the probe loop.
+        self.history_positions = defaultdict(deque)
         self.last_speed_text   = defaultdict(str)
         self.last_update_frame = defaultdict(lambda: -1000)
 
@@ -453,8 +456,20 @@ class SpeedProbe:
                 l_frame = l_frame.next
                 continue
 
-            ts_ns = getattr(frame_meta, "ntp_timestamp", 0) or int(time.time() * 1e9)
-            ts_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts_ns / 1e9))
+            ts_ns = getattr(frame_meta, "ntp_timestamp", 0)
+            # DeepStream ntp_timestamp is nanoseconds since the NTP epoch (Jan 1 1900).
+            # Convert to Unix epoch (Jan 1 1970) by subtracting 70 years in seconds.
+            # If the value is 0 or clearly invalid (before 2000-01-01 Unix), fall
+            # back to the current wall-clock time.
+            _NTP_UNIX_OFFSET_NS = 2_208_988_800 * 1_000_000_000  # 70 years in ns
+            _MIN_VALID_UNIX_NS = 946_684_800 * 1_000_000_000     # 2000-01-01 in ns
+            if ts_ns and ts_ns > _NTP_UNIX_OFFSET_NS:
+                unix_ns = ts_ns - _NTP_UNIX_OFFSET_NS
+            else:
+                unix_ns = int(time.time() * 1e9)
+            if unix_ns < _MIN_VALID_UNIX_NS:
+                unix_ns = int(time.time() * 1e9)
+            ts_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(unix_ns / 1e9))
 
             # Đếm FPS: đánh dấu một frame đã xử lý cho camera này
             self._tick_fps(cam_cfg.camera_id)
@@ -543,10 +558,10 @@ class SpeedProbe:
                 hist = self.history_positions[stid]
                 hist.append(y_world)
                 
-                # Maintain list size based on FPS (~ 1.5 seconds max)
+                # Maintain deque size based on FPS (~ 1.5 seconds max) — O(1) with deque
                 max_hist_len = int(cam_cfg.fps * 1.5)
-                if len(hist) > max_hist_len:
-                    hist.pop(0)
+                while len(hist) > max_hist_len:
+                    hist.popleft()
 
                 if stid not in self.track_birth_frame:
                     self.track_birth_frame[stid] = frame_number

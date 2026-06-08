@@ -370,8 +370,11 @@ def _health_push_loop(peer_orch=None) -> None:
             if peer_orch is not None:
                 peer_orch.publish_status(_msgpack.packb(payload, use_bin_type=True))
 
-        except Exception:
-            pass
+        except Exception as _exc:
+            import logging as _logging
+            _logging.getLogger("health_push").warning(
+                "[HealthPush] Exception in health loop (will retry): %s", _exc, exc_info=True
+            )
         _time.sleep(HEALTH_INTERVAL)
 
 
