@@ -451,6 +451,12 @@ async function startWhepPlayer(streamName, videoEl, onStats) {
   pc.ontrack = (evt) => {
     if (evt.track.kind === 'video' && videoEl) {
       videoEl.srcObject = evt.streams[0];
+      // Update status badge to "live" once media flows
+      const cell = videoEl.parentElement;
+      if (cell) {
+        const badge = cell.querySelector('.status-badge');
+        if (badge) { badge.className = 'status-badge live'; badge.textContent = 'Live'; }
+      }
     }
   };
 
@@ -463,21 +469,10 @@ async function startWhepPlayer(streamName, videoEl, onStats) {
     return null;
   }
 
-  await new Promise((resolve) => {
-    if (pc.iceGatheringState === 'complete') { resolve(); return; }
-    const handler = () => {
-      if (pc.iceGatheringState === 'complete') {
-        pc.removeEventListener('icegatheringstatechange', handler);
-        resolve();
-      }
-    };
-    pc.addEventListener('icegatheringstatechange', handler);
-    setTimeout(() => {
-      pc.removeEventListener('icegatheringstatechange', handler);
-      resolve();
-    }, 5000);
-  });
-
+  // Send immediately — do NOT wait for local ICE gathering to complete.
+  // MediaMTX includes all server-side ICE candidates (public IP) directly in
+  // the SDP answer, so the browser can start connectivity checks right away
+  // without needing to finish its own gathering first.
   try {
     const resp = await fetch(whepUrl, {
       method: 'POST',
