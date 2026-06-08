@@ -28,7 +28,7 @@ cameras:
     uri: "rtsp://192.168.212.20:8554/cam1"
     enabled: true
     name: "Camera 01"
-    fps: 60.0
+    fps: 25.0
     speed_limit_kmh: 80.0
     homography:
       source_points:
@@ -49,7 +49,7 @@ cameras:
     uri: "rtsp://192.168.212.20:8554/cam2"
     enabled: true
     name: "Camera02 - Điểm đo phía Nam"
-    fps: 60.0
+    fps: 25.0
     speed_limit_kmh: 80.0
     homography:
       source_points:
@@ -70,7 +70,7 @@ cameras:
     uri: "rtsp://192.168.212.20:8554/cam3"
     enabled: true
     name: "Camera 03 - Giao lộ Đông"
-    fps: 60.0
+    fps: 25.0
     speed_limit_kmh: 80.0
     homography:
       source_points:
@@ -91,7 +91,7 @@ cameras:
     uri: "rtsp://192.168.212.20:8554/cam4"
     enabled: true
     name: "Camera 04 - Dự phòng"
-    fps: 60.0
+    fps: 25.0
     speed_limit_kmh: 80.0
     homography:
       source_points:
