@@ -5,8 +5,7 @@ logDestinations: [stdout]
 # ── RTSP server ──────────────────────────────────────────────
 rtsp: yes
 rtspAddress: :8554
-# TCP avoids UDP fragmentation loss on congested LAN
-protocols: [tcp]
+rtspTransports: [tcp]
 
 # ── Disable unused protocols to save overhead ────────────────
 rtmp: no
@@ -18,6 +17,3 @@ api: no
 paths:
   all_others:
     source: publisher
-    # Drop frames when the Jetson reader is slow instead of buffering
-    # indefinitely — prevents unbounded memory growth
-    readBufferCount: 512

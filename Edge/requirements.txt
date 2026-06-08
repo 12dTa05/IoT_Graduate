@@ -16,6 +16,7 @@ psutil>=5.9.0
 # --- Networking / Messaging ---
 websocket-client>=1.6.0          # MonitorClient WS to Dashboard
 aiohttp>=3.9.0                   # PeerOrchestrator REST fallback
+aiofiles>=23.0.0                 # violation_store async file writes
 eclipse-zenoh>=1.0.0             # P2P peer orchestration
 
 # --- Dynamic Camera Config ---
