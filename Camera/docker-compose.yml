@@ -30,3 +30,26 @@ services:
       - ./videos:/videos
     restart: unless-stopped
 
+  cam3:
+    build: .
+    container_name: cam3
+    depends_on:
+      - rtsp_server
+    environment:
+      - VIDEO_FILE=/videos/sample.mp4
+      - RTSP_URL=rtsp://rtsp_server:8554/cam3
+    volumes:
+      - ./videos:/videos
+    restart: unless-stopped
+
+  cam4:
+    build: .
+    container_name: cam4
+    depends_on:
+      - rtsp_server
+    environment:
+      - VIDEO_FILE=/videos/sample.mp4
+      - RTSP_URL=rtsp://rtsp_server:8554/cam4
+    volumes:
+      - ./videos:/videos
+    restart: unless-stopped
