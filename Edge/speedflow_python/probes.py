@@ -415,7 +415,7 @@ class SpeedProbe:
     # Stale-track cleanup  (every 30 s)
     # ------------------------------------------------------------------
 
-    def _periodic_cleanup(self, current_time: float) -> None:
+    def _periodic_cleanup(self, current_time: float, current_frame: int) -> None:
         if current_time - self.last_cleanup_time < 30.0:
             return
         self.last_cleanup_time = current_time
@@ -427,13 +427,35 @@ class SpeedProbe:
         all_stids.update(self.last_speed_text.keys())
         all_stids.update(self.plate_locked.keys())
 
-        stale_cutoff = current_time - 60.0
-        stale_keys = [
-            stid for stid in all_stids
-            if self.last_alert_ts.get(stid, 0.0) <= stale_cutoff
-            and not (stid in self.history_positions
-                     and len(self.history_positions[stid]) > 0)
-        ]
+        # BUG-5 fix: use last_update_frame age to detect stale tracks, not
+        # last_alert_ts (which is only set on overspeed events and remains 0
+        # for slow vehicles).  A track is stale if it hasn't produced a valid
+        # speed reading for >60 s worth of frames AND its history deque is
+        # empty (vehicle has left the scene).  Using history being non-empty
+        # alone was wrong — the deque retains up to 1.5 s of old positions
+        # even after the vehicle leaves the ROI.
+        # We use a 60-second wall-clock staleness guard via last_alert_ts as
+        # a secondary gate only when last_update_frame was never set (i.e.,
+        # the track never produced a valid speed).
+        max_fps_estimate = 30  # conservative upper bound
+        stale_frame_age  = int(60 * max_fps_estimate)  # 60 s × 30 fps = 1800 frames
+        stale_cutoff_ts  = current_time - 60.0
+
+        stale_keys = []
+        for stid in all_stids:
+            last_frame = self.last_update_frame.get(stid, -1000)
+            age_frames = current_frame - last_frame
+            if age_frames < stale_frame_age:
+                # Recently updated — keep
+                continue
+            # Old enough; also verify history is empty (vehicle gone)
+            hist = self.history_positions.get(stid)
+            if hist and len(hist) > 0:
+                # Still has positional history: vehicle may still be in frame.
+                # Only evict if the alert timestamp is also stale (>60 s).
+                if self.last_alert_ts.get(stid, 0.0) > stale_cutoff_ts:
+                    continue
+            stale_keys.append(stid)
 
         for stid in stale_keys:
             self.history_positions.pop(stid, None)
@@ -779,7 +801,10 @@ class SpeedProbe:
                                     cam_cfg.source_points,
                                     color=(0.0, 1.0, 0.0, 1.0))
 
-            self._periodic_cleanup(time.time())
+            # BUG-16 fix: reuse unix_ns / ts already computed above instead of
+            # calling time.time() again on every frame.  BUG-5 fix: pass
+            # frame_number so the cleanup can use frame-age staleness.
+            self._periodic_cleanup(unix_ns / 1e9, frame_number)
             l_frame = l_frame.next
 
         return Gst.PadProbeReturn.OK

@@ -17,11 +17,18 @@ class ViolationStore:
     def __init__(self, data_dir: str | Path) -> None:
         self._root = Path(data_dir)
         self._root.mkdir(parents=True, exist_ok=True)
-        # Single asyncio.Lock guards all async writes.  The old sync save()
-        # and threading.Lock have been removed (BUG-A fix): two separate lock
-        # objects for the same file created a data race between the sync and
-        # async code paths.  All production writes go through save_async().
-        self._async_write_lock = asyncio.Lock()
+        # BUG-17 fix: do NOT create asyncio.Lock() at __init__ time.
+        # On Python 3.8-3.9, a Lock created before asyncio.run() starts is
+        # bound to the default (possibly wrong) event loop and raises
+        # "Task got Future attached to a different loop" at runtime.
+        # We create it lazily on the first coroutine call instead.
+        self._async_write_lock: Optional[asyncio.Lock] = None
+
+    def _get_write_lock(self) -> asyncio.Lock:
+        """Return the write lock, creating it lazily inside the running loop."""
+        if self._async_write_lock is None:
+            self._async_write_lock = asyncio.Lock()
+        return self._async_write_lock
 
     async def save_async(self, record: Dict[str, Any]) -> Optional[Path]:
         node_id = record.get("node_id", "unknown")
@@ -62,7 +69,7 @@ class ViolationStore:
             except Exception as exc:
                 logger.warning("Failed to save snapshot for %s/%s: %s", node_id, camera_id, exc)
 
-        async with self._async_write_lock:
+        async with self._get_write_lock():
             try:
                 async with aiofiles.open(jsonl_path, "a") as f:
                     await f.write(json.dumps(record, default=str) + "\n")

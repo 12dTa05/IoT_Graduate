@@ -204,6 +204,11 @@ class CameraManager:
         """
         Khởi động watcher và processor.
 
+        BUG-11 fix: this method is now safe to call multiple times (e.g. on
+        pipeline restart inside run_rtsp_push_mode).  On a re-call we update
+        the callbacks and restart only the threads/observer that have stopped;
+        the CameraManager's in-memory config state is preserved across calls.
+
         Args:
             on_add:         Gọi khi cần thêm luồng mới vào GStreamer pipeline.
             on_remove:      Gọi khi cần xóa luồng (source_id) khỏi pipeline.
@@ -215,16 +220,20 @@ class CameraManager:
         self._glib_idle_add = glib_idle_add
         self._running = True
 
-        # Khởi động processor thread (consume delta_q)
-        self._processor_thread = threading.Thread(
-            target=self._processor_loop,
-            name="CameraManager-Processor",
-            daemon=True,
-        )
-        self._processor_thread.start()
+        # Restart processor thread if it has exited
+        if (self._processor_thread is None
+                or not self._processor_thread.is_alive()):
+            self._processor_thread = threading.Thread(
+                target=self._processor_loop,
+                name="CameraManager-Processor",
+                daemon=True,
+            )
+            self._processor_thread.start()
 
-        # Khởi động watchdog observer (inotify)
-        self._start_watchdog()
+        # Restart watchdog observer if it has stopped
+        if self._observer is None or not self._observer.is_alive():
+            self._start_watchdog()
+
         logger.info("[CameraManager] Started. Watching: %s", self.yml_path)
 
     def stop(self) -> None:

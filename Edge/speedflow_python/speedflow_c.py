@@ -140,6 +140,24 @@ def _declare_signatures() -> None:
 _load_lib()
 
 
+# BUG-12 fix: pre-allocate the three CLAHE handles used by the Python
+# fallback of enhance_bgr_inplace() so we don't call cv2.createCLAHE()
+# on every frame.  This mirrors the static cv::Ptr<cv::CLAHE> objects in
+# plate_enhance.cpp.  Initialised lazily on first use to avoid importing
+# cv2 at module load time (cv2 is not available in all environments).
+_clahe_cache: dict = {}   # clip_limit (float) → cv2.CLAHE instance
+
+
+def _get_clahe(clip_limit: float):
+    """Return a cached CLAHE handle for the given clip limit."""
+    if clip_limit not in _clahe_cache:
+        import cv2 as _cv2
+        _clahe_cache[clip_limit] = _cv2.createCLAHE(
+            clipLimit=clip_limit, tileGridSize=(8, 8)
+        )
+    return _clahe_cache[clip_limit]
+
+
 # ---------------------------------------------------------------------------
 # Public API — thin wrappers with Python fallbacks
 # ---------------------------------------------------------------------------
@@ -405,7 +423,10 @@ def enhance_bgr_inplace(bgr: np.ndarray, motion_level: int) -> np.ndarray:
     out = cv2.filter2D(out, -1, kernel)
     lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
+    # BUG-12 fix: reuse a cached CLAHE handle instead of creating a new one
+    # on every call.  cv2.createCLAHE() is non-trivial and was being called
+    # at 30 fps × N cameras in the Python fallback path.
+    clahe = _get_clahe(clip)
     l = clahe.apply(l)
     out = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
     np.copyto(bgr, out)

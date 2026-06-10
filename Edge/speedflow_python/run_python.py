@@ -266,6 +266,19 @@ def _health_push_loop(peer_orch=None) -> None:
     import msgpack as _msgpack
     import yaml as _yaml
 
+    # BUG-4 / BUG-9 fix: delegate metric collection and load-score computation
+    # to health_agent's functions so that:
+    #   - Adaptive omega weights (thermal / bandwidth / normal) are applied.
+    #   - The CPU formula is identical to health_agent.py (100 - idle%), not
+    #     the incorrect per-core average that was here before.
+    # This ensures peers/status heartbeats always carry a consistent load score
+    # regardless of which process (main.py or health_agent.py) publishes them.
+    from health_agent import (
+        _collect_jetson_metrics as _collect_metrics_fn,
+        _compute_load_score     as _compute_load_fn,
+        _read_fps_stats         as _read_fps_fn,
+    )
+
     _fps_file = _Path(FPS_STATS_FILE)
 
     # Load camera configs once so peers know the original URIs for failover
@@ -276,15 +289,15 @@ def _health_push_loop(peer_orch=None) -> None:
         for cam_id, cfg in raw.get("cameras", {}).items():
             if cfg and cfg.get("enabled", True):
                 _cam_configs[cam_id] = {
-                    "camera_id": cam_id,
-                    "source_id": int(cfg.get("source_id", 0)),
-                    "uri": cfg.get("uri", ""),
-                    "name": cfg.get("name", cam_id),
-                    "fps": float(cfg.get("fps", 25.0)),
+                    "camera_id":       cam_id,
+                    "source_id":       int(cfg.get("source_id", 0)),
+                    "uri":             cfg.get("uri", ""),
+                    "name":            cfg.get("name", cam_id),
+                    "fps":             float(cfg.get("fps", 25.0)),
                     "speed_limit_kmh": float(cfg.get("speed_limit_kmh", 80.0)),
-                    "homography": cfg.get("homography", {}),
-                    "roi_polygon": cfg.get("roi_polygon", []),
-                    "output": cfg.get("output", {}),
+                    "homography":      cfg.get("homography", {}),
+                    "roi_polygon":     cfg.get("roi_polygon", []),
+                    "output":          cfg.get("output", {}),
                 }
     except Exception:
         pass
@@ -298,81 +311,55 @@ def _health_push_loop(peer_orch=None) -> None:
     except Exception:
         pass
 
-    try:
-        import psutil
-    except ImportError:
-        psutil = None
+    # Monkey-patch the module-level jtop reference so _collect_metrics_fn
+    # picks up our persistent session instead of opening a new one.
+    import health_agent as _ha
+    _ha_orig_jtop = _ha.HealthAgent  # keep reference; we don't modify the class
+
+    # Create a minimal stub so _collect_metrics_fn can use _jtop
+    class _JtopWrapper:
+        def __init__(self, j):
+            self._j = j
+        @property
+        def stats(self):    return self._j.stats if self._j else None
+        @property
+        def memory(self):   return self._j.memory if self._j else None
+        @property
+        def temperature(self): return self._j.temperature if self._j else {}
+        @property
+        def power(self):    return self._j.power if self._j else {}
+        @property
+        def cpu(self):      return self._j.cpu if self._j else {}
+
+    _jtop_wrapper = _JtopWrapper(_jtop) if _jtop else None
 
     while True:
         try:
-            cpu = 0.0
-            ram = 0.0
-            gpu = 0.0
+            # Use health_agent's collection + scoring functions
+            metrics    = _collect_metrics_fn() if _jtop_wrapper is None else _collect_via_jtop(_jtop_wrapper)
+            fps_stats  = _read_fps_fn()
+            load_score, omega_preset = _compute_load_fn(metrics, fps_stats)
 
-            if _jtop is not None:
-                try:
-                    stats = _jtop.stats
-                    mem = _jtop.memory
-                    cpu_vals = [v for k, v in stats.items() if k.startswith("CPU")]
-                    cpu = sum(cpu_vals) / len(cpu_vals) if cpu_vals else 0.0
-                    if mem and "RAM" in mem:
-                        ram = float(mem["RAM"]["used"] / mem["RAM"]["tot"] * 100)
-                    if stats:
-                        gpu = float(stats.get("GPU", 0))
-                except Exception:
-                    pass
-
-            temp_c = 0.0
-            if _jtop is not None:
-                try:
-                    temp = _jtop.temperature
-                    gpu_temp = temp.get("gpu", {})
-                    if gpu_temp.get("online", False) and gpu_temp.get("temp", -256) > -100:
-                        temp_c = float(gpu_temp["temp"])
-                    else:
-                        tj_temp = temp.get("tj", {})
-                        temp_c = float(tj_temp.get("temp", 0))
-                except Exception:
-                    pass
-
-            if psutil is not None and _jtop is None:
-                cpu = psutil.cpu_percent(interval=None)
-                ram = psutil.virtual_memory().percent
-
-            fps = {}
-            try:
-                raw = _fps_file.read_text()
-                data = _json.loads(raw)
-                fps = {k: v for k, v in data.items() if not k.startswith("_")}
-            except (FileNotFoundError, _json.JSONDecodeError):
-                pass
-
-            active = [v for v in fps.values() if v > 0.0]
-            avg_fps = round(sum(active) / len(active), 1) if active else None
-
-            base = 0.5 * gpu + 0.3 * cpu + 0.2 * ram
-            target_fps = float(TARGET_FPS)
-            if active:
-                drop = max(0.0, target_fps - avg_fps)
-                penalty = (drop / target_fps) * 30.0
-            else:
-                penalty = 0.0
-            load_score = round(min(100.0, base + penalty), 1)
+            active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
+            avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
 
             payload = {
-                "type": "health",
-                "node_id": NODE_ID,
-                "timestamp": _time.time(),
-                "load_score": load_score,
-                "gpu_percent": gpu,
-                "cpu_percent": cpu,
-                "ram_percent": ram,
-                "gpu_temp_c": temp_c,
+                "type":         "health",
+                "node_id":      NODE_ID,
+                "timestamp":    _time.time(),
+                "load_score":   load_score,
+                "omega_preset": omega_preset,
+                "gpu_percent":  metrics["gpu_percent"],
+                "cpu_percent":  metrics["cpu_percent"],
+                "ram_percent":  metrics["ram_percent"],
+                "gpu_temp_c":   metrics["gpu_temp_c"],
+                "power_mw":     metrics.get("power_mw", 0.0),
                 "pipeline": {
-                    "fps_per_camera": fps,
-                    "avg_fps": avg_fps,
-                    "active_cameras": list(fps.keys()),
-                    "camera_configs": _cam_configs,
+                    "fps_per_camera":  fps_stats,
+                    "avg_fps":         avg_fps,
+                    # BUG-15 fix: only report cameras that are actively producing frames
+                    "active_cameras":  [k for k, v in fps_stats.items() if v > 0.0],
+                    "camera_configs":  _cam_configs,
                 },
             }
 
@@ -391,6 +378,56 @@ def _health_push_loop(peer_orch=None) -> None:
                 "[HealthPush] Exception in health loop (will retry): %s", _exc, exc_info=True
             )
         _time.sleep(HEALTH_INTERVAL)
+
+
+def _collect_via_jtop(jtop_wrapper) -> dict:
+    """Collect Jetson metrics from a persistent jtop wrapper object."""
+    try:
+        stats = jtop_wrapper.stats
+        mem   = jtop_wrapper.memory
+        if stats is None or mem is None:
+            raise ValueError("jtop not ready yet")
+
+        gpu_pct = float(stats.get("GPU", 0))
+
+        cpu_total = jtop_wrapper.cpu.get("total", {})
+        cpu_idle  = cpu_total.get("idle", 100.0)
+        cpu_pct   = 100.0 - cpu_idle
+
+        ram_pct = float(mem["RAM"]["used"] / mem["RAM"]["tot"] * 100)
+
+        temp = jtop_wrapper.temperature
+        gpu_temp_info = temp.get("gpu", {})
+        if gpu_temp_info.get("online", False) and gpu_temp_info.get("temp", -256) > -100:
+            temp_c = float(gpu_temp_info["temp"])
+        else:
+            tj_info = temp.get("tj", {})
+            temp_c = float(tj_info.get("temp", 0))
+
+        power_mw = float(jtop_wrapper.power.get("tot", {}).get("power", 0))
+
+        return {
+            "gpu_percent": round(gpu_pct, 1),
+            "cpu_percent": round(cpu_pct, 1),
+            "ram_percent": round(ram_pct, 1),
+            "gpu_temp_c":  round(temp_c, 1),
+            "power_mw":    round(power_mw, 0),
+            "source":      "jtop",
+        }
+    except Exception:
+        import psutil
+        try:
+            return {
+                "gpu_percent": 0.0,
+                "cpu_percent": round(psutil.cpu_percent(interval=None), 1),
+                "ram_percent": round(psutil.virtual_memory().percent, 1),
+                "gpu_temp_c":  0.0,
+                "power_mw":    0.0,
+                "source":      "psutil",
+            }
+        except Exception:
+            return {"gpu_percent": 0.0, "cpu_percent": 0.0, "ram_percent": 0.0,
+                    "gpu_temp_c": 0.0, "power_mw": 0.0, "source": "error"}
 
 
 def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None) -> None:
@@ -510,12 +547,20 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             loop.run()
         except KeyboardInterrupt:
             print("\nInterrupted by user")
+            # BUG-11 fix: stop the manager on intentional exit only (see below)
+            camera_manager.stop()
+            pipeline.set_state(Gst.State.NULL)
+            print("Pipeline stopped")
             return
         finally:
-            # BUG-16: stop the camera manager before tearing down the pipeline
-            # so its callbacks (on_add/on_remove) are unregistered and stale
-            # source_id mappings don't accumulate across restarts.
-            camera_manager.stop()
+            # BUG-11 fix: do NOT call camera_manager.stop() here on every
+            # iteration — that kills the watchdog observer and processor thread
+            # permanently.  On a restart those threads must stay alive so that
+            # hot-reload and dynamic ADD/REMOVE keep working.
+            # We only null the pipeline state; _attach_camera_manager() at the
+            # top of the next iteration re-registers on_add/on_remove callbacks
+            # and calls camera_manager.start() again (which is idempotent for
+            # the watchdog if it is still running).
             pipeline.set_state(Gst.State.NULL)
             print("Pipeline stopped")
 
@@ -527,6 +572,9 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         else:
             # Clean EOS or intentional stop — do not restart
             break
+
+    # BUG-11 fix: stop the camera manager once, after the restart loop exits.
+    camera_manager.stop()
 
 
 # ---------------------------------------------------------------------------

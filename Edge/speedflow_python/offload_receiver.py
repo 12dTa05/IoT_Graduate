@@ -39,6 +39,18 @@ from .zenoh_session import make_session
 
 logger = logging.getLogger(__name__)
 
+# BUG-7 fix: replace the unsafe function-attribute label cache with a
+# module-level dict protected by a lock.  The old approach was not
+# thread-safe: two worker threads calling _decode_lpr_output concurrently
+# before the first completed the file read could each partially initialise
+# _decode_lpr_output._labels, leaving a corrupt list.
+_lpr_labels_cache: dict = {}          # labels_path → List[str]
+_lpr_labels_lock  = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# TensorRT engine loader (lazy, cached)
+# ---------------------------------------------------------------------------
+
 # ---------------------------------------------------------------------------
 # TensorRT engine loader (lazy, cached)
 # ---------------------------------------------------------------------------
@@ -150,18 +162,22 @@ def _decode_lpr_output(outputs: list, labels_path: str) -> Tuple[str, float]:
     Mirrors the C++ NvDsInferParseCustomNVPlate logic in nvdsinfer_custom_impl_lpr.cpp.
 
     Returns (plate_text, avg_confidence).
-    """
-    # Load labels once per process
-    if not hasattr(_decode_lpr_output, "_labels"):
-        try:
-            with open(labels_path, "r", encoding="utf-8") as f:
-                _decode_lpr_output._labels = [
-                    l.rstrip() for l in f if l.strip()
-                ]
-        except Exception:
-            _decode_lpr_output._labels = []
 
-    labels = _decode_lpr_output._labels
+    BUG-7 fix: labels are cached in a module-level dict protected by a lock
+    so concurrent worker threads never see a partially-initialised label list.
+    """
+    # Thread-safe label loading
+    with _lpr_labels_lock:
+        if labels_path not in _lpr_labels_cache:
+            try:
+                with open(labels_path, "r", encoding="utf-8") as f:
+                    _lpr_labels_cache[labels_path] = [
+                        l.rstrip() for l in f if l.strip()
+                    ]
+            except Exception:
+                _lpr_labels_cache[labels_path] = []
+        labels = _lpr_labels_cache[labels_path]
+
     blank  = len(labels)
 
     # outputs[0]: argmax sequence  (seqLen,) int32
@@ -286,12 +302,15 @@ class OffloadReceiver:
 
     def start(self) -> None:
         self._running = True
+        # BUG-18 fix: Zenoh uses '*' for single-level wildcards, not '+'.
+        # '+' is MQTT syntax and is silently ignored by Zenoh, causing these
+        # subscribers to never match any published key expression.
         self._session.declare_subscriber(
-            f"offload/plates/+/{self._node_id}",
+            f"offload/plates/*/{self._node_id}",
             self._on_plate_sample,
         )
         self._session.declare_subscriber(
-            f"offload/vehicles/+/{self._node_id}",
+            f"offload/vehicles/*/{self._node_id}",
             self._on_vehicle_sample,
         )
         self._thread = threading.Thread(
