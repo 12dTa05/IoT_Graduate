@@ -539,6 +539,33 @@ if __name__ == "__main__":
         logger.error("zenoh not installed. Run: pip install zenoh")
         sys.exit(1)
 
+    # PID file lock — prevent two health_agent instances for the same node.
+    # Two instances connecting with the same node_id cause the server to close
+    # the older connection (code 1000) every time the newer one sends a message,
+    # creating an endless close/reconnect loop.
+    import os as _os
+    _PID_FILE = Path(__file__).resolve().parent / "health_agent.pid"
+    _my_pid   = _os.getpid()
+    if _PID_FILE.exists():
+        try:
+            _old_pid = int(_PID_FILE.read_text().strip())
+            if _old_pid != _my_pid:
+                try:
+                    _os.kill(_old_pid, 0)   # signal 0 = existence check only
+                    logger.error(
+                        "health_agent.py is already running (PID %d). "
+                        "Kill it first: kill %d", _old_pid, _old_pid
+                    )
+                    sys.exit(1)
+                except OSError:
+                    pass   # old process is dead — stale PID file, safe to continue
+        except ValueError:
+            pass
+    _PID_FILE.write_text(str(_my_pid))
+
+    import atexit as _atexit
+    _atexit.register(lambda: _PID_FILE.unlink(missing_ok=True))
+
     agent = HealthAgent()
     agent.start()
 
