@@ -153,6 +153,9 @@ class PeerOrchestrator:
 
         # Trạng thái của chính node này (cập nhật từ peers/status/+ của mình)
         self._self_state = PeerState(node_id=node_id)
+        # BUG-1 fix: separate lock for _self_state so the Zenoh callback
+        # thread and the decision loop never see a torn write.
+        self._self_lock = threading.RLock()
 
         # Migration log — relative to Edge/logs/
         log_dir = _ROOT / "logs"
@@ -181,6 +184,12 @@ class PeerOrchestrator:
 
         # Track peers already reported offline (no cameras) to avoid log spam
         self._notified_offline: set = set()
+
+        # BUG-6 fix: track which dead peers have already had failover triggered
+        # so we don't re-trigger on the next decision-loop tick.  We no longer
+        # clear active_cameras on the dead peer's PeerState (that would race
+        # with _check_rebalance reading it to detect camera returns).
+        self._failover_triggered: set = set()
 
         # Cameras rescued via failover: camera_id → original_owner_node_id
         # Used to return cameras when the original owner comes back online.
@@ -350,21 +359,24 @@ class PeerOrchestrator:
 
         # Cập nhật trạng thái của chính mình
         if node_id == self._node_id:
-            self._self_state.load_score = payload.get("load_score", 0.0)
-            self._self_state.gpu_percent = payload.get("gpu_percent", 0.0)
-            self._self_state.cpu_percent = payload.get("cpu_percent", 0.0)
-            self._self_state.ram_percent = payload.get("ram_percent", 0.0)
-            self._self_state.gpu_temp_c = payload.get("gpu_temp_c", 0.0)
-            pipeline = payload.get("pipeline", {})
-            self._self_state.avg_fps = pipeline.get("avg_fps")
-            self._self_state.fps_per_camera = pipeline.get("fps_per_camera", {})
-            self._self_state.active_cameras = pipeline.get("active_cameras", [])
-            # Track overload onset
-            if self._self_state.load_score > self._cfg.get("overload_threshold", 75.0):
-                if self._self_state.overload_since is None:
-                    self._self_state.overload_since = time.time()
-            else:
-                self._self_state.overload_since = None
+            # BUG-1 fix: hold _self_lock while updating so the decision loop
+            # always reads a consistent snapshot of _self_state.
+            with self._self_lock:
+                self._self_state.load_score = payload.get("load_score", 0.0)
+                self._self_state.gpu_percent = payload.get("gpu_percent", 0.0)
+                self._self_state.cpu_percent = payload.get("cpu_percent", 0.0)
+                self._self_state.ram_percent = payload.get("ram_percent", 0.0)
+                self._self_state.gpu_temp_c = payload.get("gpu_temp_c", 0.0)
+                pipeline = payload.get("pipeline", {})
+                self._self_state.avg_fps = pipeline.get("avg_fps")
+                self._self_state.fps_per_camera = pipeline.get("fps_per_camera", {})
+                self._self_state.active_cameras = pipeline.get("active_cameras", [])
+                # Track overload onset
+                if self._self_state.load_score > self._cfg.get("overload_threshold", 75.0):
+                    if self._self_state.overload_since is None:
+                        self._self_state.overload_since = time.time()
+                else:
+                    self._self_state.overload_since = None
             return
 
         # Cập nhật trạng thái peer khác
@@ -430,28 +442,33 @@ class PeerOrchestrator:
             silent_s = now - peer.last_seen
             if silent_s > timeout:
                 if peer.active_cameras:
-                    orphans = list(peer.active_cameras)
-                    # Prevent re-triggering
-                    with self._lock:
-                        if node_id in self._peers:
-                            self._peers[node_id].active_cameras = []
-                    logger.critical(
-                        "[PeerOrch] Peer '%s' OFFLINE with %d cameras! Triggering failover...",
-                        node_id, len(orphans),
-                    )
-                    self._notified_offline.discard(node_id)
-                    threading.Thread(
-                        target=self._leaderless_failover,
-                        args=(node_id, orphans),
-                        daemon=True,
-                    ).start()
+                    # BUG-6 fix: use _failover_triggered set to prevent
+                    # re-triggering instead of clearing active_cameras.
+                    # Clearing active_cameras races with _check_rebalance which
+                    # reads it to decide whether the original owner has resumed
+                    # a rescued camera.
+                    if node_id not in self._failover_triggered:
+                        orphans = list(peer.active_cameras)
+                        self._failover_triggered.add(node_id)
+                        logger.critical(
+                            "[PeerOrch] Peer '%s' OFFLINE with %d cameras! Triggering failover...",
+                            node_id, len(orphans),
+                        )
+                        self._notified_offline.discard(node_id)
+                        threading.Thread(
+                            target=self._leaderless_failover,
+                            args=(node_id, orphans),
+                            daemon=True,
+                        ).start()
                 else:
                     if node_id not in self._notified_offline:
                         logger.warning("[PeerOrch] Peer '%s' OFFLINE (no cameras).", node_id)
                         self._notified_offline.add(node_id)
             else:
-                # Peer is alive — clear the notified flag so we log again if it goes offline
+                # Peer is alive — clear the notified/failover flags so we
+                # react again if it goes offline a second time.
                 self._notified_offline.discard(node_id)
+                self._failover_triggered.discard(node_id)
 
     def _check_rebalance(self) -> None:
         """
@@ -488,9 +505,13 @@ class PeerOrchestrator:
                 "[Rebalance] Returning '%s' to original owner '%s'. REMOVE sent.",
                 camera_id, original_owner,
             )
+            # BUG-1 fix: read _self_state under its lock
+            with self._self_lock:
+                _self_load = self._self_state.load_score
+                _self_fps  = self._self_state.avg_fps
             self._migration_log.log(
                 self._node_id, original_owner, camera_id,
-                "rebalance_return", self._self_state.load_score, self._self_state.avg_fps,
+                "rebalance_return", _self_load, _self_fps,
                 0.0, "RETURNED",
             )
 
@@ -507,7 +528,22 @@ class PeerOrchestrator:
         """
         cfg   = self._cfg
         now   = time.time()
-        state = self._self_state
+        # BUG-1 fix: snapshot _self_state under lock so we work with a
+        # consistent view for the entire overload-check decision.
+        with self._self_lock:
+            state = PeerState(
+                node_id=self._self_state.node_id,
+                load_score=self._self_state.load_score,
+                gpu_percent=self._self_state.gpu_percent,
+                cpu_percent=self._self_state.cpu_percent,
+                ram_percent=self._self_state.ram_percent,
+                gpu_temp_c=self._self_state.gpu_temp_c,
+                avg_fps=self._self_state.avg_fps,
+                fps_per_camera=dict(self._self_state.fps_per_camera),
+                active_cameras=list(self._self_state.active_cameras),
+                overload_since=self._self_state.overload_since,
+                penalty_until=self._self_state.penalty_until,
+            )
 
         if state.overload_since is None:
             return
@@ -583,7 +619,9 @@ class PeerOrchestrator:
                 self.set_offload_level(cam_to_offload, 0)
 
     def _trigger_level1_if_due(self, state, now: float, cfg: dict) -> None:
-        """Legacy Level-1 overload trigger (existing behaviour, unchanged)."""
+        """Legacy Level-1 overload trigger (existing behaviour, unchanged).
+        NOTE: `state` is already a consistent snapshot captured by _check_self_overload.
+        """
         cam_to_offload = self._pick_camera_to_offload(state)
         if not cam_to_offload:
             return
@@ -755,7 +793,8 @@ class PeerOrchestrator:
         eps_fps       = payload.get("eps_fps", 18.0)
         eps_net_ms    = payload.get("eps_network_ms", 50.0)
 
-        with self._lock:
+        # BUG-1 fix: read _self_state under its own lock
+        with self._self_lock:
             current_streams = len(self._self_state.active_cameras)
             self_load = self._self_state.load_score
 
@@ -840,8 +879,15 @@ class PeerOrchestrator:
                 logger.error("[PeerOrch] Decision missing cam_config for '%s'", camera_id)
                 return
             add_cmd = {**cam_config, "cmd": "ADD"}
-            self._pubs["control"].put(msgpack.packb(add_cmd, use_bin_type=True))
-            logger.info("[PeerOrch] ADD command sent to self for '%s'", camera_id)
+            # BUG-13 fix: publish on the winner's control key, not our own.
+            # When we are the winner, winner == self._node_id so
+            # peers/control/{winner} == peers/control/{self._node_id} and the
+            # pre-declared publisher is the right one.  When another node is
+            # the winner the ADD must go to peers/control/{winner} — we cannot
+            # reuse the local publisher for that, so use session.put() directly.
+            winner_key = f"peers/control/{winner}"
+            self._session.put(winner_key, msgpack.packb(add_cmd, use_bin_type=True))
+            logger.info("[PeerOrch] ADD command sent to '%s' for '%s'", winner, camera_id)
 
         elif from_node == self._node_id:
             # --- MÌNH LÀ REQUESTER: chờ ack rồi REMOVE ---
@@ -863,8 +909,11 @@ class PeerOrchestrator:
 
         start_ms = time.time() * 1000
         timeout = self._cfg.get("migration_timeout_s", 15.0)
-        trigger_load = self._self_state.load_score
-        trigger_fps = self._self_state.avg_fps
+        # BUG-14 fix: capture trigger metrics under _self_lock for a consistent
+        # snapshot at the moment the migration starts, not at some later point.
+        with self._self_lock:
+            trigger_load = self._self_state.load_score
+            trigger_fps  = self._self_state.avg_fps
 
         confirmed = event.wait(timeout=timeout)
 
@@ -971,7 +1020,10 @@ class PeerOrchestrator:
             peer_cam_configs = dead_peer.camera_configs if dead_peer else {}
 
             # Build alive candidate list — includes self so this node can rescue too
+            # BUG-1 fix: read active_cameras from _self_state under _self_lock.
+        with self._self_lock:
             self_streams = len(self._self_state.active_cameras)
+        with self._lock:
             self_eligible = (
                 self._node_id != dead_node_id
                 and self_streams < self._cfg.get("eps_streams_max", 4)
@@ -1001,7 +1053,8 @@ class PeerOrchestrator:
 
             if winner == self._node_id:
                 # Re-check capacity including cameras accepted earlier in this loop
-                with self._lock:
+                # BUG-1 fix: read active_cameras under _self_lock
+                with self._self_lock:
                     current_streams = len(self._self_state.active_cameras)
                 if current_streams + self_accepted >= self._cfg.get("eps_streams_max", 8):
                     logger.warning(
@@ -1093,17 +1146,62 @@ class PeerOrchestrator:
         """
         Đọc cấu hình camera từ cameras.yml.
 
-        BUG-15: Cache the parsed YAML in memory after the first read so that
-        repeated calls (from _evaluate_and_bid, _close_vote_window, failover)
-        do not hit disk every time.
+        BUG-2 fix: prefer the live CameraManager when available — it already
+        maintains a hot-reloaded, up-to-date config dict so we never serve
+        stale homography/ROI/URI data after a cameras.yml change.  Fall back
+        to a YAML parse only when the manager is not set (standalone tests).
+
+        BUG-15 (original BUG-15 from bug report): cache is now irrelevant
+        because CameraManager owns the in-memory state.  The _cameras_cache
+        field is kept for the YAML fallback path only.
         """
+        # Fast path: use live CameraManager (always up-to-date)
+        if self._camera_manager is not None:
+            try:
+                cfg_obj = None
+                # CameraManager stores CameraConfig objects keyed by camera_id
+                with self._camera_manager._lock:
+                    cfg_obj = self._camera_manager._configs.get(camera_id)
+                if cfg_obj is not None:
+                    return {
+                        "camera_id":       camera_id,
+                        "source_id":       int(cfg_obj.source_id),
+                        "uri":             cfg_obj.uri,
+                        "name":            cfg_obj.name,
+                        "fps":             float(cfg_obj.fps),
+                        "speed_limit_kmh": float(cfg_obj.speed_limit_kmh),
+                        "homography": {
+                            "source_points": cfg_obj.source_points.tolist(),
+                            "target_width":  int(cfg_obj.target_points[2, 0]),
+                            "target_height": int(cfg_obj.target_points[2, 1]),
+                        },
+                        "roi_polygon": cfg_obj.roi_polygon.tolist(),
+                        "output": {
+                            "record":      cfg_obj.record,
+                            "record_path": cfg_obj.record_path,
+                        },
+                    }
+            except Exception as exc:
+                logger.debug("CameraManager config lookup failed for '%s': %s", camera_id, exc)
+
+        # Fallback: parse cameras.yml (used in tests / standalone mode)
+        # BUG-2 fix: invalidate the cache based on file mtime so hot-reload is
+        # respected even in the fallback path.
         try:
             import yaml
-            if self._cameras_cache is None:
-                yml_path = self._camera_configs_dir / "cameras.yml"
+            yml_path = self._camera_configs_dir / "cameras.yml"
+            try:
+                current_mtime = yml_path.stat().st_mtime
+            except OSError:
+                current_mtime = 0.0
+
+            if (self._cameras_cache is None
+                    or getattr(self, "_cameras_cache_mtime", None) != current_mtime):
                 with open(yml_path, "r", encoding="utf-8") as f:
                     raw = yaml.safe_load(f)
                 self._cameras_cache = raw.get("cameras", {})
+                self._cameras_cache_mtime = current_mtime
+
             cameras = self._cameras_cache
             cfg = cameras.get(camera_id)
             if not cfg:

@@ -130,7 +130,10 @@ async def handle_violations(request: web.Request) -> web.Response:
     except ValueError:
         page = 0
     offset = page * limit
-    results = state.store.query(node_id=node_id, date=date, limit=limit, offset=offset)
+    # BUG-8 fix: use query_async() (runs in a thread via asyncio.to_thread)
+    # instead of the synchronous query() which blocked the event loop and
+    # stalled WebSocket heartbeats during large JSONL reads.
+    results = await state.store.query_async(node_id=node_id, date=date, limit=limit, offset=offset)
     return web.json_response(results)
 
 

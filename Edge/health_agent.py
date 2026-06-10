@@ -427,7 +427,9 @@ class HealthAgent:
                     "pipeline": {
                         "fps_per_camera": fps_stats,
                         "avg_fps":        avg_fps,
-                        "active_cameras": list(fps_stats.keys()),
+                        # BUG-15 fix: only include cameras actively producing
+                        # frames — 0-FPS entries are stale/removed cameras.
+                        "active_cameras": [k for k, v in fps_stats.items() if v > 0.0],
                     },
                 }
 

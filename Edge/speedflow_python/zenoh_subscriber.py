@@ -95,7 +95,11 @@ class ZenohCommandSubscriber:
         self._running = False
         if self._subscriber:
             self._subscriber.undeclare()
-        if self._session:
+        # BUG-10 fix: only close the session if we opened it ourselves.
+        # When an external (shared) session was supplied, the caller
+        # (PeerOrchestrator / run_python.py) owns the lifecycle — closing it
+        # here would crash all sibling modules that share the same session.
+        if self._session and self._external_session is None:
             self._session.close()
 
     def publish_status(self, payload: dict) -> None:
@@ -202,22 +206,63 @@ class ZenohCommandSubscriber:
                 "source_id": source_id,
             })
 
-            # P2P vote ack — delay 3s to let GLib idle_add process the stream
-            _session = self._session
-            _cam_id = cam_id
-            _node_id = self._node_id
-            def _send_ack():
+            # P2P vote ack — wait until the stream actually reaches PLAYING
+            # state (or timeout) before acknowledging Make-Before-Break.
+            #
+            # BUG-3 fix: the old implementation sent the ack unconditionally
+            # after a hardcoded sleep(3), which could ack a failed ADD and
+            # cause the requester to REMOVE its own stream before the new one
+            # is actually up.
+            #
+            # Strategy: poll the CameraConfig.enabled flag AND verify that
+            # the CameraManager has a live source_id mapping (set by on_add
+            # which runs on the GLib main loop after dynamic_add_stream
+            # succeeds).  We also apply a generous 15-second timeout so that
+            # slow RTSP sources don't block forever.
+            _session     = self._session
+            _cam_id      = cam_id
+            _source_id   = source_id
+            _node_id     = self._node_id
+            _cam_manager = self._camera_manager
+            _ack_timeout = 15.0   # seconds — matches migration_timeout_s default
+
+            def _send_ack() -> None:
                 import time as _time
-                _time.sleep(3.0)
+                deadline = _time.monotonic() + _ack_timeout
+                playing  = False
+
+                # Poll until the source_id appears in the live lookup table
+                # (populated by on_add on the GLib main loop thread after
+                # dynamic_add_stream completes) or until timeout.
+                while _time.monotonic() < deadline:
+                    _time.sleep(0.25)
+                    try:
+                        with _cam_manager._lock:
+                            live_cfg = _cam_manager._by_source_id.get(_source_id)
+                        if live_cfg is not None and live_cfg.camera_id == _cam_id and live_cfg.enabled:
+                            playing = True
+                            break
+                    except Exception:
+                        pass
+
+                if not playing:
+                    logger.warning(
+                        "[Zenoh C2] ADD ack NOT sent for '%s': stream did not reach "
+                        "PLAYING within %.0fs.", _cam_id, _ack_timeout,
+                    )
+                    return
+
                 try:
                     ack_payload = msgpack.packb({
-                        "node_id": _node_id,
+                        "node_id":   _node_id,
                         "camera_id": _cam_id,
-                        "event": "PLAYING",
+                        "event":     "PLAYING",
                     }, use_bin_type=True)
                     _session.put(f"peers/vote/ack/{_cam_id}", ack_payload)
-                except Exception:
-                    pass
+                    logger.info("[Zenoh C2] ADD ack sent for '%s' (stream PLAYING).", _cam_id)
+                except Exception as exc:
+                    logger.warning("[Zenoh C2] Failed to send ack for '%s': %s", _cam_id, exc)
+
             threading.Thread(target=_send_ack, daemon=True).start()
 
         except KeyError as exc:
