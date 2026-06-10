@@ -309,88 +309,115 @@ class HealthAgent:
             logger.debug("[HealthAgent] Traffic event forward error: %s", exc)
 
     def _open_jtop(self):
-        """Try to open a persistent jtop session; return it or None."""
+        """Try to open a persistent jtop session; return it or None.
+
+        jtop is a Thread subclass.  The correct persistent usage (without
+        the 'with' context manager) is:
+            j = jtop()
+            j.start()          # starts the background thread
+            j.ok()             # BLOCKS until the first data packet arrives
+
+        Calling any property (gpu, cpu, temperature, …) before ok() returns
+        True raises KeyError because self._stats is still {}.
+        """
         try:
             from jtop import jtop as JTop
             j = JTop()
             j.start()
-            logger.info("[HealthAgent] jtop session opened (persistent).")
+            # Block until the first data collection completes so _stats is
+            # populated before _collect_metrics reads from it.
+            if not j.ok():
+                raise RuntimeError("jtop ok() returned False immediately")
+            logger.info("[HealthAgent] jtop session opened and ready (persistent).")
             return j
         except Exception as exc:
             logger.debug("[HealthAgent] jtop unavailable: %s — using psutil.", exc)
             return None
 
     def _collect_metrics(self) -> Dict:
-        """Read metrics from persistent jtop session or fall back to psutil."""
+        """Read metrics from persistent jtop session or fall back to psutil.
+
+        Reads from jtop's dedicated properties (gpu, cpu, memory, temperature,
+        power) rather than from jtop.stats.  jtop.stats is a computed property
+        that calls all sub-properties internally — if any one of them raises a
+        KeyError (e.g. 'power' not in _stats) the entire stats call fails.
+        Reading each property individually lets us handle missing sensors
+        gracefully without losing GPU% and Temp.
+        """
         if self._jtop is not None:
             try:
-                stats    = self._jtop.stats
-                mem      = self._jtop.memory
-                temp     = self._jtop.temperature
-                power    = self._jtop.power
-
-                # BUG-17: jtop.stats returns None until the first collection
-                # interval completes. Guard explicitly before calling .get().
-                if stats is None or mem is None:
-                    raise ValueError("jtop not ready yet")
-
-                # BUG-GPU fix: jtop.stats GPU key varies across JetPack/jtop
-                # versions.  On some versions it is "GPU", on others "GPU1",
-                # "Gpu", or absent entirely.  Scan all keys case-insensitively.
+                # --- GPU % ---
+                # jtop.gpu is a GPU object (dict-like): {name: {status: {load:…}}}
+                # The first GPU entry's status.load is the utilisation percentage.
                 gpu_pct = 0.0
-                if stats:
-                    for k, v in stats.items():
-                        if k.upper().startswith("GPU") and isinstance(v, (int, float)):
-                            candidate = float(v)
-                            if 0.0 <= candidate <= 100.0:
-                                gpu_pct = candidate
-                                break
+                try:
+                    for gpu_info in self._jtop.gpu.values():
+                        load = gpu_info.get("status", {}).get("load", 0.0)
+                        gpu_pct = float(load)
+                        break  # only first GPU
+                except Exception:
+                    pass
 
-                # CPU: stats has CPU1..CPU12, not a single "CPU" key.
-                # Compute average from j.cpu['total']['idle'].
-                cpu_total = self._jtop.cpu.get("total", {})
-                cpu_idle  = cpu_total.get("idle", 100.0)
-                cpu_pct   = 100.0 - cpu_idle
+                # --- CPU % ---
+                # jtop.cpu = {"total": {"idle": float, …}, "cpu": […]}
+                # total.idle is the aggregate idle percentage across all cores.
+                cpu_pct = 0.0
+                try:
+                    cpu_total = self._jtop.cpu.get("total", {})
+                    cpu_idle  = cpu_total.get("idle", 100.0)
+                    cpu_pct   = 100.0 - float(cpu_idle)
+                except Exception:
+                    pass
 
-                ram_pct  = float(mem["RAM"]["used"] / mem["RAM"]["tot"] * 100)
+                # --- RAM % ---
+                # jtop.memory["RAM"] = {"used": int KB, "tot": int KB, …}
+                ram_pct = 0.0
+                try:
+                    mem = self._jtop.memory
+                    ram_tot = mem["RAM"]["tot"]
+                    if ram_tot > 0:
+                        ram_pct = float(mem["RAM"]["used"]) / ram_tot * 100.0
+                except Exception:
+                    pass
 
-                # BUG-TEMP fix: temperature sensor key names differ by Jetson
-                # model and JetPack version.  Priority order:
-                #   1. "gpu"  sensor (Orin, AGX)
-                #   2. "GPU"  sensor (some NX/Nano)
-                #   3. "tj"   junction temperature (thermal fallback)
-                #   4. First sensor with a plausible value (>0 and <120°C)
-                temp_c = None
-                for key in ("gpu", "GPU", "tj"):
-                    info = temp.get(key, {})
-                    if not isinstance(info, dict):
-                        continue
-                    t = info.get("temp", -256)
-                    if isinstance(t, (int, float)) and -10 < t < 120:
-                        temp_c = float(t)
-                        break
-
-                if temp_c is None:
-                    # Last resort: scan all sensors for any plausible value
-                    for key, info in temp.items():
+                # --- Temperature ---
+                # jtop.temperature = {sensor_name: {"temp": float, "online": bool, …}}
+                # Sensor names on Orin/JetPack 6: "cpu", "gpu", "soc0", "soc1",
+                # "soc2", "tj" etc.  Pick "gpu" first, then "tj" (junction),
+                # then the first online sensor with a plausible value.
+                temp_c = 0.0
+                try:
+                    temp_dict = self._jtop.temperature
+                    for key in ("gpu", "tj", "cpu"):
+                        info = temp_dict.get(key)
                         if not isinstance(info, dict):
                             continue
                         t = info.get("temp", -256)
                         if isinstance(t, (int, float)) and 0 < t < 120:
                             temp_c = float(t)
                             break
+                    else:
+                        # fallback: first sensor with plausible value
+                        for info in temp_dict.values():
+                            if not isinstance(info, dict):
+                                continue
+                            t = info.get("temp", -256)
+                            if isinstance(t, (int, float)) and 0 < t < 120:
+                                temp_c = float(t)
+                                break
+                except Exception:
+                    pass
 
-                if temp_c is None:
-                    temp_c = 0.0
-
-                # Power: total power in mW
-                # Guard: jtop.power is None when no INA3221 rails are
-                # configured (common on some JetPack 6 Orin variants).
-                # A None here would crash the entire try-block and silently
-                # fall through to the psutil fallback, zeroing out GPU% and Temp.
+                # --- Power ---
+                # jtop.power = {"rail": {…}, "tot": {"power": int mW, …}}
+                # May not exist on all boards; guard carefully.
                 power_mw = 0.0
-                if isinstance(power, dict):
-                    power_mw = float(power.get("tot", {}).get("power", 0))
+                try:
+                    pwr = self._jtop.power
+                    if isinstance(pwr, dict):
+                        power_mw = float(pwr.get("tot", {}).get("power", 0))
+                except Exception:
+                    pass
 
                 return {
                     "gpu_percent": round(gpu_pct, 1),
@@ -398,7 +425,7 @@ class HealthAgent:
                     "ram_percent": round(ram_pct, 1),
                     "gpu_temp_c":  round(temp_c, 1),
                     "power_mw":    round(power_mw, 0),
-                    "source": "jtop",
+                    "source":      "jtop",
                 }
             except Exception as exc:
                 logger.debug("[HealthAgent] jtop read error: %s — falling back.", exc)

@@ -381,77 +381,79 @@ def _health_push_loop(peer_orch=None) -> None:
 
 
 def _collect_via_jtop(jtop_wrapper) -> dict:
-    """Collect Jetson metrics from a persistent jtop wrapper object."""
+    """Collect Jetson metrics by reading jtop's dedicated properties directly.
+
+    Reads gpu, cpu, memory, temperature and power individually so that a
+    missing or unready property (e.g. power on boards without INA3221) does
+    not crash the entire collection and zero out GPU% and Temp.
+    """
+    # GPU %
+    gpu_pct = 0.0
     try:
-        stats = jtop_wrapper.stats
-        mem   = jtop_wrapper.memory
-        if stats is None or mem is None:
-            raise ValueError("jtop not ready yet")
+        for gpu_info in jtop_wrapper._j.gpu.values():
+            gpu_pct = float(gpu_info.get("status", {}).get("load", 0.0))
+            break
+    except Exception:
+        pass
 
-        # Same robust GPU key scan as health_agent.py (key varies by JetPack)
-        gpu_pct = 0.0
-        if stats:
-            for k, v in stats.items():
-                if k.upper().startswith("GPU") and isinstance(v, (int, float)):
-                    candidate = float(v)
-                    if 0.0 <= candidate <= 100.0:
-                        gpu_pct = candidate
-                        break
+    # CPU % — jtop.cpu["total"]["idle"] is aggregate idle across all cores
+    cpu_pct = 0.0
+    try:
+        cpu_total = jtop_wrapper._j.cpu.get("total", {})
+        cpu_pct   = 100.0 - float(cpu_total.get("idle", 100.0))
+    except Exception:
+        pass
 
-        cpu_total = jtop_wrapper.cpu.get("total", {})
-        cpu_idle  = cpu_total.get("idle", 100.0)
-        cpu_pct   = 100.0 - cpu_idle
+    # RAM %
+    ram_pct = 0.0
+    try:
+        mem     = jtop_wrapper._j.memory
+        ram_tot = mem["RAM"]["tot"]
+        if ram_tot > 0:
+            ram_pct = float(mem["RAM"]["used"]) / ram_tot * 100.0
+    except Exception:
+        pass
 
-        ram_pct = float(mem["RAM"]["used"] / mem["RAM"]["tot"] * 100)
-
-        temp = jtop_wrapper.temperature
-        # Same robust temperature sensor scan as health_agent.py
-        temp_c = None
-        for key in ("gpu", "GPU", "tj"):
-            info = temp.get(key, {})
+    # Temperature — same priority order as health_agent.py
+    temp_c = 0.0
+    try:
+        temp_dict = jtop_wrapper._j.temperature
+        for key in ("gpu", "tj", "cpu"):
+            info = temp_dict.get(key)
             if not isinstance(info, dict):
                 continue
             t = info.get("temp", -256)
-            if isinstance(t, (int, float)) and -10 < t < 120:
+            if isinstance(t, (int, float)) and 0 < t < 120:
                 temp_c = float(t)
                 break
-        if temp_c is None:
-            for key, info in temp.items():
+        else:
+            for info in temp_dict.values():
                 if not isinstance(info, dict):
                     continue
                 t = info.get("temp", -256)
                 if isinstance(t, (int, float)) and 0 < t < 120:
                     temp_c = float(t)
                     break
-        if temp_c is None:
-            temp_c = 0.0
-
-        power_mw = 0.0
-        if isinstance(jtop_wrapper.power, dict):
-            power_mw = float(jtop_wrapper.power.get("tot", {}).get("power", 0))
-
-        return {
-            "gpu_percent": round(gpu_pct, 1),
-            "cpu_percent": round(cpu_pct, 1),
-            "ram_percent": round(ram_pct, 1),
-            "gpu_temp_c":  round(temp_c, 1),
-            "power_mw":    round(power_mw, 0),
-            "source":      "jtop",
-        }
     except Exception:
-        import psutil
-        try:
-            return {
-                "gpu_percent": 0.0,
-                "cpu_percent": round(psutil.cpu_percent(interval=None), 1),
-                "ram_percent": round(psutil.virtual_memory().percent, 1),
-                "gpu_temp_c":  0.0,
-                "power_mw":    0.0,
-                "source":      "psutil",
-            }
-        except Exception:
-            return {"gpu_percent": 0.0, "cpu_percent": 0.0, "ram_percent": 0.0,
-                    "gpu_temp_c": 0.0, "power_mw": 0.0, "source": "error"}
+        pass
+
+    # Power (optional — not available on all boards)
+    power_mw = 0.0
+    try:
+        pwr = jtop_wrapper._j.power
+        if isinstance(pwr, dict):
+            power_mw = float(pwr.get("tot", {}).get("power", 0))
+    except Exception:
+        pass
+
+    return {
+        "gpu_percent": round(gpu_pct, 1),
+        "cpu_percent": round(cpu_pct, 1),
+        "ram_percent": round(ram_pct, 1),
+        "gpu_temp_c":  round(temp_c, 1),
+        "power_mw":    round(power_mw, 0),
+        "source":      "jtop",
+    }
 
 
 def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None) -> None:
