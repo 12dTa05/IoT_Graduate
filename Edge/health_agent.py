@@ -334,7 +334,17 @@ class HealthAgent:
                 if stats is None or mem is None:
                     raise ValueError("jtop not ready yet")
 
-                gpu_pct  = float(stats.get("GPU", 0))
+                # BUG-GPU fix: jtop.stats GPU key varies across JetPack/jtop
+                # versions.  On some versions it is "GPU", on others "GPU1",
+                # "Gpu", or absent entirely.  Scan all keys case-insensitively.
+                gpu_pct = 0.0
+                if stats:
+                    for k, v in stats.items():
+                        if k.upper().startswith("GPU") and isinstance(v, (int, float)):
+                            candidate = float(v)
+                            if 0.0 <= candidate <= 100.0:
+                                gpu_pct = candidate
+                                break
 
                 # CPU: stats has CPU1..CPU12, not a single "CPU" key.
                 # Compute average from j.cpu['total']['idle'].
@@ -344,16 +354,43 @@ class HealthAgent:
 
                 ram_pct  = float(mem["RAM"]["used"] / mem["RAM"]["tot"] * 100)
 
-                # Temperature: use 'gpu' sensor if online, else 'tj' (junction)
-                gpu_temp_info = temp.get("gpu", {})
-                if gpu_temp_info.get("online", False) and gpu_temp_info.get("temp", -256) > -100:
-                    temp_c = float(gpu_temp_info["temp"])
-                else:
-                    tj_info = temp.get("tj", {})
-                    temp_c = float(tj_info.get("temp", 0))
+                # BUG-TEMP fix: temperature sensor key names differ by Jetson
+                # model and JetPack version.  Priority order:
+                #   1. "gpu"  sensor (Orin, AGX)
+                #   2. "GPU"  sensor (some NX/Nano)
+                #   3. "tj"   junction temperature (thermal fallback)
+                #   4. First sensor with a plausible value (>0 and <120°C)
+                temp_c = None
+                for key in ("gpu", "GPU", "tj"):
+                    info = temp.get(key, {})
+                    if not isinstance(info, dict):
+                        continue
+                    t = info.get("temp", -256)
+                    if isinstance(t, (int, float)) and -10 < t < 120:
+                        temp_c = float(t)
+                        break
+
+                if temp_c is None:
+                    # Last resort: scan all sensors for any plausible value
+                    for key, info in temp.items():
+                        if not isinstance(info, dict):
+                            continue
+                        t = info.get("temp", -256)
+                        if isinstance(t, (int, float)) and 0 < t < 120:
+                            temp_c = float(t)
+                            break
+
+                if temp_c is None:
+                    temp_c = 0.0
 
                 # Power: total power in mW
-                power_mw = float(power.get("tot", {}).get("power", 0))
+                # Guard: jtop.power is None when no INA3221 rails are
+                # configured (common on some JetPack 6 Orin variants).
+                # A None here would crash the entire try-block and silently
+                # fall through to the psutil fallback, zeroing out GPU% and Temp.
+                power_mw = 0.0
+                if isinstance(power, dict):
+                    power_mw = float(power.get("tot", {}).get("power", 0))
 
                 return {
                     "gpu_percent": round(gpu_pct, 1),

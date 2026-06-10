@@ -388,7 +388,15 @@ def _collect_via_jtop(jtop_wrapper) -> dict:
         if stats is None or mem is None:
             raise ValueError("jtop not ready yet")
 
-        gpu_pct = float(stats.get("GPU", 0))
+        # Same robust GPU key scan as health_agent.py (key varies by JetPack)
+        gpu_pct = 0.0
+        if stats:
+            for k, v in stats.items():
+                if k.upper().startswith("GPU") and isinstance(v, (int, float)):
+                    candidate = float(v)
+                    if 0.0 <= candidate <= 100.0:
+                        gpu_pct = candidate
+                        break
 
         cpu_total = jtop_wrapper.cpu.get("total", {})
         cpu_idle  = cpu_total.get("idle", 100.0)
@@ -397,14 +405,30 @@ def _collect_via_jtop(jtop_wrapper) -> dict:
         ram_pct = float(mem["RAM"]["used"] / mem["RAM"]["tot"] * 100)
 
         temp = jtop_wrapper.temperature
-        gpu_temp_info = temp.get("gpu", {})
-        if gpu_temp_info.get("online", False) and gpu_temp_info.get("temp", -256) > -100:
-            temp_c = float(gpu_temp_info["temp"])
-        else:
-            tj_info = temp.get("tj", {})
-            temp_c = float(tj_info.get("temp", 0))
+        # Same robust temperature sensor scan as health_agent.py
+        temp_c = None
+        for key in ("gpu", "GPU", "tj"):
+            info = temp.get(key, {})
+            if not isinstance(info, dict):
+                continue
+            t = info.get("temp", -256)
+            if isinstance(t, (int, float)) and -10 < t < 120:
+                temp_c = float(t)
+                break
+        if temp_c is None:
+            for key, info in temp.items():
+                if not isinstance(info, dict):
+                    continue
+                t = info.get("temp", -256)
+                if isinstance(t, (int, float)) and 0 < t < 120:
+                    temp_c = float(t)
+                    break
+        if temp_c is None:
+            temp_c = 0.0
 
-        power_mw = float(jtop_wrapper.power.get("tot", {}).get("power", 0))
+        power_mw = 0.0
+        if isinstance(jtop_wrapper.power, dict):
+            power_mw = float(jtop_wrapper.power.get("tot", {}).get("power", 0))
 
         return {
             "gpu_percent": round(gpu_pct, 1),
