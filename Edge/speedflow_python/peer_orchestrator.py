@@ -1064,11 +1064,14 @@ class PeerOrchestrator:
                     continue
 
                 # Double-check: camera đã được rescue bởi peer khác chưa?
+                # Exclude both self AND the dead peer — the dead peer's stale
+                # active_cameras still lists its own cameras and would otherwise
+                # cause every rescue to be skipped in a 2-node cluster.
                 with self._lock:
                     already_handled = any(
                         camera_id in peer.active_cameras
                         for nid, peer in self._peers.items()
-                        if nid != self._node_id
+                        if nid != self._node_id and nid != dead_node_id
                     )
                 if already_handled:
                     logger.info(
