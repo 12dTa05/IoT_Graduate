@@ -668,13 +668,26 @@ def run_python_mode(args) -> None:
         except Exception as exc:
             print(f"[OffloadPub/Rcv] Failed to start: {exc}", file=sys.stderr)
 
-    # --- MonitorClient (edge registration + health push) ---
-    if MONITOR_URL:
+    # --- MonitorClient ---
+    # Do NOT open a MonitorClient here.  health_agent.py is the sole owner
+    # of the WebSocket connection to the Central Monitor Server for this
+    # node_id.  Opening a second client from main.py causes the server to
+    # close the health_agent's connection (code 1000 normal closure) every
+    # time main.py starts, triggering an endless close/reconnect loop between
+    # the two competing clients for the same node_id.
+    #
+    # The _health_push_loop below calls send_to_monitor() which is a no-op
+    # when no MonitorClient has been registered — so health metrics from this
+    # process are forwarded via Zenoh → health_agent → server instead.
+    #
+    # If you run main.py WITHOUT health_agent.py (standalone / dev mode),
+    # set the env var PIPELINE_OWN_WS=1 to re-enable the client here.
+    if MONITOR_URL and os.environ.get("PIPELINE_OWN_WS") == "1":
         from speedflow_python.monitor_client import MonitorClient, set_default_client
         _client = MonitorClient(MONITOR_URL, NODE_ID, ADVERTISE_IP)
         _client.start()
         set_default_client(_client)
-        print(f"[MonitorClient] Started → {MONITOR_URL}")
+        print(f"[MonitorClient] Started → {MONITOR_URL} (PIPELINE_OWN_WS mode)")
 
     # --- Health Push (periodic metrics → Dashboard + Zenoh) ---
     _health_thread = threading.Thread(
