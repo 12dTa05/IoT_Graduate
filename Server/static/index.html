@@ -371,6 +371,18 @@ function fmtTime(ts) {
 }
 function fmtPct(v) { return v != null ? `${v.toFixed(1)}%` : '--'; }
 function fmtTemp(v) { return v != null ? `${v.toFixed(1)}\u00B0C` : '--'; }
+// When the edge is running on a non-Jetson machine (psutil fallback), GPU%
+// and Temp are always 0.0 — indistinguishable from a real zero reading.
+// The health payload includes "source":"psutil" in that case; use it to
+// show "N/A" so users know the metric is unavailable rather than actually 0.
+function fmtGpuPct(v, source) {
+  if (source === 'psutil') return 'N/A';
+  return v != null ? `${v.toFixed(1)}%` : '--';
+}
+function fmtGpuTemp(v, source) {
+  if (source === 'psutil') return 'N/A';
+  return v != null ? `${v.toFixed(1)}\u00B0C` : '--';
+}
 function fmtBitrate(bps) {
   if (!bps || bps <= 0) return '';
   if (bps > 1e6) return `${(bps / 1e6).toFixed(1)} Mbps`;
@@ -778,6 +790,7 @@ function updateSidebarCard(card, edge) {
   const pipeline = h.pipeline || {};
   const fps = pipeline.fps_per_camera || {};
   const targetFps = 30;
+  const source = h.source || '';   // 'jtop' | 'psutil' | 'error' | ''
 
   const metrics = [
     { key: 'gpu', val: h.gpu_percent },
@@ -788,16 +801,20 @@ function updateSidebarCard(card, edge) {
   for (const m of metrics) {
     const bar = card.querySelector(`[data-metric="${m.key}"]`);
     const text = card.querySelector(`[data-metric="${m.key}-text"]`);
+    // GPU bar is meaningless on psutil (always 0) — keep it empty
+    const isGpuOnPsutil = (m.key === 'gpu' && source === 'psutil');
     if (bar) {
-      const pct = Math.min(100, Math.max(0, m.val != null ? m.val : 0));
+      const pct = isGpuOnPsutil ? 0 : Math.min(100, Math.max(0, m.val != null ? m.val : 0));
       bar.style.width = `${pct}%`;
       bar.className = 'bar-fill' + (pct > 80 ? ' crit' : pct > 60 ? ' warn' : '');
     }
-    if (text) text.textContent = fmtPct(m.val);
+    if (text) {
+      text.textContent = (m.key === 'gpu') ? fmtGpuPct(m.val, source) : fmtPct(m.val);
+    }
   }
 
   const tempEl = card.querySelector('[data-metric="temp-text"]');
-  if (tempEl) tempEl.textContent = fmtTemp(h.gpu_temp_c);
+  if (tempEl) tempEl.textContent = fmtGpuTemp(h.gpu_temp_c, source);
 
   const loadEl = card.querySelector('[data-metric="load-text"]');
   if (loadEl) loadEl.textContent = h.load_score != null ? h.load_score.toFixed(1) : '--';
