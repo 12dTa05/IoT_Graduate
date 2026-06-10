@@ -254,6 +254,24 @@ async def _process_edge_message(
     msg_type = data.get("type", "")
 
     if msg_type == "health":
+        # Log every health payload at DEBUG level so you can inspect what
+        # each edge is sending.  Run the server with DEBUG logging to see it:
+        #   python3 app.py --log-level debug
+        # or set the env var: LOG_LEVEL=DEBUG python3 app.py
+        logger.debug(
+            "[EDGE-HEALTH] '%s' → load=%.1f%% gpu=%.1f%% cpu=%.1f%% "
+            "ram=%.1f%% temp=%.1f°C power=%.0fmW fps=%s active=%s source=%s",
+            node_id,
+            data.get("load_score", 0),
+            data.get("gpu_percent", 0),
+            data.get("cpu_percent", 0),
+            data.get("ram_percent", 0),
+            data.get("gpu_temp_c", 0),
+            data.get("power_mw", 0),
+            data.get("pipeline", {}).get("fps_per_camera", {}),
+            data.get("pipeline", {}).get("active_cameras", []),
+            data.get("source", "?"),
+        )
         state.registry.update_health(node_id, data)
         health_msg = {**data, "type": "health_update", "node_id": node_id}
         state.broadcast(health_msg)
@@ -360,7 +378,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="IoT Graduate \u2014 Central Monitoring Server")
     parser.add_argument("--host", default=os.getenv("SERVER_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.getenv("SERVER_PORT", "9090")))
+    parser.add_argument(
+        "--log-level",
+        default=os.getenv("LOG_LEVEL", "INFO").upper(),
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity. Use DEBUG to see every health payload from each edge.",
+    )
     args = parser.parse_args()
+
+    logging.getLogger().setLevel(args.log_level)
 
     logger.info("=" * 55)
     logger.info("  IoT Graduate \u2014 Central Monitoring Server")
