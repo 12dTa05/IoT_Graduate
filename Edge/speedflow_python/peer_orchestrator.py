@@ -714,9 +714,12 @@ class PeerOrchestrator:
         eps_net = cfg.get("eps_network_ms_strict", 50.0) if relaxation_tier == 0 \
                   else cfg.get("eps_network_ms_tier1", 80.0)
 
+        cam_uri = self._get_camera_uri(camera_id) or ""
+
         payload = {
             "requester":      self._node_id,
             "camera_id":      camera_id,
+            "cam_uri":        cam_uri,
             "load_score":     self._self_state.load_score,
             "avg_fps":        self._self_state.avg_fps,
             "eps_fps":        eps_fps,
@@ -876,8 +879,10 @@ class PeerOrchestrator:
             return
 
         # ε3 — Network RTT to camera RTSP origin (blocking — safe here in thread pool)
-        cam_uri = self._get_camera_uri(camera_id)
-        if cam_uri is None:
+        # Prefer URI from the RFO payload (sent by requester who owns the camera).
+        # Fall back to local lookup for backward compatibility.
+        cam_uri = payload.get("cam_uri") or self._get_camera_uri(camera_id)
+        if not cam_uri:
             logger.info("[PeerOrch] RFO rejected for '%s': ε3 (network) — camera URI not found", camera_id)
             return
         rtt_ms = self._measure_rtt(cam_uri)
