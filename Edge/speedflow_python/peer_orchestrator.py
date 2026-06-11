@@ -546,8 +546,11 @@ class PeerOrchestrator:
             )
 
         if state.overload_since is None:
+            logger.debug("[PeerOrch] Not overloaded (overload_since=None)")
             return
         if now - state.overload_since < cfg.get("overload_duration_s", 10.0):
+            logger.debug("[PeerOrch] Overload too recent (%.1fs < %.1fs)", 
+                        now - state.overload_since, cfg.get("overload_duration_s", 10.0))
             return
 
         load          = state.load_score
@@ -556,6 +559,9 @@ class PeerOrchestrator:
         thr1          = cfg.get("offload_level1_threshold", 85.0)
         level_cd      = cfg.get("offload_level_cooldown_s", 20.0)
         global_offload = cfg.get("offload_level", 0)
+        logger.debug("[PeerOrch] Overload check: load=%.1f, thr1=%.1f, thr2=%.1f, thr3=%.1f, "
+                    "global_offload=%d, cam_ready=%s",
+                    load, thr1, thr2, thr3, global_offload, state)
 
         # If offload is disabled in config, fall straight through to Level 1
         if global_offload == 0:
@@ -624,9 +630,13 @@ class PeerOrchestrator:
         """
         cam_to_offload = self._pick_camera_to_offload(state)
         if not cam_to_offload:
+            logger.debug("[PeerOrch] No camera to offload (all inactive or locked)")
             return
         last_mig = self._cam_cooldown.get(cam_to_offload, 0.0)
-        if now - last_mig < cfg.get("cooldown_s", 45.0):
+        time_since_mig = now - last_mig
+        if time_since_mig < cfg.get("cooldown_s", 45.0):
+            logger.debug("[PeerOrch] Cooldown not met for '%s' (%.1fs / %.1fs)",
+                        cam_to_offload, time_since_mig, cfg.get("cooldown_s", 45.0))
             return
         trigger_reason = (
             "fps_drop"
