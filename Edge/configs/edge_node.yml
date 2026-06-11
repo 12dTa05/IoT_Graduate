@@ -8,29 +8,29 @@
 # ============================================================
 
 p2p:
-  overload_threshold: 75.0      # load_score above this triggers RFO
-  overload_duration_s: 10.0     # must be overloaded this long before RFO
-  cooldown_s: 45.0              # per-camera cooldown between migrations
-  migration_timeout_s: 15.0     # wait for ADD ack before rollback
-  heartbeat_timeout_s: 6.0      # peer declared OFFLINE after this silence
+  overload_threshold: 65.0      # load_score above this triggers RFO
+  overload_duration_s: 5.0     # must be overloaded this long before RFO
+  cooldown_s: 15.0              # per-camera cooldown between migrations
+  migration_timeout_s: 2.0     # wait for ADD ack before rollback
+  heartbeat_timeout_s: 5.0      # peer declared OFFLINE after this silence
   vote_window_s: 3.0            # proposal collection duration
-  failover_jitter_max_s: 2.0    # random delay before failover ADD (race prevention)
+  failover_jitter_max_s: 3.0    # random delay before failover ADD (race prevention)
 
   # epsilon-Constraint tiers (Pareto optimization)
-  eps_fps_strict: 18.0          # Tier 0 — strict FPS floor
-  eps_fps_tier1: 15.0           # Tier 1 relaxation
-  eps_fps_tier2: 12.0           # Tier 2 relaxation
-  eps_network_ms_strict: 50.0   # Tier 0 — RTSP RTT ceiling
-  eps_network_ms_tier1: 80.0    # Tier 1 relaxation
+  eps_fps_strict: 15.0          # Tier 0 — strict FPS floor
+  eps_fps_tier1: 12.0           # Tier 1 relaxation
+  eps_fps_tier2: 10.0           # Tier 2 relaxation
+  eps_network_ms_strict: 30.0   # Tier 0 — RTSP RTT ceiling
+  eps_network_ms_tier1: 60.0    # Tier 1 relaxation
   eps_streams_max: 8            # Hard capacity ceiling (matches cameras.yml max_streams)
 
   # FPS prediction model — calibrate offline per Jetson model
   # key = number of streams AFTER accepting the new camera
   fps_model:
-    1: 24.5
-    2: 22.0
-    3: 18.5
-    4: 14.5
+    1: 30.0
+    2: 25.0
+    3: 20.5
+    4: 12.5
 
   # ---------------------------------------------------------------------------
   # Multi-level offload (Levels 1–3 from the paper)
@@ -45,11 +45,11 @@ p2p:
 
   # Load thresholds that trigger each escalation step
   offload_level3_threshold: 65.0   # ≥ this load → try plate-crop offload first
-  offload_level2_threshold: 75.0   # ≥ this load → escalate to vehicle-crop offload
-  offload_level1_threshold: 85.0   # ≥ this load → escalate to full stream migration
+  offload_level2_threshold: 72.0   # ≥ this load → escalate to vehicle-crop offload
+  offload_level1_threshold: 80.0   # ≥ this load → escalate to full stream migration (DEBUG: lowered for testing)
 
   # Cooldown between level changes for the same camera (seconds)
-  offload_level_cooldown_s: 20.0
+  offload_level_cooldown_s: 12.0
 
   # TensorRT engine paths used by the offload receiver (Level 2 + 3)
   lpr_engine_path: "models/lpr.engine"
@@ -74,5 +74,5 @@ load_score:
   weights_bandwidth: [0.2, 0.5, 0.3]
 
   # FPS-drop penalty cap (additive points on top of weighted hardware score)
-  fps_penalty_max: 30.0
+  fps_penalty_max: 25.0
 
