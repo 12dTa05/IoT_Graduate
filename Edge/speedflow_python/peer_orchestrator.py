@@ -197,6 +197,13 @@ class PeerOrchestrator:
         # Used to return cameras when the original owner comes back online.
         self._rescued_cameras: Dict[str, str] = {}
 
+        # Cameras migrated away due to overload: camera_id → winner_node_id
+        # Used to reclaim cameras when this node's load drops below threshold.
+        self._migrated_out: Dict[str, str] = {}
+
+        # Timestamp when load first dropped below reclaim threshold (for stability check)
+        self._reclaim_eligible_since: Optional[float] = None
+
         # Penalty timestamp for this node itself (set on migration timeout rollback)
         self._self_penalty_until: float = 0.0
 
@@ -377,6 +384,8 @@ class PeerOrchestrator:
                 if self._self_state.load_score > self._cfg.get("overload_threshold", 75.0):
                     if self._self_state.overload_since is None:
                         self._self_state.overload_since = time.time()
+                    # Node is overloaded again — reset reclaim eligibility
+                    self._reclaim_eligible_since = None
                 else:
                     self._self_state.overload_since = None
             return
@@ -423,6 +432,7 @@ class PeerOrchestrator:
             try:
                 self._check_offline_peers()
                 self._check_rebalance()
+                self._check_reclaim()
                 self._check_self_overload()
             except Exception as exc:
                 logger.error("[PeerOrch] Decision loop error: %s", exc)
@@ -516,6 +526,118 @@ class PeerOrchestrator:
                 "rebalance_return", _self_load, _self_fps,
                 0.0, "RETURNED",
             )
+
+    def _check_reclaim(self) -> None:
+        """
+        Reclaim cameras that were migrated away due to overload, once this
+        node's load drops sufficiently below the overload threshold.
+
+        Reclaim condition:
+          - This node's load_score has been below (overload_threshold - reclaim_margin)
+            for at least reclaim_stable_s seconds.
+          - The camera is still being held by the peer it was migrated to
+            (confirmed via peer heartbeat).
+          - Cooldown has expired since the migration.
+
+        Reclaim is done one camera at a time to avoid oscillation.
+        """
+        if not self._migrated_out:
+            return
+
+        cfg = self._cfg
+        now = time.time()
+
+        reclaim_threshold = cfg.get("overload_threshold", 75.0) - cfg.get("reclaim_margin", 15.0)
+        reclaim_stable_s  = cfg.get("reclaim_stable_s", 20.0)
+        cooldown_s        = cfg.get("cooldown_s", 45.0)
+        heartbeat_timeout = cfg.get("heartbeat_timeout_s", 6.0)
+
+        with self._self_lock:
+            load         = self._self_state.load_score
+            overload_since = self._self_state.overload_since
+
+        # Only reclaim if load has been stable and low
+        if load >= reclaim_threshold:
+            return
+        # overload_since being None means load has dropped — good.
+        # If it's still set, the node is still above overload_threshold.
+        if overload_since is not None:
+            return
+        # Wait reclaim_stable_s after load dropped before reclaiming
+        # We use _reclaim_eligible_since to track when load first dropped
+        if not hasattr(self, "_reclaim_eligible_since") or self._reclaim_eligible_since is None:
+            self._reclaim_eligible_since = now
+            return
+        if now - self._reclaim_eligible_since < reclaim_stable_s:
+            return
+
+        # Find one camera to reclaim (oldest migration first)
+        with self._lock:
+            candidates = list(self._migrated_out.items())
+
+        for camera_id, holder_node in candidates:
+            # Check cooldown
+            last_mig = self._cam_cooldown.get(camera_id, 0.0)
+            if now - last_mig < cooldown_s:
+                continue
+
+            # Confirm holder is still alive and still holding this camera
+            with self._lock:
+                peer = self._peers.get(holder_node)
+            if peer is None:
+                # Peer gone — remove stale entry
+                self._migrated_out.pop(camera_id, None)
+                continue
+            if now - peer.last_seen > heartbeat_timeout:
+                # Holder offline — failover will handle it
+                self._migrated_out.pop(camera_id, None)
+                continue
+            if camera_id not in peer.active_cameras:
+                # Holder no longer running this camera — already returned or lost
+                self._migrated_out.pop(camera_id, None)
+                continue
+
+            # Send ADD to self (reclaim)
+            cam_config = self._get_camera_config(camera_id)
+            if cam_config is None:
+                logger.warning("[PeerOrch] Reclaim: cannot get config for '%s', skipping", camera_id)
+                continue
+
+            add_cmd = {**cam_config, "cmd": "ADD"}
+            self._pubs["control"].put(msgpack.packb(add_cmd, use_bin_type=True))
+            logger.info(
+                "[PeerOrch] Reclaim: load=%.1f < threshold=%.1f — "
+                "ADD '%s' back to self (was held by '%s')",
+                load, reclaim_threshold, camera_id, holder_node,
+            )
+
+            # Send REMOVE to holder
+            remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
+            holder_control_key = f"nodes/{holder_node}/control"
+            try:
+                self._session.put(
+                    holder_control_key,
+                    msgpack.packb(remove_cmd, use_bin_type=True),
+                )
+                logger.info(
+                    "[PeerOrch] Reclaim: REMOVE sent to '%s' for '%s'",
+                    holder_node, camera_id,
+                )
+            except Exception as exc:
+                logger.error("[PeerOrch] Reclaim: failed to send REMOVE to '%s': %s", holder_node, exc)
+
+            self._migrated_out.pop(camera_id, None)
+            self._cam_cooldown[camera_id] = now
+            # Reset eligible timer to avoid immediately reclaiming next camera
+            self._reclaim_eligible_since = now
+
+            self._migration_log.log(
+                holder_node, self._node_id, camera_id,
+                "reclaim", load, None,
+                0.0, "RECLAIMED",
+            )
+            # Reclaim one at a time
+            return
 
     def _check_self_overload(self) -> None:
         """
@@ -1039,8 +1161,9 @@ class PeerOrchestrator:
             camera_id,
         )
 
-        # Update cooldown
+        # Update cooldown and track migration for future reclaim
         self._cam_cooldown[camera_id] = time.time()
+        self._migrated_out[camera_id] = winner_node
 
         elapsed_ms = time.time() * 1000 - start_ms
         # Δτ: time from migration complete to first valid speed on the new node.

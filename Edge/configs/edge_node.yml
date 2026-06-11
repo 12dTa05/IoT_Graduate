@@ -15,6 +15,8 @@ p2p:
   heartbeat_timeout_s: 5.0      # peer declared OFFLINE after this silence
   vote_window_s: 3.0            # proposal collection duration
   failover_jitter_max_s: 3.0    # random delay before failover ADD (race prevention)
+  reclaim_margin: 15.0          # reclaim only when load < (overload_threshold - reclaim_margin)
+  reclaim_stable_s: 20.0        # load must stay low this long before reclaiming
 
   # epsilon-Constraint tiers (Pareto optimization)
   eps_fps_strict: 15.0          # Tier 0 — strict FPS floor
@@ -69,9 +71,10 @@ load_score:
   thermal_threshold_c: 75.0       # gpu_temp_c ≥ this → use thermal preset
   stream_bandwidth_threshold: 3   # active_cameras ≥ this → use bandwidth preset
 
-  weights_normal:    [0.5, 0.3, 0.2]
-  weights_thermal:   [0.3, 0.2, 0.5]
-  weights_bandwidth: [0.2, 0.5, 0.3]
+  #[w_gpu, w_cpu, w_ram]
+  weights_normal:    [0.3, 0.3, 0.4]
+  weights_thermal:   [0.2, 0.2, 0.6]
+  weights_bandwidth: [0.2, 0.3, 0.5]
 
   # FPS-drop penalty cap (additive points on top of weighted hardware score)
   fps_penalty_max: 25.0
