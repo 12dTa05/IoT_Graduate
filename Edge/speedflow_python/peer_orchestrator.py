@@ -603,28 +603,25 @@ class PeerOrchestrator:
                 logger.warning("[PeerOrch] Reclaim: cannot get config for '%s', skipping", camera_id)
                 continue
 
+            # Make-before-Break:
+            #   Step 1 — ADD to self first, wait for stream PLAYING ack
+            #   Step 2 — Only then REMOVE from holder
+            # This reuses the same _pending_acks + _wait_and_remove mechanism
+            # used by normal RFO migration.
             add_cmd = {**cam_config, "cmd": "ADD"}
             self._pubs["control"].put(msgpack.packb(add_cmd, use_bin_type=True))
             logger.info(
                 "[PeerOrch] Reclaim: load=%.1f < threshold=%.1f — "
-                "ADD '%s' back to self (was held by '%s')",
+                "ADD '%s' back to self (was held by '%s'), waiting for ack...",
                 load, reclaim_threshold, camera_id, holder_node,
             )
 
-            # Send REMOVE to holder
-            remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
-            holder_control_key = f"nodes/{holder_node}/control"
-            try:
-                self._session.put(
-                    holder_control_key,
-                    msgpack.packb(remove_cmd, use_bin_type=True),
-                )
-                logger.info(
-                    "[PeerOrch] Reclaim: REMOVE sent to '%s' for '%s'",
-                    holder_node, camera_id,
-                )
-            except Exception as exc:
-                logger.error("[PeerOrch] Reclaim: failed to send REMOVE to '%s': %s", holder_node, exc)
+            # Spin up a thread that waits for the local ADD ack then removes holder
+            threading.Thread(
+                target=self._wait_and_remove_reclaim,
+                args=(camera_id, holder_node),
+                daemon=True,
+            ).start()
 
             self._migrated_out.pop(camera_id, None)
             self._cam_cooldown[camera_id] = now
@@ -1186,6 +1183,52 @@ class PeerOrchestrator:
             elapsed_ms, camera_id, winner_node,
         )
 
+    def _wait_and_remove_reclaim(self, camera_id: str, holder_node: str) -> None:
+        """
+        Make-before-Break for reclaim:
+          - Wait for local ADD ack (stream PLAYING on self)
+          - Then send REMOVE to holder node
+
+        Reuses the same _pending_acks event mechanism as _wait_and_remove.
+        If timeout, log error but do NOT rollback — the ADD is already live
+        and the holder will eventually be cleaned up by rebalance.
+        """
+        event = threading.Event()
+        with self._lock:
+            self._pending_acks[camera_id] = event
+
+        timeout = self._cfg.get("migration_timeout_s", 15.0)
+        confirmed = event.wait(timeout=timeout)
+
+        with self._lock:
+            self._pending_acks.pop(camera_id, None)
+
+        if not confirmed:
+            logger.error(
+                "[PeerOrch] Reclaim: TIMEOUT (%ds) waiting for local ADD ack of '%s'. "
+                "Camera added to self but holder '%s' NOT removed — may cause duplicate stream.",
+                int(timeout), camera_id, holder_node,
+            )
+            return
+
+        # Stream confirmed PLAYING on self — safe to remove from holder
+        remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
+        holder_control_key = f"peers/control/{holder_node}"
+        try:
+            self._session.put(
+                holder_control_key,
+                msgpack.packb(remove_cmd, use_bin_type=True),
+            )
+            logger.info(
+                "[PeerOrch] Reclaim: stream PLAYING on self — REMOVE sent to '%s' for '%s'. Reclaim complete.",
+                holder_node, camera_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[PeerOrch] Reclaim: failed to send REMOVE to '%s' for '%s': %s",
+                holder_node, camera_id, exc,
+            )
+
     # ------------------------------------------------------------------
     # Vote ack
     # ------------------------------------------------------------------
@@ -1448,9 +1491,16 @@ class PeerOrchestrator:
         """
         Chọn camera để offload — ưu tiên camera có FPS cao nhất.
 
-        Copy từ MasterOrchestrator._pick_camera_to_offload() (master_orchestrator.py:420).
+        Không bao giờ offload camera cuối cùng — node phải giữ ít nhất 1 camera
+        để tiếp tục hoạt động. Nếu chỉ còn 1 camera mà vẫn overload thì đó là
+        giới hạn phần cứng, không thể giải quyết bằng migration.
         """
-        if not state.active_cameras:
+        if len(state.active_cameras) <= 1:
+            if state.active_cameras:
+                logger.debug(
+                    "[PeerOrch] Only 1 camera left ('%s') — cannot offload last camera",
+                    state.active_cameras[0],
+                )
             return None
         if state.fps_per_camera:
             return max(
