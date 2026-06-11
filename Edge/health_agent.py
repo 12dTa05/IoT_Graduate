@@ -77,40 +77,17 @@ def _read_fps_stats() -> Dict[str, float]:
 
 def _collect_jetson_metrics() -> Dict:
     """
-    Thu thập thông số phần cứng từ thiết bị Jetson bằng thư viện jtop.
-    Trả về dict với các key chuẩn hoá.
-
-    Fallback sang psutil nếu không chạy trên Jetson thật (phục vụ dev/test).
-
-    NOTE: Do NOT open a new jtop() context here — use the persistent
-    session held by HealthAgent._jtop to avoid socket/fd exhaustion.
-    This function is only used as a one-shot fallback during init.
+    Return empty metrics when jtop is not available.
+    All metrics collection relies solely on jtop.
     """
-    # --- Fallback: psutil (non-blocking, no interval sleep) ---
-    try:
-        import psutil
-        # interval=None: non-blocking, returns value since last call.
-        # Call virtual_memory() inside a local scope — no fd leak.
-        cpu_pct = psutil.cpu_percent(interval=None)
-        ram_pct = psutil.virtual_memory().percent
-        return {
-            "gpu_percent": 0.0,   # psutil không đo được GPU
-            "cpu_percent": round(cpu_pct, 1),
-            "ram_percent": round(ram_pct, 1),
-            "gpu_temp_c":  0.0,
-            "power_mw":    0.0,
-            "source": "psutil",
-        }
-    except Exception as exc:
-        logger.error("psutil error: %s", exc)
-        return {
-            "gpu_percent": 0.0,
-            "cpu_percent": 0.0,
-            "ram_percent": 0.0,
-            "gpu_temp_c":  0.0,
-            "power_mw":    0.0,
-            "source": "error",
-        }
+    return {
+        "gpu_percent": 0.0,
+        "cpu_percent": 0.0,
+        "ram_percent": 0.0,
+        "gpu_temp_c":  0.0,
+        "power_mw":    0.0,
+        "source": "jtop_unavailable",
+    }
 
 
 def _load_edge_node_cfg() -> dict:
@@ -440,13 +417,6 @@ class HealthAgent:
             logger.error("[HealthAgent] Zenoh unavailable. Running in log-only mode.")
 
         self._jtop = self._open_jtop()
-
-        # Pre-warm psutil cpu_percent (first call always returns 0.0)
-        try:
-            import psutil
-            psutil.cpu_percent(interval=None)
-        except Exception:
-            pass
 
         _zenoh_retry_interval = 30.0  # seconds between Zenoh reconnect attempts
         _last_zenoh_attempt = time.time()
