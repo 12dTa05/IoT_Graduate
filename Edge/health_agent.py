@@ -28,6 +28,7 @@ _sys.path.insert(0, str(Path(__file__).resolve().parent))
 from speedflow_python.settings import (
     NODE_ID,
     HEALTH_INTERVAL,
+    HEALTH_LOG_EVERY,
     TARGET_FPS,
     FPS_STATS_FILE,
     MONITOR_URL,
@@ -449,6 +450,7 @@ class HealthAgent:
 
         _zenoh_retry_interval = 30.0  # seconds between Zenoh reconnect attempts
         _last_zenoh_attempt = time.time()
+        _log_cycle = 0  # counts health cycles; log LoadScore every HEALTH_LOG_EVERY
 
         while self._running:
             try:
@@ -500,20 +502,22 @@ class HealthAgent:
                 if warmup_ms is not None:
                     payload["warmup_ms"] = warmup_ms
 
-                logger.info(
-                    "LoadScore=%.1f [%s] | GPU=%.1f%% CPU=%.1f%% RAM=%.1f%% "
-                    "Temp=%.1f°C Power=%.0fmW | FPS=%s",
-                    load_score, omega_preset,
-                    metrics["gpu_percent"],
-                    metrics["cpu_percent"],
-                    metrics["ram_percent"],
-                    metrics["gpu_temp_c"],
-                    metrics["power_mw"],
-                    fps_stats,
-                )
-
                 if self._pub:
                     self._pub.put(msgpack.packb(payload, use_bin_type=True))
+
+                _log_cycle += 1
+                if _log_cycle % HEALTH_LOG_EVERY == 1:
+                    logger.info(
+                        "LoadScore=%.1f [%s] | GPU=%.1f%% CPU=%.1f%% RAM=%.1f%% "
+                        "Temp=%.1f°C Power=%.0fmW | FPS=%s",
+                        load_score, omega_preset,
+                        metrics["gpu_percent"],
+                        metrics["cpu_percent"],
+                        metrics["ram_percent"],
+                        metrics["gpu_temp_c"],
+                        metrics["power_mw"],
+                        fps_stats,
+                    )
 
                 # Push to Central Monitor Server (qua MonitorClient)
                 try:
