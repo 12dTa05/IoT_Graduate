@@ -596,10 +596,10 @@ class PeerOrchestrator:
                                       state.avg_fps < cfg.get("eps_fps_strict", 18.0)
                                       ) else "load_score"
             with self._lock:
-                already_voting = cam_to_offload in self._vote_in_progress
+                already_voting = bool(self._vote_in_progress)
             if already_voting:
-                logger.debug("[PeerOrch] Vote already in progress for '%s', skipping L1 trigger",
-                             cam_to_offload)
+                logger.debug("[PeerOrch] Vote already in progress for %s, skipping L1 trigger",
+                             self._vote_in_progress)
             elif now - last_mig >= cfg.get("cooldown_s", 45.0):
                 logger.warning("[PeerOrch] RFO trigger: %s reason=%s", cam_to_offload, trigger)
                 self._trigger_rfo(cam_to_offload, relaxation_tier=0)
@@ -635,17 +635,19 @@ class PeerOrchestrator:
         """Legacy Level-1 overload trigger (existing behaviour, unchanged).
         NOTE: `state` is already a consistent snapshot captured by _check_self_overload.
         """
+        # If ANY camera already has a vote in progress, wait for its outcome
+        # before triggering another RFO. This prevents migrating more cameras
+        # than needed — one migration at a time until load drops.
+        with self._lock:
+            if self._vote_in_progress:
+                logger.debug("[PeerOrch] Vote already in progress for %s, skipping re-trigger",
+                             self._vote_in_progress)
+                return
+
         cam_to_offload = self._pick_camera_to_offload(state)
         if not cam_to_offload:
             logger.debug("[PeerOrch] No camera to offload (all inactive or locked)")
             return
-        
-        # Skip if RFO is already in progress (vote window open)
-        with self._lock:
-            if cam_to_offload in self._vote_in_progress:
-                logger.debug("[PeerOrch] Vote already in progress for '%s', skipping re-trigger",
-                           cam_to_offload)
-                return
         
         last_mig = self._cam_cooldown.get(cam_to_offload, 0.0)
         time_since_mig = now - last_mig
