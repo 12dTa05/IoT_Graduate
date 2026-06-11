@@ -781,6 +781,9 @@ class PeerOrchestrator:
         if requester == self._node_id:
             return  # Bỏ qua RFO của chính mình
 
+        camera_id = payload.get("camera_id", "")
+        logger.info("[PeerOrch] RFO received from '%s' for camera '%s'", requester, camera_id)
+
         # Offload the blocking work immediately so this callback returns fast
         self._executor.submit(self._evaluate_and_bid, payload)
 
@@ -799,7 +802,13 @@ class PeerOrchestrator:
             self_load = self._self_state.load_score
 
         # ε1 — Capacity constraint
-        if current_streams >= self._cfg.get("eps_streams_max", 4):
+        eps_streams_max = self._cfg.get("eps_streams_max", 4)
+        if current_streams >= eps_streams_max:
+            logger.info(
+                "[PeerOrch] RFO rejected for '%s': ε1 (capacity) — "
+                "current=%d, max=%d",
+                camera_id, current_streams, eps_streams_max,
+            )
             return
 
         # ε2 — FPS prediction
@@ -809,24 +818,47 @@ class PeerOrchestrator:
         predicted_fps = fps_model.get(streams_after,
                         fps_model.get(str(streams_after), 0.0))
         if predicted_fps < eps_fps:
+            logger.info(
+                "[PeerOrch] RFO rejected for '%s': ε2 (FPS) — "
+                "predicted=%.1f, required=%.1f",
+                camera_id, predicted_fps, eps_fps,
+            )
             return
 
         # ε3 — Network RTT to camera RTSP origin (blocking — safe here in thread pool)
         cam_uri = self._get_camera_uri(camera_id)
         if cam_uri is None:
+            logger.info("[PeerOrch] RFO rejected for '%s': ε3 (network) — camera URI not found", camera_id)
             return
         rtt_ms = self._measure_rtt(cam_uri)
         if rtt_ms is None or rtt_ms > eps_net_ms:
+            logger.info(
+                "[PeerOrch] RFO rejected for '%s': ε3 (network) — "
+                "RTT=%.1fms, threshold=%.1fms",
+                camera_id, rtt_ms if rtt_ms else -1.0, eps_net_ms,
+            )
             return
 
         # ε4 — Per-camera cooldown
         last_mig = self._cam_cooldown.get(camera_id, 0.0)
-        if time.time() - last_mig < self._cfg.get("cooldown_s", 45.0):
+        cooldown_s = self._cfg.get("cooldown_s", 45.0)
+        time_since_last = time.time() - last_mig
+        if time_since_last < cooldown_s:
+            logger.info(
+                "[PeerOrch] RFO rejected for '%s': ε4 (cooldown) — "
+                "%.1fs since last migration, need %.1fs",
+                camera_id, time_since_last, cooldown_s,
+            )
             return
 
         # ε5 — Penalty check (applied when this node previously caused a migration timeout)
         now = time.time()
         if now < self._self_penalty_until:
+            logger.info(
+                "[PeerOrch] RFO rejected for '%s': ε5 (penalty) — "
+                "penalized until %.1f",
+                camera_id, self._self_penalty_until,
+            )
             return
 
         # All constraints pass — compute F(x)
@@ -844,7 +876,8 @@ class PeerOrchestrator:
 
         self._pubs["vote_proposal"].put(msgpack.packb(proposal, use_bin_type=True))
         logger.info(
-            "[PeerOrch] Bid for '%s': score=%.1f, fps_pred=%.1f, rtt=%.0fms",
+            "[PeerOrch] RFO accepted for '%s' (ALL ε-constraints pass) — "
+            "Bid: score=%.1f, fps_pred=%.1f, rtt=%.0fms",
             camera_id, f_x, predicted_fps, rtt_ms,
         )
 
