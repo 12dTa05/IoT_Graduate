@@ -167,6 +167,8 @@ class PeerOrchestrator:
         # Vote windows: camera_id → list[proposal]
         self._vote_windows: Dict[str, List[dict]] = {}
         self._vote_timers: Dict[str, threading.Timer] = {}
+        # Cameras with RFO sent but vote window still open (prevent re-trigger)
+        self._vote_in_progress: set = set()
 
         # Pending ack events cho Make-before-Break
         self._pending_acks: Dict[str, threading.Event] = {}
@@ -593,7 +595,12 @@ class PeerOrchestrator:
             trigger  = "fps_drop" if (state.avg_fps and
                                       state.avg_fps < cfg.get("eps_fps_strict", 18.0)
                                       ) else "load_score"
-            if now - last_mig >= cfg.get("cooldown_s", 45.0):
+            with self._lock:
+                already_voting = cam_to_offload in self._vote_in_progress
+            if already_voting:
+                logger.debug("[PeerOrch] Vote already in progress for '%s', skipping L1 trigger",
+                             cam_to_offload)
+            elif now - last_mig >= cfg.get("cooldown_s", 45.0):
                 logger.warning("[PeerOrch] RFO trigger: %s reason=%s", cam_to_offload, trigger)
                 self._trigger_rfo(cam_to_offload, relaxation_tier=0)
 
@@ -632,6 +639,14 @@ class PeerOrchestrator:
         if not cam_to_offload:
             logger.debug("[PeerOrch] No camera to offload (all inactive or locked)")
             return
+        
+        # Skip if RFO is already in progress (vote window open)
+        with self._lock:
+            if cam_to_offload in self._vote_in_progress:
+                logger.debug("[PeerOrch] Vote already in progress for '%s', skipping re-trigger",
+                           cam_to_offload)
+                return
+        
         last_mig = self._cam_cooldown.get(cam_to_offload, 0.0)
         time_since_mig = now - last_mig
         if time_since_mig < cfg.get("cooldown_s", 45.0):
@@ -712,6 +727,8 @@ class PeerOrchestrator:
 
         with self._lock:
             self._vote_windows[camera_id] = []
+            # Mark this camera as having RFO in progress
+            self._vote_in_progress.add(camera_id)
 
         self._pubs["vote_request"].put(msgpack.packb(payload, use_bin_type=True))
         logger.info("[PeerOrch] RFO sent for '%s' (tier=%d, eps_fps=%.1f, eps_net=%.0fms)",
@@ -737,6 +754,9 @@ class PeerOrchestrator:
         with self._lock:
             proposals = self._vote_windows.pop(camera_id, [])
             self._vote_timers.pop(camera_id, None)
+            # Keep _vote_in_progress set until we know we're not escalating,
+            # to prevent _check_self_overload from re-triggering in the gap.
+            # It will be cleared below if we're not escalating another tier.
 
         if not proposals:
             if relaxation_tier < 2:
@@ -744,6 +764,7 @@ class PeerOrchestrator:
                     "[PeerOrch] Zero bids for '%s' (tier=%d). Relaxing ε...",
                     camera_id, relaxation_tier,
                 )
+                # _vote_in_progress stays set; _trigger_rfo will keep it set
                 self._trigger_rfo(camera_id, relaxation_tier=relaxation_tier + 1)
             else:
                 logger.error(
@@ -751,7 +772,19 @@ class PeerOrchestrator:
                     "Continuing with current load.",
                     camera_id,
                 )
+                # All tiers exhausted — clear in_progress and set cooldown
+                with self._lock:
+                    self._vote_in_progress.discard(camera_id)
+                self._cam_cooldown[camera_id] = time.time()
+                logger.info(
+                    "[PeerOrch] Cooldown set for '%s' (%.1fs) to prevent RFO spam",
+                    camera_id, self._cfg.get("cooldown_s", 45.0),
+                )
             return
+
+        # Winner found — clear in_progress
+        with self._lock:
+            self._vote_in_progress.discard(camera_id)
 
         # Winner = proposal có F(x) thấp nhất
         winner = min(proposals, key=lambda p: p["score"])
@@ -826,12 +859,19 @@ class PeerOrchestrator:
         fps_model = self._cfg.get("fps_model", {})
         streams_after = current_streams + 1
         predicted_fps = fps_model.get(streams_after,
-                        fps_model.get(str(streams_after), 0.0))
+                        fps_model.get(str(streams_after), None))
+        if predicted_fps is None:
+            logger.info(
+                "[PeerOrch] RFO rejected for '%s': ε2 (FPS) — "
+                "no fps_model entry for streams_after=%d (current=%d, max modeled=%d)",
+                camera_id, streams_after, current_streams, max(fps_model.keys(), default=0),
+            )
+            return
         if predicted_fps < eps_fps:
             logger.info(
                 "[PeerOrch] RFO rejected for '%s': ε2 (FPS) — "
-                "predicted=%.1f, required=%.1f",
-                camera_id, predicted_fps, eps_fps,
+                "predicted=%.1f, required=%.1f (streams_after=%d)",
+                camera_id, predicted_fps, eps_fps, streams_after,
             )
             return
 

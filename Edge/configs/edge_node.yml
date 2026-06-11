@@ -22,7 +22,7 @@ p2p:
   eps_fps_tier2: 10.0           # Tier 2 relaxation
   eps_network_ms_strict: 30.0   # Tier 0 — RTSP RTT ceiling
   eps_network_ms_tier1: 60.0    # Tier 1 relaxation
-  eps_streams_max: 8            # Hard capacity ceiling (matches cameras.yml max_streams)
+  eps_streams_max: 4            # Hard capacity ceiling (must match max key in fps_model)
 
   # FPS prediction model — calibrate offline per Jetson model
   # key = number of streams AFTER accepting the new camera
