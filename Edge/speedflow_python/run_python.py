@@ -2,13 +2,14 @@
 """
 Python backend runner.
 Uses speedflow_python pipeline + GStreamer pad probes for processing.
-Hỗ trợ Multi-Stream Dynamic.
+Supports Multi-Stream Dynamic.
 """
 import sys
 import os
 import logging
 import time
 import threading
+from typing import Optional
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -42,13 +43,15 @@ logger = logging.getLogger(__name__)
 def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
                   camera_manager: CameraManager,
                   peer_orch=None,
-                  offload_pub=None) -> SpeedProbe:
+                  offload_pub=None,
+                  zenoh_pub=None) -> SpeedProbe:
     """
     Attach ROI filter, plate preprocessor, and speed probe to *pipeline*.
     Returns the SpeedProbe instance.
 
     peer_orch:   PeerOrchestrator — lets the probe query offload levels.
     offload_pub: OffloadPublisher — lets the probe send crops to peers.
+    zenoh_pub:   ZenohPublisher — lets the probe publish overspeed events.
     """
     # 1. ROI filter
     analytics = pipeline.get_by_name("analytics")
@@ -85,6 +88,8 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
     probe = SpeedProbe(camera_manager, peer_orch=peer_orch)
     if offload_pub is not None:
         probe.set_offload_publisher(offload_pub)
+    if zenoh_pub is not None:
+        probe.set_publisher(zenoh_pub)
 
     tiler = pipeline.get_by_name("tiler")
     if tiler:
@@ -121,9 +126,9 @@ def _attach_camera_manager(
         which are always called via GLib.idle_add → run on GLib Main Loop
         thread → no concurrent mutation possible.
     """
-    # Mapping ngược: source_id (int) → camera_id (str)
-    # Khởi tạo từ các camera đã được enabled khi pipeline bắt đầu.
-    # Chỉ được đọc/ghi từ GLib Main Loop thread (thông qua idle_add).
+    # Reverse mapping: source_id (int) → camera_id (str)
+    # Initialized from enabled cameras when pipeline starts.
+    # Only read/written from GLib Main Loop thread (via idle_add).
     source_id_to_cam_id: dict[int, str] = {
         cfg.source_id: cfg.camera_id
         for cfg in camera_manager.get_enabled_configs()
@@ -133,13 +138,13 @@ def _attach_camera_manager(
         current_n = streammux.get_property("batch-size")
         print(f"[Dynamic] Adding camera '{cam_cfg.camera_id}' (source_id={cam_cfg.source_id})")
         dynamic_add_stream(pipeline, streammux, cam_cfg, tiler, source_bins, current_n)
-        # Đăng ký ánh xạ ngay sau khi thêm thành công.
-        # Hàm này chạy trong GLib Main Loop → an toàn, không cần lock.
+        # Register mapping immediately after successful add.
+        # This function runs in GLib Main Loop → safe, no lock needed.
         source_id_to_cam_id[cam_cfg.source_id] = cam_cfg.camera_id
 
     def on_remove(source_id):
-        # Tra cứu camera_id từ dict ánh xạ —
-        # không dùng GStreamer pad scan vì phức tạp và không thread-safe.
+        # Look up camera_id from the mapping dict.
+        # Not using GStreamer pad scan because it's complex and not thread-safe.
         cam_id = source_id_to_cam_id.get(source_id)
         if cam_id is None:
             print(
@@ -153,9 +158,9 @@ def _attach_camera_manager(
         print(f"[Dynamic] Removing camera '{cam_id}' (source_id={source_id})")
         dynamic_remove_stream(pipeline, streammux, cam_id, source_id, tiler, source_bins, current_n)
 
-        # Dọn dẹp key sau khi xóa thành công.
-        # Phòng tránh memory leak khi hệ thống chạy liên tục nhiều tháng
-        # và xung đột source_id nếu cùng ID được tái sử dụng sau này.
+        # Clean up key after successful removal.
+        # Prevents memory leak during continuous operation over months
+        # and avoids source_id conflicts if the same ID is reused later.
         removed = source_id_to_cam_id.pop(source_id, None)
         if removed:
             print(f"[Dynamic] Cleaned up mapping: source_id={source_id} → '{removed}'")
@@ -203,7 +208,7 @@ def _run_loop_until_eos_or_error(
 # Modes
 # ---------------------------------------------------------------------------
 
-def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None) -> None:
+def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, zenoh_pub=None) -> None:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
@@ -216,7 +221,7 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
     pipeline, nvdsosd, streammux, source_bins = ret_build
     tiler = pipeline.get_by_name("tiler")
 
-    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub)
+    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, zenoh_pub=zenoh_pub)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
     t0_playing = time.monotonic()
@@ -231,7 +236,7 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
     _run_loop_until_eos_or_error(pipeline, camera_manager)
 
 
-def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None) -> None:
+def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, zenoh_pub=None) -> SpeedProbe:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
@@ -243,7 +248,7 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
     )
     pipeline, nvdsosd, streammux, source_bins = ret_build
 
-    _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub)
+    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, zenoh_pub=zenoh_pub)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, None)
 
     print(f"[Python File Mode] Processing multi-streams to output files...")
@@ -253,6 +258,7 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
         sys.exit(1)
 
     _run_loop_until_eos_or_error(pipeline, camera_manager)
+    return probe
 
 
 # ---------------------------------------------------------------------------
@@ -266,78 +272,69 @@ def _health_push_loop(peer_orch=None) -> None:
     import msgpack as _msgpack
     import yaml as _yaml
 
-    # BUG-4 / BUG-9 fix: delegate metric collection and load-score computation
-    # to health_agent's functions so that:
-    #   - Adaptive omega weights (thermal / bandwidth / normal) are applied.
-    #   - The CPU formula is identical to health_agent.py (100 - idle%), not
-    #     the incorrect per-core average that was here before.
-    # This ensures peers/status heartbeats always carry a consistent load score
-    # regardless of which process (main.py or health_agent.py) publishes them.
+    # Delegate metric collection and load-score computation to health_agent's
+    # functions so adaptive omega weights and the correct CPU formula are used.
     from health_agent import (
-        _collect_jetson_metrics as _collect_metrics_fn,
         _compute_load_score     as _compute_load_fn,
         _read_fps_stats         as _read_fps_fn,
+        _read_feature_stats     as _read_feat_fn,
+        _EDGE_CFG               as _edge_cfg,
     )
+    from speedflow_python.load_model import ProactiveModel as _ProactiveModel
+    _proactive_model = _ProactiveModel(_edge_cfg.get("proactive", {}))
 
     _fps_file = _Path(FPS_STATS_FILE)
 
-    # Load camera configs once so peers know the original URIs for failover
-    _cam_configs = {}
-    try:
-        with open(CAMERAS_YML, "r", encoding="utf-8") as f:
-            raw = _yaml.safe_load(f)
-        for cam_id, cfg in raw.get("cameras", {}).items():
-            if cfg and cfg.get("enabled", True):
-                _cam_configs[cam_id] = {
-                    "camera_id":       cam_id,
-                    "source_id":       int(cfg.get("source_id", 0)),
-                    "uri":             cfg.get("uri", ""),
-                    "name":            cfg.get("name", cam_id),
-                    "fps":             float(cfg.get("fps", 25.0)),
-                    "speed_limit_kmh": float(cfg.get("speed_limit_kmh", 80.0)),
-                    "homography":      cfg.get("homography", {}),
-                    "roi_polygon":     cfg.get("roi_polygon", []),
-                    "output":          cfg.get("output", {}),
-                }
-    except Exception:
-        pass
+    # Load camera configs once so peers know the original URIs for failover.
+    # Fix #12: use a mutable container so the inner closure can update it.
+    _cam_configs: dict = {}
 
-    # Open persistent jtop session for Jetson GPU/CPU/RAM metrics
-    _jtop = None
-    try:
-        from jtop import jtop as _JTop
-        _jtop = _JTop()
-        _jtop.start()
-    except Exception:
-        pass
+    def _reload_cam_configs() -> dict:
+        try:
+            with open(CAMERAS_YML, "r", encoding="utf-8") as f:
+                raw = _yaml.safe_load(f)
+            result = {}
+            for cam_id, cfg in raw.get("cameras", {}).items():
+                if cfg and cfg.get("enabled", True):
+                    result[cam_id] = {
+                        "camera_id":       cam_id,
+                        "source_id":       int(cfg.get("source_id", 0)),
+                        "uri":             cfg.get("uri", ""),
+                        "name":            cfg.get("name", cam_id),
+                        "fps":             float(cfg.get("fps", 25.0)),
+                        "speed_limit_kmh": float(cfg.get("speed_limit_kmh", 80.0)),
+                        "homography":      cfg.get("homography", {}),
+                        "roi_polygon":     cfg.get("roi_polygon", []),
+                        "output":          cfg.get("output", {}),
+                    }
+            return result
+        except Exception:
+            return {}
 
-    # Monkey-patch the module-level jtop reference so _collect_metrics_fn
-    # picks up our persistent session instead of opening a new one.
+    _cam_configs = _reload_cam_configs()
+    _cam_configs_reload_interval = 30.0   # re-read cameras.yml every 30 s
+    _last_cam_reload = _time.monotonic()
+
+    # Fix #2: open a persistent jtop session directly in this loop so that
+    # _collect_metrics (from health_agent) can use it.  The old monkey-patch
+    # approach was dead code — _collect_via_jtop was called instead, bypassing
+    # _collect_metrics_fn entirely.  We now call health_agent._collect_metrics
+    # via a HealthAgent instance so the full fallback chain works correctly.
     import health_agent as _ha
-    _ha_orig_jtop = _ha.HealthAgent  # keep reference; we don't modify the class
-
-    # Create a minimal stub so _collect_metrics_fn can use _jtop
-    class _JtopWrapper:
-        def __init__(self, j):
-            self._j = j
-        @property
-        def stats(self):    return self._j.stats if self._j else None
-        @property
-        def memory(self):   return self._j.memory if self._j else None
-        @property
-        def temperature(self): return self._j.temperature if self._j else {}
-        @property
-        def power(self):    return self._j.power if self._j else {}
-        @property
-        def cpu(self):      return self._j.cpu if self._j else {}
-
-    _jtop_wrapper = _JtopWrapper(_jtop) if _jtop else None
+    _agent_stub = _ha.HealthAgent.__new__(_ha.HealthAgent)
+    _agent_stub._jtop = _agent_stub._open_jtop()
 
     while True:
         try:
-            # Use health_agent's collection + scoring functions
-            metrics    = _collect_metrics_fn() if _jtop_wrapper is None else _collect_via_jtop(_jtop_wrapper)
-            fps_stats  = _read_fps_fn()
+            # Fix #12: periodically refresh camera configs to pick up dynamic changes
+            if _time.monotonic() - _last_cam_reload >= _cam_configs_reload_interval:
+                _cam_configs = _reload_cam_configs()
+                _last_cam_reload = _time.monotonic()
+
+            # Use health_agent's collection + scoring functions via the stub instance
+            metrics       = _agent_stub._collect_metrics()
+            fps_stats     = _read_fps_fn()
+            feature_stats = _read_feat_fn()
             load_score, omega_preset = _compute_load_fn(metrics, fps_stats)
 
             active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
@@ -354,6 +351,7 @@ def _health_push_loop(peer_orch=None) -> None:
                 "ram_percent":  metrics["ram_percent"],
                 "gpu_temp_c":   metrics["gpu_temp_c"],
                 "power_mw":     metrics.get("power_mw", 0.0),
+                "source":       metrics.get("source", "jtop"),
                 "pipeline": {
                     "fps_per_camera":  fps_stats,
                     "avg_fps":         avg_fps,
@@ -362,6 +360,10 @@ def _health_push_loop(peer_orch=None) -> None:
                     "camera_configs":  _cam_configs,
                 },
             }
+
+            # ── Proactive model (payload parity with health_agent._run) ────
+            proactive_result = _proactive_model.compute(metrics, feature_stats)
+            payload.update(proactive_result)
 
             # Push to Dashboard via WebSocket
             from speedflow_python.monitor_client import send_to_monitor
@@ -380,83 +382,8 @@ def _health_push_loop(peer_orch=None) -> None:
         _time.sleep(HEALTH_INTERVAL)
 
 
-def _collect_via_jtop(jtop_wrapper) -> dict:
-    """Collect Jetson metrics by reading jtop's dedicated properties directly.
 
-    Reads gpu, cpu, memory, temperature and power individually so that a
-    missing or unready property (e.g. power on boards without INA3221) does
-    not crash the entire collection and zero out GPU% and Temp.
-    """
-    # GPU %
-    gpu_pct = 0.0
-    try:
-        for gpu_info in jtop_wrapper._j.gpu.values():
-            gpu_pct = float(gpu_info.get("status", {}).get("load", 0.0))
-            break
-    except Exception:
-        pass
-
-    # CPU % — jtop.cpu["total"]["idle"] is aggregate idle across all cores
-    cpu_pct = 0.0
-    try:
-        cpu_total = jtop_wrapper._j.cpu.get("total", {})
-        cpu_pct   = 100.0 - float(cpu_total.get("idle", 100.0))
-    except Exception:
-        pass
-
-    # RAM %
-    ram_pct = 0.0
-    try:
-        mem     = jtop_wrapper._j.memory
-        ram_tot = mem["RAM"]["tot"]
-        if ram_tot > 0:
-            ram_pct = float(mem["RAM"]["used"]) / ram_tot * 100.0
-    except Exception:
-        pass
-
-    # Temperature — same priority order as health_agent.py
-    temp_c = 0.0
-    try:
-        temp_dict = jtop_wrapper._j.temperature
-        for key in ("gpu", "tj", "cpu"):
-            info = temp_dict.get(key)
-            if not isinstance(info, dict):
-                continue
-            t = info.get("temp", -256)
-            if isinstance(t, (int, float)) and 0 < t < 120:
-                temp_c = float(t)
-                break
-        else:
-            for info in temp_dict.values():
-                if not isinstance(info, dict):
-                    continue
-                t = info.get("temp", -256)
-                if isinstance(t, (int, float)) and 0 < t < 120:
-                    temp_c = float(t)
-                    break
-    except Exception:
-        pass
-
-    # Power (optional — not available on all boards)
-    power_mw = 0.0
-    try:
-        pwr = jtop_wrapper._j.power
-        if isinstance(pwr, dict):
-            power_mw = float(pwr.get("tot", {}).get("power", 0))
-    except Exception:
-        pass
-
-    return {
-        "gpu_percent": round(gpu_pct, 1),
-        "cpu_percent": round(cpu_pct, 1),
-        "ram_percent": round(ram_pct, 1),
-        "gpu_temp_c":  round(temp_c, 1),
-        "power_mw":    round(power_mw, 0),
-        "source":      "jtop",
-    }
-
-
-def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None) -> None:
+def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, zenoh_pub=None) -> Optional["SpeedProbe"]:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
@@ -494,6 +421,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
 
     _RESTART_DELAYS = [5, 10, 20, 30]
     restart_idx = 0
+    _last_probe = None
 
     while True:
         ret_build = build_pipeline(
@@ -507,7 +435,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         pipeline, nvdsosd, streammux, source_bins = ret_build
         tiler = pipeline.get_by_name("tiler")
 
-        _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub)
+        _last_probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, zenoh_pub=zenoh_pub)
         _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
         ret = pipeline.set_state(Gst.State.PLAYING)
@@ -577,7 +505,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             camera_manager.stop()
             pipeline.set_state(Gst.State.NULL)
             print("Pipeline stopped")
-            return
+            return _last_probe
         finally:
             # BUG-11 fix: do NOT call camera_manager.stop() here on every
             # iteration — that kills the watchdog observer and processor thread
@@ -601,6 +529,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
 
     # BUG-11 fix: stop the camera manager once, after the restart loop exits.
     camera_manager.stop()
+    return _last_probe
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +589,26 @@ def run_python_mode(args) -> None:
         )
     except Exception as exc:
         print(f"[Zenoh C2] Failed to start subscriber: {exc}", file=sys.stderr)
+
+    # --- Zenoh event publisher (overspeed violations → traffic/events/...) ---
+    # SpeedProbe enqueues overspeed payloads here; a daemon thread publishes
+    # them via Zenoh. health_agent.py subscribes to traffic/events/{NODE_ID}/**
+    # and forwards them to the Central Monitor Server. Without this, overspeed
+    # events are computed but never leave the pipeline.
+    zenoh_pub = None
+    try:
+        from .zenoh_publisher import ZenohPublisher
+        zenoh_pub = ZenohPublisher(node_id=NODE_ID)
+        zenoh_pub.start()
+        print(f"[ZenohPub] Started. Key=traffic/events/{NODE_ID}/<camera_id>")
+    except ImportError:
+        print(
+            "[ZenohPub] zenoh/msgpack not installed — overspeed events disabled. "
+            "Run: pip install zenoh msgpack",
+            file=sys.stderr,
+        )
+    except Exception as exc:
+        print(f"[ZenohPub] Failed to start: {exc}", file=sys.stderr)
 
     # --- Offload Publisher + Receiver (Level 2/3 crop offload) ---
     offload_pub = None
@@ -722,12 +671,24 @@ def run_python_mode(args) -> None:
     _health_thread.start()
     print("[HealthPush] Started (metrics → Dashboard + Zenoh)")
 
-    # Run pipeline — offload_pub reference passed so SpeedProbe can use it
+    # Run pipeline — offload_pub + zenoh_pub references passed so SpeedProbe can use them
     if args.mode == "display":
-        probe = run_display_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub)
+        probe = run_display_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, zenoh_pub=zenoh_pub)
     elif args.mode == "file":
-        probe = run_file_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub)
+        probe = run_file_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, zenoh_pub=zenoh_pub)
     elif args.mode == "rtsp_push":
-        probe = run_rtsp_push_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub)
+        probe = run_rtsp_push_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, zenoh_pub=zenoh_pub)
     else:
         raise ValueError(f"Unknown mode: '{args.mode}'")
+
+    # Fix #1 / #7: stop the FPS writer thread cleanly now that the pipeline
+    # has exited, regardless of which mode was used.
+    if probe is not None:
+        probe.stop_fps_writer()
+
+    # Stop the overspeed event publisher and flush its queue on exit.
+    if zenoh_pub is not None:
+        try:
+            zenoh_pub.stop()
+        except Exception as exc:
+            print(f"[ZenohPub] Stop error: {exc}", file=sys.stderr)

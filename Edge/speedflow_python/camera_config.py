@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # speedflow_python/camera_config.py
 """
-CameraManager — Quản lý cấu hình đa camera cho hệ thống Multi-Stream.
+CameraManager — Manage multi-camera configuration for Multi-Stream system.
 
-Cung cấp:
-  - Đọc/parse file cameras.yml
-  - Pre-compute ma trận Homography cho từng camera
-  - API tra cứu nhanh theo source_id
-  - Watcher độ trễ thấp (inotify qua watchdog) + debounce 100ms
-  - REST API (FastAPI) cho thêm/bớt lập trình
-  - Thread-safe delta queue → GLib.idle_add() để đảm bảo GStreamer ops
-    luôn chạy trên GLib Main Loop thread.
+Provides:
+  - Read/parse cameras.yml file
+  - Pre-compute Homography matrix for each camera
+  - Fast lookup API by source_id
+  - Low-latency watcher (inotify via watchdog) + 100ms debounce
+  - REST API (FastAPI) for programmatic add/remove
+  - Thread-safe delta queue → GLib.idle_add() to ensure GStreamer ops
+    always run on GLib Main Loop thread.
 
-Yêu cầu:
+Requirements:
     pip install watchdog fastapi uvicorn
 """
 
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CameraConfig:
-    """Thông tin cấu hình đầy đủ của một camera."""
+    """Complete configuration information for a camera."""
     camera_id: str
     source_id: int
     uri: str
@@ -55,14 +55,14 @@ class CameraConfig:
     target_points: np.ndarray          # shape (4, 2) float32
     homo_matrix: np.ndarray            # shape (3, 3) float64 — pre-computed
 
-    # ROI polygon (pixel coords) cho ROI filter probe
+    # ROI polygon (pixel coords) for ROI filter probe
     roi_polygon: np.ndarray            # shape (N, 2) int32
 
     # Output
     record: bool
     record_path: str
 
-    # --- Derived speed validation params (từ fps) ---
+    # --- Derived speed validation params (from fps) ---
     @property
     def min_track_age_frames(self) -> int:
         return int(self.fps * 0.5)
@@ -70,7 +70,7 @@ class CameraConfig:
 
 @dataclass
 class StreamDelta:
-    """Thay đổi được phát hiện giữa 2 lần đọc file config."""
+    """Changes detected between two config file reads."""
     to_add: List[CameraConfig] = field(default_factory=list)
     to_remove: List[int] = field(default_factory=list)   # list of source_id
 
@@ -80,7 +80,7 @@ class StreamDelta:
 # ---------------------------------------------------------------------------
 
 def _parse_cameras_yml(yml_path: Path) -> Dict[str, CameraConfig]:
-    """Đọc cameras.yml, trả về dict camera_id -> CameraConfig."""
+    """Read cameras.yml, return dict camera_id -> CameraConfig."""
     with open(yml_path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
@@ -99,14 +99,14 @@ def _parse_cameras_yml(yml_path: Path) -> Dict[str, CameraConfig]:
         target_pts = np.array(
             [[0, 0], [tw, 0], [tw, th], [0, th]], dtype=np.float32
         )
-        # Pre-compute homography matrix ngay lúc đọc config
+        # Pre-compute homography matrix when reading config
         homo_matrix, _ = cv2.findHomography(source_pts, target_pts)
         if homo_matrix is None:
-            # Fallback: getPerspectiveTransform yêu cầu đúng 4 điểm
+            # Fallback: getPerspectiveTransform requires exactly 4 points
             homo_matrix = cv2.getPerspectiveTransform(source_pts, target_pts)
 
         roi_raw = cfg.get("roi_polygon", [])
-        # roi_polygon: [x1,y1, x2,y2, x3,y3, x4,y4] → reshape (N,2)
+        # roi_polygon: [x1,y1, x2,y2, x3,y3, x4,y4] → reshape to (N,2)
         roi_arr = np.array(roi_raw, dtype=np.int32).reshape(-1, 2)
 
         out_cfg = cfg.get("output", {})
@@ -136,8 +136,8 @@ def _parse_cameras_yml(yml_path: Path) -> Dict[str, CameraConfig]:
 
 def compute_tiler_layout(num_streams: int) -> tuple[int, int]:
     """
-    Tính rows × cols tối ưu cho nvmultistreamtiler.
-    Ưu tiên layout vuông (hoặc gần vuông).
+    Compute optimal rows × cols for nvmultistreamtiler.
+    Prefer square (or near-square) layout.
     """
     if num_streams <= 0:
         return 1, 1
@@ -152,9 +152,9 @@ def compute_tiler_layout(num_streams: int) -> tuple[int, int]:
 
 class CameraManager:
     """
-    Quản lý toàn bộ vòng đời cấu hình camera.
+    Manage the complete lifecycle of camera configuration.
 
-    Sử dụng:
+    Usage:
         manager = CameraManager("configs/cameras.yml")
         manager.start(on_add_callback, on_remove_callback, glib_idle_add_fn)
         ...
@@ -168,16 +168,16 @@ class CameraManager:
         if not self.yml_path.exists():
             raise FileNotFoundError(f"Camera config not found: {self.yml_path}")
 
-        # Trạng thái hiện tại: camera_id -> CameraConfig
+        # Current state: camera_id -> CameraConfig
         self._configs: Dict[str, CameraConfig] = {}
-        # Lookup nhanh theo source_id (immutable view, rebuild khi reload)
+        # Fast lookup by source_id (immutable view, rebuild on reload)
         self._by_source_id: Dict[int, CameraConfig] = {}
         self._lock = threading.RLock()
 
         # Delta queue: [StreamDelta, ...] — thread-safe
         self._delta_q: queue.Queue[StreamDelta] = queue.Queue()
 
-        # Callbacks (set khi start())
+        # Callbacks (set when start() is called)
         self._on_add: Optional[Callable[[CameraConfig], None]] = None
         self._on_remove: Optional[Callable[[int], None]] = None
         self._glib_idle_add: Optional[Callable] = None
@@ -188,7 +188,7 @@ class CameraManager:
         self._processor_thread: Optional[threading.Thread] = None
         self._observer = None   # watchdog Observer
 
-        # Load lần đầu
+        # Initial load
         self._load_initial()
 
     # ------------------------------------------------------------------
@@ -202,7 +202,7 @@ class CameraManager:
         glib_idle_add: Callable,
     ) -> None:
         """
-        Khởi động watcher và processor.
+        Start watcher and processor.
 
         BUG-11 fix: this method is now safe to call multiple times (e.g. on
         pipeline restart inside run_rtsp_push_mode).  On a re-call we update
@@ -210,10 +210,10 @@ class CameraManager:
         the CameraManager's in-memory config state is preserved across calls.
 
         Args:
-            on_add:         Gọi khi cần thêm luồng mới vào GStreamer pipeline.
-            on_remove:      Gọi khi cần xóa luồng (source_id) khỏi pipeline.
-            glib_idle_add:  Hàm GLib.idle_add để đảm bảo GStreamer ops
-                            chạy trên GLib Main Loop thread.
+            on_add:         Called when a new stream needs to be added to GStreamer pipeline.
+            on_remove:      Called when a stream (source_id) needs to be removed from pipeline.
+            glib_idle_add:  GLib.idle_add function to ensure GStreamer ops
+                            run on GLib Main Loop thread.
         """
         self._on_add = on_add
         self._on_remove = on_remove
@@ -237,7 +237,7 @@ class CameraManager:
         logger.info("[CameraManager] Started. Watching: %s", self.yml_path)
 
     def stop(self) -> None:
-        """Dừng watcher và processor."""
+        """Stop watcher and processor."""
         self._running = False
         if self._observer:
             self._observer.stop()
@@ -249,21 +249,93 @@ class CameraManager:
         logger.info("[CameraManager] Stopped.")
 
     def get_config(self, source_id: int) -> Optional[CameraConfig]:
-        """Tra cứu CameraConfig theo source_id. Thread-safe."""
+        """Look up CameraConfig by source_id. Thread-safe."""
         with self._lock:
             return self._by_source_id.get(source_id)
 
+    def handle_add_command(self, cmd: dict) -> bool:
+        """
+        Build a CameraConfig from an ADD command dict and enqueue it for
+        dynamic addition to the running pipeline.
+
+        Used by PeerOrchestrator's direct-dispatch path (when this node wins a
+        migration) so the ADD is applied even if no ZenohCommandSubscriber is
+        running.  Mirrors the config-building logic in
+        ZenohCommandSubscriber._handle_add (without the Zenoh status/ack
+        publishing — those belong to the subscriber path).
+
+        cmd keys: camera_id, source_id, uri, homography{source_points,
+        target_width, target_height}, roi_polygon, name, fps, speed_limit_kmh,
+        output{record, record_path}.
+
+        Returns True if the ADD was queued, False if it was a no-op
+        (e.g. source_id already active).
+        """
+        cam_id    = cmd["camera_id"]
+        source_id = int(cmd["source_id"])
+        uri       = cmd["uri"]
+
+        existing = self.get_config(source_id)
+        if existing and existing.enabled:
+            logger.warning(
+                "[CameraManager] ADD ignored: source_id=%d ('%s') already active.",
+                source_id, existing.camera_id,
+            )
+            return False
+
+        homo_cfg = cmd["homography"]
+        src_pts  = np.array(homo_cfg["source_points"], dtype=np.float32)
+        tw       = int(homo_cfg["target_width"])
+        th       = int(homo_cfg["target_height"])
+        tgt_pts  = np.array([[0, 0], [tw, 0], [tw, th], [0, th]], dtype=np.float32)
+        homo_mat, _ = cv2.findHomography(src_pts, tgt_pts)
+        if homo_mat is None:
+            homo_mat = cv2.getPerspectiveTransform(src_pts, tgt_pts)
+
+        roi_raw = cmd.get("roi_polygon", [])
+        roi_arr = (np.array(roi_raw, dtype=np.int32).reshape(-1, 2)
+                   if roi_raw else np.zeros((0, 2), dtype=np.int32))
+
+        out_cfg = cmd.get("output", {})
+
+        cam_cfg = CameraConfig(
+            camera_id=cam_id,
+            source_id=source_id,
+            uri=uri,
+            enabled=True,
+            name=cmd.get("name", cam_id),
+            fps=float(cmd.get("fps", 25.0)),
+            speed_limit_kmh=float(cmd.get("speed_limit_kmh", 80.0)),
+            source_points=src_pts,
+            target_points=tgt_pts,
+            homo_matrix=homo_mat,
+            roi_polygon=roi_arr,
+            record=bool(out_cfg.get("record", False)),
+            record_path=str(out_cfg.get("record_path", f"output/{cam_id}.mp4")),
+        )
+
+        with self._lock:
+            self._configs[cam_id] = cam_cfg
+            self._rebuild_lookup()
+
+        self._delta_q.put(StreamDelta(to_add=[cam_cfg]))
+        logger.info(
+            "[CameraManager] ADD queued via handle_add_command: "
+            "camera_id='%s', source_id=%d", cam_id, source_id,
+        )
+        return True
+
     def get_enabled_configs(self) -> List[CameraConfig]:
-        """Trả về danh sách tất cả camera đang enabled."""
+        """Return list of all enabled cameras."""
         with self._lock:
             return [c for c in self._configs.values() if c.enabled]
 
     def get_max_streams(self) -> int:
-        """Đọc max_streams từ file yml (cached khi init)."""
+        """Read max_streams from yml file (cached on init)."""
         return self._max_streams
 
     def get_tiler_layout(self) -> tuple[int, int]:
-        """rows, cols cho nvmultistreamtiler dựa trên số camera enabled."""
+        """rows, cols for nvmultistreamtiler based on enabled camera count."""
         n = len(self.get_enabled_configs())
         return compute_tiler_layout(n)
 
@@ -272,7 +344,7 @@ class CameraManager:
     # ------------------------------------------------------------------
 
     def _load_initial(self) -> None:
-        """Load lần đầu, không tạo delta."""
+        """Initial load, no delta creation."""
         try:
             raw = yaml.safe_load(self.yml_path.read_text(encoding="utf-8"))
             self._max_streams = int(raw.get("max_streams", 4))
@@ -293,8 +365,8 @@ class CameraManager:
 
     def _reload_and_diff(self) -> Optional[StreamDelta]:
         """
-        Đọc lại file YAML, so sánh với trạng thái hiện tại.
-        Trả về StreamDelta nếu có thay đổi, None nếu không.
+        Re-read YAML file, compare with current state.
+        Return StreamDelta if changed, None otherwise.
         """
         try:
             new_configs = _parse_cameras_yml(self.yml_path)
@@ -317,8 +389,8 @@ class CameraManager:
             to_add_ids = set(new_enabled) - set(old_enabled)
             to_remove_ids = set(old_enabled) - set(new_enabled)
 
-            # Phát hiện thay đổi URI hoặc config của camera đang chạy
-            # → remove rồi re-add để restart luồng
+            # Detect URI or config changes of running cameras
+            # → remove then re-add to restart stream
             for sid in set(old_enabled) & set(new_enabled):
                 old_c = old_enabled[sid]
                 new_c = new_enabled[sid]
@@ -329,7 +401,7 @@ class CameraManager:
                     to_remove_ids.add(sid)
                     to_add_ids.add(sid)
 
-            # Commit state mới
+            # Commit new state
             self._configs = new_configs
             self._rebuild_lookup()
 
@@ -348,7 +420,7 @@ class CameraManager:
         return delta
 
     def _rebuild_lookup(self) -> None:
-        """Rebuild _by_source_id từ _configs. Gọi khi đang giữ lock."""
+        """Rebuild _by_source_id from _configs. Call while holding lock."""
         self._by_source_id = {
             c.source_id: c
             for c in self._configs.values()
@@ -376,7 +448,7 @@ class CameraManager:
                     with self._debounce_lock:
                         if self._debounce_timer:
                             self._debounce_timer.cancel()
-                        # Debounce 100ms — tránh đọc file khi đang ghi dở
+                        # Debounce 100ms — avoid reading file while still writing
                         self._debounce_timer = threading.Timer(
                             0.1, manager._trigger_reload
                         )
@@ -403,13 +475,13 @@ class CameraManager:
             self._watcher_thread.start()
 
     def _trigger_reload(self) -> None:
-        """Gọi khi file thay đổi — tính delta và đẩy vào queue."""
+        """Called when file changes — compute delta and push to queue."""
         delta = self._reload_and_diff()
         if delta:
             self._delta_q.put(delta)
 
     def _polling_loop(self) -> None:
-        """Fallback khi watchdog không có: poll file mỗi 1s."""
+        """Fallback when watchdog unavailable: poll file every 1s."""
         last_mtime = self.yml_path.stat().st_mtime
         while self._running:
             time.sleep(1.0)
@@ -428,8 +500,8 @@ class CameraManager:
 
     def _processor_loop(self) -> None:
         """
-        Consume StreamDelta từ queue và lên lịch GStreamer ops
-        thông qua GLib.idle_add để đảm bảo thread safety.
+        Consume StreamDelta from queue and schedule GStreamer ops
+        via GLib.idle_add to ensure thread safety.
         """
         while self._running:
             try:
@@ -440,7 +512,7 @@ class CameraManager:
             if delta is None:   # stop signal
                 break
 
-            # Xóa trước, thêm sau (tránh source_id conflict)
+            # Remove first, add second (avoid source_id conflict)
             for source_id in delta.to_remove:
                 sid = source_id  # capture for lambda
                 if self._glib_idle_add and self._on_remove:
@@ -449,7 +521,7 @@ class CameraManager:
                         "[CameraManager] Scheduled REMOVE source_id=%d on GLib loop", sid
                     )
 
-            # Chờ GLib một cycle trước khi add (phòng ngừa race condition)
+            # Wait one GLib cycle before add (prevent race condition)
             if delta.to_remove and delta.to_add:
                 time.sleep(0.05)
 
@@ -463,13 +535,13 @@ class CameraManager:
                     )
 
     # ------------------------------------------------------------------
-    # REST API (tuỳ chọn — Giai đoạn 3)
+    # REST API (optional — Phase 3)
     # ------------------------------------------------------------------
 
     def start_rest_api(self, host: str = "0.0.0.0", port: int = 8765) -> None:
         """
-        Khởi động REST API server (FastAPI + uvicorn) trên thread riêng.
-        Endpoint:
+        Start REST API server (FastAPI + uvicorn) on separate thread.
+        Endpoints:
           POST   /cameras/add    body: CameraConfig JSON
           DELETE /cameras/{camera_id}
           GET    /cameras        list all cameras
@@ -500,7 +572,7 @@ class CameraManager:
                     cfg = manager._configs.get(camera_id)
                     if not cfg or not cfg.enabled:
                         return {"status": "not_running", "camera_id": camera_id}
-                    # Disable và push delta
+                    # Disable and push delta
                     cfg.enabled = False
                     manager._rebuild_lookup()
                     delta = StreamDelta(to_remove=[cfg.source_id])

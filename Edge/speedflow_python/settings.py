@@ -46,7 +46,6 @@ MONITOR_URL = os.environ.get("MONITOR_URL", "").strip()   # empty → disabled
 # Node identity
 # -----------------------------------------------------------
 NODE_ID        = _get("NODE_ID")
-EDGE_ID        = _get("EDGE_ID")
 
 # -----------------------------------------------------------
 # Zenoh (P2P peer mode — no broker needed)

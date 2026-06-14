@@ -1,12 +1,12 @@
 # speedflow/core_pipeline.py  (Multi-Stream Edition)
 """
-Xây dựng DeepStream pipeline hỗ trợ đa luồng (Multi-Stream).
+Builds a DeepStream pipeline with multi-stream support.
 
-Kiến trúc:
+Architecture:
   N × uridecodebin ──→ nvstreammux ──→ PGIE ──→ Tracker ──→ SGIE1 ──→ SGIE2
-                                                                          │
-                                                                    nvdsanalytics
-                                                                          │
+                                                                        │
+                                                                  nvdsanalytics
+                                                                        │
                                ┌──────────────────────────────────────────┘
                                │
                     sink_type == "display":     nvmultistreamtiler → OSD → EGL sink
@@ -37,7 +37,7 @@ Gst.init(None)
 # ---------------------------------------------------------------------------
 
 def normalize_uri(uri: str) -> str:
-    """Đảm bảo URI có scheme hợp lệ."""
+    """Ensure the URI has a valid scheme."""
     if uri.startswith(("file://", "rtsp://", "rtmp://", "http://")):
         return uri
     if os.path.exists(uri):
@@ -61,10 +61,10 @@ def _make_source_bin(
     cam_cfg: CameraConfig,
 ) -> Gst.Element:
     """
-    Tạo một source bin cho một camera và nối vào streammux.
-    Trả về element source (uridecodebin) để có thể gỡ sau.
+    Create a source bin for one camera and connect it to streammux.
+    Returns the source element (uridecodebin) so it can be removed later.
 
-    Quy ước tên element: "src-{camera_id}"
+    Element naming convention: "src-{camera_id}"
     """
     uri = normalize_uri(cam_cfg.uri)
     is_file = is_file_uri(uri)
@@ -126,10 +126,10 @@ def build_pipeline(
     **kwargs,
 ):
     """
-    Xây dựng DeepStream pipeline đa luồng.
+    Build a multi-stream DeepStream pipeline.
     """
     if not camera_configs:
-        raise ValueError("camera_configs không được rỗng.")
+        raise ValueError("camera_configs must not be empty.")
 
     n_cameras = len(camera_configs)
 
@@ -144,7 +144,7 @@ def build_pipeline(
     streammux.set_property("width", mux_width)
     streammux.set_property("height", mux_height)
     streammux.set_property("batched-push-timeout", 33_000)
-    streammux.set_property("live-source", 1)   # đa phần là RTSP live
+    streammux.set_property("live-source", 1)   # mostly RTSP live sources
     streammux.set_property("attach-sys-ts", True)
 
     # ── Core AI processing ───────────────────────────────────────────────────
@@ -167,10 +167,10 @@ def build_pipeline(
     analytics = make_element("analytics", "nvdsanalytics")
     analytics.set_property("config-file", analytics_config)
 
-    # ── Xác định chiến lược hiển thị / ghi file ──────────────────────────────
+    # ── Determine display / file-write strategy ──────────────────────────────
     is_tiled = (sink_type in ["display", "rtsp_push"])
 
-    # ── Tiler (chỉ tạo nếu cần ghép lưới) ────────────────────────────────────
+    # ── Tiler (only create when a tiled grid is needed) ───────────────────────
     if is_tiled:
         tiler = make_element("tiler", "nvmultistreamtiler")
         # Grid is computed from the INITIAL camera count so it looks square.
@@ -245,7 +245,7 @@ def build_pipeline(
                 continue
             
             sid = cam_cfg.source_id
-            # Thêm queue để tách biệt luồng và ổn định timestamp (PTS)
+            # Add queue to isolate streams and stabilize timestamp (PTS)
             queue = make_element(f"queue_file_{sid}", "queue")
             postosd = make_element(f"postosd_{sid}", "nvvideoconvert")
             enc = make_element(f"enc_{sid}", "nvv4l2h264enc")
@@ -255,11 +255,11 @@ def build_pipeline(
             
             parse = make_element(f"parse_{sid}", "h264parse")
             muxer = make_element(f"mux_{sid}", "qtmux")
-            # faststart giúp file mp4 có thể xem được ngay cả khi bị crash giữa chừng
+            # faststart allows MP4 file to be viewable even if it crashes midway
             muxer.set_property("faststart", True)
             
             fsink = make_element(f"fsink_{sid}", "filesink")
-            fsink.set_property("sync", False) # Thường để False cho file recording từ live source
+            fsink.set_property("sync", False) # Usually False for file recording from live source
             
             os.makedirs(os.path.dirname(os.path.abspath(cam_cfg.record_path)), exist_ok=True)
             fsink.set_property("location", os.path.abspath(cam_cfg.record_path))
@@ -269,7 +269,7 @@ def build_pipeline(
             
             gst_link(queue, postosd, enc, parse, muxer, fsink)
             
-            # Ghi nhớ srcpad để nối sau khi core linking hoàn tất
+            # Store srcpad to connect after core linking is complete
             setattr(demux, f"_delayed_link_{sid}", queue)
 
     else:
@@ -281,7 +281,7 @@ def build_pipeline(
         analytics, preosd_convert, preosd_caps, nvdsosd,
     ]
     if is_tiled:
-        core_elements.insert(-3, tiler)  # Thêm tiler trước preosd_convert
+        core_elements.insert(-3, tiler)  # Add tiler before preosd_convert
 
     for el in core_elements + sink_elements:
         pipeline.add(el)
@@ -308,10 +308,10 @@ def build_pipeline(
         gst_link(nvdsosd, conv, enc, parse, sink)
 
     elif sink_type == "file":
-        # Nối OSD vào Demux
+        # Connect OSD to Demux
         nvdsosd.get_static_pad("src").link(demux.get_static_pad("sink"))
         
-        # Nối Demux src pads ra các nhánh file riêng biệt
+        # Connect Demux src pads to separate file branches
         for cam_cfg in camera_configs:
             if not cam_cfg.record:
                 continue
@@ -336,7 +336,7 @@ def build_pipeline(
 
 
 # ---------------------------------------------------------------------------
-# Dynamic stream add/remove helpers (Giai đoạn 3)
+# Dynamic stream add/remove helpers (Phase 3)
 # ---------------------------------------------------------------------------
 
 def dynamic_add_stream(
@@ -347,10 +347,10 @@ def dynamic_add_stream(
     source_bins: dict,
     current_n: int,
 ) -> Gst.Element:
-    # 1. Tăng batch-size của muxer
+    # 1. Increase muxer batch-size
     streammux.set_property("batch-size", current_n + 1)
     
-    # 2. Thêm và chạy source mới
+    # 2. Add and start the new source
     src = _make_source_bin(pipeline, streammux, cam_cfg)
     src.sync_state_with_parent()
 
@@ -379,7 +379,7 @@ def dynamic_remove_stream(
     conv_src_pad = conv.get_static_pad("src") if conv else None
 
     def _cleanup_bin(pad, probe_id):
-        # 1. Đặt state về NULL để dừng luồng dữ liệu từ gốc đến ngọn
+        # 1. Set state to NULL to stop data flow from source to sink
         if src:
             src.set_state(Gst.State.NULL)
         for prefix in [f"q_{camera_id}", f"conv_{camera_id}"]:
@@ -387,11 +387,11 @@ def dynamic_remove_stream(
             if el:
                 el.set_state(Gst.State.NULL)
 
-        # 2. Gỡ kết nối (unlink) khỏi bộ trộn (streammux)
+        # 2. Unlink from muxer (streammux)
         mux_sinkpad = streammux.get_static_pad(f"sink_{source_id}")
         if mux_sinkpad:
             if conv_src_pad:
-                # Gỡ probe block nếu nó còn tồn tại
+                # Remove probe block if it still exists
                 if pad and probe_id:
                     try:
                         pad.remove_probe(probe_id)
@@ -400,7 +400,7 @@ def dynamic_remove_stream(
                 conv_src_pad.unlink(mux_sinkpad)
             streammux.release_request_pad(mux_sinkpad)
 
-        # 3. Xóa element khỏi pipeline
+        # 3. Remove element from pipeline
         if src:
             pipeline.remove(src)
         for prefix in [f"q_{camera_id}", f"conv_{camera_id}"]:
@@ -413,20 +413,20 @@ def dynamic_remove_stream(
 
         new_n = max(1, current_n - 1)
         
-        # Giảm batch-size
+        # Decrease batch-size
         streammux.set_property("batch-size", new_n)
         
-        # Lưu ý: Không thay đổi rows/cols của tiler để tránh VIC error trên Jetson
-            
+        # Note: Do not change tiler rows/cols to avoid VIC error on Jetson
+             
         logger.info(f"[Pipeline] Cleaned up resources for camera {camera_id}")
 
 
         return False
 
     def _blocking_probe(pad, info, _user_data):
-        # Không remove probe ở đây để giữ trạng thái block
+        # Do not remove probe here to maintain block state
         GLib.idle_add(_cleanup_bin, pad, info.id)
-        # DROP buffer hiện tại để tránh nó lọt qua khi unlink
+        # DROP current buffer to prevent it from leaking through on unlink
         return Gst.PadProbeReturn.DROP
 
     if conv_src_pad:
@@ -434,5 +434,5 @@ def dynamic_remove_stream(
             Gst.PadProbeType.BLOCK_DOWNSTREAM, _blocking_probe, None
         )
     else:
-        # Nếu không có pad, dọn dẹp luôn
+        # If no pad exists, clean up immediately
         GLib.idle_add(_cleanup_bin, None, None)

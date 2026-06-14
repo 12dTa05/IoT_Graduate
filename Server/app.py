@@ -211,17 +211,27 @@ async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
     if old_ws and not old_ws.closed:
         await old_ws.close()
 
-    state.registry.register(node_id, ip)
+    is_new = state.registry.register(node_id, ip)
     state.edge_ws[node_id] = ws
 
     logger.info("[EDGE-WS] '%s' connected (%s). Edges online: %d",
                 node_id, ip, len(state.edge_ws))
 
-    state.broadcast({
-        "type": "edge_registered",
-        "node_id": node_id,
-        "ip": ip,
-    })
+    # Fix #10: only broadcast edge_registered for genuinely new nodes; for
+    # reconnects the registry keeps the node online so a spurious second
+    # edge_registered event would confuse the dashboard.
+    if is_new:
+        state.broadcast({
+            "type": "edge_registered",
+            "node_id": node_id,
+            "ip": ip,
+        })
+    else:
+        state.broadcast({
+            "type": "edge_reconnected",
+            "node_id": node_id,
+            "ip": ip,
+        })
 
     try:
         async for msg in ws:

@@ -371,16 +371,16 @@ function fmtTime(ts) {
 }
 function fmtPct(v) { return v != null ? `${v.toFixed(1)}%` : '--'; }
 function fmtTemp(v) { return v != null ? `${v.toFixed(1)}\u00B0C` : '--'; }
-// When the edge is running on a non-Jetson machine (psutil fallback), GPU%
-// and Temp are always 0.0 — indistinguishable from a real zero reading.
-// The health payload includes "source":"psutil" in that case; use it to
+// When the jtop daemon is unavailable on an edge, GPU%, Temp (and all other
+// metrics) are reported as 0.0 — indistinguishable from a real zero reading.
+// The health payload sets "source":"jtop_unavailable" in that case; use it to
 // show "N/A" so users know the metric is unavailable rather than actually 0.
 function fmtGpuPct(v, source) {
-  if (source === 'psutil') return 'N/A';
+  if (source === 'jtop_unavailable') return 'N/A';
   return v != null ? `${v.toFixed(1)}%` : '--';
 }
 function fmtGpuTemp(v, source) {
-  if (source === 'psutil') return 'N/A';
+  if (source === 'jtop_unavailable') return 'N/A';
   return v != null ? `${v.toFixed(1)}\u00B0C` : '--';
 }
 function fmtBitrate(bps) {

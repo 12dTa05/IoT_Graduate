@@ -19,12 +19,12 @@ def add_polygon_display(batch_meta, frame_meta, points: np.ndarray, color=(1.0, 
 
 
 def _colorize_osd(self, obj_meta, red_alert: bool):
-        # Viền bbox + nền text
+    # Bbox border + text background
     if red_alert:
         obj_meta.rect_params.border_width = max(2, int(obj_meta.rect_params.border_width) or 2)
-        obj_meta.rect_params.border_color.set(1.0, 0.0, 0.0, 1.0)  # đỏ
-        obj_meta.text_params.text_bg_clr.set(1.0, 0.0, 0.0, 0.6)    # nền đỏ transparent
-        obj_meta.text_params.font_params.font_color.set(1.0, 1.0, 1.0, 1.0) # chữ trắng
+        obj_meta.rect_params.border_color.set(1.0, 0.0, 0.0, 1.0)  # red
+        obj_meta.text_params.text_bg_clr.set(1.0, 0.0, 0.0, 0.6)    # red bg transparent
+        obj_meta.text_params.font_params.font_color.set(1.0, 1.0, 1.0, 1.0) # white text
     else:
         obj_meta.rect_params.border_color.set(0.0, 1.0, 0.0, 1.0)
         obj_meta.text_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.4)
