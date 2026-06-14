@@ -21,11 +21,9 @@ import logging
 import threading
 from typing import Optional
 
-import cv2
 import msgpack
-import numpy as np
 
-from .camera_config import CameraConfig, CameraManager, StreamDelta
+from .camera_config import CameraManager, StreamDelta
 from .zenoh_session import make_session
 
 logger = logging.getLogger(__name__)
@@ -144,14 +142,11 @@ class ZenohCommandSubscriber:
         try:
             cam_id    = payload["camera_id"]
             source_id = int(payload["source_id"])
-            uri       = payload["uri"]
 
-            existing = self._camera_manager.get_config(source_id)
-            if existing and existing.enabled:
-                logger.warning(
-                    "[Zenoh C2] ADD ignored: source_id=%d ('%s') already active.",
-                    source_id, existing.camera_id,
-                )
+            # Delegate config building + delta enqueue to CameraManager so the
+            # same logic is shared with PeerOrchestrator's direct-dispatch path.
+            queued = self._camera_manager.handle_add_command(payload)
+            if not queued:
                 self.publish_status({
                     "node_id": self._node_id,
                     "event": "ADD_REJECTED",
@@ -159,45 +154,6 @@ class ZenohCommandSubscriber:
                     "reason": "source_id_conflict",
                 })
                 return
-
-            homo_cfg   = payload["homography"]
-            src_pts    = np.array(homo_cfg["source_points"], dtype=np.float32)
-            tw         = int(homo_cfg["target_width"])
-            th         = int(homo_cfg["target_height"])
-            tgt_pts    = np.array([[0, 0], [tw, 0], [tw, th], [0, th]], dtype=np.float32)
-            homo_mat, _ = cv2.findHomography(src_pts, tgt_pts)
-            if homo_mat is None:
-                homo_mat = cv2.getPerspectiveTransform(src_pts, tgt_pts)
-
-            roi_raw = payload.get("roi_polygon", [])
-            roi_arr = np.array(roi_raw, dtype=np.int32).reshape(-1, 2) if roi_raw else np.zeros((0, 2), dtype=np.int32)
-
-            out_cfg = payload.get("output", {})
-
-            cam_cfg = CameraConfig(
-                camera_id=cam_id,
-                source_id=source_id,
-                uri=uri,
-                enabled=True,
-                name=payload.get("name", cam_id),
-                fps=float(payload.get("fps", 25.0)),
-                speed_limit_kmh=float(payload.get("speed_limit_kmh", 80.0)),
-                source_points=src_pts,
-                target_points=tgt_pts,
-                homo_matrix=homo_mat,
-                roi_polygon=roi_arr,
-                record=bool(out_cfg.get("record", False)),
-                record_path=str(out_cfg.get("record_path", f"output/{cam_id}.mp4")),
-            )
-
-            with self._camera_manager._lock:
-                self._camera_manager._configs[cam_id] = cam_cfg
-                self._camera_manager._rebuild_lookup()
-
-            delta = StreamDelta(to_add=[cam_cfg])
-            self._camera_manager._delta_q.put(delta)
-
-            logger.info("[Zenoh C2] ADD queued: camera_id='%s', source_id=%d", cam_id, source_id)
 
             self.publish_status({
                 "node_id": self._node_id,

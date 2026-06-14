@@ -8,15 +8,22 @@
 # ============================================================
 
 p2p:
-  overload_threshold: 65.0      # load_score above this triggers RFO
-  overload_duration_s: 5.0     # must be overloaded this long before RFO
-  cooldown_s: 15.0              # per-camera cooldown between migrations
-  migration_timeout_s: 2.0     # wait for ADD ack before rollback
+  overload_threshold: 65.0      # load_score above this triggers RFO (legacy reactive path)
+  overload_duration_s: 35.0    # must be overloaded this long before RFO
+                                 # ≈ one red phase (30–45 s) — prevents migrating during
+                                 # normal peak-then-recover traffic-light cycles
+  cooldown_s: 120.0             # per-camera cooldown between migrations
+                                 # ≥ one full signal cycle (90 s) — prevents ping-pong
+                                 # where camera offloads every red and reclaims every green
+  migration_timeout_s: 15.0    # wait for ADD ack before rollback (restored to safe default;
+                                 # 2 s was too tight for slow RTSP sources across LAN)
   heartbeat_timeout_s: 5.0      # peer declared OFFLINE after this silence
   vote_window_s: 3.0            # proposal collection duration
   failover_jitter_max_s: 3.0    # random delay before failover ADD (race prevention)
   reclaim_margin: 15.0          # reclaim only when load < (overload_threshold - reclaim_margin)
-  reclaim_stable_s: 20.0        # load must stay low this long before reclaiming
+  reclaim_stable_s: 120.0      # load must stay below reclaim threshold this long before
+                                 # reclaiming — ≥ one full signal cycle to confirm genuine
+                                 # capacity recovery rather than a momentary green phase
 
   # epsilon-Constraint tiers (Pareto optimization)
   eps_fps_strict: 15.0          # Tier 0 — strict FPS floor
@@ -59,23 +66,74 @@ p2p:
 
 # ---------------------------------------------------------------------------
 # Load-score adaptive ω weights
-# Three presets; the health agent selects based on runtime context.
+# Two presets remain after thermal unification (thermal is now handled
+# exclusively by Θ_thermal in load_model.py — smooth ramp 75→90°C).
 #
-#   normal   — default balanced weights
-#   thermal  — shift weight to hardware-overload term when GPU is hot
-#   bandwidth— shift weight to CPU/throughput term when running many cameras
+#   normal    — default balanced weights
+#   bandwidth — shift weight when running many cameras (≥ stream_bandwidth_threshold)
 #
-# weight order: [w_gpu, w_cpu, w_ram]  (must sum to 1.0)
+# weight order: [w_gpu, w_cpu, w_ram]  (should sum to 1.0)
 # ---------------------------------------------------------------------------
 load_score:
-  thermal_threshold_c: 75.0       # gpu_temp_c ≥ this → use thermal preset
   stream_bandwidth_threshold: 3   # active_cameras ≥ this → use bandwidth preset
 
   #[w_gpu, w_cpu, w_ram]
   weights_normal:    [0.3, 0.3, 0.4]
-  weights_thermal:   [0.2, 0.2, 0.6]
   weights_bandwidth: [0.2, 0.3, 0.5]
 
   # FPS-drop penalty cap (additive points on top of weighted hardware score)
   fps_penalty_max: 25.0
+
+# ---------------------------------------------------------------------------
+# Proactive load model — Vehicle-Driven Proactive Load Profiling
+#
+# Coefficients are fitted offline by tools/fit_coefficients.py on data
+# collected from the target Jetson via tools/profile_collect.py.
+#
+# Workflow:
+#   1. Measure W_base:
+#        python3 tools/profile_collect.py --wbase --wbase-output logs/wbase.txt
+#   2. Collect calibration data (10 min, varying traffic density):
+#        python3 tools/profile_collect.py --output logs/calibration.csv \
+#                --wbase-ref <W_base from step 1>
+#   3. Fit coefficients:
+#        python3 tools/fit_coefficients.py --csv logs/calibration.csv \
+#                --wbase <W_base> --output configs/edge_node.yml
+#   4. Set enabled: true and restart.
+#
+# Formula (L_proactive normalised to [0,1]):
+#   L = (W_base + Σ_cam[α₁·N_track + α₂·N_track² + β·N_plate + γ·S]) / 100
+#   H = max(R_GPU, R_CPU, R_RAM) × Θ_thermal   (Θ ramps 1.0→max_mult over t_low→t_high)
+#   U = 1 - (1 - L̂_avg)(1 - Ĥ_avg)             noisy-OR; both cycle-averaged
+#
+# Risk trigger: U ≥ risk_threshold → overload onset (replaces load_score threshold
+#               when enabled, zero behaviour change when disabled).
+# ---------------------------------------------------------------------------
+proactive:
+  enabled: false          # set true after running fit_coefficients.py
+
+  # W_base: idle GPU load with an active Zenoh session but zero video sources.
+  # Measure with: python3 tools/profile_collect.py --wbase
+  w_base: 12.0            # placeholder — replace with measured value
+
+  # Regression coefficients (α₂ = 0.0 if linear model chosen by held-out RMSE)
+  alpha1: 0.0             # N_track linear coefficient   — fill after Phase 1
+  alpha2: 0.0             # N_track² quadratic coeff     — 0.0 if linear wins
+  beta:   0.0             # N_plate coefficient           — fill after Phase 1
+  gamma:  0.0             # stationary_fraction coeff     — fill after Phase 1
+
+  # Cycle-aware smoothing window (≈ one full traffic-light cycle)
+  cycle_window_s: 90.0    # seconds; adjust if local signal cycle differs
+
+  # Offload trigger threshold on the smoothed risk index U
+  risk_threshold: 0.85    # U ≥ this → overload (replaces overload_threshold when enabled)
+
+  # Hardware safety fuse: U ≥ this → force Level-1 migration regardless of L
+  hard_fuse_threshold: 0.95
+
+  # Θ_thermal smooth ramp (replaces discrete omega thermal preset)
+  theta_thermal:
+    t_low:    75.0         # °C — ramp starts here (multiplier = 1.0)
+    t_high:   90.0         # °C — ramp ends here   (multiplier = max_mult)
+    max_mult: 1.25         # ≈ Jetson thermal throttle factor (~20–25% clock cut)
 

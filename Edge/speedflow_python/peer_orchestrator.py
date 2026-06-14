@@ -1,22 +1,22 @@
 """
 Edge/speedflow_python/peer_orchestrator.py
 
-Peer Orchestrator — Bộ não P2P, thay thế MasterOrchestrator.
+Peer Orchestrator — P2P brain, replaces MasterOrchestrator.
 
-Mỗi Edge Node chạy một instance PeerOrchestrator độc lập.
-Các instance giao tiếp qua Zenoh key expressions:
-  - peers/status/<node_id>  ← heartbeat từ mọi peer
-  - peers/vote/request      ← RFO (Request for Offload) từ peer quá tải
-  - peers/vote/proposal     ← bid từ peer có khả năng nhận
-  - peers/vote/decision     ← kết quả bầu chọn
-  - peers/vote/ack/{cam}    ← xác nhận stream đã PLAYING
+Each Edge Node runs an independent PeerOrchestrator instance.
+Instances communicate via Zenoh key expressions:
+  - peers/status/<node_id>  ← heartbeat from all peers
+  - peers/vote/request      ← RFO (Request for Offload) from overloaded peer
+  - peers/vote/proposal     ← bid from capable peer
+  - peers/vote/decision     ← election result
+  - peers/vote/ack/{cam}    ← confirmation that stream is PLAYING
 
-Migration thực thi theo chiến lược Make-before-Break:
-  1. Requester mở vote window → thu thập proposals (3s)
-  2. Chọn winner = proposal có F(x) thấp nhất (ε-constraint)
-  3. Publish decision → winner tự ADD camera vào pipeline
-  4. Winner publish peers/vote/ack/{cam} khi stream PLAYING
-  5. Requester nhận ack → REMOVE camera khỏi pipeline của mình
+Migration uses Make-before-Break strategy:
+  1. Requester opens vote window → collects proposals (3s)
+  2. Select winner = proposal with lowest F(x) (ε-constraint)
+  3. Publish decision → winner auto-ADD camera to pipeline
+  4. Winner publishes peers/vote/ack/{cam} when stream PLAYING
+  5. Requester receives ack → REMOVE camera from its pipeline
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ logger = logging.getLogger("peer_orchestrator")
 
 @dataclass
 class PeerState:
-    """Trạng thái hiện tại của một Peer Node (thay thế NodeState)."""
+    """Current state of a Peer Node (replaces NodeState)."""
     node_id: str
     load_score: float = 0.0
     gpu_percent: float = 0.0
@@ -74,6 +74,9 @@ class PeerState:
     last_seen: float = field(default_factory=time.time)
     overload_since: Optional[float] = None
     penalty_until: float = 0.0
+    # Proactive model output — populated when proactive.enabled is True.
+    # Defaults to 0.0 (no risk) so legacy comparisons (load_score only) are unaffected.
+    risk_index: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +84,7 @@ class PeerState:
 # ---------------------------------------------------------------------------
 
 class MigrationLogger:
-    """Ghi log mỗi lần migration ra file CSV — copy từ master_orchestrator.py."""
+    """Log each migration to a CSV file — copied from master_orchestrator.py."""
 
     HEADER = [
         "timestamp_iso", "from_node", "to_node", "camera_id",
@@ -131,9 +134,9 @@ class MigrationLogger:
 
 class PeerOrchestrator:
     """
-    Phiên bản P2P của MasterOrchestrator — chạy trên mỗi Edge Node.
+    P2P version of MasterOrchestrator — runs on each Edge Node.
 
-    Giao tiếp qua Zenoh (peer mode, key expressions).
+    Communicates via Zenoh (peer mode, key expressions).
     """
 
     def __init__(
@@ -147,11 +150,11 @@ class PeerOrchestrator:
         self._cfg = cfg
         self._camera_manager = camera_manager
 
-        # Trạng thái peers
+        # Peer state
         self._peers: Dict[str, PeerState] = {}
         self._lock = threading.RLock()
 
-        # Trạng thái của chính node này (cập nhật từ peers/status/+ của mình)
+        # State of this node itself (updated from our own peers/status/+)
         self._self_state = PeerState(node_id=node_id)
         # BUG-1 fix: separate lock for _self_state so the Zenoh callback
         # thread and the decision loop never see a torn write.
@@ -161,7 +164,7 @@ class PeerOrchestrator:
         log_dir = _ROOT / "logs"
         self._migration_log = MigrationLogger(log_dir / "p2p_migrations.csv")
 
-        # Cooldown per-camera: camera_id → timestamp migration gần nhất
+        # Cooldown per-camera: camera_id → timestamp of most recent migration
         self._cam_cooldown: Dict[str, float] = {}
 
         # Vote windows: camera_id → list[proposal]
@@ -170,7 +173,7 @@ class PeerOrchestrator:
         # Cameras with RFO sent but vote window still open (prevent re-trigger)
         self._vote_in_progress: set = set()
 
-        # Pending ack events cho Make-before-Break
+        # Pending ack events for Make-before-Break
         self._pending_acks: Dict[str, threading.Event] = {}
 
         # Camera config lookup — relative to Edge/configs/
@@ -361,27 +364,33 @@ class PeerOrchestrator:
     # ------------------------------------------------------------------
 
     def _on_peer_status(self, payload: dict) -> None:
-        """Cập nhật PeerState từ heartbeat."""
+        """Update PeerState from heartbeat."""
         node_id = payload.get("node_id", "")
         if not node_id:
             return
 
-        # Cập nhật trạng thái của chính mình
+        # Update state of this node itself
         if node_id == self._node_id:
             # BUG-1 fix: hold _self_lock while updating so the decision loop
             # always reads a consistent snapshot of _self_state.
             with self._self_lock:
-                self._self_state.load_score = payload.get("load_score", 0.0)
+                self._self_state.load_score  = payload.get("load_score",  0.0)
                 self._self_state.gpu_percent = payload.get("gpu_percent", 0.0)
                 self._self_state.cpu_percent = payload.get("cpu_percent", 0.0)
                 self._self_state.ram_percent = payload.get("ram_percent", 0.0)
-                self._self_state.gpu_temp_c = payload.get("gpu_temp_c", 0.0)
+                self._self_state.gpu_temp_c  = payload.get("gpu_temp_c",  0.0)
+                self._self_state.risk_index  = payload.get("risk_index",  0.0)
                 pipeline = payload.get("pipeline", {})
                 self._self_state.avg_fps = pipeline.get("avg_fps")
                 self._self_state.fps_per_camera = pipeline.get("fps_per_camera", {})
                 self._self_state.active_cameras = pipeline.get("active_cameras", [])
-                # Track overload onset
-                if self._self_state.load_score > self._cfg.get("overload_threshold", 75.0):
+
+                # Overload onset: use risk_index when proactive mode is active,
+                # otherwise fall back to the legacy load_score threshold.
+                overloaded = self._is_overloaded(
+                    self._self_state.load_score, self._self_state.risk_index
+                )
+                if overloaded:
                     if self._self_state.overload_since is None:
                         self._self_state.overload_since = time.time()
                     # Node is overloaded again — reset reclaim eligibility
@@ -390,7 +399,7 @@ class PeerOrchestrator:
                     self._self_state.overload_since = None
             return
 
-        # Cập nhật trạng thái peer khác
+        # Update state of other peers
         # BUG-04: update ALL mutable fields inside the lock to prevent torn
         # reads from _decision_loop running on a separate thread.
         with self._lock:
@@ -400,32 +409,81 @@ class PeerOrchestrator:
                 logger.info("[PeerOrch] Discovered peer '%s' via Zenoh", node_id)
             peer = self._peers[node_id]
 
-            peer.load_score = payload.get("load_score", 0.0)
+            peer.load_score  = payload.get("load_score",  0.0)
             peer.gpu_percent = payload.get("gpu_percent", 0.0)
             peer.cpu_percent = payload.get("cpu_percent", 0.0)
             peer.ram_percent = payload.get("ram_percent", 0.0)
-            peer.gpu_temp_c = payload.get("gpu_temp_c", 0.0)
+            peer.gpu_temp_c  = payload.get("gpu_temp_c",  0.0)
+            peer.risk_index  = payload.get("risk_index",  0.0)
 
             pipeline = payload.get("pipeline", {})
-            peer.avg_fps = pipeline.get("avg_fps")
+            peer.avg_fps        = pipeline.get("avg_fps")
             peer.fps_per_camera = pipeline.get("fps_per_camera", {})
             peer.active_cameras = pipeline.get("active_cameras", [])
             peer.camera_configs = pipeline.get("camera_configs", peer.camera_configs)
             peer.last_seen = time.time()
 
-            # Track overload onset
-            if peer.load_score > self._cfg.get("overload_threshold", 75.0):
+            # Track overload onset using same proactive-aware helper
+            overloaded = self._is_overloaded(peer.load_score, peer.risk_index)
+            if overloaded:
                 if peer.overload_since is None:
                     peer.overload_since = time.time()
             else:
                 peer.overload_since = None
 
     # ------------------------------------------------------------------
-    # Decision loop (chạy mỗi 2s)
+    # Overload classification helper (proactive-aware)
+    # ------------------------------------------------------------------
+
+    def _is_overloaded(self, load_score: float, risk_index: float) -> bool:
+        """
+        Return True when this node (or a peer) should be considered overloaded.
+
+        When proactive.enabled is True, driven by cycle-smoothed risk_index (U)
+        against proactive.risk_threshold.
+
+        A hard_fuse_threshold (default 0.95) forces overload regardless of
+        proactive.enabled — it is a safety fuse against hardware saturation that
+        load_score alone may under-report (e.g. when thermal throttling has just
+        started and the jtop reading hasn't caught up).
+
+        Falls back to legacy load_score > overload_threshold when disabled.
+        """
+        proactive_cfg = self._cfg.get("proactive", {})
+        hard_fuse     = float(proactive_cfg.get("hard_fuse_threshold", 0.95))
+
+        # Hard fuse — always active regardless of proactive.enabled
+        if risk_index >= hard_fuse:
+            return True
+
+        if proactive_cfg.get("enabled", False) and risk_index > 0.0:
+            threshold = float(proactive_cfg.get("risk_threshold", 0.85))
+            return risk_index >= threshold
+
+        # Legacy path
+        return load_score > self._cfg.get("overload_threshold", 65.0)
+
+    # ------------------------------------------------------------------
+    # Overload trigger score helper (for log messages + RFO payload)
+    # ------------------------------------------------------------------
+
+    def _effective_load(self, load_score: float, risk_index: float) -> float:
+        """
+        Return the score that best represents the current load for logging
+        and for populating RFO payloads.  When proactive is enabled, returns
+        risk_index × 100 (scaled to the same 0–100 range as load_score).
+        """
+        proactive_cfg = self._cfg.get("proactive", {})
+        if proactive_cfg.get("enabled", False) and risk_index > 0.0:
+            return round(risk_index * 100.0, 1)
+        return load_score
+
+    # ------------------------------------------------------------------
+    # Decision loop (runs every 1s)
     # ------------------------------------------------------------------
 
     def _decision_loop(self) -> None:
-        """Vòng lặp chính — kiểm tra overload + OFFLINE peers + rebalance."""
+        """Main loop — check overload + OFFLINE peers + rebalance."""
         logger.info("[PeerOrch] Decision loop started (interval=1s).")
         while self._running:
             time.sleep(1.0)
@@ -439,8 +497,8 @@ class PeerOrchestrator:
 
     def _check_offline_peers(self) -> None:
         """
-        Phát hiện peer OFFLINE (heartbeat timeout).
-        Nếu peer có active cameras → trigger leaderless failover.
+        Detect offline peers (heartbeat timeout).
+        If peer has active cameras → trigger leaderless failover.
         """
         now = time.time()
         timeout = self._cfg.get("heartbeat_timeout_s", 15.0)
@@ -563,9 +621,10 @@ class PeerOrchestrator:
         # If it's still set, the node is still above overload_threshold.
         if overload_since is not None:
             return
-        # Wait reclaim_stable_s after load dropped before reclaiming
-        # We use _reclaim_eligible_since to track when load first dropped
-        if not hasattr(self, "_reclaim_eligible_since") or self._reclaim_eligible_since is None:
+        # Wait reclaim_stable_s after load dropped before reclaiming.
+        # _reclaim_eligible_since is initialised to None in __init__ and set
+        # here on first entry; the hasattr guard was dead code.
+        if self._reclaim_eligible_since is None:
             self._reclaim_eligible_since = now
             return
         if now - self._reclaim_eligible_since < reclaim_stable_s:
@@ -664,17 +723,21 @@ class PeerOrchestrator:
                 active_cameras=list(self._self_state.active_cameras),
                 overload_since=self._self_state.overload_since,
                 penalty_until=self._self_state.penalty_until,
+                risk_index=self._self_state.risk_index,
             )
 
         if state.overload_since is None:
             logger.debug("[PeerOrch] Not overloaded (overload_since=None)")
             return
         if now - state.overload_since < cfg.get("overload_duration_s", 10.0):
-            logger.debug("[PeerOrch] Overload too recent (%.1fs < %.1fs)", 
+            logger.debug("[PeerOrch] Overload too recent (%.1fs < %.1fs)",
                         now - state.overload_since, cfg.get("overload_duration_s", 10.0))
             return
 
-        load          = state.load_score
+        # Use effective load (risk_index×100 when proactive, else load_score)
+        # for threshold comparisons so Level 1/2/3 boundaries are consistent
+        # whether proactive mode is on or off.
+        load = self._effective_load(state.load_score, state.risk_index)
         thr3          = cfg.get("offload_level3_threshold", 65.0)
         thr2          = cfg.get("offload_level2_threshold", 75.0)
         thr1          = cfg.get("offload_level1_threshold", 85.0)
@@ -703,13 +766,16 @@ class PeerOrchestrator:
 
         # Escalation ladder: 3 → 2 → 1
         if load >= thr1 and global_offload >= 1:
-            # Full stream migration (Level 1) — existing RFO path
+            # Full stream migration (Level 1) — existing RFO path.
+            # Fix #6: clear any fine-grained offload first so a camera cannot
+            # simultaneously be at Level 2/3 AND undergoing Level 1 migration.
+            if self.get_offload_level(cam_to_offload) in (2, 3):
+                self.set_offload_level(cam_to_offload, 0)
             logger.warning(
                 "[PeerOrch] Load=%.1f ≥ L1 threshold=%.1f. Escalating to "
                 "Level 1 stream migration for '%s'.",
                 load, thr1, cam_to_offload,
             )
-            self.set_offload_level(cam_to_offload, 0)   # clear fine-grained offload
             last_mig = self._cam_cooldown.get(cam_to_offload, 0.0)
             trigger  = "fps_drop" if (state.avg_fps and
                                       state.avg_fps < cfg.get("eps_fps_strict", 18.0)
@@ -818,7 +884,7 @@ class PeerOrchestrator:
 
     def _trigger_rfo(self, camera_id: str, relaxation_tier: int = 0) -> None:
         """
-        Gửi Request for Offload (RFO) và mở vote window.
+        Send Request for Offload (RFO) and open vote window.
 
         relaxation_tier:
           0 = strict (eps_fps_strict, eps_network_ms_strict)
@@ -837,12 +903,16 @@ class PeerOrchestrator:
 
         cam_uri = self._get_camera_uri(camera_id) or ""
 
+        with self._self_lock:
+            _rfo_load = self._self_state.load_score
+            _rfo_fps  = self._self_state.avg_fps
+
         payload = {
             "requester":      self._node_id,
             "camera_id":      camera_id,
             "cam_uri":        cam_uri,
-            "load_score":     self._self_state.load_score,
-            "avg_fps":        self._self_state.avg_fps,
+            "load_score":     _rfo_load,
+            "avg_fps":        _rfo_fps,
             "eps_fps":        eps_fps,
             "eps_network_ms": eps_net,
             "tier":           relaxation_tier,
@@ -858,7 +928,7 @@ class PeerOrchestrator:
         logger.info("[PeerOrch] RFO sent for '%s' (tier=%d, eps_fps=%.1f, eps_net=%.0fms)",
                     camera_id, relaxation_tier, eps_fps, eps_net)
 
-        # Timer đóng vote window
+        # Timer to close vote window
         timer = threading.Timer(
             cfg.get("vote_window_s", 3.0),
             self._close_vote_window,
@@ -870,10 +940,10 @@ class PeerOrchestrator:
 
     def _close_vote_window(self, camera_id: str, relaxation_tier: int) -> None:
         """
-        Đóng vote window, chọn winner.
+        Close vote window, select winner.
 
-        Nếu không có proposal nào → escalate relaxation tier.
-        Nếu max tier rồi vẫn không có → log CLUSTER_SATURATED.
+        If no proposals → escalate relaxation tier.
+        If max tier exhausted with no proposals → log CLUSTER_SATURATED.
         """
         with self._lock:
             proposals = self._vote_windows.pop(camera_id, [])
@@ -910,7 +980,7 @@ class PeerOrchestrator:
         with self._lock:
             self._vote_in_progress.discard(camera_id)
 
-        # Winner = proposal có F(x) thấp nhất
+        # Winner = proposal with lowest F(x)
         winner = min(proposals, key=lambda p: p["score"])
         cam_config = self._get_camera_config(camera_id)
         if cam_config is None:
@@ -938,15 +1008,15 @@ class PeerOrchestrator:
 
     def _on_vote_request(self, payload: dict) -> None:
         """
-        Nhận RFO từ peer khác.
-        Kiểm tra ε-constraints, nếu pass → gửi proposal.
+        Receive RFO from another peer.
+        Check ε-constraints, if pass → send proposal.
 
         RTT measurement runs in a thread pool so we never block
         the Zenoh subscriber callback thread.
         """
         requester = payload.get("requester", "")
         if requester == self._node_id:
-            return  # Bỏ qua RFO của chính mình
+            return  # Ignore own RFO
 
         camera_id = payload.get("camera_id", "")
         logger.info("[PeerOrch] RFO received from '%s' for camera '%s'", requester, camera_id)
@@ -1058,7 +1128,7 @@ class PeerOrchestrator:
         )
 
     def _on_vote_proposal(self, payload: dict) -> None:
-        """Thu thập proposals — chỉ requester mới xử lý."""
+        """Collect proposals — only requester processes."""
         camera_id = payload.get("camera_id", "")
         if not camera_id:
             return
@@ -1072,34 +1142,42 @@ class PeerOrchestrator:
 
     def _on_vote_decision(self, payload: dict) -> None:
         """
-        Nhận kết quả bầu chọn.
+        Receive election result.
 
-        Nếu mình là winner → ADD camera.
-        Nếu mình là requester → chờ ack rồi REMOVE.
+        If I am winner → ADD camera.
+        If I am requester → wait for ack then REMOVE.
         """
         winner    = payload.get("winner", "")
         camera_id = payload.get("camera_id", "")
         from_node = payload.get("from_node", "")
 
         if winner == self._node_id:
-            # --- MÌNH THẮNG: ADD camera vào pipeline ---
+            # --- I WON: ADD camera to pipeline ---
             cam_config = payload.get("cam_config", {})
             if not cam_config:
                 logger.error("[PeerOrch] Decision missing cam_config for '%s'", camera_id)
                 return
             add_cmd = {**cam_config, "cmd": "ADD"}
-            # BUG-13 fix: publish on the winner's control key, not our own.
-            # When we are the winner, winner == self._node_id so
-            # peers/control/{winner} == peers/control/{self._node_id} and the
-            # pre-declared publisher is the right one.  When another node is
-            # the winner the ADD must go to peers/control/{winner} — we cannot
-            # reuse the local publisher for that, so use session.put() directly.
+            # Fix #9: when WE are the winner, dispatch the ADD directly to the
+            # camera_manager instead of relying on ZenohCommandSubscriber being
+            # alive.  We still also publish to the control key so that any
+            # external subscriber (e.g. the ZenohCommandSubscriber) can act too,
+            # but the orchestrator itself handles it immediately via the shared
+            # camera_manager reference, making the ADD robust.
             winner_key = f"peers/control/{winner}"
             self._session.put(winner_key, msgpack.packb(add_cmd, use_bin_type=True))
             logger.info("[PeerOrch] ADD command sent to '%s' for '%s'", winner, camera_id)
 
+            # Direct dispatch — works even when ZenohCommandSubscriber is absent
+            if self._camera_manager is not None:
+                try:
+                    self._camera_manager.handle_add_command(add_cmd)
+                    logger.info("[PeerOrch] Direct ADD dispatched to camera_manager for '%s'", camera_id)
+                except Exception as exc:
+                    logger.warning("[PeerOrch] Direct ADD dispatch failed for '%s': %s", camera_id, exc)
+
         elif from_node == self._node_id:
-            # --- MÌNH LÀ REQUESTER: chờ ack rồi REMOVE ---
+            # --- I AM REQUESTER: wait for ack then REMOVE ---
             threading.Thread(
                 target=self._wait_and_remove,
                 args=(camera_id, winner),
@@ -1108,9 +1186,9 @@ class PeerOrchestrator:
 
     def _wait_and_remove(self, camera_id: str, winner_node: str) -> None:
         """
-        Make-before-Break: chờ winner xác nhận PLAYING → REMOVE từ mình.
+        Make-before-Break: wait for winner to confirm PLAYING → REMOVE from self.
 
-        Nếu timeout → rollback (đánh penalty winner node).
+        If timeout → rollback (penalize winner node).
         """
         event = threading.Event()
         with self._lock:
@@ -1150,7 +1228,7 @@ class PeerOrchestrator:
             )
             return
 
-        # Success — REMOVE từ mình
+        # Success — REMOVE from self
         remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
         self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
         logger.info(
@@ -1234,7 +1312,7 @@ class PeerOrchestrator:
     # ------------------------------------------------------------------
 
     def _on_vote_ack(self, payload: dict) -> None:
-        """Nhận ack rằng stream đã PLAYING trên winner node."""
+        """Receive ack that stream is PLAYING on winner node."""
         camera_id = payload.get("camera_id", "")
         if not camera_id:
             return
@@ -1251,7 +1329,7 @@ class PeerOrchestrator:
     @staticmethod
     def _consistent_hash(camera_id: str, peer_ids: List[str]) -> str:
         """
-        Deterministic hash: tất cả nodes dùng sorted(peer_ids) → cùng input → cùng output.
+        Deterministic hash: all nodes use sorted(peer_ids) → same input → same output.
         """
         alive = sorted(peer_ids)
         key = int(hashlib.sha256(camera_id.encode()).hexdigest(), 16)
@@ -1259,11 +1337,11 @@ class PeerOrchestrator:
 
     def _leaderless_failover(self, dead_node_id: str, orphaned_cameras: List[str]) -> None:
         """
-        Rescue orphaned cameras bằng consistent hash.
+        Rescue orphaned cameras using consistent hash.
 
-        Mỗi peer sống chạy độc lập → cùng kết quả hash.
-        Winner thực thi ADD sau jitter (0-2s) để tránh race.
-        Sau jitter, kiểm tra peers/status/+ xem camera đã được rescue chưa.
+        Each surviving peer runs independently → same hash result.
+        Winner executes ADD after jitter (0-2s) to avoid race.
+        After jitter, check peers/status/+ to see if camera already rescued.
         """
         cfg = self._cfg
         now = time.time()
@@ -1312,14 +1390,14 @@ class PeerOrchestrator:
                 # BUG-1 fix: read active_cameras under _self_lock
                 with self._self_lock:
                     current_streams = len(self._self_state.active_cameras)
-                if current_streams + self_accepted >= self._cfg.get("eps_streams_max", 8):
+                if current_streams + self_accepted >= self._cfg.get("eps_streams_max", 4):
                     logger.warning(
                         "[Failover] Cannot rescue '%s': at stream capacity (%d). Skipping.",
                         camera_id, current_streams + self_accepted,
                     )
                     continue
 
-                # Double-check: camera đã được rescue bởi peer khác chưa?
+                # Double-check: camera already rescued by another peer?
                 # Exclude both self AND the dead peer — the dead peer's stale
                 # active_cameras still lists its own cameras and would otherwise
                 # cause every rescue to be skipped in a 2-node cluster.
@@ -1403,7 +1481,7 @@ class PeerOrchestrator:
 
     def _get_camera_config(self, camera_id: str) -> Optional[dict]:
         """
-        Đọc cấu hình camera từ cameras.yml.
+        Read camera config from cameras.yml.
 
         BUG-2 fix: prefer the live CameraManager when available — it already
         maintains a hot-reloaded, up-to-date config dict so we never serve
@@ -1481,7 +1559,7 @@ class PeerOrchestrator:
             return None
 
     def _get_camera_uri(self, camera_id: str) -> Optional[str]:
-        """Lấy RTSP URI của camera từ cameras.yml."""
+        """Get RTSP URI of camera from cameras.yml."""
         cfg = self._get_camera_config(camera_id)
         if cfg:
             return cfg.get("uri")
@@ -1489,11 +1567,11 @@ class PeerOrchestrator:
 
     def _pick_camera_to_offload(self, state: PeerState) -> Optional[str]:
         """
-        Chọn camera để offload — ưu tiên camera có FPS cao nhất.
+        Select camera to offload — prioritize camera with highest FPS.
 
-        Không bao giờ offload camera cuối cùng — node phải giữ ít nhất 1 camera
-        để tiếp tục hoạt động. Nếu chỉ còn 1 camera mà vẫn overload thì đó là
-        giới hạn phần cứng, không thể giải quyết bằng migration.
+        Never offload the last camera — node must keep at least 1 camera
+        to continue operation. If only 1 camera remains and still overloaded,
+        that's a hardware limit that cannot be solved by migration.
         """
         if len(state.active_cameras) <= 1:
             if state.active_cameras:

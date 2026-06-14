@@ -1,8 +1,10 @@
 # IoT_Graduate — Decentralized Real-Time Traffic Monitoring with P2P Load Balancing
 
-A production-grade distributed real-time traffic monitoring system that runs **AI inference (NVIDIA DeepStream with YOLOv8 and custom LPR)** on multiple autonomous Jetson Edge nodes to detect vehicles, measure speed using perspective transform homography, and read license plates in real time.
+A production-grade distributed real-time traffic monitoring system that runs **AI inference (NVIDIA DeepStream with YOLO and custom LPR)** on multiple autonomous Jetson Edge nodes to detect vehicles, measure speed using perspective transform homography, and read license plates in real time.
 
 **Architecture**: Jetson Edge nodes are **fully decentralized** and communicate via **Eclipse Zenoh** (peer mode with UDP multicast scouting) for P2P load balancing and failover. A **Central Monitoring Server** aggregates health metrics and violations for visualization and long-term storage. Each Edge pushes a composite RTSP stream to a central **MediaMTX** relay, which converts it to **WebRTC (WHEP)** for low-latency browser playback.
+
+**Deployment target**: 4 Jetson Edge nodes at a signalized intersection, each handling 2 cameras (8 cameras total). Traffic load follows a deterministic 60–90 second signal cycle (red-phase queue buildup → green-phase discharge), which the proactive load model explicitly accounts for.
 
 ---
 
@@ -14,16 +16,16 @@ Each Jetson Edge node runs a **real-time DeepStream GStreamer pipeline** that pr
 
 - **Vehicle Detection**: YOLO detector (primary inference engine) identifies vehicles in each frame and assigns a unique track ID via NvDCF tracker.
 - **Speed Measurement**: Using **homography matrix perspective transform** (calibrated per camera), the system converts pixel-space vehicle positions to real-world coordinates (meters). Velocity is computed as `Δworld_Y / Δtime × 3.6` to convert m/s to km/h.
-- **Validation**: Speed measurements are validated against multiple filters: minimum world displacement (0.5m), bounding box area stability (max 3× change), detection confidence (≥0.5), and minimum track age (0.5s).
-- **Smoothing**: Raw speed samples are smoothed using a median filter (3–5 frame window) to reject noise and outliers.
+- **Validation**: Speed measurements are validated against multiple filters, configured in `Edge/.env`: minimum world displacement (`MIN_WORLD_DISPL_M=0.5`m), bounding box area stability (`BBOX_AREA_JUMP=2.5`× max change), detection confidence (`MIN_DET_CONF=0.45`), maximum plausible speed (`MAX_ABS_KMH=160`), and minimum track age (0.5s, derived as `VIDEO_FPS × 0.5` frames).
+- **Smoothing**: Raw speed samples are smoothed with a median filter over a `MEDIAN_WINDOW=5` sample window (smoothing kicks in once ≥3 samples are collected) to reject noise and outliers.
 
 ### 2. License Plate Detection & Recognition (LPR)
 
 **License Plate Detection (LPD)**: A secondary classifier (SGIE) marks potential license plate regions in the vehicle bounding box.
 
-**License Plate Recognition (LPR)**: A tertiary OCR classifier reads the text from detected plates. The system employs a **frame accumulation strategy**: it collects plate candidates over 5 frames per vehicle track, selects the most frequent/highest-quality text via voting, and "locks" it to that vehicle. Once locked, the plate is displayed alongside the speed overlay.
+**License Plate Recognition (LPR)**: A tertiary OCR classifier reads the text from detected plates. The system employs a **frame accumulation strategy**: it collects plate candidates over a 20-frame window per vehicle track (`PLATE_DETECTION_FRAMES = 20`), selects the most frequent/highest-quality text via voting, and "locks" it to that vehicle. Once locked, the plate is displayed alongside the speed overlay.
 
-**Retry Logic**: If no plate is detected after 5 frames, up to 3 retry attempts are made (15 frames total). After 3 failures, the vehicle is marked with `plate_locked = None`.
+**Retry Logic**: If no plate text is selected after a 20-frame window, up to 3 attempts are made (60 frames total). After 3 failures, the vehicle is marked with `plate_locked = None`.
 
 ### 3. Region of Interest (ROI) Filtering
 
@@ -52,36 +54,58 @@ Each Jetson runs an independent **PeerOrchestrator** instance that implements a 
 
 ### Peer Status & Monitoring
 
-Every 2 seconds, the **health_agent** collects hardware metrics and computes a **unified load score**:
+Every 2 seconds, the **health_agent** collects hardware metrics, CV-plane features, and computes two complementary load signals:
+
+#### Reactive Baseline (legacy, always active)
 
 ```
 Load Score = w_gpu × GPU% + w_cpu × CPU% + w_ram × RAM% + FPS_penalty
 ```
 
-**Adaptive Weights** (from `edge_node.yml`):
-- **thermal** preset (GPU temp ≥ 75°C): ω = [0.3, 0.2, 0.5] (prioritize cooling)
-- **bandwidth** preset (≥3 cameras): ω = [0.2, 0.5, 0.3] (balance CPU)
-- **normal** preset (default): ω = [0.5, 0.3, 0.2] (GPU-heavy)
+**Adaptive Weights** ω = `[w_gpu, w_cpu, w_ram]` (from `edge_node.yml load_score`):
+- **bandwidth** preset (active cameras ≥ `stream_bandwidth_threshold=3`): ω = [0.2, 0.3, 0.5]
+- **normal** preset (default): ω = [0.3, 0.3, 0.4]
 
-The FPS penalty is applied when actual average FPS drops below target — each frame/second lost incurs up to 30 points. This metric is published to `peers/status/{node_id}` over Zenoh. All peers listen and update their in-memory view of peer state.
+The FPS penalty is applied when average FPS drops below `TARGET_FPS` — capped at `fps_penalty_max=25` points. The `omega_preset` name is included in the heartbeat.
 
-**Heartbeat Timeout**: If a peer has not published a status update for `heartbeat_timeout_s` (typically 15 seconds), it is marked **OFFLINE**.
+> **Note**: The `thermal` omega preset has been removed. Thermal stress is now handled exclusively by the smooth `Θ_thermal` ramp inside `H_reactive` (see below), eliminating double-counting of the same signal.
+
+#### Proactive Load Model (Vehicle-Driven, optional)
+
+When `proactive.enabled: true` in `edge_node.yml`, the system also computes a **Unified Risk Index U** that bridges the Computer Vision plane to the Hardware plane:
+
+```
+L_proactive = (W_base + Σ_cam[α₁·N_track + α₂·N_track² + β·N_plate + γ·S]) / 100
+H_reactive  = max(R_GPU, R_CPU, R_RAM) × Θ_thermal
+U           = 1 − (1 − L̂_avg)(1 − Ĥ_avg)        [noisy-OR; both cycle-averaged]
+```
+
+**Parameters**:
+- `W_base`: idle GPU% with zero video sources (measured offline via `tools/profile_collect.py --wbase`).
+- `N_track`, `N_plate`, `S`: per-camera vehicle count, plate count, and stationary fraction — extracted live from `SpeedProbe` every frame.
+- `α₁, α₂, β, γ`: regression coefficients fitted offline by `tools/fit_coefficients.py` on intersection data. `α₂=0` if the linear model wins on held-out RMSE.
+- `Θ_thermal`: smooth linear ramp 1.0 → `max_mult=1.25` over `t_low=75`°C → `t_high=90`°C (matches Jetson's hardware throttle curve).
+- **Cycle-aware smoothing**: both `L̂` and `Ĥ` are averaged over a `cycle_window_s=90`s sliding window (≈ one signal cycle) before fusion. This prevents transient red-phase peaks from triggering unnecessary migrations — only sustained, cycle-averaged overload triggers offload.
+
+The heartbeat payload gains: `l_proactive`, `h_reactive`, `risk_index` (U, cycle-smoothed), `l_proactive_instant`, `h_reactive_instant`, `risk_index_instant`, `n_track_mean`, `n_plate_mean`, `stationary_fraction`, `theta_thermal`.
+
+**Heartbeat Timeout**: If a peer has not published a status update for `heartbeat_timeout_s` (default 5 seconds), it is marked **OFFLINE**.
 
 ### Request for Offload (RFO) Voting Protocol
 
-When a node detects it is overloaded (`load_score > 75%` for >10 seconds continuously):
+When a node detects it is overloaded (`load_score > overload_threshold` for longer than `overload_duration_s`; defaults 65 and 5s in `edge_node.yml`):
 
 1. **Select Camera**: Prioritized by FPS (highest FPS camera is most effective to offload).
 2. **Publish RFO**: Declares camera ID, its load score, and tiered ε-constraint requirements:
-   - **ε₁ Capacity**: Responder must have < `eps_streams_max` (e.g., 4) active cameras.
-   - **ε₂ FPS Prediction**: Responder's predicted FPS after adding this stream must be ≥ `eps_fps` (with tier-based relaxation).
-   - **ε₃ Network RTT**: RTSP source round-trip latency must be ≤ `eps_network_ms`.
-   - **ε₄ Per-Camera Cooldown**: Camera must not have been migrated in the last 45 seconds.
+   - **ε₁ Capacity**: Responder must have < `eps_streams_max` (default 4) active cameras.
+   - **ε₂ FPS Prediction**: Responder's predicted FPS after adding this stream (from the `fps_model` table) must be ≥ `eps_fps` (`eps_fps_strict=15` → `eps_fps_tier1=12` → `eps_fps_tier2=10` with tier-based relaxation).
+   - **ε₃ Network RTT**: RTSP source round-trip latency must be ≤ `eps_network_ms` (`eps_network_ms_strict=30` → `eps_network_ms_tier1=60`).
+   - **ε₄ Per-Camera Cooldown**: Camera must not have been migrated within the last `cooldown_s` (default 15) seconds.
    - **ε₅ Penalty Check**: Responder must not have an active penalty from a previous failed migration.
 
 3. **Collect Bids**: All peers passing all ε-constraints respond with a **bid** including composite score `F(x)` (estimated load after adding stream).
 
-4. **Elect Winner**: Requester collects bids for `vote_window_s` (3 seconds), selects the peer with the lowest F(x) score.
+4. **Elect Winner**: Requester collects bids for `vote_window_s` (default 3 seconds), selects the peer with the lowest F(x) score.
 
 5. **Escalate on Failure**: If no peer bids, the requester escalates to a more relaxed ε-constraint tier and retries. If all tiers fail, log **CLUSTER_SATURATED** and continue at overload.
 
@@ -93,8 +117,8 @@ Once the winner is elected:
 2. The **winner receives an ADD control command** on `peers/control/{winner_node_id}` with full camera config (URI, homography, ROI, FPS, speed limit, etc.).
 3. The winner **immediately begins streaming** from the camera.
 4. When the stream reaches **PLAYING state** (buffered), the winner publishes an ack (`peers/vote/ack/{camera_id}`).
-5. The **requester waits for this ack** (15-second timeout). Upon receipt, it publishes a **REMOVE command** to stop its own stream.
-6. A **per-camera cooldown** (45 seconds) prevents the same camera from being offloaded again immediately.
+5. The **requester waits for this ack** (`migration_timeout_s`, default 2 seconds; on timeout it rolls back and penalizes the winner). Upon receipt, it publishes a **REMOVE command** to stop its own stream.
+6. A **per-camera cooldown** (`cooldown_s`, default 15 seconds) prevents the same camera from being offloaded again immediately.
 
 This **Make-Before-Break** strategy ensures **zero frame loss** during migration.
 
@@ -104,7 +128,7 @@ When any peer detects another peer is **OFFLINE** (heartbeat timeout):
 
 1. All living peers **independently compute the same assignment** using **consistent hash** of the offline peer's camera list. This deterministic approach ensures all peers elect the same **rescuer** for each orphaned camera—no coordination needed.
 
-2. The elected peer **waits for random jitter** (0–2 seconds uniform) to avoid a "thundering herd".
+2. The elected peer **waits for random jitter** (0–`failover_jitter_max_s` seconds uniform, default 0–3s) to avoid a "thundering herd".
 
 3. **Verify RTSP reachability** — if the camera was hosted on the dead node's subnet, it will be unreachable, and rescue is skipped.
 
@@ -202,13 +226,14 @@ The `health_agent.py` daemon runs as a separate process on each Edge:
    - Query parameters are URL-encoded to handle special characters.
    - Connection implicitly registers the node (no separate registration endpoint).
 2. Every `HEALTH_INTERVAL` seconds (e.g., 2 seconds), publishes health containing:
-   - GPU %, CPU %, RAM %, temperature, load score.
-   - FPS per camera.
+   - GPU %, CPU %, RAM %, temperature, power, load score, `omega_preset`.
+   - `source` (`jtop` or `jtop_unavailable`) — the dashboard shows GPU%/Temp as "N/A" when jtop is down rather than a misleading 0.0.
+   - FPS per camera, average FPS.
    - Active camera list.
 3. Subscribes to `traffic/events/{NODE_ID}/**` on Zenoh (published by SpeedProbe).
    - When an overspeed violation is published, forwards it to Server over WebSocket.
    - This avoids the pipeline needing its own WebSocket connection.
-4. Implements exponential backoff reconnection (5s, 10s, 20s, 30s, repeat).
+4. Implements exponential backoff reconnection (2s, 5s, 10s, 30s, repeat).
 
 **Note**: The pipeline (`main.py`) does NOT connect to Server directly. It publishes events via Zenoh; health_agent bridges them.
 
@@ -254,6 +279,9 @@ Zenoh is a pub-sub framework with hierarchical key expressions. All peer communi
 | `peers/vote/ack/{camera_id}` | zenoh_subscriber (winner) | requester | msgpack: node_id, camera_id, event: PLAYING | **Acknowledgment**. Stream is PLAYING. Requester waits before REMOVE. |
 | `peers/control/{node_id}` | peer_orch | zenoh_subscriber | msgpack: cmd (ADD/REMOVE/STATUS), camera_id, source_id, uri, homography, roi_polygon, fps, speed_limit | **Control command**. ADD (full config) or REMOVE (camera_id only) or STATUS (query). |
 | `traffic/events/{node_id}/{camera_id}` | zenoh_publisher (probe) | health_agent | msgpack: type (overspeed), node_id, camera_id, ts, track_id, speed_kmh, license_plate, image_b64, dedup_key | **Overspeed event**. Published by SpeedProbe when vehicle exceeds speed limit. Includes snapshot. |
+| `offload/plates/{src}/{dst}` | offload_publisher | offload_receiver (dst) | msgpack: type (plate), src, dst, camera_id, stid, frame_no, jpeg, confidence | **Level 3 offload**. Plate crops sent to a peer for remote LPR. Only used when `offload_level ≥ 3`. |
+| `offload/vehicles/{src}/{dst}` | offload_publisher | offload_receiver (dst) | msgpack: type (vehicle), src, dst, camera_id, stid, frame_no, jpeg, bbox_world_y | **Level 2 offload**. Vehicle crops sent to a peer for remote LPD+LPR. Only used when `offload_level ≥ 2`. |
+| `offload/results/{node_id}/{sender}` | offload_receiver | offload_publisher (sender) | msgpack: src, dst, camera_id, stid, frame_no, plate_text, confidence | **Offload result**. Decoded plate text returned to the sender for OSD overlay. |
 
 ---
 
@@ -279,7 +307,7 @@ Zenoh is a pub-sub framework with hierarchical key expressions. All peer communi
   - **Demultiplexing**: N RTSP sources (`uridecodebin`) feeding into single `nvstreammux` (batch muxer).
   - **Primary Inference (PGIE)**: YOLO detector (vehicle detection, classification).
   - **Tracking**: NvDCF tracker — assigns consistent track IDs via motion prediction.
-  - **Secondary Inferences**: Vehicle attribute classifier + License Plate Reader (LPR) classifier.
+  - **Secondary Inferences**: License Plate Detector (LPD, `SGIE_CONFIG`) followed by License Plate Reader (LPR, `LPR_CONFIG`) classifier. Both use custom DeepStream parsers under `configs/nvdsinfer_custom_impl_Yolo/` and `configs/nvinfer_custom_lpr_parser/`.
   - **Analytics**: `nvdsanalytics` probe attachment point.
   - **Tiling**: `nvmultistreamtiler` arranges cameras into grid (2×2 for 4 cameras, etc.).
   - **Rendering**: `nvdsosd` overlays speed, plate text, bounding boxes.
@@ -289,17 +317,19 @@ Zenoh is a pub-sub framework with hierarchical key expressions. All peer communi
     - `rtsp_push`: H.264 encoder → `rtspclientsink` pushes composite to MediaMTX.
 
 - **`speedflow_python/probes.py`**: **GStreamer pad probes** — functions attached to pipeline pads:
-  - **`ROIFilterProbe`**: Filters objects outside per-camera ROI polygon using OpenCV point-in-polygon.
+  - **`ROIFilterProbe`**: Filters objects outside per-camera ROI polygon using C extension for performance. Skips filter entirely if ROI is not configured.
   - **`SpeedProbe`**: Main analytics probe (called once per frame):
     - Iterates over objects; separates vehicles from license plates.
-    - **Perspective Transform**: Converts pixel-space vehicle centroids to world coordinates using homography matrix.
+    - **Perspective Transform**: Converts pixel-space vehicle centroids to world coordinates using homography matrix in one batched C call.
     - **Position History**: Maintains deque of world positions per (source_id, track_id).
     - **Speed Calculation**: When history is long enough, computes velocity and converts to km/h.
     - **Validation**: Checks minimum displacement, area stability, confidence, track age.
     - **Median Smoothing**: 3–5 frame window to smooth noisy speeds.
-    - **License Plate Tracking**: Accumulates detections over 5 frames; selects most frequent/highest-quality text.
+    - **License Plate Tracking**: Accumulates detections over a 20-frame window; selects most frequent/highest-quality text.
     - **Overspeed Publishing**: If speed ≥ limit, encodes JPEG snapshot and calls `publisher.put(payload)` (non-blocking).
-  - **FPS Statistics**: Separate thread reads FPS counters every 2 seconds, writes to JSON file that health_agent consumes.
+  - **Proactive Feature Counting**: On every frame, counts per-camera `n_track` (active vehicle tracks), `n_plate` (plate detections), and `n_stationary` (vehicles with smoothed speed < 3 km/h, i.e. stopped at red). Averages are flushed every 2 seconds alongside FPS into the shared stats file.
+  - **FPS Statistics**: Separate thread writes FPS counters + proactive feature averages every 2 seconds to `FPS_STATS_FILE` (`/dev/shm/speedflow_fps.json`). Both FPS and features are consumed by `health_agent.py`. Properly stopped on pipeline exit.
+  - **Cleanup**: Every 30 seconds, removes stale tracks that have not produced speed readings or left the scene.
 
 - **`speedflow_python/camera_config.py`**: **Camera configuration manager**. Reads `cameras.yml`, parses per-camera settings (RTSP URI, homography matrix, ROI polygon, speed limit, FPS). Implements **file-system watcher** (via `watchdog` library) with 100ms debounce to detect `cameras.yml` changes and hot-reload without restarting. Uses `GLib.idle_add()` to queue dynamic stream add/remove operations on GLib Main Loop thread (thread-safe).
 
@@ -311,7 +341,9 @@ Zenoh is a pub-sub framework with hierarchical key expressions. All peer communi
   - Detects offline peers via heartbeat timeout; triggers leaderless failover using consistent hashing.
   - Tracks rescued cameras; automatically returns them to recovered owners.
   - Manages per-camera cooldowns to prevent thrashing.
+  - Implements three-level offload partitioning: Level 3 (plate crops), Level 2 (vehicle crops), Level 1 (full stream migration).
   - All P2P parameters loaded from `Edge/configs/edge_node.yml`.
+  - **Thread safety**: Uses `_self_lock` for private state snapshots, `_lock` for peer state, `_offload_lock` for camera offload table.
 
 - **`speedflow_python/zenoh_publisher.py`**: **Non-blocking event publisher**. Maintains bounded queue and daemon thread:
   - When SpeedProbe detects overspeed, calls `publisher.put(payload)` (non-blocking, < 0.1ms).
@@ -319,17 +351,33 @@ Zenoh is a pub-sub framework with hierarchical key expressions. All peer communi
   - Daemon thread consumes queue; publishes via Zenoh to `traffic/events/{node_id}/{camera_id}` (msgpack format).
 
 - **`speedflow_python/zenoh_subscriber.py`**: **Control command receiver**. Subscribes to `peers/control/{node_id}`:
-  - **ADD**: Adds new camera; computes homography; enqueues delta for dynamic stream addition.
+  - **ADD**: Adds new camera; delegates config build + delta enqueue to `CameraManager.handle_add_command()`.
   - **REMOVE**: Marks camera disabled; enqueues delta for dynamic stream removal.
   - **STATUS**: Returns current active camera list.
-  - After successful ADD, waits 3 seconds (GLib processing), then publishes ack to `peers/vote/ack/{camera_id}`.
+  - After an ADD, a background thread polls the live `source_id` lookup until the stream reaches PLAYING (15-second timeout), then publishes ack to `peers/vote/ack/{camera_id}` — it never acks a failed ADD.
 
 - **`speedflow_python/zenoh_session.py`**: **Zenoh session factory**. Creates peer-mode Zenoh session (no broker required) with UDP multicast scouting for local-network peer discovery.
+
+#### Multi-Level Offload (Fine-Grained Load Shedding)
+
+- **`speedflow_python/offload_publisher.py`**: **Non-blocking crop sender**. When `PeerOrchestrator` sets a camera's offload level to 2 or 3, `SpeedProbe` sends crops to the target peer instead of (or in addition to) processing locally:
+  - **Level 3**: plate crops → `offload/plates/{src}/{dst}` (~1–3 KB).
+  - **Level 2**: vehicle crops → `offload/vehicles/{src}/{dst}` (~15–40 KB).
+  - Shares one daemon thread + bounded queue (drop-oldest), same non-blocking contract as `ZenohPublisher`.
+
+- **`speedflow_python/offload_receiver.py`**: **Standalone TensorRT inference for offloaded crops**. Subscribes to `offload/plates/*/{node_id}` and `offload/vehicles/*/{node_id}`:
+  - **Level 3**: runs LPR directly on the plate crop.
+  - **Level 2**: runs LPD then LPR on the detected plate sub-crop.
+  - Loads `.engine` files lazily in a worker thread (no DeepStream pipeline needed). Publishes results back to the sender on `offload/results/{node_id}/{sender}`; the sender's `SpeedProbe.inject_offload_result()` overlays the text on the next frame.
+
+#### Native Extension (Hot-Path Acceleration)
+
+- **`speedflow_cpp/` + `speedflow_python/speedflow_c.py`**: **C/C++ extension** loaded via ctypes. Replaces the per-frame hot path (speed computation, batched perspective transform, point-in-polygon, plate quality, center distance, plate enhancement) with native code. Every binding has a pure-Python/OpenCV fallback in `speedflow_c.py`, so the pipeline still runs if `speedflow_cpp.so` is not built. Override the `.so` path with `SPEEDFLOW_CPP_SO`.
 
 #### Monitoring & Communication
 
 - **`health_agent.py`**: **Standalone daemon process** that runs independently from pipeline:
-  - Collects hardware metrics every `HEALTH_INTERVAL` seconds: GPU %, CPU %, RAM %, GPU temp (via `jtop` on Jetson, or `psutil` fallback).
+  - Collects hardware metrics every `HEALTH_INTERVAL` seconds: GPU %, CPU %, RAM %, GPU temp (via `jtop` on Jetson with 10-second timeout guard). If jtop is unavailable, metrics are reported as zero and a warning is logged — no psutil fallback (Jetson-only deployment).
   - Reads FPS stats from file written by `SpeedProbe._fps_writer_loop()`.
   - Computes unified **load score** using weighted formula with adaptive ω presets.
   - Publishes health payload to `peers/status/{node_id}` via Zenoh.
@@ -338,18 +386,23 @@ Zenoh is a pub-sub framework with hierarchical key expressions. All peer communi
   - Implements exponential backoff reconnection on WebSocket drop.
 
 - **`speedflow_python/monitor_client.py`**: **WebSocket client** used by health_agent:
-  - Persistent outbound connection with exponential backoff (5s, 10s, 20s, 30s).
+  - Persistent outbound connection with exponential backoff (`_RECONNECT_DELAYS = [2, 5, 10, 30]` seconds).
   - Thread-safe queue for outbound messages.
   - Daemon thread consumes queue; sends JSON over WebSocket.
   - URL parameter encoding for special characters in node_id/advertise_ip.
 
 - **`speedflow_python/run_python.py`**: **Pipeline orchestration glue**. Initializes and manages lifecycle of:
   - GStreamer pipeline (via core_pipeline.py).
-  - Zenoh publisher/subscriber.
-  - Peer orchestrator instance.
-  - Probe instances (ROI, Speed).
-  - Loop and signal handlers (SIGINT, SIGTERM) for graceful shutdown.
-  - **PID file lock** (`run_python.pid`) prevents two instances (would cause MediaMTX publisher conflicts).
+  - `PeerOrchestrator` (owns the single shared Zenoh session for all P2P traffic).
+  - `ZenohCommandSubscriber` (control commands) — shares the orchestrator's session.
+  - `ZenohPublisher` (overspeed events) — wired into `SpeedProbe.set_publisher()` so violations actually publish.
+  - `OffloadPublisher` / `OffloadReceiver` — started only when `offload_level > 0` in `edge_node.yml`.
+  - Probe instances (ROI filter, plate preprocessor, Speed/LPR).
+  - A health-push thread (metrics → Dashboard via MonitorClient + Zenoh).
+  - Loop and signal handlers for graceful shutdown.
+  - **PID file lock** (`run_python.pid`, rtsp_push mode) prevents two instances (would cause MediaMTX publisher conflicts).
+  - Returns probe from all execution modes; cleanly stops the FPS writer and event publisher on exit.
+  - Does **not** open its own MonitorClient WebSocket unless `PIPELINE_OWN_WS=1` (avoids competing with `health_agent.py` for the same `node_id`).
 
 ### Server (Central Monitoring & Dashboard)
 
@@ -364,7 +417,7 @@ Zenoh is a pub-sub framework with hierarchical key expressions. All peer communi
     - **`GET /health`**: Health check.
     - **`GET /api/edges`**: All registered edges with live health state.
     - **`GET /api/clusters`**: Edges grouped by cluster (IP subnet or cluster_id from health).
-    - **`GET /api/violations`**: Query violations with filters (node_id, date, limit, offset).
+    - **`GET /api/violations`**: Query violations with filters (node_id, date, limit, offset). Uses early-exit optimization to bound memory.
     - **`GET /api/streams`**: Proxy to MediaMTX API (list active RTSP sessions).
     - **`GET /api/snapshots/{node_id}/{filename}`**: Serve snapshot images (path traversal-safe).
     - **`GET /ws/edge`**: WebSocket for Edge nodes. Implicit registration + receives health/violations + broadcasts to browsers.
@@ -379,7 +432,7 @@ Zenoh is a pub-sub framework with hierarchical key expressions. All peer communi
   - Organizes files by date and node_id: `violations/{date}/{node_id}/violations.jsonl` and `violations/{date}/{node_id}/{camera_id}_{timestamp_ms}.jpg`.
   - **Async write**: All violations appended via `aiofiles` (avoids blocking event loop).
   - **Snapshot handling**: JPEG snapshots (base64-encoded in payload) decoded and saved separately.
-  - **Query method**: Synchronous method reads JSONL; returns paginated results (supports filtering by node_id/date).
+  - **Query method**: Synchronous method reads JSONL with early-exit when sufficient records collected; bounded memory for large violation stores.
   - Single `asyncio.Lock` guards all async writes to prevent race conditions.
 
 #### Dashboard (Frontend)
@@ -477,27 +530,34 @@ docker compose up -d
 
 ### 3. Edge Node — Configure `.env`
 
-```bash
-cd Edge
-cp .env.example .env
-```
-
-Edit `Edge/.env`:
+`Edge/.env` is the single source of truth and is strictly validated at import time
+(missing required keys raise an error — no silent defaults). Edit it to match your
+deployment:
 
 ```ini
 NODE_ID=jetson_A
-MAX_STREAMS=4
+MAX_STREAMS=8
 
 # RTSP push destination (MediaMTX on VPS)
 RTSP_PUSH_URL=rtsp://SERVER_IP:8554/jetson_A
-RTSP_PUSH_BITRATE=4000000
+RTSP_PUSH_BITRATE=2500000
 
 # Central Monitor (set to your Server IP)
 MONITOR_URL=http://SERVER_IP:9090
 
 # Your LAN IP (for Server to display the correct address)
 ADVERTISE_IP=192.168.1.200
+
+# Pipeline / detection
+TARGET_FPS=25.0
+VIDEO_FPS=25.0
+MUX_WIDTH=1280
+MUX_HEIGHT=720
+FPS_STATS_FILE=/dev/shm/speedflow_fps.json
 ```
+
+P2P tuning (overload thresholds, ε-constraints, offload levels, ω weights) lives
+separately in `Edge/configs/edge_node.yml`.
 
 ### 4. Edge Node — Launch (Two Processes)
 
@@ -534,7 +594,7 @@ Open [http://<SERVER_IP>:9090](http://<SERVER_IP>:9090). The dashboard shows:
 | `/` | GET | Dashboard HTML |
 | `/health` | GET | Server health check |
 | `/api/edges` | GET | All registered edges with live health |
-| `/api/clusters` | GET | Edges grouped by cluster (IP subnet) |
+| `/api/clusters` | GET | Edges grouped by cluster (`cluster_id` from health, else IP /24 subnet) |
 | `/api/violations` | GET | Query violations `?node_id=&date=&limit=&page=` |
 | `/api/streams` | GET | Proxy to MediaMTX — list active RTSP streams |
 | `/api/snapshots/{node}/{file}` | GET | Serve snapshot image (path traversal safe) |
@@ -551,13 +611,16 @@ IoT_Graduate/
 │   ├── .env
 │   ├── docker-compose.yml
 │   ├── Dockerfile
-│   ├── generate-compose.sh
+│   ├── mediamtx.yml                # MediaMTX config for the simulator
+│   ├── generate-compose.sh         # Generate docker-compose.yml for N cameras
+│   ├── start.sh                    # Convenience launcher
 │   └── videos/
 ├── Edge/                           # AI processing node
-│   ├── .env                        # Single source of truth
+│   ├── .env                        # Single source of truth (strictly validated)
 │   ├── main.py
 │   ├── health_agent.py             # Hardware metrics → Zenoh + MonitorClient
 │   ├── speed_gui.py                # PyQt5 calibration GUI
+│   ├── setup_system.sh             # System dependency installer (first-time)
 │   ├── requirements.txt
 │   ├── configs/
 │   │   ├── cameras.yml                 # Multi-camera sources + homography + ROI
@@ -567,10 +630,16 @@ IoT_Graduate/
 │   │   ├── config_nvdsanalytics.txt          # DeepStream analytics
 │   │   ├── config_tracker_NvDCF_perf.yml     # NvDCF tracker
 │   │   ├── config_tracker_lpd.yml            # Tracker for LPD
-│   │   ├── edge_node.yml               # P2P tuning parameters (p2p: section)
+│   │   ├── edge_node.yml               # P2P tuning + load-score weights
 │   │   ├── labels_lpd.txt              # Plate detector class labels
 │   │   ├── labels_lpr.txt              # Plate reader class labels
-│   │   └── labels_YOLO.txt             # YOLO detector class labels
+│   │   ├── labels_YOLO.txt             # YOLO detector class labels
+│   │   ├── nvdsinfer_custom_impl_Yolo/ # Custom DeepStream YOLO parser (C/C++)
+│   │   └── nvinfer_custom_lpr_parser/  # Custom DeepStream LPR output parser (C/C++)
+│   ├── speedflow_cpp/                  # Native C/C++ hot-path extension
+│   │   ├── speedflow.cpp               # Speed/perspective/polygon/quality math
+│   │   ├── speedflow.h
+│   │   └── plate_enhance.cpp           # CLAHE + sharpen plate enhancement
 │   └── speedflow_python/
 │       ├── __init__.py
 │       ├── settings.py               # Config loader (strict validation)
@@ -578,15 +647,19 @@ IoT_Graduate/
 │       ├── core_pipeline.py          # DeepStream pipeline builder
 │       ├── run_python.py             # Pipeline runner + orchestration
 │       ├── peer_orchestrator.py      # P2P load balancing
+│       ├── peer_discovery.py         # No-op shim (Zenoh scouting handles discovery)
 │       ├── probes.py                 # GStreamer pad probes (SpeedProbe, ROIFilterProbe)
 │       ├── plate_preprocessor.py     # Plate image preparation
 │       ├── camera_config.py          # Camera config manager + file watcher
 │       ├── analytics.py              # Future analytics (stub)
 │       ├── draw.py                   # OSD helpers
 │       ├── io_utils.py               # Utilities
-│       ├── zenoh_publisher.py        # Non-blocking event publisher
-│       ├── zenoh_subscriber.py       # Control command receiver
+│       ├── speedflow_c.py            # ctypes bindings to speedflow_cpp.so (+ Python fallbacks)
+│       ├── zenoh_publisher.py        # Non-blocking overspeed-event publisher
+│       ├── zenoh_subscriber.py       # Control command receiver (ADD/REMOVE/STATUS)
 │       ├── zenoh_session.py          # Zenoh session factory
+│       ├── offload_publisher.py      # Level 2/3 crop offload sender
+│       ├── offload_receiver.py       # Level 2/3 crop receiver (standalone TensorRT LPR/LPD)
 │       └── monitor_client.py         # WebSocket client → Server
 ├── Server/                         # Central Monitoring Server + MediaMTX
 │   ├── .env                        # SERVER_HOST, SERVER_PORT, DATA_DIR, MEDIAMTX_API
@@ -625,28 +698,10 @@ IoT_Graduate/
 | Metric | Target |
 |--------|--------|
 | **Probe Latency** | < 0.1 ms (non-blocking queue) |
-| **Health Heartbeat** | Every 2–5 seconds |
-| **Peer Decision Loop** | Every 30 seconds |
-| **FPS per Camera** | 25–30 fps (configurable) |
+| **Health Heartbeat** | Every `HEALTH_INTERVAL` seconds (default 2.0) |
+| **Peer Decision Loop** | Every 1 second |
+| **Stale-Track Cleanup** | Every 30 seconds |
+| **FPS per Camera** | `TARGET_FPS` (default 25 fps, configurable) |
 | **Speed Accuracy** | ±5% (with proper calibration) |
 | **Memory Footprint** | ~800MB–1.2GB per edge (GStreamer + CUDA) |
 
----
-
-## Known Issues & Fixes
-
-| Issue | File | Status |
-|-------|------|--------|
-| **BUG-05** | Server/app.py:45 | Watchdog task GC fix — store strong ref |
-| **BUG-03/12** | Server/app.py:92 | Path traversal prevention in static serving |
-| **BUG-08** | Server/app.py:133 | Event loop blocking fix — use `query_async()` |
-| **BUG-09** | Edge/speedflow_python/monitor_client.py:92 | Thread-safe counter reads |
-| **BUG-18** | Edge/speedflow_python/monitor_client.py:54 | URL-encode node_id/advertise_ip |
-| **BUG-B** | Edge/speedflow_python/monitor_client.py:68 | Lock-ordering inversion fix |
-| **BUG-F** | Server/app.py:50 | RuntimeError guard for broadcast outside event loop |
-
----
-
-## License & Contributing
-
-This is a production-grade research project. For questions or contributions, please open an issue or PR.

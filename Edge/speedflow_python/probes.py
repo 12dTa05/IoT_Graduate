@@ -96,6 +96,10 @@ class ROIFilterProbe:
                 continue
 
             roi = cam_cfg.roi_polygon          # (N,2) int32 ndarray or None
+            # Fix #13: if no ROI is configured, keep all objects (no filter).
+            if roi is None or len(roi) == 0:
+                l_frame = l_frame.next
+                continue
             objects_to_remove = []
             l_obj = frame_meta.obj_meta_list
 
@@ -199,6 +203,28 @@ class SpeedProbe:
         self._fps_stats_lock  = threading.Lock()
         self._fps_stats_cache: Dict[str, float] = {}
 
+        # ── Proactive feature cache (per camera, updated every frame) ──────
+        # Written on the GLib/GStreamer thread; read by the FPS writer thread
+        # under _feature_lock.  Values are per-frame instantaneous counts that
+        # the writer loop time-averages before flushing.
+        #
+        # Per-camera accumulators:
+        #   n_track_sum         — sum of active vehicle tracks seen this window
+        #   n_plate_sum         — sum of plate detections seen this window
+        #   n_stationary_sum    — sum of stationary (≈stopped) vehicle counts
+        #   frame_count         — number of frames accumulated since last flush
+        #
+        # "Stationary" threshold: speed_history median < STATIONARY_KMH_THRESH.
+        # Any vehicle whose smoothed speed is below the threshold (or whose
+        # speed history is empty, i.e., not yet computed) is counted as stopped.
+        self._feature_lock    = threading.Lock()
+        self._feature_acc: Dict[str, Dict[str, float]] = defaultdict(
+            lambda: {"n_track_sum": 0.0, "n_plate_sum": 0.0,
+                     "n_stationary_sum": 0.0, "frame_count": 0.0}
+        )
+        # Published snapshot — what the writer thread serialises to disk
+        self._feature_cache: Dict[str, Dict[str, float]] = {}
+
         self._fps_writer_running = True
         self._fps_writer_thread  = threading.Thread(
             target=self._fps_writer_loop, name="FPSStatsWriter", daemon=True
@@ -256,16 +282,102 @@ class SpeedProbe:
         with self._fps_stats_lock:
             return dict(self._fps_stats_cache)
 
+    # ------------------------------------------------------------------
+    # Proactive feature counter
+    # ------------------------------------------------------------------
+
+    # Vehicles with smoothed speed below this are counted as stationary
+    # (stopped at red light).  3 km/h tolerates GPS/homography noise.
+    _STATIONARY_KMH_THRESH: float = 3.0
+
+    def _tick_features(self, camera_id: str, source_id: int,
+                       vehicles_in_frame: dict) -> None:
+        """
+        Accumulate per-frame feature counts for camera_id.
+
+        Called once per frame inside osd_sink_pad_buffer_probe, after Pass 1
+        (vehicles_in_frame is populated) and Pass 2 (plate counts available via
+        plates_in_frame length — passed through n_plate argument).
+
+        This method only handles vehicle-side counts; plate count is injected
+        separately via _tick_features_plates so the call site stays clean.
+        """
+        n_track = len(vehicles_in_frame)
+        n_stationary = 0
+        for tid in vehicles_in_frame:
+            stid = (source_id, tid)
+            sh = self.speed_history.get(stid)
+            if sh is None or len(sh) == 0:
+                # No speed history yet (new track) — assume stopped
+                n_stationary += 1
+            else:
+                smoothed = sf.median_speed(list(sh))
+                if smoothed < self._STATIONARY_KMH_THRESH:
+                    n_stationary += 1
+
+        with self._feature_lock:
+            acc = self._feature_acc[camera_id]
+            acc["n_track_sum"]      += n_track
+            acc["n_stationary_sum"] += n_stationary
+            acc["frame_count"]      += 1.0
+
+    def _tick_features_plates(self, camera_id: str, n_plate: int) -> None:
+        """Add plate count for this frame (called after Pass 2)."""
+        with self._feature_lock:
+            self._feature_acc[camera_id]["n_plate_sum"] += n_plate
+
+    def get_feature_stats(self) -> Dict[str, Dict[str, float]]:
+        """Return the last-published per-camera feature snapshot."""
+        with self._feature_lock:
+            return dict(self._feature_cache)
+
     def _fps_writer_loop(self) -> None:
         while self._fps_writer_running:
             time.sleep(2.0)
             try:
-                stats = self.get_fps_stats()
-                stats["_updated_at"] = time.time()
+                fps   = self.get_fps_stats()
+                feats = self._flush_features()
+
+                # Build unified payload: fps_per_camera + per-camera features
+                out: Dict = {"_updated_at": time.time()}
+                # FPS entries (bare floats, backward-compat)
+                for cam_id, f in fps.items():
+                    out[cam_id] = f
+                # Feature entries nested under a "_features" key so readers
+                # that only care about FPS are unaffected.
+                out["_features"] = feats
+
                 with open(FPS_STATS_FILE, "w") as f:
-                    json.dump(stats, f)
+                    json.dump(out, f)
             except Exception:
                 pass
+
+    def _flush_features(self) -> Dict[str, Dict[str, float]]:
+        """
+        Drain accumulators, compute per-camera averages, update cache.
+        Returns a snapshot dict {camera_id: {n_track, n_plate, stationary_fraction}}.
+        """
+        snapshot: Dict[str, Dict[str, float]] = {}
+        with self._feature_lock:
+            for cam_id, acc in self._feature_acc.items():
+                fc = acc["frame_count"]
+                if fc > 0:
+                    n_track  = acc["n_track_sum"]      / fc
+                    n_plate  = acc["n_plate_sum"]       / fc
+                    n_stat   = acc["n_stationary_sum"]  / fc
+                    stat_frac = n_stat / max(1.0, n_track)
+                else:
+                    n_track = n_plate = stat_frac = 0.0
+                snapshot[cam_id] = {
+                    "n_track":             round(n_track,  2),
+                    "n_plate":             round(n_plate,  2),
+                    "stationary_fraction": round(stat_frac, 3),
+                }
+                # Reset accumulator for next window
+                acc["n_track_sum"] = acc["n_plate_sum"] = \
+                    acc["n_stationary_sum"] = acc["frame_count"] = 0.0
+            self._feature_cache = dict(snapshot)
+        return snapshot
 
     def stop_fps_writer(self) -> None:
         self._fps_writer_running = False
@@ -583,6 +695,12 @@ class SpeedProbe:
             else:
                 y_world_by_tid = {}
 
+            # ── Proactive feature tick (vehicle counts) ────────────────────
+            # Called after Pass 1 so vehicles_in_frame is complete.
+            # speed_history is still valid from previous frames — stationary
+            # classification uses cached median, free of the batch-transform result.
+            self._tick_features(cam_cfg.camera_id, source_id, vehicles_in_frame)
+
             # ── Pass 2: License plate accumulation or Level-3 offload ────────
             # Level 3: plate crops are sent to the peer; local accumulation skipped.
             if offload_level == 3 and self._offload_pub is not None and offload_target:
@@ -662,6 +780,11 @@ class SpeedProbe:
                                 self.plate_candidates[stid] = []
                             else:
                                 self.plate_locked[stid] = None
+
+            # ── Proactive feature tick (plate count) ───────────────────────
+            # plates_in_frame is populated in Pass 1 regardless of offload level;
+            # tick here so n_plate reflects the true detector output.
+            self._tick_features_plates(cam_cfg.camera_id, len(plates_in_frame))
 
             # ── Pass 3: Speed & OSD display ───────────────────────────────
             fps_int = int(cam_cfg.fps)
@@ -801,10 +924,11 @@ class SpeedProbe:
                                     cam_cfg.source_points,
                                     color=(0.0, 1.0, 0.0, 1.0))
 
-            # BUG-16 fix: reuse unix_ns / ts already computed above instead of
-            # calling time.time() again on every frame.  BUG-5 fix: pass
-            # frame_number so the cleanup can use frame-age staleness.
-            self._periodic_cleanup(unix_ns / 1e9, frame_number)
+            # Fix #8: always use wall-clock time for the cleanup timer, not the
+            # buffer NTP timestamp.  A replayed video file carries old NTP
+            # timestamps that diverge wildly from wall clock, making the
+            # cleanup interval fire every frame (or never).
+            self._periodic_cleanup(time.time(), frame_number)
             l_frame = l_frame.next
 
         return Gst.PadProbeReturn.OK

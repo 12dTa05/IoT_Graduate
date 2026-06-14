@@ -44,30 +44,51 @@ logger = logging.getLogger("health_agent")
 
 
 # ---------------------------------------------------------------------------
-# FPS Reader (đọc từ file JSON được SpeedProbe ghi ra)
+# FPS Reader (read JSON file written by SpeedProbe)
 # ---------------------------------------------------------------------------
 
 def _read_fps_stats() -> Dict[str, float]:
     """
-    Đọc file JSON do SpeedProbe ghi chứa FPS theo từng camera.
-    Trả về dict {camera_id: fps} hoặc dict rỗng nếu chưa có file.
+    Read JSON file written by SpeedProbe containing FPS per camera.
+    Return dict {camera_id: fps} or empty dict if file doesn't exist.
 
-    Định dạng file:
+    File format:
         {
             "cam_01": 24.7,
             "cam_02": 25.1,
-            "_updated_at": 1714739900.12
+            "_updated_at": 1714739900.12,
+            "_features": {"cam_01": {"n_track": 8.2, ...}, ...}
         }
     """
     try:
         with open(FPS_STATS_FILE, "r") as f:
             data = json.load(f)
-        # Loại bỏ meta-keys không phải camera
-        return {k: v for k, v in data.items() if not k.startswith("_")}
+        # Filter out meta-keys that are not cameras
+        return {k: v for k, v in data.items()
+                if not k.startswith("_") and isinstance(v, (int, float))}
     except FileNotFoundError:
         return {}
     except Exception as exc:
         logger.debug("Failed to read FPS stats: %s", exc)
+        return {}
+
+
+def _read_feature_stats() -> Dict[str, Dict[str, float]]:
+    """
+    Read per-camera proactive features written by SpeedProbe._fps_writer_loop.
+
+    Returns {camera_id: {n_track, n_plate, stationary_fraction}} or {} on error.
+    Gracefully returns empty dict when running without the DeepStream pipeline
+    (e.g., during offline calibration or health-agent-only mode).
+    """
+    try:
+        with open(FPS_STATS_FILE, "r") as f:
+            data = json.load(f)
+        return data.get("_features", {})
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.debug("Failed to read feature stats: %s", exc)
         return {}
 
 
@@ -77,9 +98,17 @@ def _read_fps_stats() -> Dict[str, float]:
 
 def _collect_jetson_metrics() -> Dict:
     """
-    Return empty metrics when jtop is not available.
-    All metrics collection relies solely on jtop.
+    Called when jtop is unavailable (e.g. daemon not running or JetPack
+    version mismatch).  Returns all-zero metrics so the health loop never
+    crashes — the load score will just be driven entirely by the FPS penalty
+    until jtop recovers.
+
+    This project is Jetson-only; no psutil fallback is intentional.
     """
+    logger.warning(
+        "[HealthAgent] jtop unavailable — metrics are zero. "
+        "Ensure the jtop daemon is running: sudo systemctl start jtop"
+    )
     return {
         "gpu_percent": 0.0,
         "cpu_percent": 0.0,
@@ -92,7 +121,7 @@ def _collect_jetson_metrics() -> Dict:
 
 def _load_edge_node_cfg() -> dict:
     """
-    Read edge_node.yml once.  Returns the full parsed dict, or {} on error.
+    Read edge_node.yml once. Returns the full parsed dict, or {} on error.
     The health agent is also started standalone (no GStreamer), so we cannot
     assume the speedflow_python settings module has loaded edge_node.yml.
     """
@@ -115,35 +144,25 @@ def _select_omega(metrics: dict, n_active_cameras: int) -> tuple:
     Select adaptive ω weight triple (w_gpu, w_cpu, w_ram) based on context.
 
     Presets (from edge_node.yml load_score section):
-      thermal   — when gpu_temp_c ≥ thermal_threshold_c
       bandwidth — when active camera count ≥ stream_bandwidth_threshold
       normal    — default
 
-    Returns (w_gpu, w_cpu, w_ram, preset_name) so the preset can be logged
-    and included in the heartbeat payload.
+    NOTE: The 'thermal' preset has been removed.  Thermal stress is now handled
+    exclusively by Θ_thermal inside H_reactive (load_model.py), which applies a
+    smooth ramp from 75→90°C.  Keeping both mechanisms double-counts the same
+    signal.  The load_score baseline uses only bandwidth/normal omega.
+
+    Returns (w_gpu, w_cpu, w_ram, preset_name).
     """
     ls_cfg = _EDGE_CFG.get("load_score", {})
 
-    thermal_thresh = float(ls_cfg.get("thermal_threshold_c", 75.0))
-    bw_thresh      = int(ls_cfg.get("stream_bandwidth_threshold", 3))
+    bw_thresh   = int(ls_cfg.get("stream_bandwidth_threshold", 3))
+    w_normal    = ls_cfg.get("weights_normal",    [0.3, 0.3, 0.4])
+    w_bandwidth = ls_cfg.get("weights_bandwidth", [0.2, 0.3, 0.5])
 
-    w_normal    = ls_cfg.get("weights_normal",    [0.5, 0.3, 0.2])
-    w_thermal   = ls_cfg.get("weights_thermal",   [0.3, 0.2, 0.5])
-    w_bandwidth = ls_cfg.get("weights_bandwidth", [0.2, 0.5, 0.3])
-
-    gpu_temp = metrics.get("gpu_temp_c", 0.0)
-
-    if gpu_temp >= thermal_thresh:
-        w = w_thermal
-        preset = "thermal"
-    elif n_active_cameras >= bw_thresh:
-        w = w_bandwidth
-        preset = "bandwidth"
-    else:
-        w = w_normal
-        preset = "normal"
-
-    return float(w[0]), float(w[1]), float(w[2]), preset
+    if n_active_cameras >= bw_thresh:
+        return float(w_bandwidth[0]), float(w_bandwidth[1]), float(w_bandwidth[2]), "bandwidth"
+    return float(w_normal[0]), float(w_normal[1]), float(w_normal[2]), "normal"
 
 
 def _compute_load_score(metrics: dict, fps_stats: dict) -> tuple:
@@ -209,6 +228,9 @@ class HealthAgent:
         self._monitor_client = None  # own WS client when run standalone
         # One-shot warmup_ms set by run_python.py after pipeline PLAYING
         self._warmup_ms: Optional[float] = None
+        # Proactive load model — instantiated lazily in _run so that
+        # edge_node.yml is read after the process fully starts.
+        self._proactive_model = None
 
     def start(self) -> None:
         """Start agent in daemon thread."""
@@ -297,15 +319,42 @@ class HealthAgent:
 
         Calling any property (gpu, cpu, temperature, …) before ok() returns
         True raises KeyError because self._stats is still {}.
+
+        Fix #15: run j.ok() in a daemon thread with a hard timeout so a hung
+        jtop daemon (unresponsive hardware / JetPack mismatch) never deadlocks
+        the HealthAgent startup.
         """
         try:
             from jtop import jtop as JTop
             j = JTop()
             j.start()
             # Block until the first data collection completes so _stats is
-            # populated before _collect_metrics reads from it.
-            if not j.ok():
-                raise RuntimeError("jtop ok() returned False immediately")
+            # populated before _collect_metrics reads from it — but give up
+            # after 10 seconds so a frozen jtop daemon never deadlocks startup.
+            _ok_event = threading.Event()
+
+            def _wait_ok():
+                try:
+                    if j.ok():
+                        _ok_event.set()
+                except Exception:
+                    pass
+
+            _t = threading.Thread(target=_wait_ok, daemon=True)
+            _t.start()
+            _t.join(timeout=10.0)
+
+            if not _ok_event.is_set():
+                logger.warning(
+                    "[HealthAgent] jtop ok() did not return within 10 s "
+                    "(hardware unresponsive?) — falling back to psutil."
+                )
+                try:
+                    j.close()
+                except Exception:
+                    pass
+                return None
+
             logger.info("[HealthAgent] jtop session opened and ready (persistent).")
             return j
         except Exception as exc:
@@ -313,7 +362,7 @@ class HealthAgent:
             return None
 
     def _collect_metrics(self) -> Dict:
-        """Read metrics from persistent jtop session or fall back to psutil.
+        """Read metrics from persistent jtop session.
 
         Reads from jtop's dedicated properties (gpu, cpu, memory, temperature,
         power) rather than from jtop.stats.  jtop.stats is a computed property
@@ -321,6 +370,9 @@ class HealthAgent:
         KeyError (e.g. 'power' not in _stats) the entire stats call fails.
         Reading each property individually lets us handle missing sensors
         gracefully without losing GPU% and Temp.
+
+        If jtop is unavailable, returns all-zero metrics with source='jtop_unavailable'.
+        This project is Jetson-only — no psutil fallback is used.
         """
         if self._jtop is not None:
             try:
@@ -418,6 +470,18 @@ class HealthAgent:
 
         self._jtop = self._open_jtop()
 
+        # Instantiate proactive model using the proactive: section of edge_node.yml.
+        from speedflow_python.load_model import ProactiveModel
+        self._proactive_model = ProactiveModel(
+            _EDGE_CFG.get("proactive", {})
+        )
+        if self._proactive_model.enabled:
+            logger.info("[HealthAgent] Proactive load model ENABLED "
+                        "(risk_threshold=%.2f)", self._proactive_model.risk_threshold)
+        else:
+            logger.info("[HealthAgent] Proactive load model disabled "
+                        "(set proactive.enabled: true in edge_node.yml to activate)")
+
         _zenoh_retry_interval = 30.0  # seconds between Zenoh reconnect attempts
         _last_zenoh_attempt = time.time()
         _log_cycle = 0  # counts health cycles; log LoadScore every HEALTH_LOG_EVERY
@@ -433,8 +497,9 @@ class HealthAgent:
                         if self._session:
                             logger.info("[HealthAgent] Zenoh reconnected successfully.")
 
-                metrics    = self._collect_metrics()
-                fps_stats  = _read_fps_stats()
+                metrics       = self._collect_metrics()
+                fps_stats     = _read_fps_stats()
+                feature_stats = _read_feature_stats()
                 load_score, omega_preset = _compute_load_score(metrics, fps_stats)
 
                 # BUG-I fix: exclude 0-fps cameras from avg_fps, matching the
@@ -460,6 +525,9 @@ class HealthAgent:
                     "ram_percent":   metrics["ram_percent"],
                     "gpu_temp_c":    metrics["gpu_temp_c"],
                     "power_mw":      metrics["power_mw"],
+                    # Metric source ("jtop" or "jtop_unavailable") so the dashboard
+                    # can render GPU%/Temp as "N/A" instead of a misleading 0.0.
+                    "source":        metrics.get("source", "jtop"),
                     "pipeline": {
                         "fps_per_camera": fps_stats,
                         "avg_fps":        avg_fps,
@@ -472,14 +540,30 @@ class HealthAgent:
                 if warmup_ms is not None:
                     payload["warmup_ms"] = warmup_ms
 
+                # ── Proactive model ────────────────────────────────────────
+                # Compute and merge proactive fields when enabled.
+                # The legacy load_score is always present for backward-compat
+                # (reactive baseline used in Chart 2 comparison).
+                if self._proactive_model is not None:
+                    proactive_result = self._proactive_model.compute(
+                        metrics, feature_stats
+                    )
+                    payload.update(proactive_result)
+
                 if self._pub:
                     self._pub.put(msgpack.packb(payload, use_bin_type=True))
 
                 _log_cycle += 1
                 if _log_cycle % HEALTH_LOG_EVERY == 1:
+                    _risk_str = (
+                        f" | U={payload.get('risk_index', 0.0):.3f}"
+                        f" L={payload.get('l_proactive', 0.0):.3f}"
+                        f" H={payload.get('h_reactive', 0.0):.3f}"
+                        if payload.get("proactive_enabled") else ""
+                    )
                     logger.info(
                         "LoadScore=%.1f [%s] | GPU=%.1f%% CPU=%.1f%% RAM=%.1f%% "
-                        "Temp=%.1f°C Power=%.0fmW | FPS=%s",
+                        "Temp=%.1f°C Power=%.0fmW | FPS=%s%s",
                         load_score, omega_preset,
                         metrics["gpu_percent"],
                         metrics["cpu_percent"],
@@ -487,6 +571,7 @@ class HealthAgent:
                         metrics["gpu_temp_c"],
                         metrics["power_mw"],
                         fps_stats,
+                        _risk_str,
                     )
 
                 # Push to Central Monitor Server (qua MonitorClient)
@@ -503,7 +588,7 @@ class HealthAgent:
 
 
 # ---------------------------------------------------------------------------
-# Entry point (chạy standalone)
+# Entry point (run standalone)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":

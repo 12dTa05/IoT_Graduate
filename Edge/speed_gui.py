@@ -1,5 +1,6 @@
 import sys
 import os
+import shlex
 import cv2
 import yaml
 from dataclasses import dataclass, field
@@ -226,8 +227,8 @@ class MainWindow(QWidget):
         self.tabs = QTabWidget()
         self.tab_config = QWidget()
         self.tab_run = QWidget()
-        self.tabs.addTab(self.tab_config, "Cấu hình & Hiệu chuẩn")
-        self.tabs.addTab(self.tab_run, "Chạy")
+        self.tabs.addTab(self.tab_config, "Configuration & Calibration")
+        self.tabs.addTab(self.tab_run, "Run")
 
         root = QVBoxLayout(self)
         root.addWidget(self.tabs)
@@ -235,20 +236,20 @@ class MainWindow(QWidget):
         self._build_tab_config()
         self._build_tab_run()
 
-    # ---------- Tab: Cấu hình & Hiệu chuẩn ----------
+    # ---------- Tab: Configuration & Calibration ----------
     def _build_tab_config(self):
         layout = QVBoxLayout(self.tab_config)
 
         # Source management
-        src_group = QGroupBox("Nguồn video")
+        src_group = QGroupBox("Video Source")
         src_layout = QHBoxLayout(src_group)
         self.combo_source = QComboBox()
         self.combo_source.setMinimumWidth(300)
-        self.btn_add_source = QPushButton("Thêm")
-        self.btn_remove_source = QPushButton("Xoá")
-        self.btn_browse_file = QPushButton("Chọn file")
+        self.btn_add_source = QPushButton("Add")
+        self.btn_remove_source = QPushButton("Remove")
+        self.btn_browse_file = QPushButton("Browse File")
         self.le_new_uri = QLineEdit()
-        self.le_new_uri.setPlaceholderText("Đường dẫn file hoặc rtsp://...")
+        self.le_new_uri.setPlaceholderText("File path or rtsp://...")
         src_layout.addWidget(self.combo_source)
         src_layout.addWidget(self.btn_add_source)
         src_layout.addWidget(self.btn_remove_source)
@@ -257,14 +258,14 @@ class MainWindow(QWidget):
         layout.addWidget(src_group)
 
         # Video preview
-        preview_group = QGroupBox("Xem trước")
+        preview_group = QGroupBox("Preview")
         preview_layout = QVBoxLayout(preview_group)
         self.video_widget = VideoWidget()
         btn_row = QHBoxLayout()
-        self.btn_preview = QPushButton("Bắt đầu xem")
-        self.btn_stop_preview = QPushButton("Dừng xem")
-        self.btn_capture = QPushButton("Chụp khung hình")
-        self.btn_use_last = QPushButton("Dùng khung hình hiện tại")
+        self.btn_preview = QPushButton("Start Preview")
+        self.btn_stop_preview = QPushButton("Stop Preview")
+        self.btn_capture = QPushButton("Capture Frame")
+        self.btn_use_last = QPushButton("Use Current Frame")
         btn_row.addWidget(self.btn_preview)
         btn_row.addWidget(self.btn_stop_preview)
         btn_row.addWidget(self.btn_capture)
@@ -274,16 +275,16 @@ class MainWindow(QWidget):
         layout.addWidget(preview_group)
 
         # Calibration controls
-        calib_group = QGroupBox("Hiệu chuẩn (4 điểm trên đường)")
+        calib_group = QGroupBox("Calibration (4 points on road)")
         calib_layout = QGridLayout(calib_group)
-        calib_layout.addWidget(QLabel("Chiều rộng thực (m):"), 0, 0)
+        calib_layout.addWidget(QLabel("Real Width (m):"), 0, 0)
         self.dsb_width = QDoubleSpinBox()
         self.dsb_width.setRange(0.5, 50.0)
         self.dsb_width.setValue(3.5)
         self.dsb_width.setSingleStep(0.5)
         self.dsb_width.setSuffix(" m")
         calib_layout.addWidget(self.dsb_width, 0, 1)
-        calib_layout.addWidget(QLabel("Chiều dài vùng đo (m):"), 0, 2)
+        calib_layout.addWidget(QLabel("Measurement Region Length (m):"), 0, 2)
         self.dsb_length = QDoubleSpinBox()
         self.dsb_length.setRange(1.0, 200.0)
         self.dsb_length.setValue(20.0)
@@ -291,8 +292,8 @@ class MainWindow(QWidget):
         self.dsb_length.setSuffix(" m")
         calib_layout.addWidget(self.dsb_length, 0, 3)
 
-        self.btn_clear_points = QPushButton("Xoá điểm")
-        self.btn_save_config = QPushButton("Lưu cấu hình")
+        self.btn_clear_points = QPushButton("Clear Points")
+        self.btn_save_config = QPushButton("Save Configuration")
         calib_layout.addWidget(self.btn_clear_points, 1, 0, 1, 2)
         calib_layout.addWidget(self.btn_save_config, 1, 2, 1, 2)
         layout.addWidget(calib_group)
@@ -335,14 +336,14 @@ class MainWindow(QWidget):
     def on_add_source(self):
         uri = self.le_new_uri.text().strip()
         if not uri:
-            QMessageBox.warning(self, "Thiếu URL", "Nhập đường dẫn file hoặc RTSP URL.")
+            QMessageBox.warning(self, "Missing URL", "Enter file path or RTSP URL.")
             return
         if not (uri.startswith("rtsp://") or os.path.exists(uri)):
-            QMessageBox.warning(self, "Nguồn không hợp lệ",
-                                "Nhập file tồn tại hoặc RTSP bắt đầu bằng rtsp://")
+            QMessageBox.warning(self, "Invalid Source",
+                                "Enter existing file or RTSP starting with rtsp://")
             return
         if uri in self.sources:
-            QMessageBox.information(self, "Đã tồn tại", "Nguồn này đã có trong danh sách.")
+            QMessageBox.information(self, "Already Exists", "This source is already in the list.")
             return
         self.sources[uri] = SourceItem(uri=uri)
         self.combo_source.addItem(uri)
@@ -363,15 +364,15 @@ class MainWindow(QWidget):
         self._refresh_run_combo()
 
     def on_browse_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Chọn video", "",
-                                              "Videos (*.mp4 *.avi *.mkv *.MOV);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select Video", "",
+                                               "Videos (*.mp4 *.avi *.mkv *.MOV);;All files (*)")
         if path:
             self.le_new_uri.setText(path)
 
     def on_start_preview(self):
         uri = self.combo_source.currentText()
         if not uri:
-            QMessageBox.information(self, "Chưa chọn", "Hãy chọn một nguồn trong danh sách.")
+            QMessageBox.information(self, "Not Selected", "Please select a source from the list.")
             return
         self.vthread.set_source(uri)
         self.vthread.start()
@@ -387,8 +388,8 @@ class MainWindow(QWidget):
             return
         frame = self.video_widget.get_frame()
         if frame is None:
-            QMessageBox.information(self, "Chưa có frame",
-                                    "Hãy bắt đầu xem trước hoặc dùng 'Dùng khung hình hiện tại'.")
+            QMessageBox.information(self, "No Frame",
+                                    "Please start preview or use 'Use Current Frame'.")
             return
         self.sources[uri].captured_frame = frame.copy()
         self.video_widget.set_frame(self.sources[uri].captured_frame)
@@ -399,8 +400,8 @@ class MainWindow(QWidget):
             return
         si = self.sources[uri]
         if si.last_preview_frame is None:
-            QMessageBox.information(self, "Chưa có frame",
-                                    "Hãy bắt đầu xem trước để có khung hình.")
+            QMessageBox.information(self, "No Frame",
+                                    "Please start preview to get a frame.")
             return
         si.captured_frame = si.last_preview_frame.copy()
         self.video_widget.set_frame(si.captured_frame)
@@ -411,20 +412,20 @@ class MainWindow(QWidget):
             return
         si = self.sources[uri]
         if si.captured_frame is None and si.last_preview_frame is None:
-            QMessageBox.information(self, "Chưa có frame",
-                                    "Hãy chụp khung hình hoặc xem trước trước.")
+            QMessageBox.information(self, "No Frame",
+                                    "Please capture a frame or preview first.")
             return
         if len(si.calib.points) >= 4:
-            QMessageBox.information(self, "Đã đủ 4 điểm",
-                                    "Bấm 'Xoá điểm' nếu muốn chọn lại.")
+            QMessageBox.information(self, "4 Points Enough",
+                                    "Click 'Clear Points' to select again.")
             return
         si.calib.points.append((x, y))
         self.video_widget.set_points(si.calib.points)
         if len(si.calib.points) == 4:
             si.calib.calculate_expanded_roi(1.2)
             self.video_widget.set_expanded_roi(si.calib.expanded_roi)
-            QMessageBox.information(self, "Hoàn tất",
-                                    "Đã chọn 4 điểm. Vùng ROI mở rộng (vàng) đã được tính.")
+            QMessageBox.information(self, "Complete",
+                                    "4 points selected. Expanded ROI (yellow) calculated.")
 
     def on_clear_points(self):
         uri = self.combo_source.currentText()
@@ -447,14 +448,14 @@ class MainWindow(QWidget):
     def on_save_config(self):
         uri = self.combo_source.currentText()
         if uri not in self.sources:
-            QMessageBox.warning(self, "Chưa chọn nguồn", "Hãy chọn một nguồn trước.")
+            QMessageBox.warning(self, "No Source Selected", "Please select a source first.")
             return
         si = self.sources[uri]
         if len(si.calib.points) != 4:
-            QMessageBox.warning(self, "Thiếu điểm", "Hãy chọn đủ 4 điểm trên đường.")
+            QMessageBox.warning(self, "Missing Points", "Please select 4 points on the road.")
             return
         if si.captured_frame is None and si.last_preview_frame is None:
-            QMessageBox.warning(self, "Thiếu ảnh", "Hãy chụp khung hình hoặc xem trước.")
+            QMessageBox.warning(self, "Missing Image", "Please capture a frame or preview first.")
             return
 
         # Update measurements
@@ -468,7 +469,7 @@ class MainWindow(QWidget):
         os.makedirs(yaml_dir, exist_ok=True)
         default_yaml = os.path.join(yaml_dir, f"points_{uri.replace(':', '_').replace('/', '_')}.yml")
         yaml_path, _ = QFileDialog.getSaveFileName(
-            self, "Lưu file YAML", default_yaml, "YAML (*.yml *.yaml)"
+            self, "Save YAML File", default_yaml, "YAML (*.yml *.yaml)"
         )
         if not yaml_path:
             return
@@ -480,7 +481,7 @@ class MainWindow(QWidget):
         self._write_analytics_config(analytics_path, si.calib.expanded_roi)
 
         QMessageBox.information(
-            self, "Đã lưu",
+            self, "Saved",
             f"✓ YAML: {yaml_path}\n✓ Analytics: {analytics_path}"
         )
 
@@ -506,12 +507,12 @@ class MainWindow(QWidget):
         with open(path, 'w') as f:
             f.writelines(config)
 
-    # ---------- Tab: Chạy ----------
+    # ---------- Tab: Run ----------
     def _build_tab_run(self):
         layout = QVBoxLayout(self.tab_run)
 
         src_layout = QHBoxLayout()
-        src_layout.addWidget(QLabel("Nguồn:"))
+        src_layout.addWidget(QLabel("Source:"))
         self.combo_run_source = QComboBox()
         src_layout.addWidget(self.combo_run_source)
         layout.addLayout(src_layout)
@@ -521,10 +522,10 @@ class MainWindow(QWidget):
         layout.addLayout(backend_layout)
 
         btn_layout = QHBoxLayout()
-        self.btn_run_display = QPushButton("Hiển thị (file/RTSP)")
-        self.btn_run_mp4 = QPushButton("Ghi MP4")
-        self.btn_run_rtsp = QPushButton("Hiển thị RTSP")
-        self.btn_stop = QPushButton("Dừng")
+        self.btn_run_display = QPushButton("Display (file/RTSP)")
+        self.btn_run_mp4 = QPushButton("Record MP4")
+        self.btn_run_rtsp = QPushButton("Display RTSP")
+        self.btn_stop = QPushButton("Stop")
         btn_layout.addWidget(self.btn_run_display)
         btn_layout.addWidget(self.btn_run_mp4)
         btn_layout.addWidget(self.btn_run_rtsp)
@@ -550,41 +551,45 @@ class MainWindow(QWidget):
     def run_pipeline(self, mode: str):
         uri = self.combo_run_source.currentText()
         if not uri:
-            QMessageBox.warning(self, "Chưa chọn nguồn", "Hãy chọn một nguồn trong danh sách.")
+            QMessageBox.warning(self, "No Source Selected", "Please select a source from the list.")
             return
 
         if self.proc and self.proc.state() == QProcess.Running:
-            QMessageBox.warning(self, "Đang chạy", "Pipeline đang chạy. Hãy Stop trước.")
+            QMessageBox.warning(self, "Running", "Pipeline is running. Please Stop first.")
             return
 
-        cmd_parts = [
+        # Fix #14: build argv list and pass directly to QProcess so URIs and
+        # file paths containing spaces are not mangled by shell word-splitting.
+        argv = [
             "python3", "main.py",
-            f"--source {uri}",
-            f"--width {PROCESSING_WIDTH}",
-            f"--height {PROCESSING_HEIGHT}"
+            "--source", uri,
+            "--width", str(PROCESSING_WIDTH),
+            "--height", str(PROCESSING_HEIGHT),
         ]
 
         if mode == "display":
-            cmd_parts.append("--mode display")
+            argv += ["--mode", "display"]
         elif mode == "file":
             out_dir = os.path.join(os.getcwd(), "output")
             os.makedirs(out_dir, exist_ok=True)
             out_file = os.path.join(out_dir, "output.mp4")
-            cmd_parts.append(f"--mode file --output {out_file}")
+            argv += ["--mode", "file", "--output", out_file]
         elif mode == "rtsp":
             if not uri.startswith("rtsp://"):
-                QMessageBox.warning(self, "Không phải RTSP", "Chế độ này yêu cầu nguồn RTSP.")
+                QMessageBox.warning(self, "Not RTSP", "This mode requires RTSP source.")
                 return
-            cmd_parts.append("--mode display")
+            argv += ["--mode", "display"]
 
-        cmd = " ".join(cmd_parts)
-        self.txt_log.append(f"$ {cmd}")
+        # Log the equivalent shell command for visibility
+        cmd_display = " ".join(shlex.quote(a) for a in argv)
+        self.txt_log.append(f"$ {cmd_display}")
         if self.proc is None:
             self.proc = QProcess(self)
             self.proc.setProcessChannelMode(QProcess.MergedChannels)
             self.proc.readyReadStandardOutput.connect(self._read_proc_out)
-            self.proc.finished.connect(lambda: self.txt_log.append("=== Kết thúc ==="))
-        self.proc.start("bash", ["-c", cmd])
+            self.proc.finished.connect(lambda: self.txt_log.append("=== Finished ==="))
+        program = argv[0]
+        self.proc.start(program, argv[1:])
 
     def _read_proc_out(self):
         if not self.proc:
@@ -597,12 +602,12 @@ class MainWindow(QWidget):
         if self.proc:
             self.proc.kill()
             self.proc = None
-            self.txt_log.append("=== Đã dừng ===")
+            self.txt_log.append("=== Stopped ===")
 
     # ---------- Common slots ----------
     def on_opened(self, ok: bool, msg: str):
         if not ok:
-            QMessageBox.critical(self, "Lỗi mở nguồn", msg)
+            QMessageBox.critical(self, "Error Opening Source", msg)
 
     def on_frame_ready(self, frame):
         self.video_widget.set_frame(frame)

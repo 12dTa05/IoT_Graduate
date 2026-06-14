@@ -97,6 +97,12 @@ class ViolationStore:
                 if d.is_dir():
                     date_dirs.append(d)
 
+        # Fix #11: collect only offset+limit records across all files so the
+        # in-memory footprint stays bounded regardless of how many violations
+        # are stored.  Records are sorted descending by timestamp, so we read
+        # the newest date directories first and stop as soon as we have enough.
+        need = offset + limit
+
         for date_dir in date_dirs:
             node_dirs: List[Path] = []
             if node_id:
@@ -124,6 +130,11 @@ class ViolationStore:
                                     continue
                 except Exception as exc:
                     logger.warning("Failed to read %s: %s", jsonl, exc)
+
+            # Early-exit: once we have more than enough records for this
+            # page we can stop reading further (older) date directories.
+            if len(results) >= need:
+                break
 
         results.sort(key=lambda r: r.get("timestamp", 0), reverse=True)
         return results[offset:offset + limit]
