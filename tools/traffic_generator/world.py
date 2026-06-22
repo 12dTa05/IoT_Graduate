@@ -1,272 +1,281 @@
-"""Physical world model: lanes, traffic lights, vehicles with IDM physics."""
+"""Physical world model: lanes, traffic lights, vehicles with IDM physics.
+
+Topology
+--------
+Four 150 m road segments radiate from a centre intersection (N, S, E, W).
+Each segment has two inbound lanes and two outbound lanes (right‑hand traffic,
+lane width = 3.5 m, half‑offset = ±1.75 m).
+
+Vehicle lifecycle (phase machine)
+---------------------------------
+INBOUND   →  vehicle spawns at 150 m from centre, drives toward centre.
+             Inbound‑rear camera (far end) sees its rear + plate.
+             At position = 150 m (= centre) it enters TRANSIT.
+TRANSIT   →  hidden phase (no camera sees it).  Speed‑based delay
+             proportional to turn‑arc length.
+OUTBOUND  →  reappears on the resolved outbound lane at position = 0,
+             drives away from centre.  Outbound‑rear camera (near centre)
+             sees its rear + plate.
+DONE      →  vehicle leaves the 150 m outbound segment, gets culled.
+"""
 
 import random
 import numpy as np
 from dataclasses import dataclass
-from typing import List
+from enum import Enum
+from typing import Optional
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+ROAD_LENGTH    = 150.0        # metres from centre to far end
+STOP_LINE_POS  = 132.0        # distance from spawn where stop line sits (18 m from centre)
+LANE_HALF_W    = 1.75         # half lane width (3.5 m lanes)
+LANE_SPEED_LIMIT = 13.89      # 50 km/h in m/s
+
+
+class VehiclePhase(Enum):
+    INBOUND  = "inbound"
+    TRANSIT  = "transit"
+    OUTBOUND = "outbound"
+    DONE     = "done"
+
+
+# Turn routing → outbound direction key (right‑hand traffic)
+TURN_ROUTES = {
+    "N": {"uturn": "N_out", "left": "E_out", "right": "W_out", "straight": "S_out"},
+    "S": {"uturn": "S_out", "left": "W_out", "right": "E_out", "straight": "N_out"},
+    "E": {"uturn": "E_out", "left": "N_out", "right": "S_out", "straight": "W_out"},
+    "W": {"uturn": "W_out", "left": "S_out", "right": "N_out", "straight": "E_out"},
+}
+
+# Approximate path length through the intersection centre for each turn type
+TURN_PATH_LENGTHS = {
+    "uturn":    50.0,
+    "left":     42.0,
+    "right":    42.0,
+    "straight": 36.0,
+}
+
+TURN_WEIGHTS = {
+    "straight": 0.45,
+    "right":    0.25,
+    "left":     0.20,
+    "uturn":    0.10,
+}
+
+
+# ---------------------------------------------------------------------------
+# Lane
+# ---------------------------------------------------------------------------
 @dataclass
 class Lane:
     """A single lane at the intersection.
-    
-    Attributes:
-        id: Unique lane identifier (e.g., 'N_in_0')
-        direction: Cardinal direction ('N', 'S', 'E', 'W')
-        lane_index: 0 for right lane, 1 for left lane (right-hand traffic)
-        is_inbound: True if entering intersection, False if exiting
-        speed_limit: Speed limit in m/s (default 13.89 = 50 km/h)
+
+    Attributes
+    ----------
+    id:            Unique lane identifier (e.g. ``N_in_0``, ``S_out_1``).
+    direction:     Cardinal direction of the ROAD this lane runs on.
+    lane_index:    0 = right (curb‑side), 1 = left (median‑side).
+    is_inbound:    True → entering; False → exiting.
+    speed_limit:   Speed limit in m/s.
     """
     id: str
-    direction: str          # 'N', 'S', 'E', 'W'
-    lane_index: int         # 0: right lane (nearer to curb), 1: left lane (nearer to median)
-    is_inbound: bool        # True: entering intersection, False: exiting
-    speed_limit: float = 13.89  # 50 km/h in m/s
+    direction: str
+    lane_index: int
+    is_inbound: bool
+    speed_limit: float = LANE_SPEED_LIMIT
 
+
+# ---------------------------------------------------------------------------
+# Traffic‑light controller (unchanged logic)
+# ---------------------------------------------------------------------------
 class TrafficLightController:
-    """Two-phase traffic light with optional yellow and all-red intervals."""
-    
-    def __init__(self, cycle_time=90.0, ns_green=35.0, ew_green=35.0, 
+    """Two‑phase traffic light with yellow and all‑red intervals."""
+
+    def __init__(self, cycle_time=90.0, ns_green=35.0, ew_green=35.0,
                  yellow=4.0, all_red=3.0):
         self.cycle_time = cycle_time
         self.ns_green = ns_green
         self.ew_green = ew_green
         self.yellow = yellow
         self.all_red = all_red
-        
-        # Compute phase boundaries
-        # Phase 1: NS green, EW red
-        # Then NS yellow (while EW still red)
-        # Then all-red interphase
-        # Then EW green, NS red
-        # Then EW yellow
-        # Then all-red, repeat
         self.ns_end = ns_green + yellow
         self.ew_start = self.ns_end + all_red
         self.ew_end = self.ew_start + ew_green + yellow
-        
+
     def get_state_for_axis(self, current_time: float, axis: str) -> str:
-        """Get traffic light state for an approach axis.
-        
-        Args:
-            current_time: Simulation time in seconds
-            axis: 'N', 'S', 'E', or 'W'
-            
-        Returns:
-            'green', 'yellow', or 'red'
-        """
         t = current_time % self.cycle_time
-        
-        if axis in ['N', 'S']:
-            if t < self.ns_green:
-                return 'green'
-            elif t < self.ns_end:
-                return 'yellow'
-            else:
-                return 'red'
-        else:  # E, W
-            if t < self.ew_start:
-                return 'red'
-            elif t < self.ew_start + self.ew_green:
-                return 'green'
-            elif t < self.ew_end:
-                return 'yellow'
-            else:
-                return 'red'
+        if axis in ("N", "S"):
+            if t < self.ns_green:      return "green"
+            if t < self.ns_end:        return "yellow"
+            return "red"
+        else:
+            if t < self.ew_start:                          return "red"
+            if t < self.ew_start + self.ew_green:          return "green"
+            if t < self.ew_end:                            return "yellow"
+            return "red"
 
 
+# ---------------------------------------------------------------------------
+# Vehicle agent with IDM car‑following + turning phase machine
+# ---------------------------------------------------------------------------
 class VehicleAgent:
-    """Autonomous vehicle with IDM car-following behavior."""
-    
-    # Class-level IDM parameters by vehicle type
+    """Autonomous vehicle with IDM car‑following and intersection turning."""
+
     IDM_PARAMS = {
-        'car':   {'s0': 2.5, 'T': 1.5, 'a_max': 1.8, 'b_comf': 2.5},
-        'suv':   {'s0': 2.8, 'T': 1.6, 'a_max': 1.6, 'b_comf': 2.5},
-        'truck': {'s0': 5.0, 'T': 1.8, 'a_max': 0.8, 'b_comf': 2.0},
-        'bus':   {'s0': 6.0, 'T': 2.0, 'a_max': 0.6, 'b_comf': 1.8},
+        "car":   {"s0": 2.5, "T": 1.5, "a_max": 1.8, "b_comf": 2.5},
+        "suv":   {"s0": 2.8, "T": 1.6, "a_max": 1.6, "b_comf": 2.5},
+        "truck": {"s0": 5.0, "T": 1.8, "a_max": 0.8, "b_comf": 2.0},
+        "bus":   {"s0": 6.0, "T": 2.0, "a_max": 0.6, "b_comf": 1.8},
     }
-    
-    # Vehicle dimensions (length, width, height) in meters
+
     VEHICLE_DIMS = {
-        'car':   (4.6, 1.8, 1.4),
-        'suv':   (4.8, 2.0, 1.6),
-        'truck': (8.5, 2.4, 2.8),
-        'bus':   (11.5, 2.5, 3.2),
+        "car":   (4.6,  1.8, 1.4),
+        "suv":   (4.8,  2.0, 1.6),
+        "truck": (8.5,  2.4, 2.8),
+        "bus":   (11.5, 2.5, 3.2),
     }
-    
-    def __init__(self, vid: str, plate: str, vtype: str, lane: Lane, spawn_time: float):
-        """Initialize a vehicle agent.
-        
-        Args:
-            vid: Unique vehicle ID
-            plate: License plate string
-            vtype: Vehicle type ('car', 'suv', 'truck', 'bus')
-            lane: Lane object this vehicle travels in
-            spawn_time: Simulation time when vehicle spawns
-        """
-        self.id = vid
-        self.plate = plate
-        self.type = vtype
-        self.lane = lane
+
+    def __init__(self, vid: str, plate: str, vtype: str, lane: Lane,
+                 spawn_time: float, turn: str, dest_lane: Lane):
+        self.id         = vid
+        self.plate      = plate
+        self.type       = vtype
+        self.lane       = lane              # current lane (inbound)
         self.spawn_time = spawn_time
-        
-        # Set physical dimensions
+        self.turn       = turn              # uturn / left / right / straight
+        self.dest_lane  = dest_lane         # outbound Lane object after transit
+
         self.l, self.w, self.h = self.VEHICLE_DIMS.get(vtype, (4.6, 1.8, 1.4))
-        
-        # Set IDM parameters based on vehicle type
-        params = self.IDM_PARAMS.get(vtype, self.IDM_PARAMS['car'])
-        self.s0 = params['s0']
-        self.T = params['T']
-        self.a_max = params['a_max']
-        self.b_comf = params['b_comf']
-        
+
+        params = self.IDM_PARAMS.get(vtype, self.IDM_PARAMS["car"])
+        self.s0       = params["s0"]
+        self.T        = params["T"]
+        self.a_max    = params["a_max"]
+        self.b_comf   = params["b_comf"]
         self.max_speed = lane.speed_limit
-        
-        # State
-        self.position_meters = 0.0  # Distance along lane from spawn point
-        self.velocity = random.uniform(5.0, self.max_speed * 0.8)
-        self.acceleration = 0.0
-        
-    def update_physics(self, dt: float, leader_dist: float, leader_vel: float, light_state: str):
-        """Update vehicle position using IDM with traffic light integration.
-        
-        Args:
-            dt: Time step in seconds
-            leader_dist: Distance to rear bumper of leading vehicle (meters)
-            leader_vel: Velocity of leading vehicle (m/s)
-            light_state: Traffic light state ('green', 'yellow', 'red')
-        """
-        # If inbound and light is red/yellow, treat stop line as virtual obstacle
-        if self.lane.is_inbound and light_state in ['red', 'yellow']:
-            dist_to_stop = self.get_distance_to_stop_line()
-            # Only use stop line as leader if it's closer than actual leader
-            if 0 < dist_to_stop < leader_dist:
-                leader_dist = dist_to_stop
-                leader_vel = 0.0
-                
-        # IDM acceleration calculation
+
+        # ── state ──
+        self.phase            = VehiclePhase.INBOUND
+        self.position_meters  = 0.0       # distance along current lane from its origin
+        self.velocity         = random.uniform(5.0, self.max_speed * 0.8)
+        self.acceleration     = 0.0
+        self._transit_remain  = 0.0       # seconds remaining in TRANSIT
+
+    # ------------------------------------------------------------------
+    # Physics
+    # ------------------------------------------------------------------
+    def update_physics(self, dt: float, leader_dist: float, leader_vel: float,
+                       light_state: str):
+        if self.phase == VehiclePhase.TRANSIT:
+            self._transit_remain -= dt
+            if self._transit_remain <= 0.0:
+                self._enter_outbound()
+            return
+
+        if self.phase == VehiclePhase.DONE:
+            return
+
+        # Inbound / Outbound IDM with stop‑line integration for inbound red
+        if self.phase == VehiclePhase.INBOUND and light_state in ("red", "yellow"):
+            d_stop = self.get_distance_to_stop_line()
+            if 0 < d_stop < leader_dist:
+                leader_dist, leader_vel = d_stop, 0.0
+
         v0 = self.max_speed
         dv = self.velocity - leader_vel
-        
-        # Desired dynamic gap
-        s_star = self.s0 + max(0.0, self.velocity * self.T + 
+        s_star = self.s0 + max(0.0, self.velocity * self.T +
                                (self.velocity * dv) / (2 * np.sqrt(self.a_max * self.b_comf)))
-        
-        # Acceleration term
+
         if leader_dist < 0.5:
-            # Very close - emergency braking
             acc = -self.b_comf * 2.0
         else:
-            acc = self.a_max * (1 - (self.velocity / v0)**4 - (s_star / leader_dist)**2)
-            
+            acc = self.a_max * (1 - (self.velocity / v0) ** 4
+                                - (s_star / leader_dist) ** 2)
+
         self.acceleration = np.clip(acc, -4.5, self.a_max)
         self.velocity += self.acceleration * dt
         self.velocity = max(0.0, self.velocity)
         self.position_meters += self.velocity * dt
-        
+
+        # Phase transition: INBOUND → TRANSIT at road end
+        if self.phase == VehiclePhase.INBOUND and self.position_meters >= ROAD_LENGTH:
+            self._enter_transit()
+
+    # ------------------------------------------------------------------
+    # Phase transitions
+    # ------------------------------------------------------------------
+    def _enter_transit(self):
+        path_len = TURN_PATH_LENGTHS.get(self.turn, 36.0)
+        vel = max(self.velocity, 3.0)  # m/s — never divide by zero
+        self._transit_remain = path_len / vel
+        self.phase = VehiclePhase.TRANSIT
+
+    def _enter_outbound(self):
+        self.phase            = VehiclePhase.OUTBOUND
+        self.lane             = self.dest_lane
+        self.position_meters  = 0.0
+        # Let vehicle continue with its current velocity (no physics gap)
+
+    # ------------------------------------------------------------------
+    # Stop line
+    # ------------------------------------------------------------------
     def get_distance_to_stop_line(self) -> float:
-        """Return distance from vehicle front bumper to stop line (at 18m from center).
-        
-        For inbound vehicles, the stop line is at position = 42m along the lane.
-        """
-        return max(0.0, 42.0 - self.position_meters)
-        
+        return max(0.0, STOP_LINE_POS - self.position_meters)
+
+    # ------------------------------------------------------------------
+    # World coordinates
+    # ------------------------------------------------------------------
     def get_world_xyz_and_heading(self) -> tuple:
-        """Convert lane-relative position to world coordinates.
-        
-        Returns:
-            (xyz, heading): xyz is np.array([x, y, 0]) in meters, 
-                           heading is radians (0 = east, π/2 = north)
+        """Convert lane‑relative position to world (x, y, 0) and heading rad.
+
+        Heading convention: 0 = +X (east), π/2 = +Y (north).
+
+        Inbound:  vehicle faces TOWARD centre, camera is behind → sees rear.
+        Outbound: vehicle faces AWAY from centre, camera is behind → sees rear.
         """
-        d = self.lane.direction
-        pos = self.position_meters
-        lane_idx = self.lane.lane_index
-        
-        # Determine X/Y offsets for the lane
-        # Right-hand traffic: lane 0 is right (curbside), lane 1 is left (median)
-        # For N-S roads, lanes offset in X direction
-        # For E-W roads, lanes offset in Y direction
-        
-        # Coordinate system: X east (+), Y north (+)
-        if d in ['N', 'S']:
-            # Road runs north-south
-            # Right lane offset: for N-bound (going north) right lane is west (-X)
-            #                   for S-bound (going south) right lane is east (+X)
-            if d == 'N':
-                offset_x = -1.75 if lane_idx == 0 else 1.75
-            else:  # S
-                offset_x = 1.75 if lane_idx == 0 else -1.75
-            offset_y = 0.0
+        d       = self.lane.direction
+        pos     = self.position_meters
+        idx     = self.lane.lane_index
+
+        # Lane offset, right‑hand traffic
+        if d in ("N", "S"):
+            off_x = (-LANE_HALF_W if idx == 0 else LANE_HALF_W) if d == "N" else \
+                    ( LANE_HALF_W if idx == 0 else -LANE_HALF_W)
+            off_y = 0.0
         else:  # E, W
-            # Road runs east-west
-            # Right lane offset: for E-bound (going east) right lane is south (-Y)
-            #                   for W-bound (going west) right lane is north (+Y)
-            if d == 'E':
-                offset_y = -1.75 if lane_idx == 0 else 1.75
-            else:  # W
-                offset_y = 1.75 if lane_idx == 0 else -1.75
-            offset_x = 0.0
-            
-        # Position along the road axis
+            off_y = (-LANE_HALF_W if idx == 0 else LANE_HALF_W) if d == "E" else \
+                    ( LANE_HALF_W if idx == 0 else -LANE_HALF_W)
+            off_x = 0.0
+
         if self.lane.is_inbound:
-            # Inbound: start at far end (60m from center), move toward stop line (18m)
-            if d == 'N':
-                world_x, world_y = offset_x, 60.0 - pos
-                heading = -np.pi/2  # facing south
-            elif d == 'S':
-                world_x, world_y = offset_x, -60.0 + pos
-                heading = np.pi/2   # facing north
-            elif d == 'E':
-                world_x, world_y = 60.0 - pos, offset_y
-                heading = np.pi     # facing west
+            # spawn at far end (150 m), drive toward centre
+            if d == "N":
+                world_x, world_y = off_x, ROAD_LENGTH - pos
+                heading = -np.pi / 2    # facing south
+            elif d == "S":
+                world_x, world_y = off_x, -ROAD_LENGTH + pos
+                heading = np.pi / 2     # facing north
+            elif d == "E":
+                world_x, world_y = ROAD_LENGTH - pos, off_y
+                heading = np.pi         # facing west
             else:  # W
-                world_x, world_y = -60.0 + pos, offset_y
-                heading = 0.0       # facing east
+                world_x, world_y = -ROAD_LENGTH + pos, off_y
+                heading = 0.0          # facing east
         else:
-            # Outbound: start at stop line (18m), move outward
-            if d == 'N':
-                world_x, world_y = offset_x, 18.0 + pos
-                heading = np.pi/2   # facing north
-            elif d == 'S':
-                world_x, world_y = offset_x, -18.0 - pos
-                heading = -np.pi/2  # facing south
-            elif d == 'E':
-                world_x, world_y = 18.0 + pos, offset_y
-                heading = 0.0       # facing east
+            # outbound — start near centre (pos=0), drive away from centre
+            if d == "N":
+                world_x, world_y = off_x, pos
+                heading = np.pi / 2     # facing north
+            elif d == "S":
+                world_x, world_y = off_x, -pos
+                heading = -np.pi / 2    # facing south
+            elif d == "E":
+                world_x, world_y = pos, off_y
+                heading = 0.0          # facing east
             else:  # W
-                world_x, world_y = -18.0 - pos, offset_y
-                heading = np.pi     # facing west
-                
+                world_x, world_y = -pos, off_y
+                heading = np.pi         # facing west
+
         return np.array([world_x, world_y, 0.0]), heading
-        
-    def get_3d_bounding_box_corners(self, x, y, z, length, width, height, heading):
-        """Generate 8 corners of the vehicle's 3D bounding box.
-        
-        Order: 0-3 ground corners (rear-left, front-left, front-right, rear-right)
-               4-7 roof corners   (same order)
-        """
-        hl, hw = length/2, width/2
-        
-        # Local corners in vehicle coordinate system (center at origin, x=forward)
-        local = np.array([
-            [-hl, -hw, 0],     # 0: rear-left ground
-            [ hl, -hw, 0],     # 1: front-left ground
-            [ hl,  hw, 0],     # 2: front-right ground
-            [-hl,  hw, 0],     # 3: rear-right ground
-            [-hl, -hw, height],  # 4: rear-left roof
-            [ hl, -hw, height],  # 5: front-left roof
-            [ hl,  hw, height],  # 6: front-right roof
-            [-hl,  hw, height],  # 7: rear-right roof
-        ], dtype=np.float32)
-        
-        # Rotate around Z axis by heading
-        cos_h, sin_h = np.cos(heading), np.sin(heading)
-        rot = np.array([
-            [cos_h, -sin_h, 0],
-            [sin_h, cos_h, 0],
-            [0, 0, 1]
-        ])
-        rotated = (rot @ local.T).T
-        
-        # Translate to world position
-        world = rotated + np.array([x, y, z])
-        return world

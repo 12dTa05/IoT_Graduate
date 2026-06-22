@@ -4,6 +4,10 @@
 Edge/logs
 Edge/__pycache__
 Edge/speedflow_python/__pycache__
-Edge/tools/__pycache__
+Edge/tools/traffic_generator/__pycache__
 
 Server/__pycache__
+
+Camera/videos/videos
+Camera/videos/ground_truth.csv
+Camera/videos/sim_cameras.yml

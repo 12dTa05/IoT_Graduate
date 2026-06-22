@@ -1,165 +1,305 @@
-"""Procedural vehicle renderer with sub-pixel Lanczos4 warping."""
+"""Procedural vehicle renderer with sub‑pixel Lanczos4 warping.
+
+The vehicle texture is drawn as a top‑down plan view:
+
+  canvas X‑axis → vehicle RIGHT side (passenger side in right‑hand traffic)
+  canvas Y‑axis → vehicle FRONT  →  REAR  direction
+
+The homography maps the texture onto the projected ground quad.
+The quad corners (from ``get_ground_quad_corners``) are ordered:
+
+  0: rear‑left   ground
+  1: front‑left  ground
+  2: front‑right ground
+  3: rear‑right  ground
+
+The source quad must follow the SAME order so the plate (drawn at the
+REAR of the texture) lands on the REAR of the projected vehicle.
+"""
 
 import cv2
 import numpy as np
 
+
 class SubPixelProceduralRenderer:
-    """Renders high-resolution vehicle textures and warps them onto the frame."""
-    
+    """Renders high‑resolution vehicle textures and warps them onto the frame."""
+
+    # Per‑camera scene variation so the 8 views are visually distinct
+    # (sky tint, asphalt tone, shoulder colour) keyed by camera id.
+    SCENE_STYLES = {
+        "cam_N_in":  {"sky": (150, 130, 110), "road": (52, 52, 54), "shoulder": (70, 95, 70)},
+        "cam_N_out": {"sky": (165, 150, 130), "road": (46, 46, 48), "shoulder": (90, 90, 95)},
+        "cam_S_in":  {"sky": (120, 140, 165), "road": (55, 53, 50), "shoulder": (60, 85, 60)},
+        "cam_S_out": {"sky": (135, 150, 170), "road": (48, 48, 50), "shoulder": (85, 88, 92)},
+        "cam_E_in":  {"sky": (160, 145, 120), "road": (50, 51, 53), "shoulder": (72, 92, 68)},
+        "cam_E_out": {"sky": (170, 158, 140), "road": (44, 45, 47), "shoulder": (95, 92, 90)},
+        "cam_W_in":  {"sky": (128, 135, 158), "road": (53, 52, 51), "shoulder": (65, 88, 64)},
+        "cam_W_out": {"sky": (142, 148, 165), "road": (47, 47, 49), "shoulder": (88, 90, 94)},
+    }
+    _DEFAULT_STYLE = {"sky": (150, 140, 125), "road": (50, 50, 52), "shoulder": (80, 90, 80)}
+
     def __init__(self):
-        # Vehicle colors (BGR)
         self.class_colors = {
-            'car': (50, 100, 200),     # Blue
-            'suv': (50, 150, 100),     # Green
-            'truck': (200, 100, 50),   # Orange
-            'bus': (150, 150, 50),     # Olive
+            "car":   (50, 100, 200),     # Blue
+            "suv":   (50, 150, 100),     # Green
+            "truck": (200, 100, 50),     # Orange
+            "bus":   (150, 150, 50),     # Olive
         }
-        
-    def render_high_res_vehicle(self, vtype: str, plate_text: str) -> np.ndarray:
-        """Procedurally draw a vehicle on 2048x1024 RGBA canvas.
-        
-        The vehicle is drawn as a top-down view with:
-        - Main body rectangle
-        - Windshield and rear window
-        - Side windows
-        - Wheels at corners
-        - License plate at rear
+
+    # ------------------------------------------------------------------
+    # Road‑scene background (perspective‑correct, per camera)
+    # ------------------------------------------------------------------
+    def render_road_background(self, camera) -> np.ndarray:
+        """Render a distinct perspective road scene for *camera*.
+
+        Projects the camera's own 150 m road segment (asphalt, lane
+        markings, edge lines, shoulders) through its projection matrix
+        so each of the 8 cameras gets a recognisably different view
+        instead of a flat grey plate.
         """
+        from .world import ROAD_LENGTH, LANE_HALF_W
+
+        H, W = 1080, 1920
+        style = self.SCENE_STYLES.get(camera.id, self._DEFAULT_STYLE)
+        frame = np.empty((H, W, 3), dtype=np.uint8)
+        frame[:] = style["sky"]                     # sky / far backdrop
+
+        axis = camera.axis
+        inbound = (camera.kind.value == "inbound_rear")
+
+        # Build the world‑space extent of THIS camera's road segment.
+        # near_d / far_d are distances from centre along the road axis.
+        # The near edge must stay in FRONT of the mount, otherwise the
+        # ground quad straddles the near plane and gets skipped.
+        if inbound:
+            # mount at 160 m looking toward centre → road 8..150 m all visible
+            near_d, far_d = 8.0, ROAD_LENGTH
+        else:
+            # mount at ~10 m looking outward → road must start past the mount
+            near_d, far_d = 18.0, ROAD_LENGTH
+
+        road_half = LANE_HALF_W * 2.0 + 1.0         # both lanes + margin
+        shoulder_half = road_half + 6.0
+
+        # World rectangle helper for each axis (along=distance from centre,
+        # lat=lateral offset). Sign chosen so the strip sits on the camera's road.
+        def strip(lat0, lat1):
+            d0, d1 = near_d, far_d
+            if axis == "N":
+                sgn = 1.0
+                quad = [[lat0, d0 * sgn, 0], [lat1, d0 * sgn, 0],
+                        [lat1, d1 * sgn, 0], [lat0, d1 * sgn, 0]]
+            elif axis == "S":
+                sgn = -1.0
+                quad = [[lat0, d0 * sgn, 0], [lat1, d0 * sgn, 0],
+                        [lat1, d1 * sgn, 0], [lat0, d1 * sgn, 0]]
+            elif axis == "E":
+                sgn = 1.0
+                quad = [[d0 * sgn, lat0, 0], [d0 * sgn, lat1, 0],
+                        [d1 * sgn, lat1, 0], [d1 * sgn, lat0, 0]]
+            else:  # W
+                sgn = -1.0
+                quad = [[d0 * sgn, lat0, 0], [d0 * sgn, lat1, 0],
+                        [d1 * sgn, lat1, 0], [d1 * sgn, lat0, 0]]
+            return np.array(quad, dtype=np.float32)
+
+        def fill_world_poly(world_quad, color):
+            px = camera.project_3d_points(world_quad)
+            if px is None or np.any(np.isnan(px)):
+                return
+            pts = px.reshape(-1, 1, 2).astype(np.int32)
+            cv2.fillPoly(frame, [pts], color)
+
+        # Shoulders (grass/kerb), then asphalt on top
+        fill_world_poly(strip(-shoulder_half, shoulder_half), style["shoulder"])
+        fill_world_poly(strip(-road_half, road_half), style["road"])
+
+        # Lane markings: dashed centre line + solid edge lines
+        # Centre dashed line (between the two lanes, lateral = 0)
+        n_dash = 26
+        for i in range(0, n_dash, 2):
+            a0 = near_d + (far_d - near_d) * (i / n_dash)
+            a1 = near_d + (far_d - near_d) * ((i + 1) / n_dash)
+            self._fill_lane_dash(frame, camera, axis, a0, a1, -0.15, 0.15,
+                                 (235, 235, 235))
+        # Solid white edge lines
+        for lat in (-LANE_HALF_W * 2.0, LANE_HALF_W * 2.0):
+            q = strip(lat - 0.15, lat + 0.15)
+            fill_world_poly(q, (220, 220, 220))
+
+        return frame
+
+    @staticmethod
+    def _fill_lane_dash(frame, camera, axis, d0, d1, lat0, lat1, color):
+        if axis == "N":
+            quad = [[lat0, d0, 0], [lat1, d0, 0], [lat1, d1, 0], [lat0, d1, 0]]
+        elif axis == "S":
+            quad = [[lat0, -d0, 0], [lat1, -d0, 0], [lat1, -d1, 0], [lat0, -d1, 0]]
+        elif axis == "E":
+            quad = [[d0, lat0, 0], [d0, lat1, 0], [d1, lat1, 0], [d1, lat0, 0]]
+        else:  # W
+            quad = [[-d0, lat0, 0], [-d0, lat1, 0], [-d1, lat1, 0], [-d1, lat0, 0]]
+        px = camera.project_3d_points(np.array(quad, dtype=np.float32))
+        if px is None or np.any(np.isnan(px)):
+            return
+        cv2.fillPoly(frame, [px.reshape(-1, 1, 2).astype(np.int32)], color)
+
+    # ------------------------------------------------------------------
+    # Texture (2048×1024 RGBA canvas)
+    #   Layout:  top = FRONT,  bottom = REAR
+    # ------------------------------------------------------------------
+    def render_high_res_vehicle(self, vtype: str, plate_text: str) -> np.ndarray:
         canvas = np.zeros((1024, 2048, 4), dtype=np.uint8)
         color = self.class_colors.get(vtype, (100, 100, 100))
-        
-        # Main body (chassis) - large rectangle
+
+        # Main body
         cv2.rectangle(canvas, (200, 212), (1848, 812), (*color, 255), -1)
-        
-        # Windshield (front)
+
+        # Windshield (front — top of canvas)
         cv2.rectangle(canvas, (500, 262), (800, 762), (60, 60, 60, 255), -1)
-        
-        # Rear window
+
+        # Rear window (rear — bottom of canvas)
         cv2.rectangle(canvas, (1400, 262), (1550, 762), (40, 40, 40, 255), -1)
-        
-        # Side windows (two rectangles)
+
+        # Side windows
         cv2.rectangle(canvas, (800, 262), (1000, 762), (80, 80, 80, 255), -1)
         cv2.rectangle(canvas, (1050, 262), (1250, 762), (80, 80, 80, 255), -1)
-        
-        # Wheels (black rectangles at corners)
-        wheel_color = (20, 20, 20, 255)
-        wheel_w, wheel_h = 120, 80
-        # Front left
-        cv2.rectangle(canvas, (400, 200), (400 + wheel_w, 200 + wheel_h), wheel_color, -1)
-        # Front right
-        cv2.rectangle(canvas, (1500, 200), (1500 + wheel_w, 200 + wheel_h), wheel_color, -1)
-        # Rear left
-        cv2.rectangle(canvas, (400, 850), (400 + wheel_w, 850 + wheel_h), wheel_color, -1)
-        # Rear right
-        cv2.rectangle(canvas, (1500, 850), (1500 + wheel_w, 850 + wheel_h), wheel_color, -1)
-        
-        # License plate area (white rectangle at rear)
-        cv2.rectangle(canvas, (1700, 437), (1830, 587), (255, 255, 255, 255), -1)
-        cv2.rectangle(canvas, (1700, 437), (1830, 587), (0, 0, 0, 255), 6)  # border
-        
-        # License plate text
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 1.6
-        thickness = 5
-        text_size = cv2.getTextSize(plate_text, font, scale, thickness)[0]
-        text_x = 1700 + (130 - text_size[0]) // 2
-        text_y = 437 + (150 + text_size[1]) // 2
-        cv2.putText(canvas, plate_text, (text_x, text_y), 
-                    font, scale, (0, 0, 0, 255), thickness, cv2.LINE_AA)
-        
-        # Add subtle shadow for depth
+
+        # Wheels
+        wc = (20, 20, 20, 255)
+        ww, wh = 120, 80
+        cv2.rectangle(canvas, (400, 200), (400 + ww, 200 + wh), wc, -1)
+        cv2.rectangle(canvas, (1500, 200), (1500 + ww, 200 + wh), wc, -1)
+        cv2.rectangle(canvas, (400, 850), (400 + ww, 850 + wh), wc, -1)
+        cv2.rectangle(canvas, (1500, 850), (1500 + ww, 850 + wh), wc, -1)
+
+        # License plate at the REAR (bottom of canvas, X‑centred)
+        plate_w, plate_h = 300, 180
+        plate_x0 = (2048 - plate_w) // 2
+        plate_y0 = 800
+        cv2.rectangle(canvas, (plate_x0, plate_y0),
+                      (plate_x0 + plate_w, plate_y0 + plate_h),
+                      (255, 255, 255, 255), -1)
+        cv2.rectangle(canvas, (plate_x0, plate_y0),
+                      (plate_x0 + plate_w, plate_y0 + plate_h),
+                      (0, 0, 0, 255), 6)
+
+        # Auto‑fit text inside the plate rectangle
+        font      = cv2.FONT_HERSHEY_SIMPLEX
+        thickness = 4
+        for scale in (1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0.6):
+            ts = cv2.getTextSize(plate_text, font, scale, thickness)[0]
+            if ts[0] <= plate_w - 20 and ts[1] <= plate_h - 20:
+                break
+        tx = plate_x0 + (plate_w - ts[0]) // 2
+        ty = plate_y0 + (plate_h + ts[1]) // 2
+        cv2.putText(canvas, plate_text, (tx, ty), font, scale,
+                    (0, 0, 0, 255), thickness, cv2.LINE_AA)
+
+        # Subtle shadow
         shadow = (canvas[:, :, 3].astype(np.float32) * 0.3).astype(np.uint8)
-        canvas[:, :, 3] = np.clip(canvas[:, :, 3].astype(np.int32) + shadow, 0, 255).astype(np.uint8)
-        
+        canvas[:, :, 3] = np.clip(
+            canvas[:, :, 3].astype(np.int32) + shadow, 0, 255
+        ).astype(np.uint8)
+
         return canvas
-    
-    def get_vehicle_3d_corners(self, x, y, z, length, width, height, heading):
-        """Generate 8 corners of vehicle bounding box in world coordinates.
-        
-        Returns:
-            corners: (8, 3) array with corners 0-3 ground (rear-left, front-left, front-right, rear-right)
-                     and 4-7 roof (same order)
+
+    # ------------------------------------------------------------------
+    # 3D corners → ground quad (shared utility — no duplicate)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def get_ground_quad_corners(x, y, z, length, width, height, heading):
+        """Return (4, 3) world coords of the ground rectangle.
+
+        Order:  0: rear‑left,  1: front‑left,  2: front‑right,  3: rear‑right.
+        This is the canonical order used by the homography source quad.
         """
         hl, hw = length / 2, width / 2
-        
-        # Local corners in vehicle coordinate system (origin at center, x=forward)
         local = np.array([
-            [-hl, -hw, 0],      # 0: rear-left ground
-            [ hl, -hw, 0],      # 1: front-left ground
-            [ hl,  hw, 0],      # 2: front-right ground
-            [-hl,  hw, 0],      # 3: rear-right ground
-            [-hl, -hw, height], # 4: rear-left roof
-            [ hl, -hw, height], # 5: front-left roof
-            [ hl,  hw, height], # 6: front-right roof
-            [-hl,  hw, height], # 7: rear-right roof
+            [-hl, -hw, 0.0],   # 0 rear‑left
+            [ hl, -hw, 0.0],   # 1 front‑left
+            [ hl,  hw, 0.0],   # 2 front‑right
+            [-hl,  hw, 0.0],   # 3 rear‑right
         ], dtype=np.float32)
-        
-        # Rotation around Z axis
+
         cos_h, sin_h = np.cos(heading), np.sin(heading)
         rot = np.array([
-            [cos_h, -sin_h, 0],
-            [sin_h, cos_h, 0],
-            [0, 0, 1]
+            [cos_h, -sin_h, 0.0],
+            [sin_h,  cos_h, 0.0],
+            [0.0,     0.0,  1.0],
         ])
         rotated = (rot @ local.T).T
-        
-        # Translate to world position
-        world = rotated + np.array([x, y, z])
-        return world
-    
-    def project_and_warp(self, frame: np.ndarray, vehicle, xyz: np.ndarray, 
-                        heading: float, camera) -> np.ndarray:
-        """Project a vehicle onto the frame using homography warping.
-        
-        Args:
-            frame: (H, W, 3) BGR image to draw on
-            vehicle: VehicleAgent object
-            xyz: World position (x, y, z)
-            heading: Heading in radians
-            camera: ProjectionCamera object
-            
-        Returns:
-            Updated frame with vehicle composited
-        """
-        # Get 3D corners of vehicle
-        corners_3d = self.get_vehicle_3d_corners(
+        return rotated + np.array([x, y, z])
+
+    @staticmethod
+    def get_3d_bounding_box_corners(x, y, z, length, width, height, heading):
+        """Return (8, 3) world coords: 0‑3 ground, 4‑7 roof."""
+        hl, hw = length / 2, width / 2
+        local = np.array([
+            [-hl, -hw, 0.0], [ hl, -hw, 0.0], [ hl, hw, 0.0], [-hl, hw, 0.0],
+            [-hl, -hw, height], [ hl, -hw, height], [ hl, hw, height], [-hl, hw, height],
+        ], dtype=np.float32)
+        cos_h, sin_h = np.cos(heading), np.sin(heading)
+        rot = np.array([
+            [cos_h, -sin_h, 0.0],
+            [sin_h,  cos_h, 0.0],
+            [0.0,     0.0,  1.0],
+        ])
+        rotated = (rot @ local.T).T
+        return rotated + np.array([x, y, z])
+
+    # ------------------------------------------------------------------
+    # Project + warp
+    # ------------------------------------------------------------------
+    def project_and_warp(self, frame: np.ndarray, vehicle, xyz: np.ndarray,
+                         heading: float, camera) -> np.ndarray:
+        """Project a vehicle onto the frame using homography warping."""
+        # Ground quad in world coords
+        quad_3d = self.get_ground_quad_corners(
             xyz[0], xyz[1], xyz[2],
-            vehicle.l, vehicle.w, vehicle.h,
-            heading
+            vehicle.l, vehicle.w, vehicle.h, heading,
         )
-        
-        # Project to 2D image coordinates
-        pixels = camera.project_3d_points(corners_3d)
+
+        # Project to 2D
+        pixels = camera.project_3d_points(quad_3d)
         if pixels is None:
             return frame
-            
-        # Use ground quadrilateral (first 4 corners) for homography
+
+        # If any quad corner is NaN (behind camera), skip rendering
+        if np.any(np.isnan(pixels)):
+            return frame
+
         dst_quad = pixels[:4].astype(np.float32)
-        
-        # Generate high-res vehicle texture with plate
+
+        # Source quad — MUST match the canonical corner order:
+        #   0: rear‑left  → (0, h_src)     bottom‑left
+        #   1: front‑left → (0, 0)          top‑left
+        #   2: front‑right → (w_src, 0)     top‑right
+        #   3: rear‑right  → (w_src, h_src) bottom‑right
         high_res = self.render_high_res_vehicle(vehicle.type, vehicle.plate)
         h_src, w_src = high_res.shape[:2]
-        src_quad = np.array([[0, 0], [w_src, 0], [w_src, h_src], [0, h_src]], dtype=np.float32)
-        
-        # Compute homography from source to destination
+        src_quad = np.array([
+            [0.0,  h_src],     # rear‑left
+            [0.0,  0.0],      # front‑left
+            [w_src, 0.0],     # front‑right
+            [w_src, h_src],   # rear‑right
+        ], dtype=np.float32)
+
         H, mask = cv2.findHomography(src_quad, dst_quad)
         if H is None:
             return frame
-            
-        # Warp with Lanczos4 interpolation for sub-pixel text preservation
+
         warped = cv2.warpPerspective(
             high_res, H, (frame.shape[1], frame.shape[0]),
             flags=cv2.INTER_LANCZOS4,
-            borderMode=cv2.BORDER_TRANSPARENT
+            borderMode=cv2.BORDER_TRANSPARENT,
         )
-        
-        # Alpha blending: foreground over background using alpha channel
+
         if warped.shape[2] == 4:
             alpha = warped[:, :, 3].astype(np.float32) / 255.0
             alpha = alpha[:, :, np.newaxis]
-            rgb = warped[:, :, :3].astype(np.float32)
-            frame_float = frame.astype(np.float32)
-            blended = frame_float * (1 - alpha) + rgb * alpha
+            rgb   = warped[:, :, :3].astype(np.float32)
+            frame_f = frame.astype(np.float32)
+            blended = frame_f * (1.0 - alpha) + rgb * alpha
             return blended.clip(0, 255).astype(np.uint8)
-        else:
-            return warped
+        return warped
