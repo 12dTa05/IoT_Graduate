@@ -7,7 +7,6 @@ for the DeepStream pipeline.
 
 import logging
 import shutil
-import time
 import yaml
 import numpy as np
 import random
@@ -24,6 +23,19 @@ from .camera import ProjectionCamera, CameraKind, build_intersection_cameras
 from .renderer import SubPixelProceduralRenderer
 from .plates import generate_vietnamese_plate
 from .ffmpeg_encoder import build_ffmpeg_cmd
+
+
+# ffmpeg writes normal progress/stats to stderr; only treat it as an error
+# if these markers appear.  Avoids spurious warnings on successful runs.
+_FFMPEG_ERROR_MARKERS = (
+    "error", "Error", "Cannot", "cannot", "failed", "Failed",
+    "Conversion failed", "Nothing was written", "No such file",
+)
+
+
+def _looks_like_ffmpeg_error(stderr_text: str) -> bool:
+    """Heuristic: does this ffmpeg stderr output indicate a real error?"""
+    return any(marker in stderr_text for marker in _FFMPEG_ERROR_MARKERS)
 
 
 class IntersectionCoordinator:
@@ -109,11 +121,9 @@ class IntersectionCoordinator:
             ffmpeg_procs[cam.id] = proc
             ffmpeg_stderr[cam.id] = stderr_temp
 
-            # Brief pause then check if the process already exited (e.g., bad
-            # codec/args).  A short sleep avoids a race where poll() returns
-            # None before ffmpeg has had time to parse args and fail; the
-            # write-path handler still covers any failure that slips past.
-            time.sleep(0.05)
+            # Check if the process already exited (e.g., bad args).  A
+            # brief race is acceptable: any failure that slips past here is
+            # caught by the write-path handler and the all-dead guard below.
             if proc.poll() is not None:
                 exit_code = proc.returncode
                 stderr_temp.seek(0)
@@ -221,6 +231,7 @@ class IntersectionCoordinator:
                 except Exception:
                     pass
             # Wait for processes to terminate
+            stderr_errors: Dict[str, str] = {}
             for cam_id, proc in ffmpeg_procs.items():
                 try:
                     proc.wait(timeout=30)
@@ -233,15 +244,37 @@ class IntersectionCoordinator:
                     try:
                         stderr_temp.seek(0)
                         err = stderr_temp.read().decode(errors="replace").strip()
-                        if err and cam_id not in dead_cameras:
-                            logging.warning(
-                                "[coordinator] ffmpeg %s stderr: %s",
-                                cam_id, err[-500:],
-                            )
+                        if err:
+                            stderr_errors[cam_id] = err[-800:]
+                            # Only warn for non-dead cameras if stderr looks
+                            # like a real error — ffmpeg writes normal progress
+                            # stats to stderr, which is not an error.
+                            if cam_id not in dead_cameras and _looks_like_ffmpeg_error(err):
+                                logging.warning(
+                                    "[coordinator] ffmpeg %s stderr: %s",
+                                    cam_id, err[-500:],
+                                )
                     except Exception:
                         pass
                     finally:
                         stderr_temp.close()
+
+        # Fail-fast: if every writer died, the run produced no usable video.
+        if len(dead_cameras) == len(self.cameras):
+            detail = "; ".join(
+                f"{cid}: {stderr_errors.get(cid, 'no stderr')[:200]}"
+                for cid in sorted(dead_cameras)
+            )
+            raise RuntimeError(
+                f"All {len(self.cameras)} ffmpeg writers died — no video "
+                f"was produced. Check encoder/GPU availability. Errors: {detail}"
+            )
+        if dead_cameras:
+            logging.warning(
+                "[coordinator] %d/%d camera writers failed: %s",
+                len(dead_cameras), len(self.cameras),
+                ", ".join(sorted(dead_cameras)),
+            )
 
         # Write cameras.yml
         self._write_cameras_yml(output_path / "sim_cameras.yml")
