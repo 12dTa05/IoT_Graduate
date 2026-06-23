@@ -5,10 +5,14 @@ subprocess pipes, one ground‑truth CSV, and a ``sim_cameras.yml`` ready
 for the DeepStream pipeline.
 """
 
+import logging
+import shutil
+import time
 import yaml
 import numpy as np
 import random
 import subprocess
+import tempfile
 from typing import List, Dict, Set
 from pathlib import Path
 
@@ -19,12 +23,13 @@ from .world import (
 from .camera import ProjectionCamera, CameraKind, build_intersection_cameras
 from .renderer import SubPixelProceduralRenderer
 from .plates import generate_vietnamese_plate
+from .ffmpeg_encoder import build_ffmpeg_cmd
 
 
 class IntersectionCoordinator:
     """8‑camera intersection simulation with turning + ffmpeg H.264 output."""
 
-    def __init__(self, duration=30.0, fps=60, seed=None):
+    def __init__(self, duration=30.0, fps=60, seed=None, video_encoder="auto"):
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
@@ -32,6 +37,7 @@ class IntersectionCoordinator:
         self.duration = duration
         self.fps      = fps
         self.dt       = 1.0 / fps
+        self._video_encoder = video_encoder
 
         self.light_controller = TrafficLightController()
         self.renderer         = SubPixelProceduralRenderer()
@@ -72,29 +78,51 @@ class IntersectionCoordinator:
         video_dir = output_path / "videos"
         video_dir.mkdir(exist_ok=True)
 
-        # ── ffmpeg writers (H.264 / 1920×1080 / yuv420p / 60 fps) ────
+        # ── ffmpeg writers (H.264 / 1920×1080 / yuv420p / self.fps) ────
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError("ffmpeg not found in PATH. Please install ffmpeg.")
+
         ffmpeg_procs: Dict[str, subprocess.Popen] = {}
+        ffmpeg_stderr: Dict[str, object] = {}
+        dead_cameras: Set[str] = set()
+
         for cam in self.cameras:
             out_file = video_dir / f"{cam.id}.mp4"
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-f", "rawvideo",
-                "-vcodec", "rawvideo",
-                "-s", "1920x1080",
-                "-pix_fmt", "bgr24",
-                "-r", str(self.fps),
-                "-i", "pipe:0",
-                "-c:v", "libx264",
-                "-preset", "medium",
-                "-crf", "23",
-                "-pix_fmt", "yuv420p",
-                "-r", str(self.fps),
-                str(out_file),
-            ]
-            ffmpeg_procs[cam.id] = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            cmd = build_ffmpeg_cmd(
+                out_file=str(out_file),
+                width=1920,
+                height=1080,
+                fps=float(self.fps),
+                video_encoder=self._video_encoder,
             )
+            # Capture stderr to a temp file for diagnostics on failure
+            stderr_temp = tempfile.TemporaryFile(mode="w+b")
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stderr=stderr_temp,
+                )
+            except FileNotFoundError as e:
+                stderr_temp.close()
+                raise RuntimeError(f"Failed to start ffmpeg for {cam.id}: {e}") from e
+            ffmpeg_procs[cam.id] = proc
+            ffmpeg_stderr[cam.id] = stderr_temp
+
+            # Brief pause then check if the process already exited (e.g., bad
+            # codec/args).  A short sleep avoids a race where poll() returns
+            # None before ffmpeg has had time to parse args and fail; the
+            # write-path handler still covers any failure that slips past.
+            time.sleep(0.05)
+            if proc.poll() is not None:
+                exit_code = proc.returncode
+                stderr_temp.seek(0)
+                err_output = stderr_temp.read().decode(errors="replace")
+                stderr_temp.close()
+                raise RuntimeError(
+                    f"ffmpeg for {cam.id} exited immediately with code {exit_code}.\n"
+                    f"Command: {' '.join(cmd)}\nStderr: {err_output}"
+                )
 
         csv_path = output_path / "ground_truth.csv"
         csv_file = None
@@ -109,6 +137,7 @@ class IntersectionCoordinator:
 
             total_frames     = int(self.duration * self.fps)
             spawn_accumulator = 0.0
+            frames_since_flush = 0
 
             for frame_idx in range(total_frames):
                 current_time = frame_idx * self.dt
@@ -118,7 +147,7 @@ class IntersectionCoordinator:
                 burst = (current_time % 60.0) < 25.0
                 spawn_interval = 0.3 if burst else 2.0
                 if spawn_accumulator >= spawn_interval:
-                    spawn_accumulator = 0.0
+                    spawn_accumulator -= spawn_interval
                     self._spawn_vehicle(current_time)
 
                 # Physics + phase transitions
@@ -129,6 +158,10 @@ class IntersectionCoordinator:
 
                 # Render each camera
                 for cam in self.cameras:
+                    # Skip cameras whose ffmpeg writer has died
+                    if cam.id in dead_cameras:
+                        continue
+
                     frame = self._backgrounds[cam.id].copy()
 
                     visible = self._vehicles_for_camera(cam)
@@ -143,14 +176,35 @@ class IntersectionCoordinator:
                             frame, veh, xyz, heading, cam,
                         )
 
-                    ffmpeg_procs[cam.id].stdin.write(frame.tobytes())
+                    try:
+                        ffmpeg_procs[cam.id].stdin.write(frame.tobytes())
+                    except (BrokenPipeError, ValueError):
+                        # Mark this camera as dead; log once and skip further writes
+                        dead_cameras.add(cam.id)
+                        proc = ffmpeg_procs.get(cam.id)
+                        exit_code = proc.returncode if proc else "unknown"
+                        stderr_temp = ffmpeg_stderr.get(cam.id)
+                        if stderr_temp is not None:
+                            stderr_temp.seek(0)
+                            err_output = stderr_temp.read().decode(errors="replace")
+                        else:
+                            err_output = "no stderr captured"
+                        logging.error(
+                            "[coordinator] ffmpeg writer for %s died (exit=%s). "
+                            "Stderr tail: %s",
+                            cam.id, exit_code, err_output[-500:],
+                        )
 
                 # Ground truth
                 self._log_ground_truth(frame_idx, current_time)
                 if self.csv_buffer:
                     csv_file.writelines(self.csv_buffer)
-                    csv_file.flush()
                     self.csv_buffer.clear()
+                frames_since_flush += 1
+                # Flush once per simulated second, not every frame
+                if frames_since_flush >= self.fps:
+                    csv_file.flush()
+                    frames_since_flush = 0
 
         finally:
             # Flush remaining CSV
@@ -162,15 +216,32 @@ class IntersectionCoordinator:
             # Close ffmpeg pipes (send EOF)
             for proc in ffmpeg_procs.values():
                 try:
-                    proc.stdin.close()
+                    if proc.stdin and not proc.stdin.closed:
+                        proc.stdin.close()
                 except Exception:
                     pass
-            for proc in ffmpeg_procs.values():
+            # Wait for processes to terminate
+            for cam_id, proc in ffmpeg_procs.items():
                 try:
                     proc.wait(timeout=30)
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=10)
+                # Close stderr temp file; surface any error output
+                stderr_temp = ffmpeg_stderr.get(cam_id)
+                if stderr_temp is not None:
+                    try:
+                        stderr_temp.seek(0)
+                        err = stderr_temp.read().decode(errors="replace").strip()
+                        if err and cam_id not in dead_cameras:
+                            logging.warning(
+                                "[coordinator] ffmpeg %s stderr: %s",
+                                cam_id, err[-500:],
+                            )
+                    except Exception:
+                        pass
+                    finally:
+                        stderr_temp.close()
 
         # Write cameras.yml
         self._write_cameras_yml(output_path / "sim_cameras.yml")
@@ -422,6 +493,12 @@ class IntersectionCoordinator:
 
                 p_pts = cam.project_3d_points(w_pts)
                 if p_pts is None:
+                    logging.warning(
+                        "[coordinator] ROI projection for %s returned None — "
+                        "measurement zone is behind the camera. Using hardcoded "
+                        "fallback quad (homography/ROI will be approximate).",
+                        cam.id,
+                    )
                     p_pts = np.array([
                         [100.0, 800.0], [1820.0, 800.0],
                         [1820.0, 200.0], [100.0, 200.0],

@@ -133,8 +133,6 @@ def build_intersection_cameras(mount_height: float = 7.0,
     The first ~5–10 m at the far extreme are behind the camera and
     invisible, which is correct for a rear‑watching mount.
     """
-    from .world import ROAD_LENGTH
-
     INBOUND_MOUNT_Y   = 160.0   # 10 m behind spawn point
     INBOUND_LOOK_Y    = 95.0    # mid‑segment, frames the whole road
     OUTBOUND_NEAR_Y   = 10.0

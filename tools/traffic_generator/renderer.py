@@ -146,7 +146,8 @@ class SubPixelProceduralRenderer:
 
     # ------------------------------------------------------------------
     # Texture (2048×1024 RGBA canvas)
-    #   Layout:  top = FRONT,  bottom = REAR
+    #   Layout:  Y‑axis = FRONT (top, y≈0) → REAR (bottom, y≈1024)
+    #            X‑axis = LEFT (x≈0) → RIGHT (x≈2048)
     # ------------------------------------------------------------------
     def render_high_res_vehicle(self, vtype: str, plate_text: str) -> np.ndarray:
         canvas = np.zeros((1024, 2048, 4), dtype=np.uint8)
@@ -155,17 +156,17 @@ class SubPixelProceduralRenderer:
         # Main body
         cv2.rectangle(canvas, (200, 212), (1848, 812), (*color, 255), -1)
 
-        # Windshield (front — top of canvas)
-        cv2.rectangle(canvas, (500, 262), (800, 762), (60, 60, 60, 255), -1)
+        # Windshield (FRONT — top of canvas, X‑centred horizontal band)
+        cv2.rectangle(canvas, (624, 212), (1424, 420), (60, 60, 60, 255), -1)
 
-        # Rear window (rear — bottom of canvas)
-        cv2.rectangle(canvas, (1400, 262), (1550, 762), (40, 40, 40, 255), -1)
+        # Rear window (REAR — bottom of canvas, X‑centred horizontal band)
+        cv2.rectangle(canvas, (724, 580), (1324, 812), (40, 40, 40, 255), -1)
 
-        # Side windows
-        cv2.rectangle(canvas, (800, 262), (1000, 762), (80, 80, 80, 255), -1)
-        cv2.rectangle(canvas, (1050, 262), (1250, 762), (80, 80, 80, 255), -1)
+        # Side windows (middle band, left and right edges)
+        cv2.rectangle(canvas, (250, 430), (550, 560), (80, 80, 80, 255), -1)
+        cv2.rectangle(canvas, (1498, 430), (1798, 560), (80, 80, 80, 255), -1)
 
-        # Wheels
+        # Wheels (front = top, rear = bottom; left/right on X)
         wc = (20, 20, 20, 255)
         ww, wh = 120, 80
         cv2.rectangle(canvas, (400, 200), (400 + ww, 200 + wh), wc, -1)
@@ -187,6 +188,8 @@ class SubPixelProceduralRenderer:
         # Auto‑fit text inside the plate rectangle
         font      = cv2.FONT_HERSHEY_SIMPLEX
         thickness = 4
+        scale = 0.6       # L1: default in case the scale list is ever empty
+        ts = (0, 0)
         for scale in (1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0.6):
             ts = cv2.getTextSize(plate_text, font, scale, thickness)[0]
             if ts[0] <= plate_w - 20 and ts[1] <= plate_h - 20:
@@ -248,6 +251,44 @@ class SubPixelProceduralRenderer:
         rotated = (rot @ local.T).T
         return rotated + np.array([x, y, z])
 
+    @staticmethod
+    def _dst_quad_sane(dst_quad: np.ndarray, frame_shape: tuple) -> bool:
+        """Validate a projected destination quad before warping.
+
+        Rejects quads that are:
+          - non-finite (NaN / inf from near-camera projection)
+          - degenerate or near-collinear (area too small)
+          - wildly extrapolated (area or coordinates far outside the frame)
+
+        These cases would produce a singular or extreme homography that
+        smears the vehicle texture across the entire frame.
+        """
+        if not np.all(np.isfinite(dst_quad)):
+            return False
+
+        x = dst_quad[:, 0]
+        y = dst_quad[:, 1]
+        # Shoelace formula for polygon area
+        area = 0.5 * abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+
+        # Minimum: a plausible distant vehicle still covers > 200 px²
+        if area < 200.0:
+            return False
+
+        # Maximum: shouldn't be many times the frame area (extrapolation)
+        h, w = frame_shape[0], frame_shape[1]
+        if area > h * w * 5:
+            return False
+
+        # Bounds: allow some overflow but reject extreme extrapolation
+        margin = max(w, h) * 0.5
+        if np.any(x < -margin) or np.any(x > w + margin):
+            return False
+        if np.any(y < -margin) or np.any(y > h + margin):
+            return False
+
+        return True
+
     # ------------------------------------------------------------------
     # Project + warp
     # ------------------------------------------------------------------
@@ -285,8 +326,16 @@ class SubPixelProceduralRenderer:
             [w_src, h_src],   # rear‑right
         ], dtype=np.float32)
 
-        H, mask = cv2.findHomography(src_quad, dst_quad)
-        if H is None:
+        # Validate the projected quad before warping (reject degenerate /
+        # near-collinear / wildly extrapolated quads that would smear the
+        # texture across the entire frame).
+        if not self._dst_quad_sane(dst_quad, frame.shape):
+            return frame
+
+        try:
+            H = cv2.getPerspectiveTransform(src_quad, dst_quad)
+        except cv2.error:
+            # Singular matrix — collinear source/dest points
             return frame
 
         warped = cv2.warpPerspective(

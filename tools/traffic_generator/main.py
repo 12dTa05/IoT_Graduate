@@ -35,6 +35,12 @@ def main():
         "--seed", type=int, default=42,
         help="Random seed for reproducibility (default: 42)",
     )
+    parser.add_argument(
+        "--video-encoder", type=str, default="auto",
+        choices=["auto", "nvenc", "x264"],
+        help="Video encoder: auto (NVENC if available, else libx264), "
+             "nvenc (force GPU), or x264 (force CPU). Default: auto",
+    )
 
     args = parser.parse_args()
 
@@ -44,11 +50,13 @@ def main():
     print(f"[+] Starting simulation: {args.duration}s @ {args.fps}fps")
     print(f"[+] Output directory: {output_path}")
     print(f"[+] 8 cameras (N/S/E/W × inbound_rear + outbound_rear)")
+    print(f"[+] Video encoder: {args.video_encoder}")
 
     coordinator = IntersectionCoordinator(
         duration=args.duration,
         fps=args.fps,
         seed=args.seed,
+        video_encoder=args.video_encoder,
     )
 
     coordinator.execute_generation(str(output_path))
