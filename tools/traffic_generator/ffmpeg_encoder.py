@@ -77,6 +77,19 @@ def _nvenc_works() -> bool:
 _nvenc_warned = False
 
 
+def reset_encoder_cache() -> None:
+    """Clear the cached NVENC probe result and one-shot warning flag.
+
+    The NVENC capability probe is cached for the process lifetime (the
+    8-camera loop must not re-probe per writer).  Call this if GPU
+    availability may have changed and a fresh probe is wanted — e.g. a
+    long-lived service that invokes the generator more than once.
+    """
+    global _nvenc_works_cache, _nvenc_warned
+    _nvenc_works_cache = None
+    _nvenc_warned = False
+
+
 def build_ffmpeg_cmd(out_file: str, width: int, height: int, fps: float,
                      video_encoder: str = "auto") -> List[str]:
     """Return the ffmpeg command list for piping raw BGR frames into an MP4.

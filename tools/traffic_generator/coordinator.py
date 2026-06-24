@@ -26,10 +26,22 @@ from .ffmpeg_encoder import build_ffmpeg_cmd
 
 
 # ffmpeg writes normal progress/stats to stderr; only treat it as an error
-# if these markers appear.  Avoids spurious warnings on successful runs.
+# if one of these phrases appears.  These are specific enough to avoid
+# matching benign output (build flags, filenames, codec metadata) while
+# still catching the failures we care about.
 _FFMPEG_ERROR_MARKERS = (
-    "error", "Error", "Cannot", "cannot", "failed", "Failed",
-    "Conversion failed", "Nothing was written", "No such file",
+    "Conversion failed",
+    "Nothing was written",
+    "No such file",
+    "Cannot load",
+    "Unknown encoder",
+    "Error while",
+    "Error initializing",
+    "Error opening",
+    "Invalid argument",
+    "Operation not permitted",
+    "not supported",
+    "Permission denied",
 )
 
 
@@ -41,7 +53,7 @@ def _looks_like_ffmpeg_error(stderr_text: str) -> bool:
 class IntersectionCoordinator:
     """8‑camera intersection simulation with turning + ffmpeg H.264 output."""
 
-    def __init__(self, duration=30.0, fps=60, seed=None, video_encoder="auto"):
+    def __init__(self, duration=30.0, fps=60, seed=None, video_encoder="auto", traffic_scale=1.0):
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
@@ -50,6 +62,9 @@ class IntersectionCoordinator:
         self.fps      = fps
         self.dt       = 1.0 / fps
         self._video_encoder = video_encoder
+        # Traffic volume multiplier: scale > 1.0 increases spawn rate
+        # (spawn_interval = base_interval / scale). Clamp to avoid zero/negative.
+        self._traffic_scale = max(0.01, float(traffic_scale))
 
         self.light_controller = TrafficLightController()
         self.renderer         = SubPixelProceduralRenderer()
@@ -155,7 +170,8 @@ class IntersectionCoordinator:
                 # Spawn
                 spawn_accumulator += self.dt
                 burst = (current_time % 60.0) < 25.0
-                spawn_interval = 0.3 if burst else 2.0
+                base_interval = 0.3 if burst else 2.0
+                spawn_interval = base_interval / self._traffic_scale
                 if spawn_accumulator >= spawn_interval:
                     spawn_accumulator -= spawn_interval
                     self._spawn_vehicle(current_time)
@@ -261,8 +277,10 @@ class IntersectionCoordinator:
 
         # Fail-fast: if every writer died, the run produced no usable video.
         if len(dead_cameras) == len(self.cameras):
+            # Use the TAIL of stderr — the actual error line lives at the end,
+            # after ffmpeg's verbose build/banner output.
             detail = "; ".join(
-                f"{cid}: {stderr_errors.get(cid, 'no stderr')[:200]}"
+                f"{cid}: {stderr_errors.get(cid, 'no stderr')[-200:]}"
                 for cid in sorted(dead_cameras)
             )
             raise RuntimeError(

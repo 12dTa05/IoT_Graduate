@@ -36,6 +36,11 @@ def main():
         help="Random seed for reproducibility (default: 42)",
     )
     parser.add_argument(
+        "--traffic-scale", type=float, default=1.0,
+        help="Traffic volume multiplier (1.0 = baseline). "
+             "Example: 1.5 = 50%% more vehicles, intervals divided by 1.5.",
+    )
+    parser.add_argument(
         "--video-encoder", type=str, default="auto",
         choices=["auto", "nvenc", "x264"],
         help="Video encoder: auto (NVENC if available, else libx264), "
@@ -50,6 +55,7 @@ def main():
     print(f"[+] Starting simulation: {args.duration}s @ {args.fps}fps")
     print(f"[+] Output directory: {output_path}")
     print(f"[+] 8 cameras (N/S/E/W × inbound_rear + outbound_rear)")
+    print(f"[+] Traffic scale: {args.traffic_scale}x")
     print(f"[+] Video encoder: {args.video_encoder}")
 
     coordinator = IntersectionCoordinator(
@@ -57,6 +63,7 @@ def main():
         fps=args.fps,
         seed=args.seed,
         video_encoder=args.video_encoder,
+        traffic_scale=args.traffic_scale,
     )
 
     coordinator.execute_generation(str(output_path))
