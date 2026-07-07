@@ -44,13 +44,11 @@ static bool loadLabels()
     if (g_labels_loaded) return !g_labels.empty();
     g_labels_loaded = true;
 
-    /* Candidate paths — resolved at runtime relative to config dirs. */
+    /* Candidate paths — no user-specific absolute fallbacks. */
     static const char *CANDIDATES[] = {
-        /* Relative to the directory that contains this .so */
-        "../labels_lpr.txt",
+        "configs/labels_lpr.txt",   /* when launched from Edge/ */
+        "../labels_lpr.txt",        /* when launched from parser dir */
         "labels_lpr.txt",
-        /* Absolute fallback */
-        "/home/mta/Documents/IoT_Graduate/Edge/configs/labels_lpr.txt",
         nullptr
     };
 
@@ -110,7 +108,8 @@ extern "C" bool NvDsInferParseCustomNVPlate(
             name == "tf_op_layer_ArgMax") {
             argmaxBuf = static_cast<const int32_t *>(layer.buffer);
             /* seqLen from last dim */
-            seqLen = layer.inferDims.d[layer.inferDims.numDims - 1];
+            if (layer.inferDims.numDims > 0)
+                seqLen = layer.inferDims.d[layer.inferDims.numDims - 1];
         } else if (name.find("Max") != std::string::npos ||
                    name == "tf_op_layer_Max") {
             maxBuf = static_cast<const float *>(layer.buffer);
@@ -122,7 +121,8 @@ extern "C" bool NvDsInferParseCustomNVPlate(
         const auto &l0 = outputLayersInfo[0];
         if (!l0.isInput) {
             argmaxBuf = static_cast<const int32_t *>(l0.buffer);
-            seqLen    = l0.inferDims.d[l0.inferDims.numDims - 1];
+            if (l0.inferDims.numDims > 0)
+                seqLen = l0.inferDims.d[l0.inferDims.numDims - 1];
         }
     }
     if (!maxBuf && outputLayersInfo.size() >= 2) {

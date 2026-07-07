@@ -12,3 +12,5 @@ Server/__pycache__
 Camera/videos/videos
 Camera/videos/ground_truth.csv
 Camera/videos/sim_cameras.yml
+
+.cortexkit

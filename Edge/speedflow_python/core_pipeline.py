@@ -112,6 +112,82 @@ def _make_source_bin(
     return source
 
 
+def _add_file_recording_branch(
+    pipeline: Gst.Pipeline,
+    demux: Gst.Element,
+    cam_cfg: CameraConfig,
+    sync: bool = False,
+) -> None:
+    """Create one nvstreamdemux → encoder → filesink branch for cam_cfg."""
+    if not cam_cfg.record:
+        return
+
+    sid = cam_cfg.source_id
+    if pipeline.get_by_name(f"queue_file_{sid}"):
+        return
+
+    queue = make_element(f"queue_file_{sid}", "queue")
+    postosd = make_element(f"postosd_{sid}", "nvvideoconvert")
+    enc = make_element(f"enc_{sid}", "nvv4l2h264enc")
+    enc.set_property("bitrate", 10_000_000)
+    enc.set_property("preset-level", 1)
+    enc.set_property("insert-sps-pps", True)
+
+    parse = make_element(f"parse_{sid}", "h264parse")
+    muxer = make_element(f"mux_{sid}", "qtmux")
+    # faststart allows MP4 file to be viewable even if it crashes midway
+    muxer.set_property("faststart", True)
+
+    fsink = make_element(f"fsink_{sid}", "filesink")
+    fsink.set_property("sync", False)
+    os.makedirs(os.path.dirname(os.path.abspath(cam_cfg.record_path)), exist_ok=True)
+    fsink.set_property("location", os.path.abspath(cam_cfg.record_path))
+
+    elements = [queue, postosd, enc, parse, muxer, fsink]
+    for el in elements:
+        pipeline.add(el)
+
+    gst_link(queue, postosd, enc, parse, muxer, fsink)
+
+    srcpad = demux.get_request_pad(f"src_{sid}")
+    sinkpad = queue.get_static_pad("sink")
+    if srcpad and sinkpad and not sinkpad.is_linked():
+        srcpad.link(sinkpad)
+
+    if sync:
+        for el in elements:
+            el.sync_state_with_parent()
+
+
+def _remove_file_recording_branch(pipeline: Gst.Pipeline, source_id: int) -> None:
+    demux = pipeline.get_by_name("demux")
+    elements = [
+        pipeline.get_by_name(f"queue_file_{source_id}"),
+        pipeline.get_by_name(f"postosd_{source_id}"),
+        pipeline.get_by_name(f"enc_{source_id}"),
+        pipeline.get_by_name(f"parse_{source_id}"),
+        pipeline.get_by_name(f"mux_{source_id}"),
+        pipeline.get_by_name(f"fsink_{source_id}"),
+    ]
+
+    for el in elements:
+        if el:
+            el.set_state(Gst.State.NULL)
+
+    if demux:
+        srcpad = demux.get_static_pad(f"src_{source_id}")
+        queue = elements[0]
+        sinkpad = queue.get_static_pad("sink") if queue else None
+        if srcpad and sinkpad and srcpad.is_linked():
+            srcpad.unlink(sinkpad)
+        if srcpad:
+            demux.release_request_pad(srcpad)
+
+    for el in elements:
+        if el:
+            pipeline.remove(el)
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline builder (Multi-Stream)
 # ---------------------------------------------------------------------------
@@ -241,36 +317,7 @@ def build_pipeline(
         pipeline.add(demux)
 
         for cam_cfg in camera_configs:
-            if not cam_cfg.record:
-                continue
-            
-            sid = cam_cfg.source_id
-            # Add queue to isolate streams and stabilize timestamp (PTS)
-            queue = make_element(f"queue_file_{sid}", "queue")
-            postosd = make_element(f"postosd_{sid}", "nvvideoconvert")
-            enc = make_element(f"enc_{sid}", "nvv4l2h264enc")
-            enc.set_property("bitrate", 10_000_000)
-            enc.set_property("preset-level", 1)
-            enc.set_property("insert-sps-pps", True)
-            
-            parse = make_element(f"parse_{sid}", "h264parse")
-            muxer = make_element(f"mux_{sid}", "qtmux")
-            # faststart allows MP4 file to be viewable even if it crashes midway
-            muxer.set_property("faststart", True)
-            
-            fsink = make_element(f"fsink_{sid}", "filesink")
-            fsink.set_property("sync", False) # Usually False for file recording from live source
-            
-            os.makedirs(os.path.dirname(os.path.abspath(cam_cfg.record_path)), exist_ok=True)
-            fsink.set_property("location", os.path.abspath(cam_cfg.record_path))
-            
-            for el in [queue, postosd, enc, parse, muxer, fsink]:
-                pipeline.add(el)
-            
-            gst_link(queue, postosd, enc, parse, muxer, fsink)
-            
-            # Store srcpad to connect after core linking is complete
-            setattr(demux, f"_delayed_link_{sid}", queue)
+            _add_file_recording_branch(pipeline, demux, cam_cfg)
 
     else:
         raise ValueError(f"Unknown sink_type: '{sink_type}'")
@@ -310,16 +357,6 @@ def build_pipeline(
     elif sink_type == "file":
         # Connect OSD to Demux
         nvdsosd.get_static_pad("src").link(demux.get_static_pad("sink"))
-        
-        # Connect Demux src pads to separate file branches
-        for cam_cfg in camera_configs:
-            if not cam_cfg.record:
-                continue
-            sid = cam_cfg.source_id
-            postosd = getattr(demux, f"_delayed_link_{sid}")
-            srcpad = demux.get_request_pad(f"src_{sid}")
-            sinkpad = postosd.get_static_pad("sink")
-            srcpad.link(sinkpad)
 
     # ── Add source bins (N cameras) ───────────────────────────────────────────
     source_bins: dict[str, Gst.Element] = {}
@@ -349,6 +386,12 @@ def dynamic_add_stream(
 ) -> Gst.Element:
     # 1. Increase muxer batch-size
     streammux.set_property("batch-size", current_n + 1)
+
+    # File mode uses nvstreamdemux branches. Dynamic ADD must create the
+    # matching branch before frames for the new source_id start flowing.
+    demux = pipeline.get_by_name("demux")
+    if demux is not None:
+        _add_file_recording_branch(pipeline, demux, cam_cfg, sync=True)
     
     # 2. Add and start the new source
     src = _make_source_bin(pipeline, streammux, cam_cfg)
@@ -407,6 +450,8 @@ def dynamic_remove_stream(
             el = pipeline.get_by_name(prefix)
             if el:
                 pipeline.remove(el)
+
+        _remove_file_recording_branch(pipeline, source_id)
 
         if camera_id in source_bins:
             del source_bins[camera_id]
