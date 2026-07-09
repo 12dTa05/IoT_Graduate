@@ -513,17 +513,32 @@ class CameraManager:
                 break
 
             # Remove first, add second (avoid source_id conflict)
+            remove_events = []
             for source_id in delta.to_remove:
                 sid = source_id  # capture for lambda
                 if self._glib_idle_add and self._on_remove:
-                    self._glib_idle_add(self._on_remove, sid)
+                    done = threading.Event()
+
+                    def _remove_with_ack(source_id=sid, event=done):
+                        try:
+                            self._on_remove(source_id)
+                        finally:
+                            event.set()
+                        return False
+
+                    self._glib_idle_add(_remove_with_ack)
+                    remove_events.append((sid, done))
                     logger.info(
                         "[CameraManager] Scheduled REMOVE source_id=%d on GLib loop", sid
                     )
 
-            # Wait one GLib cycle before add (prevent race condition)
             if delta.to_remove and delta.to_add:
-                time.sleep(0.05)
+                for sid, done in remove_events:
+                    if not done.wait(timeout=2.0):
+                        logger.warning(
+                            "[CameraManager] REMOVE source_id=%d did not ack within 2s before ADD",
+                            sid,
+                        )
 
             for cam_cfg in delta.to_add:
                 cfg = cam_cfg  # capture for lambda

@@ -103,7 +103,9 @@ def _collect_jetson_metrics() -> Dict:
     crashes — the load score will just be driven entirely by the FPS penalty
     until jtop recovers.
 
-    This project is Jetson-only; no psutil fallback is intentional.
+    This project targets NVIDIA Jetson devices.  Jetson does not use
+    nvidia-smi for the integrated GPU; jtop/tegrastats are the correct metric
+    sources.  Therefore no generic nvidia-smi fallback is used here.
     """
     logger.warning(
         "[HealthAgent] jtop unavailable — metrics are zero. "
@@ -119,24 +121,54 @@ def _collect_jetson_metrics() -> Dict:
     }
 
 
+# Path to edge_node.yml and mtime for reload-on-use
+_EDGE_NODE_YML = Path(__file__).resolve().parent / "configs" / "edge_node.yml"
+_EDGE_CFG: dict = {}
+_EDGE_CFG_MTIME: float = 0.0
+
+
 def _load_edge_node_cfg() -> dict:
     """
-    Read edge_node.yml once. Returns the full parsed dict, or {} on error.
-    The health agent is also started standalone (no GStreamer), so we cannot
-    assume the speedflow_python settings module has loaded edge_node.yml.
+    Read edge_node.yml. Returns the full parsed dict, or {} on error.
+    Used by _maybe_reload_edge_cfg for mtime-based hot-reload.
     """
     try:
         import yaml
-        yml_path = Path(__file__).resolve().parent / "configs" / "edge_node.yml"
-        with open(yml_path, "r", encoding="utf-8") as f:
+        with open(_EDGE_NODE_YML, "r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     except Exception as exc:
         logger.debug("[HealthAgent] edge_node.yml load error: %s", exc)
         return {}
 
 
-# Load once at module import — used by _compute_load_score
-_EDGE_CFG: dict = _load_edge_node_cfg()
+def _maybe_reload_edge_cfg() -> None:
+    """
+    Reload _EDGE_CFG if edge_node.yml mtime has changed since last read.
+    Idempotent — called before every config-consuming operation.
+    """
+    global _EDGE_CFG, _EDGE_CFG_MTIME
+    try:
+        mtime = _EDGE_NODE_YML.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    if mtime != _EDGE_CFG_MTIME:
+        _EDGE_CFG = _load_edge_node_cfg()
+        _EDGE_CFG_MTIME = mtime
+        logger.info("[HealthAgent] edge_node.yml reloaded (mtime changed)")
+
+
+def get_edge_cfg() -> dict:
+    """Return the latest edge_node.yml config, reloading when the file changed."""
+    _maybe_reload_edge_cfg()
+    return _EDGE_CFG
+
+
+# Seed at import time once, then mtime-based reload kicks in on each use.
+_EDGE_CFG = _load_edge_node_cfg()
+try:
+    _EDGE_CFG_MTIME = _EDGE_NODE_YML.stat().st_mtime
+except OSError:
+    _EDGE_CFG_MTIME = 0.0
 
 
 def _select_omega(metrics: dict, n_active_cameras: int) -> tuple:
@@ -154,6 +186,7 @@ def _select_omega(metrics: dict, n_active_cameras: int) -> tuple:
 
     Returns (w_gpu, w_cpu, w_ram, preset_name).
     """
+    _maybe_reload_edge_cfg()
     ls_cfg = _EDGE_CFG.get("load_score", {})
 
     bw_thresh   = int(ls_cfg.get("stream_bandwidth_threshold", 3))
@@ -178,6 +211,7 @@ def _compute_load_score(metrics: dict, fps_stats: dict) -> tuple:
     The preset is included in the heartbeat so peers can see which regime each
     node is operating in — this is the paper's "WAN context adaptation".
     """
+    _maybe_reload_edge_cfg()
     ls_cfg = _EDGE_CFG.get("load_score", {})
     fps_penalty_max = float(ls_cfg.get("fps_penalty_max", 30.0))
 
@@ -358,7 +392,7 @@ class HealthAgent:
             logger.info("[HealthAgent] jtop session opened and ready (persistent).")
             return j
         except Exception as exc:
-            logger.debug("[HealthAgent] jtop unavailable: %s — using psutil.", exc)
+            logger.debug("[HealthAgent] jtop unavailable: %s — using zero fallback.", exc)
             return None
 
     def _collect_metrics(self) -> Dict:
@@ -372,7 +406,6 @@ class HealthAgent:
         gracefully without losing GPU% and Temp.
 
         If jtop is unavailable, returns all-zero metrics with source='jtop_unavailable'.
-        This project is Jetson-only — no psutil fallback is used.
         """
         if self._jtop is not None:
             try:
@@ -471,6 +504,7 @@ class HealthAgent:
         self._jtop = self._open_jtop()
 
         # Instantiate proactive model using the proactive: section of edge_node.yml.
+        get_edge_cfg()
         from speedflow_python.load_model import ProactiveModel
         self._proactive_model = ProactiveModel(
             _EDGE_CFG.get("proactive", {})
@@ -585,6 +619,35 @@ class HealthAgent:
                 logger.error("[HealthAgent] Error in collect loop: %s", exc)
 
             time.sleep(HEALTH_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# Standalone functions for use by run_python.py's health_push_loop.
+# These expose a persistent jtop open/collect pattern without requiring
+# a HealthAgent instance (avoids the __new__ stub hack).
+# ---------------------------------------------------------------------------
+
+def open_jtop_session():
+    """
+    Open and return a persistent jtop session.
+    Identical to HealthAgent._open_jtop() — run_python.py can call this
+    directly to avoid the HealthAgent.__new__ stub pattern.
+    Returns the jtop object or None.
+    """
+    _h = HealthAgent()
+    return HealthAgent._open_jtop(_h)
+
+
+def collect_metrics(jtop_session):
+    """
+    Read metrics from a persistent jtop session.
+    Identical to HealthAgent._collect_metrics() — takes the jtop object
+    returned by open_jtop_session().
+    If jtop_session is None, returns all-zero fallback metrics.
+    """
+    _h = HealthAgent()
+    _h._jtop = jtop_session
+    return HealthAgent._collect_metrics(_h)
 
 
 # ---------------------------------------------------------------------------

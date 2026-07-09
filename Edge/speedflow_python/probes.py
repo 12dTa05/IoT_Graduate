@@ -17,6 +17,7 @@ Performance changes vs the original:
 
 import base64
 import json
+import logging
 import os
 import queue
 import time
@@ -42,25 +43,50 @@ from .settings import (
 from .draw import add_polygon_display
 from .camera_config import CameraManager, CameraConfig
 
+logger = logging.getLogger(__name__)
+
 
 class CSVLogger:
-    """Lightweight CSV appender — optional, non-critical path."""
+    """Lightweight CSV appender — optional, non-critical path.
+
+    Opens the header file lazily and holds a persistent append handle so we
+    don't pay open/close cost on every row.  close() must be called on
+    shutdown to flush and release the fd.
+    """
     def __init__(self, path, header):
         self.path = path
         self.header = header
+        self._f = None
+        self._lock = threading.Lock()
         try:
-            if not os.path.exists(path):
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(",".join(header) + "\n")
-        except Exception:
-            pass
+            needs_header = not os.path.exists(path)
+            # r+ would fail if missing; use a+ and seek to decide header
+            self._f = open(path, "a", encoding="utf-8")
+            if needs_header or os.path.getsize(path) == 0:
+                self._f.write(",".join(header) + "\n")
+                self._f.flush()
+        except OSError as exc:
+            logger.warning("[CSVLogger] cannot open %s: %s", path, exc)
+            self._f = None
 
     def write(self, row):
+        if self._f is None:
+            return
         try:
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(",".join(map(str, row)) + "\n")
-        except Exception:
-            pass
+            with self._lock:
+                self._f.write(",".join(map(str, row)) + "\n")
+                self._f.flush()
+        except OSError as exc:
+            logger.warning("[CSVLogger] write failed to %s: %s", self.path, exc)
+
+    def close(self):
+        if self._f is not None:
+            try:
+                self._f.flush()
+                self._f.close()
+            except OSError:
+                pass
+            self._f = None
 
 
 # ---------------------------------------------------------------------------
@@ -165,8 +191,8 @@ class SpeedProbe:
 
         try:
             os.makedirs(str(SNAP_DIR), exist_ok=True)
-        except Exception:
-            pass
+        except OSError as exc:
+            logger.warning("[SpeedProbe] cannot create SNAP_DIR %s: %s", SNAP_DIR, exc)
 
         # License plate collection (20 raw frames ≈ 5 SGIE runs × 4 frames)
         self.PLATE_DETECTION_FRAMES      = 20
@@ -349,8 +375,12 @@ class SpeedProbe:
 
                 with open(FPS_STATS_FILE, "w") as f:
                     json.dump(out, f)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(
+                    "[FPSWriter] write failed — retrying next cycle: %s",
+                    exc,
+                    exc_info=True,
+                )
 
     def _flush_features(self) -> Dict[str, Dict[str, float]]:
         """
@@ -381,6 +411,15 @@ class SpeedProbe:
 
     def stop_fps_writer(self) -> None:
         self._fps_writer_running = False
+        if self._fps_writer_thread.is_alive():
+            self._fps_writer_thread.join(timeout=2.5)
+
+    def _get_frame_bgr_cached(self, gst_buffer, frame_meta, cache: dict):
+        """Return CPU BGR frame for this batch/frame, copying GPU surface once."""
+        key = (frame_meta.batch_id, frame_meta.frame_num)
+        if key not in cache:
+            cache[key] = self._frame_bgr_from_gst_buffer(gst_buffer, frame_meta)
+        return cache[key]
 
     # ------------------------------------------------------------------
     # Plate helpers
@@ -517,8 +556,8 @@ class SpeedProbe:
                     self.publisher.put(payload)
                 else:
                     self.publisher(payload)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("[SpeedProbe] overspeed publish failed: %s", exc)
 
         if self.snap_count[stid] < MAX_SNAPSHOT_PER_ID and image_b64 is not None:
             self.snap_count[stid] += 1
@@ -614,6 +653,7 @@ class SpeedProbe:
             frame_meta   = pyds.NvDsFrameMeta.cast(l_frame.data)
             frame_number = frame_meta.frame_num
             source_id    = frame_meta.source_id
+            frame_bgr_cache = {}
 
             cam_cfg = self.camera_manager.get_config(source_id)
             if not cam_cfg:
@@ -714,7 +754,8 @@ class SpeedProbe:
                     if stid in self.plate_locked:
                         continue
                     try:
-                        frame_bgr_off = self._frame_bgr_from_gst_buffer(gst_buffer, frame_meta)
+                        frame_bgr_off = self._get_frame_bgr_cached(
+                            gst_buffer, frame_meta, frame_bgr_cache)
                         if frame_bgr_off is not None:
                             bb = plate_info["bbox"]
                             px = max(0, int(bb["left"]))
@@ -731,8 +772,11 @@ class SpeedProbe:
                                     crop_bgr=plate_crop,
                                     confidence=plate_info.get("conf", 0.0),
                                 )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug(
+                            "[SpeedProbe] L3 plate crop offload error for camera=%s frame=%s: %s",
+                            cam_cfg.camera_id, frame_number, exc, exc_info=True,
+                        )
 
             else:
                 # Normal local plate accumulation
@@ -792,7 +836,8 @@ class SpeedProbe:
             # Level 2: send full vehicle crops to peer; skip local speed/plate display
             if offload_level == 2 and self._offload_pub is not None and offload_target:
                 try:
-                    frame_bgr_l2 = self._frame_bgr_from_gst_buffer(gst_buffer, frame_meta)
+                    frame_bgr_l2 = self._get_frame_bgr_cached(
+                        gst_buffer, frame_meta, frame_bgr_cache)
                     if frame_bgr_l2 is not None:
                         for tid, veh_info in vehicles_in_frame.items():
                             stid = (source_id, tid)
@@ -806,8 +851,11 @@ class SpeedProbe:
                                     crop_bgr=veh_crop,
                                     bbox_world_y=y_world_by_tid.get(tid, 0.0),
                                 )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug(
+                        "[SpeedProbe] L2 vehicle crop offload error for camera=%s frame=%s: %s",
+                        cam_cfg.camera_id, frame_number, exc, exc_info=True,
+                    )
                 l_frame = l_frame.next
                 continue   # skip local speed compute for this frame
 
@@ -879,12 +927,15 @@ class SpeedProbe:
                             if speed_smooth >= cam_cfg.speed_limit_kmh:
                                 crop = None
                                 try:
-                                    frame_bgr = self._frame_bgr_from_gst_buffer(
-                                        gst_buffer, frame_meta)
+                                    frame_bgr = self._get_frame_bgr_cached(
+                                        gst_buffer, frame_meta, frame_bgr_cache)
                                     if frame_bgr is not None and frame_bgr.size > 0:
                                         crop = self._crop_bbox(frame_bgr, obj_meta)
-                                except Exception:
-                                    pass
+                                except Exception as exc:
+                                    logger.debug(
+                                        "[SpeedProbe] Overspeed snapshot capture error for camera=%s frame=%s track=%s: %s",
+                                        cam_cfg.camera_id, frame_number, tid, exc, exc_info=True,
+                                    )
                                 self._maybe_publish_and_save(
                                     stid, cam_cfg.camera_id,
                                     ts_iso, speed_smooth, crop,

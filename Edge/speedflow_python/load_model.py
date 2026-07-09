@@ -41,9 +41,12 @@ The health payload gains five new fields when proactive.enabled is True:
 from __future__ import annotations
 
 import collections
+import logging
 import math
 import time
 from typing import Dict, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Defaults (used when edge_node.yml section is absent or keys are missing)
@@ -268,10 +271,22 @@ class ProactiveModel:
         self._smoother_l = CycleSmoother(window_s)
         self._smoother_h = CycleSmoother(window_s)
         self._smoother_u = CycleSmoother(window_s)
+        self._warn_if_inert()
 
     def reload_cfg(self, proactive_cfg: dict) -> None:
         """Hot-reload coefficients from updated edge_node.yml."""
         self._cfg = {**_DEFAULT_CFG, **proactive_cfg}
+        self._warn_if_inert()
+
+    def _warn_if_inert(self) -> None:
+        if not self.enabled:
+            return
+        coeffs = ("alpha1", "alpha2", "beta", "gamma")
+        if all(float(self._cfg.get(k, 0.0)) == 0.0 for k in coeffs):
+            logger.warning(
+                "[ProactiveModel] enabled but alpha1/alpha2/beta/gamma are all zero; "
+                "L_proactive will stay at w_base/100 until coefficients are fitted."
+            )
 
     @property
     def enabled(self) -> bool:

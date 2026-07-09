@@ -44,6 +44,7 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
                   camera_manager: CameraManager,
                   peer_orch=None,
                   offload_pub=None,
+                  offload_rcv=None,
                   zenoh_pub=None) -> SpeedProbe:
     """
     Attach ROI filter, plate preprocessor, and speed probe to *pipeline*.
@@ -51,6 +52,7 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
 
     peer_orch:   PeerOrchestrator — lets the probe query offload levels.
     offload_pub: OffloadPublisher — lets the probe send crops to peers.
+    offload_rcv: OffloadReceiver — lets peer-returned crop results reach the probe.
     zenoh_pub:   ZenohPublisher — lets the probe publish overspeed events.
     """
     # 1. ROI filter
@@ -88,6 +90,8 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
     probe = SpeedProbe(camera_manager, peer_orch=peer_orch)
     if offload_pub is not None:
         probe.set_offload_publisher(offload_pub)
+    if offload_rcv is not None:
+        offload_rcv.set_result_handler(probe.inject_offload_result)
     if zenoh_pub is not None:
         probe.set_publisher(zenoh_pub)
 
@@ -208,7 +212,7 @@ def _run_loop_until_eos_or_error(
 # Modes
 # ---------------------------------------------------------------------------
 
-def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, zenoh_pub=None) -> None:
+def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, offload_rcv=None, zenoh_pub=None) -> SpeedProbe:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
@@ -221,7 +225,7 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
     pipeline, nvdsosd, streammux, source_bins = ret_build
     tiler = pipeline.get_by_name("tiler")
 
-    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, zenoh_pub=zenoh_pub)
+    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
     t0_playing = time.monotonic()
@@ -234,9 +238,10 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
     logger.info("[Display] Pipeline PLAYING after %.0f ms (warmup)", warmup_ms)
 
     _run_loop_until_eos_or_error(pipeline, camera_manager)
+    return probe
 
 
-def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, zenoh_pub=None) -> SpeedProbe:
+def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, offload_rcv=None, zenoh_pub=None) -> SpeedProbe:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
@@ -248,7 +253,7 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
     )
     pipeline, nvdsosd, streammux, source_bins = ret_build
 
-    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, zenoh_pub=zenoh_pub)
+    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, None)
 
     print(f"[Python File Mode] Processing multi-streams to output files...")
@@ -278,16 +283,20 @@ def _health_push_loop(peer_orch=None) -> None:
         _compute_load_score     as _compute_load_fn,
         _read_fps_stats         as _read_fps_fn,
         _read_feature_stats     as _read_feat_fn,
-        _EDGE_CFG               as _edge_cfg,
+        _maybe_reload_edge_cfg  as _reload_edge_cfg,
+        get_edge_cfg            as _get_edge_cfg,
+        open_jtop_session,
+        collect_metrics,
     )
+    _reload_edge_cfg()
     from speedflow_python.load_model import ProactiveModel as _ProactiveModel
-    _proactive_model = _ProactiveModel(_edge_cfg.get("proactive", {}))
+    _proactive_model = _ProactiveModel(_get_edge_cfg().get("proactive", {}))
 
     _fps_file = _Path(FPS_STATS_FILE)
 
     # Load camera configs once so peers know the original URIs for failover.
-    # Fix #12: use a mutable container so the inner closure can update it.
     _cam_configs: dict = {}
+    # ponytail: uses dict, sufficient for periodic camera config reload
 
     def _reload_cam_configs() -> dict:
         try:
@@ -315,24 +324,26 @@ def _health_push_loop(peer_orch=None) -> None:
     _cam_configs_reload_interval = 30.0   # re-read cameras.yml every 30 s
     _last_cam_reload = _time.monotonic()
 
-    # Fix #2: open a persistent jtop session directly in this loop so that
-    # _collect_metrics (from health_agent) can use it.  The old monkey-patch
-    # approach was dead code — _collect_via_jtop was called instead, bypassing
-    # _collect_metrics_fn entirely.  We now call health_agent._collect_metrics
-    # via a HealthAgent instance so the full fallback chain works correctly.
-    import health_agent as _ha
-    _agent_stub = _ha.HealthAgent.__new__(_ha.HealthAgent)
-    _agent_stub._jtop = _agent_stub._open_jtop()
+    # Open a persistent jtop session using standalone health_agent functions.
+    # This avoids the HealthAgent.__new__ stub hack and keeps the pipeline
+    # health loop independent.
+    # INVARIANT: This loop and standalone health_agent.py must NOT both run
+    # for the same NODE_ID. The pipeline process owns the health push when
+    # health_agent.py is not started separately (PIPELINE_OWN_WS=1 mode).
+    _jtop_session = open_jtop_session()
 
     while True:
         try:
-            # Fix #12: periodically refresh camera configs to pick up dynamic changes
+            # Periodically refresh camera configs to pick up dynamic changes
             if _time.monotonic() - _last_cam_reload >= _cam_configs_reload_interval:
                 _cam_configs = _reload_cam_configs()
                 _last_cam_reload = _time.monotonic()
+                # Reload edge_node.yml so ProactiveModel sees fresh coefficients
+                _reload_edge_cfg()
+                _proactive_model.reload_cfg(_get_edge_cfg().get("proactive", {}))
 
-            # Use health_agent's collection + scoring functions via the stub instance
-            metrics       = _agent_stub._collect_metrics()
+            # Use health_agent's metric collection via standalone function
+            metrics       = collect_metrics(_jtop_session)
             fps_stats     = _read_fps_fn()
             feature_stats = _read_feat_fn()
             load_score, omega_preset = _compute_load_fn(metrics, fps_stats)
@@ -383,7 +394,7 @@ def _health_push_loop(peer_orch=None) -> None:
 
 
 
-def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, zenoh_pub=None) -> Optional["SpeedProbe"]:
+def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, offload_rcv=None, zenoh_pub=None) -> Optional["SpeedProbe"]:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
@@ -435,7 +446,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         pipeline, nvdsosd, streammux, source_bins = ret_build
         tiler = pipeline.get_by_name("tiler")
 
-        _last_probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, zenoh_pub=zenoh_pub)
+        _last_probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
         _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
         ret = pipeline.set_state(Gst.State.PLAYING)
@@ -673,11 +684,11 @@ def run_python_mode(args) -> None:
 
     # Run pipeline — offload_pub + zenoh_pub references passed so SpeedProbe can use them
     if args.mode == "display":
-        probe = run_display_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, zenoh_pub=zenoh_pub)
+        probe = run_display_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
     elif args.mode == "file":
-        probe = run_file_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, zenoh_pub=zenoh_pub)
+        probe = run_file_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
     elif args.mode == "rtsp_push":
-        probe = run_rtsp_push_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, zenoh_pub=zenoh_pub)
+        probe = run_rtsp_push_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
     else:
         raise ValueError(f"Unknown mode: '{args.mode}'")
 

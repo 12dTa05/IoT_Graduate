@@ -383,7 +383,7 @@ class PeerOrchestrator:
                 pipeline = payload.get("pipeline", {})
                 self._self_state.avg_fps = pipeline.get("avg_fps")
                 self._self_state.fps_per_camera = pipeline.get("fps_per_camera", {})
-                self._self_state.active_cameras = pipeline.get("active_cameras", [])
+                self._self_state.active_cameras = list(pipeline.get("active_cameras", []))
 
                 # Overload onset: use risk_index when proactive mode is active,
                 # otherwise fall back to the legacy load_score threshold.
@@ -419,7 +419,7 @@ class PeerOrchestrator:
             pipeline = payload.get("pipeline", {})
             peer.avg_fps        = pipeline.get("avg_fps")
             peer.fps_per_camera = pipeline.get("fps_per_camera", {})
-            peer.active_cameras = pipeline.get("active_cameras", [])
+            peer.active_cameras = list(pipeline.get("active_cameras", []))
             peer.camera_configs = pipeline.get("camera_configs", peer.camera_configs)
             peer.last_seen = time.time()
 
@@ -511,6 +511,7 @@ class PeerOrchestrator:
                 continue
             silent_s = now - peer.last_seen
             if silent_s > timeout:
+                self._clear_offload_target(node_id)
                 if peer.active_cameras:
                     # BUG-6 fix: use _failover_triggered set to prevent
                     # re-triggering instead of clearing active_cameras.
@@ -539,6 +540,23 @@ class PeerOrchestrator:
                 # react again if it goes offline a second time.
                 self._notified_offline.discard(node_id)
                 self._failover_triggered.discard(node_id)
+
+    def _clear_offload_target(self, node_id: str) -> None:
+        """Clear Level 2/3 crop offload entries that target an offline peer."""
+        with self._offload_lock:
+            affected = [
+                camera_id for camera_id, target in self._offload_targets.items()
+                if target == node_id and self._offload_table.get(camera_id, 0) in (2, 3)
+            ]
+            for camera_id in affected:
+                old_level = self._offload_table.get(camera_id, 0)
+                self._offload_table[camera_id] = 0
+                self._offload_targets[camera_id] = ""
+                self._offload_level_changed_at[camera_id] = time.time()
+                logger.warning(
+                    "[PeerOrch] Offload target '%s' offline — clearing L%d for '%s'",
+                    node_id, old_level, camera_id,
+                )
 
     def _check_rebalance(self) -> None:
         """
@@ -762,7 +780,6 @@ class PeerOrchestrator:
             return
 
         current_level = self.get_offload_level(cam_to_offload)
-        best_peer     = self._pick_best_peer()
 
         # Escalation ladder: 3 → 2 → 1
         if load >= thr1 and global_offload >= 1:
@@ -789,7 +806,10 @@ class PeerOrchestrator:
                 logger.warning("[PeerOrch] RFO trigger: %s reason=%s", cam_to_offload, trigger)
                 self._trigger_rfo(cam_to_offload, relaxation_tier=0)
 
-        elif load >= thr2 and global_offload >= 2 and best_peer:
+        elif load >= thr2 and global_offload >= 2:
+            best_peer = self._pick_best_peer(for_offload_level=2)
+            if not best_peer:
+                return
             if current_level != 2:
                 logger.warning(
                     "[PeerOrch] Load=%.1f ≥ L2 threshold=%.1f. "
@@ -798,7 +818,10 @@ class PeerOrchestrator:
                 )
                 self.set_offload_level(cam_to_offload, 2, target_node=best_peer)
 
-        elif load >= thr3 and global_offload >= 3 and best_peer:
+        elif load >= thr3 and global_offload >= 3:
+            best_peer = self._pick_best_peer(for_offload_level=3)
+            if not best_peer:
+                return
             if current_level != 3:
                 logger.warning(
                     "[PeerOrch] Load=%.1f ≥ L3 threshold=%.1f. "
@@ -851,10 +874,12 @@ class PeerOrchestrator:
         )
         self._trigger_rfo(cam_to_offload, relaxation_tier=0)
 
-    def _pick_best_peer(self) -> Optional[str]:
+    def _pick_best_peer(self, for_offload_level: int = 1) -> Optional[str]:
         """
         Return the node_id of the alive peer with the lowest load score,
-        subject to not being at stream capacity and not being in cooldown.
+        subject to not being in cooldown. Stream capacity is enforced only for
+        Level 1 full-stream migration; Level 2/3 crop offload does not consume
+        a streammux slot.
         Returns None if no suitable peer is found.
         """
         now     = time.time()
@@ -868,7 +893,7 @@ class PeerOrchestrator:
                     continue
                 if now - peer.last_seen > timeout:
                     continue
-                if len(peer.active_cameras) >= peer.max_streams:
+                if for_offload_level <= 1 and len(peer.active_cameras) >= peer.max_streams:
                     continue
                 if now < peer.penalty_until:
                     continue

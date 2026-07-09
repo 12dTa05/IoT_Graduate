@@ -6,8 +6,9 @@ TensorRT inference directly (no DeepStream pipeline required on the
 receiver side).
 
 Subscribes to:
-  offload/plates/+/{my_node_id}   — Level 3: run LPR, return plate text
-  offload/vehicles/+/{my_node_id} — Level 2: run LPD then LPR, return plate text
+  offload/plates/*/{my_node_id}   — Level 3: run LPR, return plate text
+  offload/vehicles/*/{my_node_id} — Level 2: run LPD then LPR, return plate text
+  offload/results/*/{my_node_id}  — results returned when this node is sender
 
 Results are published back to the sender:
   offload/results/{my_node_id}/{sender_node_id}
@@ -88,36 +89,78 @@ class _TRTEngine:
         self._trt     = trt
         self._cuda    = cuda
 
-        # Allocate pinned host + device buffers for every binding
+        # Allocate pinned host + device buffers.  JetPack 5 / TensorRT 8 uses
+        # the legacy binding-index API; JetPack 6 / TensorRT 10 uses the
+        # name-based tensor API.  Support both so Jetson deployments can move
+        # between JetPack releases without breaking crop offload inference.
         self._bindings = []
+        self._tensor_names: list = []
+        self._use_trt10_api = hasattr(self._engine, "num_io_tensors")
         self._host_inputs:  list = []
         self._host_outputs: list = []
         self._dev_inputs:   list = []
         self._dev_outputs:  list = []
         self._output_shapes: list = []
 
-        for i in range(self._engine.num_bindings):
-            shape    = tuple(self._engine.get_binding_shape(i))
-            dtype    = trt.nptype(self._engine.get_binding_dtype(i))
-            host_mem = cuda.pagelocked_empty(int(np.prod(shape)), dtype)
-            dev_mem  = cuda.mem_alloc(host_mem.nbytes)
-            self._bindings.append(int(dev_mem))
-            if self._engine.binding_is_input(i):
-                self._host_inputs.append(host_mem)
-                self._dev_inputs.append(dev_mem)
-            else:
-                self._host_outputs.append(host_mem)
-                self._dev_outputs.append(dev_mem)
-                self._output_shapes.append(shape)
+        if self._use_trt10_api:
+            n_io = int(self._engine.num_io_tensors)
+            for i in range(n_io):
+                name  = self._engine.get_tensor_name(i)
+                shape = tuple(self._engine.get_tensor_shape(name))
+                if any(dim < 0 for dim in shape):
+                    raise RuntimeError(
+                        f"Dynamic TensorRT shape for {name} is not supported by "
+                        "the lightweight offload receiver"
+                    )
+                dtype    = trt.nptype(self._engine.get_tensor_dtype(name))
+                host_mem = cuda.pagelocked_empty(int(np.prod(shape)), dtype)
+                dev_mem  = cuda.mem_alloc(host_mem.nbytes)
+                self._bindings.append(int(dev_mem))
+                self._tensor_names.append(name)
+                self._context.set_tensor_address(name, int(dev_mem))
+                if self._engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                    self._host_inputs.append(host_mem)
+                    self._dev_inputs.append(dev_mem)
+                else:
+                    self._host_outputs.append(host_mem)
+                    self._dev_outputs.append(dev_mem)
+                    self._output_shapes.append(shape)
+            binding_count = n_io
+        else:
+            binding_count = int(self._engine.num_bindings)
+            for i in range(binding_count):
+                shape    = tuple(self._engine.get_binding_shape(i))
+                if any(dim < 0 for dim in shape):
+                    raise RuntimeError(
+                        f"Dynamic TensorRT binding shape at index {i} is not "
+                        "supported by the lightweight offload receiver"
+                    )
+                dtype    = trt.nptype(self._engine.get_binding_dtype(i))
+                host_mem = cuda.pagelocked_empty(int(np.prod(shape)), dtype)
+                dev_mem  = cuda.mem_alloc(host_mem.nbytes)
+                self._bindings.append(int(dev_mem))
+                if self._engine.binding_is_input(i):
+                    self._host_inputs.append(host_mem)
+                    self._dev_inputs.append(dev_mem)
+                else:
+                    self._host_outputs.append(host_mem)
+                    self._dev_outputs.append(dev_mem)
+                    self._output_shapes.append(shape)
+
+        if not self._host_inputs:
+            raise RuntimeError(f"TensorRT engine has no input bindings/tensors: {engine_path}")
 
         self._stream = cuda.Stream()
-        logger.info("[TRTEngine] Loaded %s — %d binding(s)", engine_path, self._engine.num_bindings)
+        logger.info("[TRTEngine] Loaded %s — %d I/O tensor(s)", engine_path, binding_count)
 
     def infer(self, input_array: np.ndarray) -> list:
         """Run one inference pass. Returns list of output ndarrays."""
         np.copyto(self._host_inputs[0], input_array.ravel())
         self._cuda.memcpy_htod_async(self._dev_inputs[0], self._host_inputs[0], self._stream)
-        self._context.execute_async_v2(self._bindings, self._stream.handle, None)
+        if self._use_trt10_api:
+            self._context.execute_async_v3(stream_handle=self._stream.handle)
+        else:
+            self._context.execute_async_v2(self._bindings, self._stream.handle, None)
         for host, dev in zip(self._host_outputs, self._dev_outputs):
             self._cuda.memcpy_dtoh_async(host, dev, self._stream)
         self._stream.synchronize()
@@ -296,6 +339,14 @@ class OffloadReceiver:
         self._processed = 0
         self._errors    = 0
 
+        # ── Sender-side result handler ──────────────────────────────────────
+        # When this node ACTS AS SENDER (offloads crops to a peer), the peer
+        # publishes results on offload/results/{peer}/{us}.  We subscribe to
+        # offload/results/*/{my_node_id} and forward decoded payloads to the
+        # registered callback (probe.inject_offload_result).
+        self._result_handler: Optional[Any] = None   # callable(result_dict) or None
+        self._result_sub_declared = False
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -320,7 +371,7 @@ class OffloadReceiver:
         )
         self._thread.start()
         logger.info(
-            "[OffloadReceiver] Started. Listening on offload/*/+/%s", self._node_id
+            "[OffloadReceiver] Started. Listening on offload/*/*/%s", self._node_id
         )
 
     def stop(self) -> None:
@@ -332,6 +383,37 @@ class OffloadReceiver:
             "[OffloadReceiver] Stopped. processed=%d errors=%d",
             self._processed, self._errors,
         )
+
+    def set_result_handler(self, handler) -> None:
+        """
+        Register a callback to receive offload results when this node is the
+        SENDER.  The handler receives the decoded result dict:
+          {src, dst, camera_id, stid, frame_no, plate_text, confidence, ts}
+
+        Declares a Zenoh subscriber on offload/results/*/{my_node_id} once,
+        and forwards every decoded message to handler(payload).
+        Called during probe setup before the pipeline starts PLAYING.
+        """
+        self._result_handler = handler
+        if not self._result_sub_declared:
+            self._result_sub_declared = True
+            self._session.declare_subscriber(
+                f"offload/results/*/{self._node_id}",
+                self._on_result_sample,
+            )
+            logger.info(
+                "[OffloadReceiver] Result subscriber declared: offload/results/*/%s",
+                self._node_id,
+            )
+
+    def _on_result_sample(self, sample) -> None:
+        """Callback for offload/results/*/{my_node_id} — dispatch to handler."""
+        try:
+            payload = msgpack.unpackb(sample.payload.to_bytes(), raw=False)
+            if self._result_handler is not None:
+                self._result_handler(payload)
+        except Exception as exc:
+            logger.warning("[OffloadReceiver] Result dispatch error: %s", exc)
 
     # ------------------------------------------------------------------
     # Zenoh subscriber callbacks — called on the Zenoh recv thread

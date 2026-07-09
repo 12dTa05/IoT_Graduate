@@ -422,7 +422,20 @@ def dynamic_remove_stream(
     conv_src_pad = conv.get_static_pad("src") if conv else None
 
     def _cleanup_bin(pad, probe_id):
-        # 1. Set state to NULL to stop data flow from source to sink
+        # 1. Remove blocking probe first so teardown cannot deadlock on a blocked pad.
+        if pad and probe_id:
+            try:
+                pad.remove_probe(probe_id)
+            except Exception:
+                pass
+
+        # 2. Unlink from muxer (streammux) after the blocking probe has been removed.
+        mux_sinkpad = streammux.get_static_pad(f"sink_{source_id}")
+        if mux_sinkpad:
+            if conv_src_pad:
+                conv_src_pad.unlink(mux_sinkpad)
+
+        # 3. Set state to NULL to stop data flow from source to sink.
         if src:
             src.set_state(Gst.State.NULL)
         for prefix in [f"q_{camera_id}", f"conv_{camera_id}"]:
@@ -430,20 +443,10 @@ def dynamic_remove_stream(
             if el:
                 el.set_state(Gst.State.NULL)
 
-        # 2. Unlink from muxer (streammux)
-        mux_sinkpad = streammux.get_static_pad(f"sink_{source_id}")
         if mux_sinkpad:
-            if conv_src_pad:
-                # Remove probe block if it still exists
-                if pad and probe_id:
-                    try:
-                        pad.remove_probe(probe_id)
-                    except Exception:
-                        pass
-                conv_src_pad.unlink(mux_sinkpad)
             streammux.release_request_pad(mux_sinkpad)
 
-        # 3. Remove element from pipeline
+        # 4. Remove element from pipeline
         if src:
             pipeline.remove(src)
         for prefix in [f"q_{camera_id}", f"conv_{camera_id}"]:
