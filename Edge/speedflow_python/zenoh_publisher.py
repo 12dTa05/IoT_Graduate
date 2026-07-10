@@ -117,10 +117,6 @@ class ZenohPublisher:
             except queue.Empty:
                 pass
 
-    def publish_event(self, data: Dict[str, Any]) -> None:
-        """Alias of put() — backward-compatible interface."""
-        self.put(data)
-
     # ------------------------------------------------------------------
     # Internal — publish loop
     # ------------------------------------------------------------------

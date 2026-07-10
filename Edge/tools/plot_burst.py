@@ -43,23 +43,15 @@ from pathlib import Path
 # Imports
 # ---------------------------------------------------------------------------
 
-def _require(pkg: str):
-    try:
-        return __import__(pkg)
-    except ImportError:
-        print(f"ERROR: {pkg} required — pip install {pkg}", file=sys.stderr)
-        sys.exit(1)
+try:
+    from ._plot_helpers import _require, _build_feature_stats, _build_metrics, ProactiveModel, CycleSmoother
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _plot_helpers import _require, _build_feature_stats, _build_metrics, ProactiveModel, CycleSmoother
 
 pd  = _require("pandas")
 np  = _require("numpy")
 plt = _require("matplotlib.pyplot")
-
-import importlib.util as _ilu
-_lm_path = Path(__file__).resolve().parents[1] / "speedflow_python" / "load_model.py"
-_spec = _ilu.spec_from_file_location("load_model", _lm_path)
-_lm   = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_lm)
-ProactiveModel = _lm.ProactiveModel
-CycleSmoother  = _lm.CycleSmoother
 
 
 # ---------------------------------------------------------------------------
@@ -73,23 +65,6 @@ def _load_cfg(yml_path: Path) -> dict:
     except Exception as exc:
         print(f"ERROR loading {yml_path}: {exc}", file=sys.stderr)
         sys.exit(1)
-
-
-def _build_feature_stats(row) -> dict:
-    return {"cam_merged": {
-        "n_track":             float(row.get("n_track_total",           0.0)),
-        "n_plate":             float(row.get("n_plate_total",           0.0)),
-        "stationary_fraction": float(row.get("stationary_fraction_mean",0.0)),
-    }}
-
-
-def _build_metrics(row) -> dict:
-    return {
-        "gpu_percent": float(row.get("gpu_percent", 0.0)),
-        "cpu_percent": float(row.get("cpu_percent", 0.0)),
-        "ram_percent": float(row.get("ram_percent", 0.0)),
-        "gpu_temp_c":  float(row.get("gpu_temp_c",  0.0)),
-    }
 
 
 def _find_red_peaks(n_track: np.ndarray, t_rel: np.ndarray,

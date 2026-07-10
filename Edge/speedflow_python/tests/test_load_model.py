@@ -1,13 +1,13 @@
 """
-Edge/tests/test_load_model.py
+Edge/speedflow_python/tests/test_load_model.py
 
 Unit tests for speedflow_python/load_model.py.
 No hardware dependencies — pure function tests only.
 
 Run from Edge/:
-    python3 -m pytest tests/test_load_model.py -v
+    python3 -m pytest speedflow_python/tests/test_load_model.py -v
 or standalone:
-    python3 tests/test_load_model.py
+    python3 speedflow_python/tests/test_load_model.py
 """
 
 import sys
@@ -18,7 +18,7 @@ from pathlib import Path
 # Import load_model directly from its file so this test has zero hardware
 # dependencies (no GStreamer, no DeepStream, no dotenv, no jtop).
 # We bypass speedflow_python/__init__.py which eagerly imports core_pipeline.
-_LM_PATH = Path(__file__).resolve().parents[1] / "speedflow_python" / "load_model.py"
+_LM_PATH = Path(__file__).resolve().parents[1] / "load_model.py"
 _spec = importlib.util.spec_from_file_location("load_model", _LM_PATH)
 _lm   = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_lm)
@@ -263,7 +263,11 @@ def test_model_disabled_returns_flag():
     cfg = _cfg(enabled=False)
     model = ProactiveModel(cfg)
     result = model.compute(_metrics(), _feats())
-    assert result == {"proactive_enabled": False}
+    assert result == {
+        "proactive_enabled": False,
+        "load_policy": "predict_with_base",
+        "load_model": "formula",
+    }
 
 def test_model_enabled_returns_all_keys():
     model = ProactiveModel(_cfg())

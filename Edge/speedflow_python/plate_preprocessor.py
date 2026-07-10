@@ -218,27 +218,4 @@ class PlatePreprocessorProbe:
         return frame_bgr[y:y2, x:x2], x, y, x2, y2
 
 
-class SimplePlateEnhancer:
-    """
-    Lightweight enhancement for cropped license plate images.
-    Unchanged from original — not on the GStreamer hot path.
-    """
 
-    @staticmethod
-    def enhance_plate_crop(image_bgr: np.ndarray) -> np.ndarray:
-        if image_bgr is None or image_bgr.size == 0:
-            return image_bgr
-        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        thresh = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 11, 2,
-        )
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        morph  = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-        return cv2.cvtColor(morph, cv2.COLOR_GRAY2BGR)
-
-    @staticmethod
-    def unsharp_mask(image: np.ndarray,
-                     sigma: float = 1.5, strength: float = 1.5) -> np.ndarray:
-        blurred = cv2.GaussianBlur(image, (0, 0), sigma)
-        return cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)

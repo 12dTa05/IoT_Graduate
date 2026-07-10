@@ -6,7 +6,7 @@ import yaml
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QPoint, QProcess
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker, QPoint, QProcess
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -66,12 +66,6 @@ class SourceItem:
     last_preview_frame: Optional[any] = None
 
 # ========= Helpers =========
-class QMutexLocker:
-    def __init__(self, mutex: QMutex):
-        self.mutex = mutex
-        self.mutex.lock()
-    def __enter__(self): return self
-    def __exit__(self, exc_type, exc, tb): self.mutex.unlock()
 
 # ========= Video thread =========
 class VideoThread(QThread):
