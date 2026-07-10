@@ -137,3 +137,8 @@ proactive:
     t_high:   90.0         # °C — ramp ends here   (multiplier = max_mult)
     max_mult: 1.25         # ≈ Jetson thermal throttle factor (~20–25% clock cut)
 
+  # Deep-learning predictor (used when LOAD_MODEL=dl)
+  dl_model:
+    model_path: "models/load_predictor.onnx"
+    window_k: 5            # number of past feature windows in one input sample
+    horizon_s: 10          # informational; must match the trained model

@@ -33,6 +33,8 @@ from speedflow_python.settings import (
     FPS_STATS_FILE,
     MONITOR_URL,
     ADVERTISE_IP,
+    LOAD_POLICY,
+    LOAD_MODEL,
 )
 
 logging.basicConfig(
@@ -507,8 +509,11 @@ class HealthAgent:
         get_edge_cfg()
         from speedflow_python.load_model import ProactiveModel
         self._proactive_model = ProactiveModel(
-            _EDGE_CFG.get("proactive", {})
+            _EDGE_CFG.get("proactive", {}),
+            policy=LOAD_POLICY,
+            model_type=LOAD_MODEL,
         )
+        logger.info("[HealthAgent] LOAD_POLICY=%s LOAD_MODEL=%s", LOAD_POLICY, LOAD_MODEL)
         if self._proactive_model.enabled:
             logger.info("[HealthAgent] Proactive load model ENABLED "
                         "(risk_threshold=%.2f)", self._proactive_model.risk_threshold)

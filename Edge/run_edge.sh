@@ -5,6 +5,7 @@
 #   ./run_edge.sh                        # rtsp_push mode (default)
 #   ./run_edge.sh --mode display         # display mode
 #   ./run_edge.sh --mode rtsp_push --rtsp-push-url rtsp://host:8554/jetson_A
+#   ./run_edge.sh --load-policy predict_with_base --load-model formula
 #
 # Press Ctrl+C once to gracefully stop both processes.
 
@@ -15,9 +16,54 @@ cd "$EDGE_DIR"
 
 PYTHON="${PYTHON:-python3}"
 MODE="${MODE:-rtsp_push}"
+LOAD_POLICY="${LOAD_POLICY:-actual}"
+LOAD_MODEL="${LOAD_MODEL:-formula}"
 
 # Parse any extra args passed to this script and forward to main.py
-EXTRA_ARGS=("$@")
+EXTRA_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --load-policy)
+            if [[ $# -lt 2 ]]; then
+                echo "[run_edge] ERROR: --load-policy requires a value" >&2
+                exit 1
+            fi
+            LOAD_POLICY="$2"
+            shift 2
+            ;;
+        --load-model)
+            if [[ $# -lt 2 ]]; then
+                echo "[run_edge] ERROR: --load-model requires a value" >&2
+                exit 1
+            fi
+            LOAD_MODEL="$2"
+            shift 2
+            ;;
+        *)
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+case "$LOAD_POLICY" in
+    actual|predict_no_base|predict_with_base) ;;
+    *)
+        echo "[run_edge] ERROR: LOAD_POLICY must be: actual | predict_no_base | predict_with_base" >&2
+        exit 1
+        ;;
+esac
+
+case "$LOAD_MODEL" in
+    formula|dl) ;;
+    *)
+        echo "[run_edge] ERROR: LOAD_MODEL must be: formula | dl" >&2
+        exit 1
+        ;;
+esac
+
+export LOAD_POLICY LOAD_MODEL
+echo "[run_edge] LOAD_POLICY=$LOAD_POLICY  LOAD_MODEL=$LOAD_MODEL"
 
 # ---------------------------------------------------------------------------
 # Cleanup: kill both child processes on Ctrl+C / EXIT

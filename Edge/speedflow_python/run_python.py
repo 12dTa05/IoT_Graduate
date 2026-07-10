@@ -290,7 +290,12 @@ def _health_push_loop(peer_orch=None) -> None:
     )
     _reload_edge_cfg()
     from speedflow_python.load_model import ProactiveModel as _ProactiveModel
-    _proactive_model = _ProactiveModel(_get_edge_cfg().get("proactive", {}))
+    from speedflow_python.settings import LOAD_MODEL as _LOAD_MODEL, LOAD_POLICY as _LOAD_POLICY
+    _proactive_model = _ProactiveModel(
+        _get_edge_cfg().get("proactive", {}),
+        policy=_LOAD_POLICY,
+        model_type=_LOAD_MODEL,
+    )
 
     _fps_file = _Path(FPS_STATS_FILE)
 

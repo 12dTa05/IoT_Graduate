@@ -44,6 +44,7 @@ import collections
 import logging
 import math
 import time
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,7 @@ def compute_h_reactive(
 def compute_l_proactive(
     feature_stats: Dict[str, Dict[str, float]],
     cfg: dict,
+    policy: str = "predict_with_base",
 ) -> Tuple[float, float, float, float]:
     """
     L_proactive = (W_base + Σ_m[α₁·N_track + α₂·N_track² + β·N_plate + γ·S_m]) / 100
@@ -150,7 +152,14 @@ def compute_l_proactive(
     Returns (L_proactive, n_track_mean, n_plate_mean, stationary_fraction_mean)
     so the caller can include raw feature values in the heartbeat.
     """
-    w_base = float(cfg.get("w_base",  _DEFAULT_CFG["w_base"]))
+    if policy == "actual":
+        return 0.0, 0.0, 0.0, 0.0
+
+    w_base = (
+        float(cfg.get("w_base",  _DEFAULT_CFG["w_base"]))
+        if policy == "predict_with_base"
+        else 0.0
+    )
     alpha1 = float(cfg.get("alpha1",  0.0))
     alpha2 = float(cfg.get("alpha2",  0.0))
     beta   = float(cfg.get("beta",    0.0))
@@ -182,6 +191,84 @@ def compute_l_proactive(
     stat_frac_mean = (sum(stat_frac_vals) / len(stat_frac_vals) if stat_frac_vals else 0.0)
 
     return l_raw, n_track_mean, n_plate_mean, stat_frac_mean
+
+
+class DLPredictor:
+    """Small ONNX time-series predictor using 3 traffic features."""
+
+    def __init__(self, dl_cfg: dict, edge_root: Optional[Path] = None) -> None:
+        self._window_k = max(1, int(dl_cfg.get("window_k", 5)))
+        self._history: collections.deque = collections.deque(maxlen=self._window_k)
+        self._session = None
+        self._input_name = None
+        model_path = str(dl_cfg.get("model_path", "")).strip()
+        self._model_path = self._resolve_path(model_path, edge_root)
+        if self._model_path:
+            self._load_model()
+
+    @staticmethod
+    def _resolve_path(model_path: str, edge_root: Optional[Path]) -> str:
+        if not model_path:
+            return ""
+        path = Path(model_path)
+        if not path.is_absolute():
+            root = edge_root or Path(__file__).resolve().parents[1]
+            path = root / path
+        return str(path)
+
+    def _load_model(self) -> None:
+        try:
+            import onnxruntime as ort
+            self._session = ort.InferenceSession(self._model_path)
+            self._input_name = self._session.get_inputs()[0].name
+            logger.info("[DLPredictor] Loaded ONNX model: %s", self._model_path)
+        except Exception as exc:
+            logger.warning("[DLPredictor] Disabled; failed to load %s: %s", self._model_path, exc)
+            self._session = None
+            self._input_name = None
+
+    @staticmethod
+    def _feature_means(feature_stats: Dict[str, Dict[str, float]]) -> Tuple[float, float, float]:
+        n_track_vals = []
+        n_plate_vals = []
+        stat_vals = []
+        for cam_feats in feature_stats.values():
+            n_track_vals.append(float(cam_feats.get("n_track", 0.0)))
+            n_plate_vals.append(float(cam_feats.get("n_plate", 0.0)))
+            stat_vals.append(float(cam_feats.get("stationary_fraction", 0.0)))
+        n_track = sum(n_track_vals) / len(n_track_vals) if n_track_vals else 0.0
+        n_plate = sum(n_plate_vals) / len(n_plate_vals) if n_plate_vals else 0.0
+        stat = sum(stat_vals) / len(stat_vals) if stat_vals else 0.0
+        return n_track, n_plate, stat
+
+    def predict(
+        self,
+        feature_stats: Dict[str, Dict[str, float]],
+    ) -> Tuple[float, float, float, float]:
+        n_track, n_plate, stat = self._feature_means(feature_stats)
+        self._history.append([n_track, n_plate, stat])
+
+        if self._session is None or self._input_name is None:
+            return 0.0, n_track, n_plate, stat
+        if len(self._history) < self._window_k:
+            return 0.0, n_track, n_plate, stat
+
+        try:
+            import numpy as np
+            x = np.asarray([list(self._history)], dtype=np.float32)
+            y = self._session.run(None, {self._input_name: x})[0]
+            pred = float(np.asarray(y).reshape(-1)[0])
+        except Exception as exc:
+            logger.debug("[DLPredictor] inference failed: %s", exc, exc_info=True)
+            return 0.0, n_track, n_plate, stat
+
+        # DL output is already the selected target on the 0-100 load scale.
+        # For predict_with_base, train on load_score/gpu_percent so base cost is
+        # included in the target. For predict_no_base, train on a delta-load
+        # target that excludes base cost. Do not add W_base here, or with-base
+        # DL predictions double-count the idle pipeline workload.
+        l_raw = min(1.0, max(0.0, pred / 100.0))
+        return l_raw, n_track, n_plate, stat
 
 
 # ---------------------------------------------------------------------------
@@ -265,21 +352,41 @@ class ProactiveModel:
             payload.update(result)
     """
 
-    def __init__(self, proactive_cfg: dict) -> None:
+    def __init__(self, proactive_cfg: dict, policy: str = "predict_with_base", model_type: str = "formula") -> None:
         self._cfg = {**_DEFAULT_CFG, **proactive_cfg}
+        self._policy = str(policy or "actual").strip().lower()
+        self._model_type = str(model_type or "formula").strip().lower()
+        if self._policy not in {"actual", "predict_no_base", "predict_with_base"}:
+            logger.warning("[ProactiveModel] Invalid policy=%r; using actual", self._policy)
+            self._policy = "actual"
+        if self._model_type not in {"formula", "dl"}:
+            logger.warning("[ProactiveModel] Invalid model_type=%r; using formula", self._model_type)
+            self._model_type = "formula"
         window_s  = float(self._cfg.get("cycle_window_s", 90.0))
         self._smoother_l = CycleSmoother(window_s)
         self._smoother_h = CycleSmoother(window_s)
         self._smoother_u = CycleSmoother(window_s)
+        self._dl_predictor = None
+        if self._model_type == "dl":
+            self._dl_predictor = DLPredictor(self._cfg.get("dl_model", {}))
         self._warn_if_inert()
 
     def reload_cfg(self, proactive_cfg: dict) -> None:
         """Hot-reload coefficients from updated edge_node.yml."""
+        old_dl_path = ""
+        if self._dl_predictor is not None:
+            old_dl_path = self._dl_predictor._model_path
         self._cfg = {**_DEFAULT_CFG, **proactive_cfg}
+        if self._model_type == "dl":
+            new_predictor = DLPredictor(self._cfg.get("dl_model", {}))
+            if new_predictor._model_path != old_dl_path:
+                self._dl_predictor = new_predictor
         self._warn_if_inert()
 
     def _warn_if_inert(self) -> None:
         if not self.enabled:
+            return
+        if self._model_type == "dl":
             return
         coeffs = ("alpha1", "alpha2", "beta", "gamma")
         if all(float(self._cfg.get(k, 0.0)) == 0.0 for k in coeffs):
@@ -290,7 +397,7 @@ class ProactiveModel:
 
     @property
     def enabled(self) -> bool:
-        return bool(self._cfg.get("enabled", False))
+        return self._policy != "actual" and bool(self._cfg.get("enabled", False))
 
     @property
     def risk_threshold(self) -> float:
@@ -315,12 +422,19 @@ class ProactiveModel:
         polluting the payload with zeroes.
         """
         if not self.enabled:
-            return {"proactive_enabled": False}
+            return {
+                "proactive_enabled": False,
+                "load_policy": self._policy,
+                "load_model": self._model_type,
+            }
 
         # Raw tiers
-        l_raw, n_track_mean, n_plate_mean, stat_frac = compute_l_proactive(
-            feature_stats, self._cfg
-        )
+        if self._model_type == "dl" and self._dl_predictor is not None:
+            l_raw, n_track_mean, n_plate_mean, stat_frac = self._dl_predictor.predict(feature_stats)
+        else:
+            l_raw, n_track_mean, n_plate_mean, stat_frac = compute_l_proactive(
+                feature_stats, self._cfg, policy=self._policy
+            )
         h_raw = compute_h_reactive(
             gpu_percent=metrics.get("gpu_percent", 0.0),
             cpu_percent=metrics.get("cpu_percent", 0.0),
@@ -337,6 +451,8 @@ class ProactiveModel:
 
         return {
             "proactive_enabled":   True,
+            "load_policy":         self._policy,
+            "load_model":          self._model_type,
             "l_proactive":         round(l_smooth, 4),
             "h_reactive":          round(h_smooth, 4),
             "risk_index":          round(u_smooth, 4),   # drives offload trigger

@@ -48,6 +48,25 @@ MONITOR_URL = os.environ.get("MONITOR_URL", "").strip()   # empty → disabled
 NODE_ID        = _get("NODE_ID")
 
 # -----------------------------------------------------------
+# Load balancing experiment mode
+# -----------------------------------------------------------
+LOAD_POLICY = os.environ.get("LOAD_POLICY", "actual").strip().lower()
+LOAD_MODEL  = os.environ.get("LOAD_MODEL", "formula").strip().lower()
+
+_VALID_LOAD_POLICIES = {"actual", "predict_no_base", "predict_with_base"}
+_VALID_LOAD_MODELS   = {"formula", "dl"}
+if LOAD_POLICY not in _VALID_LOAD_POLICIES:
+    raise RuntimeError(
+        f"LOAD_POLICY={LOAD_POLICY!r} invalid. "
+        f"Must be one of: {', '.join(sorted(_VALID_LOAD_POLICIES))}"
+    )
+if LOAD_MODEL not in _VALID_LOAD_MODELS:
+    raise RuntimeError(
+        f"LOAD_MODEL={LOAD_MODEL!r} invalid. "
+        f"Must be one of: {', '.join(sorted(_VALID_LOAD_MODELS))}"
+    )
+
+# -----------------------------------------------------------
 # Zenoh (P2P peer mode — no broker needed)
 # -----------------------------------------------------------
 ZENOH_QUEUE_MAXSIZE = _get("ZENOH_QUEUE_MAXSIZE", int)

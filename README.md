@@ -226,6 +226,14 @@ python3 main.py --mode rtsp_push
 python3 main.py --mode rtsp_push --rtsp-push-url rtsp://server:8554/jetson_A
 ```
 
+Or use the convenience launcher with load-policy selection:
+
+```bash
+./run_edge.sh --mode rtsp_push --load-policy actual
+./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model formula
+./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model dl
+```
+
 ### DeepStream Pipeline
 
 Main file: `Edge/speedflow_python/core_pipeline.py`
@@ -381,9 +389,48 @@ Relevant files:
 
 | File | Purpose |
 | --- | --- |
-| `speedflow_python/load_model.py` | Hardware load scoring, proactive model, thermal fuse, and risk index. |
-| `configs/edge_node.yml` | P2P, load-score, and proactive model configuration. |
+| `speedflow_python/load_model.py` | Hardware load scoring, proactive model, thermal fuse, risk index, and DL predictor. |
+| `configs/edge_node.yml` | P2P, load-score, proactive model, and DL model configuration. |
+| `tools/train_dl_model.py` | Trains a 3-feature ONNX load predictor and exports it for runtime use. |
 | `tests/test_load_model.py` | Unit tests for load-model behavior. |
+
+#### Load Policy and Load Model Selection
+
+The system supports three load-balancing policies and two predictor types, selectable at runtime via environment variables or `run_edge.sh` CLI flags:
+
+| `LOAD_POLICY` | Meaning |
+| --- | --- |
+| `actual` | Passive baseline — decisions use measured hardware load only; no traffic-flow prediction. |
+| `predict_no_base` | Proactive traffic-flow prediction without `W_base` (ablation study). |
+| `predict_with_base` | Proactive traffic-flow prediction with `W_base` (proposed full model). |
+
+| `LOAD_MODEL` | Meaning |
+| --- | --- |
+| `formula` | Closed-form coefficient model (linear/quadratic in vehicle/plate counts). |
+| `dl` | Deep-learning time-series predictor (ONNX Runtime, 3-feature sliding window). |
+
+Defaults: `LOAD_POLICY=actual`, `LOAD_MODEL=formula` — identical to previous behavior.
+
+Usage with `run_edge.sh`:
+
+```bash
+./run_edge.sh --mode rtsp_push --load-policy actual
+./run_edge.sh --mode rtsp_push --load-policy predict_no_base --load-model formula
+./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model formula
+./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model dl
+```
+
+Or via environment variables:
+
+```bash
+LOAD_POLICY=predict_with_base LOAD_MODEL=formula ./run_edge.sh --mode rtsp_push
+```
+
+When `LOAD_POLICY=actual`, the proactive model is disabled and the peer orchestrator falls back to the legacy `load_score > overload_threshold` path. When `predict_no_base`, `W_base` is forced to zero. When `predict_with_base`, the configured `W_base` from `edge_node.yml` is used.
+
+For the DL predictor, the base/no-base distinction is defined by the training target, not by post-hoc addition: train on `load_score`/`gpu_percent` for `predict_with_base`, or on a delta-load target (excluding idle cost) for `predict_no_base`.
+
+#### Proactive Model Formula
 
 The proactive model combines:
 
@@ -409,6 +456,36 @@ U = 1 - (1 - L̂_avg)(1 - Ĥ_avg)
 ```
 
 Where `U` is the smoothed risk index used to trigger offload escalation when proactive mode is enabled.
+
+#### DL Predictor
+
+The DL predictor (`DLPredictor` in `load_model.py`) uses ONNX Runtime with a 3-feature sliding window:
+
+- Input features per window: `[n_track_mean, n_plate_mean, stationary_fraction_mean]`
+- Input shape: `(1, window_k, 3)` — `window_k` past windows
+- Output: predicted load on a 0–100 scale, normalized to `[0, 1]`
+- Degrades safely to `0.0` if the model is missing, not enough history, or inference fails
+
+Train the model with:
+
+```bash
+cd Edge
+python3 tools/train_dl_model.py \
+  --csv logs/calibration.csv \
+  --output models/load_predictor.onnx \
+  --window-k 5 \
+  --horizon-rows 1
+```
+
+The trained model is loaded at runtime from the path configured in `edge_node.yml`:
+
+```yaml
+proactive:
+  dl_model:
+    model_path: "models/load_predictor.onnx"
+    window_k: 5
+    horizon_s: 10
+```
 
 ### P2P Orchestration
 
@@ -623,6 +700,7 @@ Holds structured P2P and load-model settings:
 - `p2p.offload_level*` thresholds
 - `load_score` weights
 - `proactive` coefficients and risk thresholds
+- `proactive.dl_model` ONNX model path, window size, and horizon
 
 Flat scalar runtime settings live in `Edge/.env` according to the comments in the file.
 
@@ -674,6 +752,7 @@ Because TensorRT engines are hardware-, TensorRT-, CUDA-, and DeepStream-version
 | --- | --- |
 | `Edge/tools/profile_collect.py` | Collects workload/profile data on target Jetson. |
 | `Edge/tools/fit_coefficients.py` | Fits proactive load-model coefficients and writes config. |
+| `Edge/tools/train_dl_model.py` | Trains a 3-feature ONNX load predictor for `LOAD_MODEL=dl`. |
 | `Edge/tools/plot_rmse.py` | Visualizes model fitting error. |
 | `Edge/tools/plot_burst.py` | Visualizes burst / workload behavior. |
 
@@ -742,6 +821,14 @@ python3 main.py --mode file --output output/result.mp4
 python3 main.py --mode rtsp_push
 ```
 
+Or use the convenience launcher with load-policy selection:
+
+```bash
+./run_edge.sh --mode rtsp_push --load-policy actual
+./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model formula
+./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model dl
+```
+
 ### 4. Multi-Node Experiment
 
 For a peer-to-peer experiment:
@@ -799,7 +886,7 @@ Common key expressions used by the peer system:
 | `peers/control/{node_id}` | Camera control commands for one node. |
 | `offload/plates/{src}/{dst}` | Plate-crop offload request. |
 | `offload/vehicles/{src}/{dst}` | Vehicle-crop offload request. |
-| `offload/results/{src}/{dst}` | Offload result. |
+| `offload/results/{receiver}/{sender}` | Offload inference result returned to sender. |
 | `traffic/events/{node_id}/{camera_id}` | Traffic event publication. |
 
 ### Violation Storage
@@ -856,10 +943,13 @@ These are acceptable in the current experimental phase but important for future 
 For research continuation:
 
 1. Calibrate `edge_node.yml` proactive coefficients on the target Jetson.
-2. Record repeatable load experiments with `tools/profile_collect.py`.
-3. Validate migration behavior under controlled overload.
-4. Compare Level 3 / Level 2 / Level 1 offload cost and accuracy.
-5. Add tests for dynamic camera config parsing and migration decisions.
+2. Collect time-series traffic/load data with `tools/profile_collect.py`.
+3. Train a DL load predictor with `tools/train_dl_model.py` and evaluate prediction accuracy.
+4. Compare active vs passive load balancing: run the same traffic scenario with `LOAD_POLICY=actual` (passive baseline) vs `LOAD_POLICY=predict_with_base` (proactive), then compare FPS, dropped frames, overload duration, and migration timing.
+5. Produce predicted-vs-actual load time-series graphs showing the proactive model crossing the overload threshold earlier than the reactive baseline.
+6. Validate migration behavior under controlled overload.
+7. Compare Level 3 / Level 2 / Level 1 offload cost and accuracy.
+8. Add tests for dynamic camera config parsing and migration decisions.
 
 For deployment hardening:
 
@@ -894,6 +984,14 @@ cd Edge && python3 main.py --mode file --output output/result.mp4
 # Edge RTSP push mode
 cd Edge && python3 main.py --mode rtsp_push
 
+# Edge with load-policy selection (active vs passive load balancing)
+cd Edge && ./run_edge.sh --mode rtsp_push --load-policy actual
+cd Edge && ./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model formula
+cd Edge && ./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model dl
+
+# Train DL load predictor
+cd Edge && python3 tools/train_dl_model.py --csv logs/calibration.csv --output models/load_predictor.onnx
+
 # Load model tests
 cd Edge && python3 -m pytest tests/test_load_model.py -q
 
@@ -913,5 +1011,6 @@ IoT Graduate is not just a single-camera traffic detector. It is a full distribu
 - The server centralizes visibility and historical violation data.
 - Zenoh lets multiple edge nodes coordinate without a central load-balancing controller.
 - The offload ladder provides a research path from cheap crop-level remote inference to full stream migration.
+- The load policy selection (`LOAD_POLICY` + `LOAD_MODEL`) enables direct comparison of passive vs active (proactive) load balancing, the main research contribution.
 
-The strongest part of the design is the integration of perception, hardware load modeling, and peer orchestration. The main engineering challenge is keeping the runtime pipeline, deployment configuration, model artifacts, and distributed control plane synchronized as the experiment evolves.
+The strongest part of the design is the integration of perception, hardware load modeling, traffic-flow prediction, and peer orchestration. The main engineering challenge is keeping the runtime pipeline, deployment configuration, model artifacts, and distributed control plane synchronized as the experiment evolves.
