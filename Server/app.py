@@ -287,12 +287,7 @@ async def _process_edge_message(
         state.broadcast(health_msg)
 
     elif msg_type in ("violation", "overspeed"):
-        record = {**data, "type": "violation", "node_id": node_id}
-        if "image_b64" in record:
-            record["snapshot_b64"] = record.pop("image_b64")
-        asyncio.create_task(state.store.save_async(record))
-        violation_msg = {k: v for k, v in record.items() if k != "snapshot_b64"}
-        state.broadcast(violation_msg)
+        pass  # violation capture disabled
 
 
 async def handle_ws_server(request: web.Request) -> web.WebSocketResponse:
