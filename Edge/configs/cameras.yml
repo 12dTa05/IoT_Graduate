@@ -57,13 +57,13 @@ cameras:
     speed_limit_kmh: 80.0
     homography:
       source_points:
-        - [1264, 542]
-        - [192,  545]
-        - [421,  145]
-        - [827,  149]
+        - [427, 71]
+        - [851, 65]
+        - [1221, 645]
+        - [57, 643]
       target_width: 15
-      target_height: 35
-    roi_polygon: [1264, 542, 192, 545, 421, 145, 827, 149]
+      target_height: 50
+    roi_polygon: [427, 71, 851, 65, 1221, 645, 57, 643]
     output:
       record: true
       record_path: "output/cam_02.mp4"
@@ -78,13 +78,13 @@ cameras:
     speed_limit_kmh: 80.0
     homography:
       source_points:
-        - [1264, 542]
-        - [192,  545]
-        - [421,  145]
-        - [827,  149]
+        - [427, 71]
+        - [851, 65]
+        - [1221, 645]
+        - [57, 643]
       target_width: 15
-      target_height: 35
-    roi_polygon: [1264, 542, 192, 545, 421, 145, 827, 149]
+      target_height: 50
+    roi_polygon: [427, 71, 851, 65, 1221, 645, 57, 643]
     output:
       record: false
       record_path: "output/cam_03.mp4"
@@ -99,13 +99,13 @@ cameras:
     speed_limit_kmh: 80.0
     homography:
       source_points:
-        - [1264, 542]
-        - [192,  545]
-        - [421,  145]
-        - [827,  149]
+        - [427, 71]
+        - [851, 65]
+        - [1221, 645]
+        - [57, 643]
       target_width: 15
-      target_height: 35
-    roi_polygon: [1264, 542, 192, 545, 421, 145, 827, 149]
+      target_height: 50
+    roi_polygon: [427, 71, 851, 65, 1221, 645, 57, 643]
     output:
       record: true
       record_path: "output/cam_04.mp4"
