@@ -41,7 +41,7 @@ cameras:
         - [1221, 645]
         - [57, 643]
       target_width: 15
-      target_height: 50
+      target_height: 35
     roi_polygon: [427, 71, 851, 65, 1221, 645, 57, 643]
     output:
       record: true
@@ -62,7 +62,7 @@ cameras:
         - [1221, 645]
         - [57, 643]
       target_width: 15
-      target_height: 50
+      target_height: 35
     roi_polygon: [427, 71, 851, 65, 1221, 645, 57, 643]
     output:
       record: true
@@ -83,7 +83,7 @@ cameras:
         - [1221, 645]
         - [57, 643]
       target_width: 15
-      target_height: 50
+      target_height: 35
     roi_polygon: [427, 71, 851, 65, 1221, 645, 57, 643]
     output:
       record: false
@@ -104,7 +104,7 @@ cameras:
         - [1221, 645]
         - [57, 643]
       target_width: 15
-      target_height: 50
+      target_height: 35
     roi_polygon: [427, 71, 851, 65, 1221, 645, 57, 643]
     output:
       record: true
