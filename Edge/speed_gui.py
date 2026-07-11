@@ -1,5 +1,18 @@
 import sys
 import os
+
+# Prepend conda lib to LD_LIBRARY_PATH so the dynamic linker resolves
+# GLib/libxcb from the conda environment before system paths.
+# Fixes ImportError("undefined symbol: g_pointer_bit_unlock_and_set")
+# and "Could not load Qt platform plugin xcb" when PyQt5 + opencv coexist.
+_conda_lib = os.path.join(os.path.dirname(sys.executable), "..", "lib")
+_conda_lib = os.path.realpath(_conda_lib)
+_curr = os.environ.get("LD_LIBRARY_PATH", "")
+if _conda_lib not in _curr.split(":"):
+    os.environ["LD_LIBRARY_PATH"] = f"{_conda_lib}:{_curr}" if _curr else _conda_lib
+    # Restart so the linker uses the updated path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
 import shlex
 import cv2
 import yaml
