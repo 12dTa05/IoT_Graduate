@@ -43,14 +43,14 @@ p2p:
 
   # ---------------------------------------------------------------------------
   # Multi-level offload (Levels 1–3 from the paper)
-  # offload_level: 0 = disabled (current behaviour)
-  #                1 = Level 1  full-stream RTSP migration (existing)
-  #                2 = Level 2  vehicle-crop offload
-  #                3 = Level 3  plate-crop offload
+  # offload_level: 0 = disabled — bypass ladder, jump straight to Level 1 only
+  #                1 = Level 1 only  (full-stream RTSP migration)
+  #                2 = Level 2 + 1   (vehicle-crop offload, then stream migration)
+  #                3 = Level 3 + 2 + 1 (full escalation ladder — plate → vehicle → stream)
   # The orchestrator escalates automatically: 3 → 2 → 1.
-  # Set offload_level: 0 to keep the system running exactly as before.
+  # Set offload_level: 0 to skip fine-grained offload and go straight to migration.
   # ---------------------------------------------------------------------------
-  offload_level: 0
+  offload_level: 3
 
   # Load thresholds that trigger each escalation step
   offload_level3_threshold: 65.0   # ≥ this load → try plate-crop offload first
