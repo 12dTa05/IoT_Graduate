@@ -896,7 +896,8 @@ function switchCluster(delta) {
 
 // ── Render: Violations ───────────────────────────────────────
 function renderViolations() {
-  VIOLATIONS_HEADER_COUNT.textContent = violations.length;
+  if (!VIOLATION_LIST) return;
+  if (VIOLATIONS_HEADER_COUNT) VIOLATIONS_HEADER_COUNT.textContent = violations.length;
 
   if (violations.length === 0) {
     VIOLATION_LIST.innerHTML = '<div class="violation-empty">No violations yet</div>';
@@ -932,6 +933,7 @@ function renderViolations() {
   }
   VIOLATION_LIST.innerHTML = html;
   VIOLATION_LIST.scrollLeft = 0;
+  // (VIOLATION_LIST null-check is at the top of this function)
 }
 
 function openModal(url) {
@@ -1115,6 +1117,7 @@ function handleWSMessage(msg) {
 }
 
 function populateNodeFilter() {
+  if (!FILTER_NODE) return;
   const nodeIds = Object.keys(edges).sort();
   const currentVal = FILTER_NODE.value;
   FILTER_NODE.innerHTML = '<option value="">All nodes</option>' +
@@ -1161,21 +1164,23 @@ function init() {
     }
   });
 
-  // Violation card click delegation
-  VIOLATION_LIST.addEventListener('click', (e) => {
-    const card = e.target.closest('.violation-card');
-    const thumb = e.target.closest('.v-thumb');
-    if (thumb) {
-      e.stopPropagation();
-      openModal(thumb.dataset.snap);
-    } else if (card) {
-      openModal(card.dataset.snap);
-    }
-  });
+  // Violation card click delegation (only if violation strip is present)
+  if (VIOLATION_LIST) {
+    VIOLATION_LIST.addEventListener('click', (e) => {
+      const card = e.target.closest('.violation-card');
+      const thumb = e.target.closest('.v-thumb');
+      if (thumb) {
+        e.stopPropagation();
+        openModal(thumb.dataset.snap);
+      } else if (card) {
+        openModal(card.dataset.snap);
+      }
+    });
+  }
 
   // Violation filters
-  FILTER_APPLY.addEventListener('click', fetchViolationHistory);
-  FILTER_DATE.value = fmtDate(new Date());
+  if (FILTER_APPLY) FILTER_APPLY.addEventListener('click', fetchViolationHistory);
+  if (FILTER_DATE) FILTER_DATE.value = fmtDate(new Date());
 
   // Modal close on Escape
   document.addEventListener('keydown', (e) => {
