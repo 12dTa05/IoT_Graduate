@@ -10,7 +10,7 @@
 #
 # Để thêm camera: copy block cam_XX, đặt enabled: true
 # Để tắt camera:  đặt enabled: false (KHÔNG xóa, hệ thống sẽ xóa luồng động)
-# Khi file này được lưu, hệ thống sẽ tự phát hiện thay đổi (<10ms qua inotify)
+# Khi file này được lưu, hệ thống sẽ tự phát hiện thay đổi (~100ms qua inotify + debounce)
 #
 # NOTE: source_points and roi_polygon are in MUX resolution (1280×720).
 # If MUX_WIDTH/MUX_HEIGHT changes, scale all coordinates by the new ratio.

@@ -195,7 +195,6 @@ def _remove_file_recording_branch(pipeline: Gst.Pipeline, source_id: int) -> Non
 def build_pipeline(
     camera_configs: list[CameraConfig],
     sink_type: str = "display",
-    max_streams: int = 4,
     mux_width: int = 1920,
     mux_height: int = 1080,
     analytics_config: str = None,

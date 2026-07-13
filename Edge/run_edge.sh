@@ -7,6 +7,12 @@
 #   ./run_edge.sh --mode rtsp_push --rtsp-push-url rtsp://host:8554/jetson_A
 #   ./run_edge.sh --load-policy predict_with_base --load-model formula
 #
+#   # Collect calibration data while the pipeline runs, then stop automatically:
+#   ./run_edge.sh --collect
+#   ./run_edge.sh --collect --collect-output logs/calibration.csv \
+#                           --collect-duration 600 \
+#                           --collect-wbase-ref 12.5
+#
 # Press Ctrl+C once to gracefully stop both processes.
 
 set -euo pipefail
@@ -18,6 +24,13 @@ PYTHON="${PYTHON:-python3}"
 MODE="${MODE:-rtsp_push}"
 LOAD_POLICY="${LOAD_POLICY:-actual}"
 LOAD_MODEL="${LOAD_MODEL:-formula}"
+
+# Collection defaults
+COLLECT=0
+COLLECT_OUTPUT="logs/calibration.csv"
+COLLECT_DURATION=600
+COLLECT_INTERVAL=2.0
+COLLECT_WBASE_REF=0.0
 
 # Parse any extra args passed to this script and forward to main.py
 EXTRA_ARGS=()
@@ -37,6 +50,42 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             LOAD_MODEL="$2"
+            shift 2
+            ;;
+        --collect)
+            COLLECT=1
+            shift
+            ;;
+        --collect-output)
+            if [[ $# -lt 2 ]]; then
+                echo "[run_edge] ERROR: --collect-output requires a value" >&2
+                exit 1
+            fi
+            COLLECT_OUTPUT="$2"
+            shift 2
+            ;;
+        --collect-duration)
+            if [[ $# -lt 2 ]]; then
+                echo "[run_edge] ERROR: --collect-duration requires a value" >&2
+                exit 1
+            fi
+            COLLECT_DURATION="$2"
+            shift 2
+            ;;
+        --collect-interval)
+            if [[ $# -lt 2 ]]; then
+                echo "[run_edge] ERROR: --collect-interval requires a value" >&2
+                exit 1
+            fi
+            COLLECT_INTERVAL="$2"
+            shift 2
+            ;;
+        --collect-wbase-ref)
+            if [[ $# -lt 2 ]]; then
+                echo "[run_edge] ERROR: --collect-wbase-ref requires a value" >&2
+                exit 1
+            fi
+            COLLECT_WBASE_REF="$2"
             shift 2
             ;;
         *)
@@ -110,7 +159,35 @@ echo "[run_edge] health_agent PID=$HEALTH_PID  |  pipeline PID=$PIPELINE_PID"
 echo "[run_edge] Press Ctrl+C to stop both."
 
 # ---------------------------------------------------------------------------
-# Wait — exit if either child dies unexpectedly
+# 3. (Optional) Start profile_collect.py and stop everything when it finishes
+# ---------------------------------------------------------------------------
+COLLECT_PID=""
+if [[ "$COLLECT" -eq 1 ]]; then
+    # Wait for the pipeline's FPS stats file to appear (written every 2s after first frame)
+    echo "[run_edge] --collect: waiting for pipeline to produce first FPS stats..."
+    WAIT_S=0
+    until [[ -f /dev/shm/speedflow_fps.json ]] || [[ $WAIT_S -ge 30 ]]; do
+        sleep 1
+        (( WAIT_S++ )) || true
+    done
+    if [[ ! -f /dev/shm/speedflow_fps.json ]]; then
+        echo "[run_edge] WARNING: FPS stats file not found after 30s — starting collector anyway."
+    fi
+
+    echo "[run_edge] Starting profile_collect.py → $COLLECT_OUTPUT  (${COLLECT_DURATION}s, interval=${COLLECT_INTERVAL}s, wbase_ref=${COLLECT_WBASE_REF})"
+    "$PYTHON" tools/profile_collect.py \
+        --output       "$COLLECT_OUTPUT" \
+        --duration     "$COLLECT_DURATION" \
+        --interval     "$COLLECT_INTERVAL" \
+        --wbase-ref    "$COLLECT_WBASE_REF" &
+    COLLECT_PID=$!
+    _pids+=("$COLLECT_PID")
+    echo "[run_edge] profile_collect PID=$COLLECT_PID"
+fi
+
+# ---------------------------------------------------------------------------
+# Wait — exit if either child dies unexpectedly;
+# if --collect is active, exit cleanly when the collector finishes.
 # ---------------------------------------------------------------------------
 while true; do
     sleep 2
@@ -123,5 +200,12 @@ while true; do
     if ! kill -0 "$PIPELINE_PID" 2>/dev/null; then
         echo "[run_edge] ERROR: pipeline exited unexpectedly. Stopping health_agent."
         exit 1
+    fi
+
+    # Collector finished → stop the pipeline gracefully
+    if [[ -n "$COLLECT_PID" ]] && ! kill -0 "$COLLECT_PID" 2>/dev/null; then
+        echo "[run_edge] Collection complete → $COLLECT_OUTPUT"
+        echo "[run_edge] Stopping pipeline and health_agent."
+        exit 0
     fi
 done

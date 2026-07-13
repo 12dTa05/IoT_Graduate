@@ -98,7 +98,6 @@ ADVERTISE_IP = os.environ.get("ADVERTISE_IP", "").strip()
 # -----------------------------------------------------------
 VIDEO_FPS   = _get("VIDEO_FPS", float)
 GPU_ID      = _get("GPU_ID", int)
-MAX_STREAMS = _get("MAX_STREAMS", int)
 MUX_WIDTH   = _get("MUX_WIDTH", int)
 MUX_HEIGHT  = _get("MUX_HEIGHT", int)
 

@@ -154,6 +154,12 @@ cat > "$SCRIPT_DIR/.env" <<EOF
 NODE_ID=$NODE_ID
 EDGE_ID=$NODE_ID
 
+# --- Load balancing experiment mode ---
+# LOAD_POLICY: actual | predict_no_base | predict_with_base
+LOAD_POLICY=actual
+# LOAD_MODEL: formula | dl
+LOAD_MODEL=formula
+
 # --- Network ---
 ADVERTISE_IP=$ADVERTISE_IP
 
@@ -162,20 +168,25 @@ MONITOR_URL=http://$SERVER_IP:9090
 
 # --- RTSP Push (→ MediaMTX on Server) ---
 RTSP_PUSH_URL=rtsp://$SERVER_IP:8554/$NODE_ID
-RTSP_PUSH_BITRATE=4000000
+# 2.5 Mbps is sufficient for 1280x720@25fps monitoring quality.
+RTSP_PUSH_BITRATE=2500000
 
 # --- Zenoh (P2P peer mode) ---
 ZENOH_QUEUE_MAXSIZE=1000
 
 # --- Health Agent ---
 HEALTH_INTERVAL=2.0
+# Log the LoadScore line once every N health cycles.
+HEALTH_LOG_EVERY=12
 TARGET_FPS=25.0
 FPS_STATS_FILE=/dev/shm/speedflow_fps.json
 
 # --- Pipeline / Video ---
 VIDEO_FPS=25.0
 GPU_ID=0
-MAX_STREAMS=4
+MAX_STREAMS=8
+# 1280x720: each tile is 640x360 at 4-cam tiling — saves ~44% GPU memory
+# bandwidth and ~30% encoder bitrate vs 1920x1080.
 MUX_WIDTH=1920
 MUX_HEIGHT=1080
 
@@ -191,7 +202,9 @@ TRACKER_LIB=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.s
 
 # --- Detection / Speed thresholds ---
 SPEED_LIMIT_KMH=80.0
-JPEG_QUALITY=100
+# 82 is visually indistinguishable from 100 for license plate images
+# but produces files ~3-4x smaller — critical for WS bandwidth on violations.
+JPEG_QUALITY=82
 MAX_SNAPSHOT_PER_ID=1
 MIN_WORLD_DISPL_M=0.5
 MAX_ABS_KMH=160.0
@@ -211,10 +224,9 @@ ok ".env written for $NODE_ID"
 CAMERAS_YML="$SCRIPT_DIR/configs/cameras.yml"
 if [ -f "$CAMERAS_YML" ]; then
     info "Updating camera URIs to point to $ADVERTISE_IP…"
-    # cam_01 + cam_02 use this node's local RTSP server
+    # Update all four camera URIs to this node's local RTSP server
     sed -i "s|uri: \"rtsp://192\.168\.212\.[0-9]*:8554/cam1\"|uri: \"rtsp://$ADVERTISE_IP:8554/cam1\"|" "$CAMERAS_YML"
     sed -i "s|uri: \"rtsp://192\.168\.212\.[0-9]*:8554/cam2\"|uri: \"rtsp://$ADVERTISE_IP:8554/cam2\"|" "$CAMERAS_YML"
-    ok "cameras.yml updated for $NODE_ID"
 fi
 
 # ──────────────────────────────────────────────────────────────
