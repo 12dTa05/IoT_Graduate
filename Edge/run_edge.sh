@@ -1,19 +1,30 @@
 #!/usr/bin/env bash
 # run_edge.sh — Start health_agent + pipeline in a single command.
 #
-# Usage:
+# Normal usage:
 #   ./run_edge.sh                        # rtsp_push mode (default)
-#   ./run_edge.sh --mode display         # display mode
+#   ./run_edge.sh --mode display
 #   ./run_edge.sh --mode rtsp_push --rtsp-push-url rtsp://host:8554/jetson_A
 #   ./run_edge.sh --load-policy predict_with_base --load-model formula
 #
-#   # Collect calibration data while the pipeline runs, then stop automatically:
+# Collect calibration data while the pipeline runs, then stop automatically:
 #   ./run_edge.sh --collect
 #   ./run_edge.sh --collect --collect-output logs/calibration.csv \
 #                           --collect-duration 600 \
 #                           --collect-wbase-ref 12.5
 #
-# Press Ctrl+C once to gracefully stop both processes.
+# Full 6-step automated calibration pipeline (wbase → collect → fit/train → plot):
+#   ./run_edge.sh --calibrate
+#   ./run_edge.sh --calibrate --load-model dl \
+#                             --collect-duration 1200 \
+#                             --collect-output logs/calibration.csv \
+#                             --wbase-output   logs/wbase.txt \
+#                             --wbase-duration 60 \
+#                             --model-output   models/load_predictor.onnx \
+#                             --plot-rmse      logs/chart1_rmse.png \
+#                             --plot-burst     logs/chart2_burst.png
+#
+# Press Ctrl+C once to gracefully stop all processes.
 
 set -euo pipefail
 
@@ -25,73 +36,64 @@ MODE="${MODE:-rtsp_push}"
 LOAD_POLICY="${LOAD_POLICY:-actual}"
 LOAD_MODEL="${LOAD_MODEL:-formula}"
 
-# Collection defaults
+# --collect defaults
 COLLECT=0
 COLLECT_OUTPUT="logs/calibration.csv"
 COLLECT_DURATION=600
 COLLECT_INTERVAL=2.0
 COLLECT_WBASE_REF=0.0
 
-# Parse any extra args passed to this script and forward to main.py
+# --calibrate defaults (superset of --collect)
+CALIBRATE=0
+WBASE_OUTPUT="logs/wbase.txt"
+WBASE_DURATION=60
+MODEL_OUTPUT="models/load_predictor.onnx"
+PLOT_RMSE="logs/chart1_rmse.png"
+PLOT_BURST="logs/chart2_burst.png"
+
+# Parse args — collect/calibrate flags consumed here; rest forwarded to main.py
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --load-policy)
-            if [[ $# -lt 2 ]]; then
-                echo "[run_edge] ERROR: --load-policy requires a value" >&2
-                exit 1
-            fi
-            LOAD_POLICY="$2"
-            shift 2
-            ;;
+            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --load-policy requires a value" >&2; exit 1; }
+            LOAD_POLICY="$2"; shift 2 ;;
         --load-model)
-            if [[ $# -lt 2 ]]; then
-                echo "[run_edge] ERROR: --load-model requires a value" >&2
-                exit 1
-            fi
-            LOAD_MODEL="$2"
-            shift 2
-            ;;
+            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --load-model requires a value" >&2; exit 1; }
+            LOAD_MODEL="$2"; shift 2 ;;
         --collect)
-            COLLECT=1
-            shift
-            ;;
+            COLLECT=1; shift ;;
+        --calibrate)
+            CALIBRATE=1; COLLECT=1; shift ;;
         --collect-output)
-            if [[ $# -lt 2 ]]; then
-                echo "[run_edge] ERROR: --collect-output requires a value" >&2
-                exit 1
-            fi
-            COLLECT_OUTPUT="$2"
-            shift 2
-            ;;
+            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --collect-output requires a value" >&2; exit 1; }
+            COLLECT_OUTPUT="$2"; shift 2 ;;
         --collect-duration)
-            if [[ $# -lt 2 ]]; then
-                echo "[run_edge] ERROR: --collect-duration requires a value" >&2
-                exit 1
-            fi
-            COLLECT_DURATION="$2"
-            shift 2
-            ;;
+            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --collect-duration requires a value" >&2; exit 1; }
+            COLLECT_DURATION="$2"; shift 2 ;;
         --collect-interval)
-            if [[ $# -lt 2 ]]; then
-                echo "[run_edge] ERROR: --collect-interval requires a value" >&2
-                exit 1
-            fi
-            COLLECT_INTERVAL="$2"
-            shift 2
-            ;;
+            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --collect-interval requires a value" >&2; exit 1; }
+            COLLECT_INTERVAL="$2"; shift 2 ;;
         --collect-wbase-ref)
-            if [[ $# -lt 2 ]]; then
-                echo "[run_edge] ERROR: --collect-wbase-ref requires a value" >&2
-                exit 1
-            fi
-            COLLECT_WBASE_REF="$2"
-            shift 2
-            ;;
+            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --collect-wbase-ref requires a value" >&2; exit 1; }
+            COLLECT_WBASE_REF="$2"; shift 2 ;;
+        --wbase-output)
+            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --wbase-output requires a value" >&2; exit 1; }
+            WBASE_OUTPUT="$2"; shift 2 ;;
+        --wbase-duration)
+            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --wbase-duration requires a value" >&2; exit 1; }
+            WBASE_DURATION="$2"; shift 2 ;;
+        --model-output)
+            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --model-output requires a value" >&2; exit 1; }
+            MODEL_OUTPUT="$2"; shift 2 ;;
+        --plot-rmse)
+            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --plot-rmse requires a value" >&2; exit 1; }
+            PLOT_RMSE="$2"; shift 2 ;;
+        --plot-burst)
+            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --plot-burst requires a value" >&2; exit 1; }
+            PLOT_BURST="$2"; shift 2 ;;
         *)
-            EXTRA_ARGS+=("$1")
-            shift
-            ;;
+            EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
 
@@ -99,23 +101,21 @@ case "$LOAD_POLICY" in
     actual|predict_no_base|predict_with_base) ;;
     *)
         echo "[run_edge] ERROR: LOAD_POLICY must be: actual | predict_no_base | predict_with_base" >&2
-        exit 1
-        ;;
+        exit 1 ;;
 esac
 
 case "$LOAD_MODEL" in
     formula|dl) ;;
     *)
         echo "[run_edge] ERROR: LOAD_MODEL must be: formula | dl" >&2
-        exit 1
-        ;;
+        exit 1 ;;
 esac
 
 export LOAD_POLICY LOAD_MODEL
 echo "[run_edge] LOAD_POLICY=$LOAD_POLICY  LOAD_MODEL=$LOAD_MODEL"
 
 # ---------------------------------------------------------------------------
-# Cleanup: kill both child processes on Ctrl+C / EXIT
+# Cleanup: kill all tracked child processes on Ctrl+C / EXIT
 # ---------------------------------------------------------------------------
 _pids=()
 _cleanup() {
@@ -129,42 +129,66 @@ _cleanup() {
 }
 trap _cleanup EXIT INT TERM
 
-# ---------------------------------------------------------------------------
-# 1. Start health_agent (WebSocket + Zenoh + metrics)
-# ---------------------------------------------------------------------------
-echo "[run_edge] Starting health_agent.py ..."
+# ===========================================================================
+# STEP 1 (--calibrate only): Measure W_base — idle GPU load, no pipeline
+# ===========================================================================
+if [[ "$CALIBRATE" -eq 1 ]]; then
+    echo ""
+    echo "[run_edge] ── STEP 1/6: Measuring W_base (${WBASE_DURATION}s, no pipeline) ──"
+    mkdir -p "$(dirname "$WBASE_OUTPUT")"
+    "$PYTHON" tools/profile_collect.py \
+        --wbase \
+        --wbase-duration  "$WBASE_DURATION" \
+        --wbase-output    "$WBASE_OUTPUT"
+
+    # Read the measured value and use it as wbase-ref for collection
+    if [[ -f "$WBASE_OUTPUT" ]]; then
+        COLLECT_WBASE_REF="$(grep -oP '[\d.]+' "$WBASE_OUTPUT" | head -1)"
+        echo "[run_edge] W_base = ${COLLECT_WBASE_REF}% GPU  (saved to $WBASE_OUTPUT)"
+    else
+        echo "[run_edge] WARNING: wbase output not found, using COLLECT_WBASE_REF=${COLLECT_WBASE_REF}"
+    fi
+fi
+
+# ===========================================================================
+# STEP 2: Start health_agent (WebSocket + Zenoh + metrics)
+# ===========================================================================
+_STEP2_LABEL="STEP 2"
+[[ "$CALIBRATE" -eq 1 ]] && _STEP2_LABEL="STEP 2/6"
+echo ""
+echo "[run_edge] ── ${_STEP2_LABEL}: Starting health_agent.py ──"
 "$PYTHON" health_agent.py &
 _pids+=($!)
 HEALTH_PID=${_pids[-1]}
 
-# Give health_agent time to connect to Zenoh and the server before the
-# pipeline starts publishing events — avoids the first few events being
-# dropped because the subscriber isn't ready yet.
+# Give health_agent time to connect to Zenoh and the monitoring server
 sleep 2
 
-# ---------------------------------------------------------------------------
-# 2. Start main.py pipeline
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# STEP 3: Start main.py pipeline
+# ===========================================================================
+_STEP3_LABEL="STEP 3"
+[[ "$CALIBRATE" -eq 1 ]] && _STEP3_LABEL="STEP 3/6"
+echo "[run_edge] ── ${_STEP3_LABEL}: Starting pipeline (mode=$MODE) ──"
 if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
-    echo "[run_edge] Starting main.py --mode $MODE ..."
     "$PYTHON" main.py --mode "$MODE" &
 else
-    echo "[run_edge] Starting main.py ${EXTRA_ARGS[*]} ..."
     "$PYTHON" main.py "${EXTRA_ARGS[@]}" &
 fi
 _pids+=($!)
 PIPELINE_PID=${_pids[-1]}
-
 echo "[run_edge] health_agent PID=$HEALTH_PID  |  pipeline PID=$PIPELINE_PID"
-echo "[run_edge] Press Ctrl+C to stop both."
 
-# ---------------------------------------------------------------------------
-# 3. (Optional) Start profile_collect.py and stop everything when it finishes
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# STEP 4 (--collect / --calibrate): Run profile_collect.py alongside pipeline
+# ===========================================================================
 COLLECT_PID=""
 if [[ "$COLLECT" -eq 1 ]]; then
-    # Wait for the pipeline's FPS stats file to appear (written every 2s after first frame)
-    echo "[run_edge] --collect: waiting for pipeline to produce first FPS stats..."
+    _STEP4_LABEL="STEP 4"
+    [[ "$CALIBRATE" -eq 1 ]] && _STEP4_LABEL="STEP 4/6"
+    echo ""
+    echo "[run_edge] ── ${_STEP4_LABEL}: Waiting for pipeline FPS stats before collecting... ──"
+
     WAIT_S=0
     until [[ -f /dev/shm/speedflow_fps.json ]] || [[ $WAIT_S -ge 30 ]]; do
         sleep 1
@@ -174,38 +198,134 @@ if [[ "$COLLECT" -eq 1 ]]; then
         echo "[run_edge] WARNING: FPS stats file not found after 30s — starting collector anyway."
     fi
 
-    echo "[run_edge] Starting profile_collect.py → $COLLECT_OUTPUT  (${COLLECT_DURATION}s, interval=${COLLECT_INTERVAL}s, wbase_ref=${COLLECT_WBASE_REF})"
+    mkdir -p "$(dirname "$COLLECT_OUTPUT")"
+    echo "[run_edge] Collecting → $COLLECT_OUTPUT  (${COLLECT_DURATION}s, interval=${COLLECT_INTERVAL}s, wbase_ref=${COLLECT_WBASE_REF})"
     "$PYTHON" tools/profile_collect.py \
-        --output       "$COLLECT_OUTPUT" \
-        --duration     "$COLLECT_DURATION" \
-        --interval     "$COLLECT_INTERVAL" \
-        --wbase-ref    "$COLLECT_WBASE_REF" &
+        --output    "$COLLECT_OUTPUT" \
+        --duration  "$COLLECT_DURATION" \
+        --interval  "$COLLECT_INTERVAL" \
+        --wbase-ref "$COLLECT_WBASE_REF" &
     COLLECT_PID=$!
     _pids+=("$COLLECT_PID")
     echo "[run_edge] profile_collect PID=$COLLECT_PID"
+
+    if [[ "$CALIBRATE" -ne 1 ]]; then
+        echo "[run_edge] Press Ctrl+C to stop early. Pipeline stops automatically when collection ends."
+    else
+        echo "[run_edge] Pipeline stops automatically when collection ends, then fit+plot will run."
+    fi
+else
+    echo "[run_edge] Press Ctrl+C to stop."
 fi
 
 # ---------------------------------------------------------------------------
-# Wait — exit if either child dies unexpectedly;
-# if --collect is active, exit cleanly when the collector finishes.
+# Watch loop — exits when collector finishes (collect/calibrate), or on error
 # ---------------------------------------------------------------------------
 while true; do
     sleep 2
 
     if ! kill -0 "$HEALTH_PID" 2>/dev/null; then
-        echo "[run_edge] ERROR: health_agent exited unexpectedly. Stopping pipeline."
+        echo "[run_edge] ERROR: health_agent exited unexpectedly. Stopping pipeline." >&2
         exit 1
     fi
 
     if ! kill -0 "$PIPELINE_PID" 2>/dev/null; then
-        echo "[run_edge] ERROR: pipeline exited unexpectedly. Stopping health_agent."
+        echo "[run_edge] ERROR: pipeline exited unexpectedly. Stopping health_agent." >&2
         exit 1
     fi
 
-    # Collector finished → stop the pipeline gracefully
     if [[ -n "$COLLECT_PID" ]] && ! kill -0 "$COLLECT_PID" 2>/dev/null; then
         echo "[run_edge] Collection complete → $COLLECT_OUTPUT"
-        echo "[run_edge] Stopping pipeline and health_agent."
-        exit 0
+        echo "[run_edge] Stopping pipeline and health_agent..."
+        # Stop pipeline and health_agent (trap will also fire, but be explicit)
+        kill "$PIPELINE_PID" 2>/dev/null || true
+        kill "$HEALTH_PID"   2>/dev/null || true
+        wait "$PIPELINE_PID" 2>/dev/null || true
+        wait "$HEALTH_PID"   2>/dev/null || true
+        # Remove from _pids so _cleanup doesn't double-kill
+        _pids=()
+        break
     fi
 done
+
+# ===========================================================================
+# STEP 5 (--calibrate only): Fit coefficients or train DL model
+# ===========================================================================
+if [[ "$CALIBRATE" -eq 1 ]]; then
+    echo ""
+    echo "[run_edge] ── STEP 5/6: Fitting model (LOAD_MODEL=$LOAD_MODEL) ──"
+
+    if [[ "$LOAD_MODEL" == "formula" ]]; then
+        # Determine target based on policy
+        if [[ "$LOAD_POLICY" == "predict_no_base" ]]; then
+            FIT_TARGET="delta_load"
+        else
+            FIT_TARGET="gpu_percent"
+        fi
+        echo "[run_edge] Running fit_coefficients.py (target=$FIT_TARGET, wbase=${COLLECT_WBASE_REF})"
+        "$PYTHON" tools/fit_coefficients.py \
+            --csv    "$COLLECT_OUTPUT" \
+            --wbase  "$COLLECT_WBASE_REF" \
+            --target "$FIT_TARGET" \
+            --output configs/edge_node.yml
+        echo "[run_edge] Coefficients written to configs/edge_node.yml"
+        echo "[run_edge] ACTION REQUIRED: set 'enabled: true' in configs/edge_node.yml → proactive: section, then restart."
+
+    else
+        # DL model
+        if [[ "$LOAD_POLICY" == "predict_no_base" ]]; then
+            DL_TARGET="delta_load"
+        else
+            DL_TARGET="gpu_percent"
+        fi
+        HORIZON_ROWS=$(python3 -c "import math; print(max(1, round(10 / ${COLLECT_INTERVAL})))")
+        echo "[run_edge] Running train_dl_model.py (target=$DL_TARGET, window_k=5, horizon_rows=${HORIZON_ROWS})"
+        mkdir -p "$(dirname "$MODEL_OUTPUT")"
+        "$PYTHON" tools/train_dl_model.py \
+            --csv          "$COLLECT_OUTPUT" \
+            --target       "$DL_TARGET" \
+            --window-k     5 \
+            --horizon-rows "$HORIZON_ROWS" \
+            --epochs       200 \
+            --output       "$MODEL_OUTPUT"
+        echo "[run_edge] ONNX model written to $MODEL_OUTPUT"
+        echo "[run_edge] ACTION REQUIRED: set 'enabled: true' in configs/edge_node.yml → proactive: section, then restart."
+    fi
+
+    # ===========================================================================
+    # STEP 6 (--calibrate only): Plot RMSE and burst charts
+    # ===========================================================================
+    echo ""
+    echo "[run_edge] ── STEP 6/6: Generating validation plots ──"
+
+    mkdir -p "$(dirname "$PLOT_RMSE")"
+    echo "[run_edge] plot_rmse.py → $PLOT_RMSE"
+    "$PYTHON" tools/plot_rmse.py \
+        --csv   "$COLLECT_OUTPUT" \
+        --cfg   configs/edge_node.yml \
+        --wbase "$COLLECT_WBASE_REF" \
+        --out   "$PLOT_RMSE" || echo "[run_edge] WARNING: plot_rmse.py failed (matplotlib missing?)"
+
+    mkdir -p "$(dirname "$PLOT_BURST")"
+    echo "[run_edge] plot_burst.py → $PLOT_BURST"
+    "$PYTHON" tools/plot_burst.py \
+        --csv   "$COLLECT_OUTPUT" \
+        --cfg   configs/edge_node.yml \
+        --wbase "$COLLECT_WBASE_REF" \
+        --out   "$PLOT_BURST" || echo "[run_edge] WARNING: plot_burst.py failed (matplotlib missing?)"
+
+    echo ""
+    echo "[run_edge] ══ Calibration complete ══"
+    echo "[run_edge]   W_base measurement : $WBASE_OUTPUT"
+    echo "[run_edge]   Calibration CSV    : $COLLECT_OUTPUT"
+    if [[ "$LOAD_MODEL" == "formula" ]]; then
+        echo "[run_edge]   Fitted coefficients: configs/edge_node.yml (proactive: section)"
+    else
+        echo "[run_edge]   ONNX model          : $MODEL_OUTPUT"
+    fi
+    echo "[run_edge]   RMSE chart         : $PLOT_RMSE"
+    echo "[run_edge]   Burst chart        : $PLOT_BURST"
+    echo ""
+    echo "[run_edge]   Next: edit configs/edge_node.yml, set proactive.enabled: true, then run:"
+    echo "[run_edge]   ./run_edge.sh --load-policy ${LOAD_POLICY} --load-model ${LOAD_MODEL}"
+fi
