@@ -1,6 +1,6 @@
 #!/bin/bash
 
-CAMERA_COUNT=${1:-3}
+CAMERA_COUNT=${1:-2}
 
 cat > docker-compose.yml <<EOF
 services:
