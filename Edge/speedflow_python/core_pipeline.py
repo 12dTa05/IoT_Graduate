@@ -295,6 +295,12 @@ def build_pipeline(
 
     elif sink_type == "rtsp_push":
         conv = make_element("conv", "nvvideoconvert")
+        scale_caps = make_element("scale_caps", "capsfilter")
+        scale_caps.set_property(
+            "caps", Gst.Caps.from_string(
+                "video/x-raw(memory:NVMM), format=NV12, width=1280, height=720"
+            )
+        )
         enc = make_element("enc", "nvv4l2h264enc")
         enc.set_property("insert-sps-pps", True)
         enc.set_property("iframeinterval", 30)
@@ -308,7 +314,7 @@ def build_pipeline(
         sink.set_property("location", kwargs["rtsp_push_url"])
         sink.set_property("protocols", "tcp")
         sink.set_property("latency", 0)
-        sink_elements = [conv, enc, parse, sink]
+        sink_elements = [conv, scale_caps, enc, parse, sink]
 
     elif sink_type == "file":
         # ── Demuxer ──
@@ -350,8 +356,8 @@ def build_pipeline(
         gst_link(nvdsosd, conv, conv_caps, eglT, sink)
 
     elif sink_type == "rtsp_push":
-        conv, enc, parse, sink = sink_elements
-        gst_link(nvdsosd, conv, enc, parse, sink)
+        conv, scale_caps, enc, parse, sink = sink_elements
+        gst_link(nvdsosd, conv, scale_caps, enc, parse, sink)
 
     elif sink_type == "file":
         # Connect OSD to Demux

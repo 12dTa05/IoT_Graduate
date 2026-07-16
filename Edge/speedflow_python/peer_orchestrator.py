@@ -288,6 +288,40 @@ class PeerOrchestrator:
         if pub:
             pub.put(payload)
 
+    def update_self_state(self, payload: dict) -> None:
+        """Update this node's local state without publishing a Zenoh heartbeat.
+
+        The standalone health_agent.py is the single publisher for
+        peers/status/<node_id>.  The pipeline process still needs a fresh
+        _self_state for local offload/migration decisions, so the internal
+        health loop calls this method directly instead of publishing a second
+        heartbeat for the same NODE_ID.
+        """
+        with self._self_lock:
+            self._self_state.load_score  = payload.get("load_score",  0.0)
+            self._self_state.gpu_percent = payload.get("gpu_percent", 0.0)
+            self._self_state.cpu_percent = payload.get("cpu_percent", 0.0)
+            self._self_state.ram_percent = payload.get("ram_percent", 0.0)
+            self._self_state.gpu_temp_c  = payload.get("gpu_temp_c",  0.0)
+            self._self_state.risk_index  = payload.get("risk_index",  0.0)
+
+            pipeline = payload.get("pipeline", {})
+            self._self_state.avg_fps = pipeline.get("avg_fps")
+            self._self_state.fps_per_camera = pipeline.get("fps_per_camera", {})
+            self._self_state.active_cameras = list(pipeline.get("active_cameras", []))
+            self._self_state.camera_configs = pipeline.get("camera_configs", {})
+            self._self_state.last_seen = time.time()
+
+            overloaded = self._is_overloaded(
+                self._self_state.load_score, self._self_state.risk_index
+            )
+            if overloaded:
+                if self._self_state.overload_since is None:
+                    self._self_state.overload_since = time.time()
+                self._reclaim_eligible_since = None
+            else:
+                self._self_state.overload_since = None
+
     def get_offload_level(self, camera_id: str) -> int:
         """
         Return the current offload level for camera_id (0–3).

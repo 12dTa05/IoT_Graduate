@@ -4,8 +4,8 @@
 Edge/logs
 Edge/__pycache__
 Edge/speedflow_python/__pycache__
-
-tools/traffic_generator/__pycache__
+Edge/speedflow_python/tests/__pycache__
+Edge/tools/__pycache__
 
 Server/__pycache__
 

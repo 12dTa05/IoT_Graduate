@@ -267,6 +267,37 @@ class HealthAgent:
         # Proactive load model — instantiated lazily in _run so that
         # edge_node.yml is read after the process fully starts.
         self._proactive_model = None
+        self._cam_configs_cache: Dict[str, dict] = {}
+        self._last_cfg_reload = 0.0
+
+    def _reload_cam_configs(self) -> Dict[str, dict]:
+        """Read cameras.yml for peer failover metadata in health payloads."""
+        try:
+            import yaml
+
+            cam_yml = Path(__file__).resolve().parent / "configs" / "cameras.yml"
+            with open(cam_yml, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f) or {}
+
+            result: Dict[str, dict] = {}
+            for cam_id, cfg in raw.get("cameras", {}).items():
+                if cfg and cfg.get("enabled", True):
+                    result[cam_id] = {
+                        "camera_id":       cam_id,
+                        "source_id":       int(cfg.get("source_id", 0)),
+                        "uri":             cfg.get("uri", ""),
+                        "name":            cfg.get("name", cam_id),
+                        "fps":             float(cfg.get("fps", 25.0)),
+                        "speed_limit_kmh": float(cfg.get("speed_limit_kmh", 80.0)),
+                        "homography":      cfg.get("homography", {}),
+                        "roi_polygon":     cfg.get("roi_polygon", []),
+                        "output":          cfg.get("output", {}),
+                    }
+            self._cam_configs_cache = result
+            return result
+        except Exception as exc:
+            logger.warning("[HealthAgent] Failed to reload camera configs: %s", exc)
+            return self._cam_configs_cache
 
     def start(self) -> None:
         """Start agent in daemon thread."""
@@ -524,9 +555,20 @@ class HealthAgent:
         _zenoh_retry_interval = 30.0  # seconds between Zenoh reconnect attempts
         _last_zenoh_attempt = time.time()
         _log_cycle = 0  # counts health cycles; log LoadScore every HEALTH_LOG_EVERY
+        _cfg_reload_interval = 30.0
+        self._last_cfg_reload = 0.0
 
         while self._running:
             try:
+                if time.monotonic() - self._last_cfg_reload >= _cfg_reload_interval:
+                    _maybe_reload_edge_cfg()
+                    if self._proactive_model is not None:
+                        self._proactive_model.reload_cfg(
+                            get_edge_cfg().get("proactive", {})
+                        )
+                    self._reload_cam_configs()
+                    self._last_cfg_reload = time.monotonic()
+
                 # Periodically retry Zenoh if the session is not established
                 if self._session is None:
                     if time.time() - _last_zenoh_attempt >= _zenoh_retry_interval:
@@ -573,6 +615,8 @@ class HealthAgent:
                         # BUG-15 fix: only include cameras actively producing
                         # frames — 0-FPS entries are stale/removed cameras.
                         "active_cameras": [k for k, v in fps_stats.items() if v > 0.0],
+                        # Used by peers for failover ADD commands when this node dies.
+                        "camera_configs": self._cam_configs_cache,
                     },
                 }
 

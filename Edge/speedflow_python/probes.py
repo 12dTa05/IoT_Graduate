@@ -833,7 +833,8 @@ class SpeedProbe:
             # ── Pass 3: Speed & OSD display ───────────────────────────────
             fps_int = int(cam_cfg.fps)
 
-            # Level 2: send full vehicle crops to peer; skip local speed/plate display
+            # Level 2: send full vehicle crops to peer for LPD/LPR, while the
+            # origin node keeps local speed/event processing below.
             if offload_level == 2 and self._offload_pub is not None and offload_target:
                 try:
                     frame_bgr_l2 = self._get_frame_bgr_cached(
@@ -856,8 +857,8 @@ class SpeedProbe:
                         "[SpeedProbe] L2 vehicle crop offload error for camera=%s frame=%s: %s",
                         cam_cfg.camera_id, frame_number, exc, exc_info=True,
                     )
-                l_frame = l_frame.next
-                continue   # skip local speed compute for this frame
+                # Fall through to Pass 3 so the origin node keeps speed history,
+                # OSD, and overspeed events while the peer handles LPD/LPR.
 
             for tid, veh_info in vehicles_in_frame.items():
                 stid     = (source_id, tid)
