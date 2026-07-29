@@ -78,8 +78,8 @@ load_score:
   stream_bandwidth_threshold: 3   # active_cameras ≥ this → use bandwidth preset
 
   #[w_gpu, w_cpu, w_ram]
-  weights_normal:    [0.3, 0.3, 0.4]
-  weights_bandwidth: [0.2, 0.3, 0.5]
+  weights_normal:    [0.6, 0.25, 0.15]
+  weights_bandwidth: [0.55, 0.25, 0.20]
 
   # FPS-drop penalty cap (additive points on top of weighted hardware score)
   fps_penalty_max: 25.0
