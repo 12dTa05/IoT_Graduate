@@ -24,6 +24,13 @@
 #                             --plot-rmse      logs/chart1_rmse.png \
 #                             --plot-burst     logs/chart2_burst.png
 #
+# Train DL model from pre-collected multi-case CSVs (no pipeline):
+#   ./run_edge.sh --train-dataset csv_collected
+#   ./run_edge.sh --train-dataset csv_collected \
+#                 --model-output   models/load_predictor.onnx \
+#                 --collect-interval 2.0 \
+#                 --load-policy    predict_with_base
+#
 # Press Ctrl+C once to gracefully stop all processes.
 
 set -euo pipefail
@@ -50,6 +57,9 @@ WBASE_DURATION=60
 MODEL_OUTPUT="models/load_predictor.onnx"
 PLOT_RMSE="logs/chart1_rmse.png"
 PLOT_BURST="logs/chart2_burst.png"
+
+# --train-dataset (multi-case DL training, no pipeline)
+TRAIN_DATASET=""
 
 # Parse args — collect/calibrate flags consumed here; rest forwarded to main.py
 EXTRA_ARGS=()
@@ -92,10 +102,66 @@ while [[ $# -gt 0 ]]; do
         --plot-burst)
             [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --plot-burst requires a value" >&2; exit 1; }
             PLOT_BURST="$2"; shift 2 ;;
+        --train-dataset)
+            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --train-dataset requires a directory" >&2; exit 1; }
+            TRAIN_DATASET="$2"; shift 2 ;;
         *)
             EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
+
+# ===========================================================================
+# --train-dataset: clean + train DL model from pre-collected CSVs, then exit
+# ===========================================================================
+if [[ -n "$TRAIN_DATASET" ]]; then
+    if [[ ! -d "$TRAIN_DATASET" ]]; then
+        echo "[run_edge] ERROR: --train-dataset not a directory: $TRAIN_DATASET" >&2
+        exit 1
+    fi
+    if [[ "$LOAD_MODEL" != "dl" ]]; then
+        echo "[run_edge] ERROR: --train-dataset requires --load-model dl (got: $LOAD_MODEL)" >&2
+        exit 1
+    fi
+
+    CLEANED_DIR="logs/cleaned"
+    echo "[run_edge] ── Cleaning CSVs: $TRAIN_DATASET → $CLEANED_DIR ──"
+    rm -rf "$CLEANED_DIR"
+    "$PYTHON" tools/clean_collected_csvs.py \
+        --input-dir  "$TRAIN_DATASET" \
+        --output-dir "$CLEANED_DIR"
+    TRAIN_CSV="$CLEANED_DIR/load_prediction_clean.csv"
+    if [[ ! -f "$TRAIN_CSV" ]]; then
+        echo "[run_edge] ERROR: cleaning produced no $TRAIN_CSV" >&2
+        exit 1
+    fi
+
+    HORIZON_ROWS=$(python3 -c "import math; print(max(1, round(10 / ${COLLECT_INTERVAL})))")
+    if [[ "$LOAD_POLICY" == "predict_no_base" ]]; then
+        echo "[run_edge] Running train_dl_model.py (target=delta_load, window_k=5, horizon_rows=$HORIZON_ROWS)"
+        mkdir -p "$(dirname "$MODEL_OUTPUT")"
+        "$PYTHON" tools/train_dl_model.py \
+            --csv          "$TRAIN_CSV" \
+            --target       delta_load \
+            --window-k     5 \
+            --horizon-rows "$HORIZON_ROWS" \
+            --epochs       200 \
+            --output       "$MODEL_OUTPUT"
+    else
+        echo "[run_edge] Running train_dl_model.py (target=<auto>, window_k=5, horizon_rows=$HORIZON_ROWS)"
+        mkdir -p "$(dirname "$MODEL_OUTPUT")"
+        "$PYTHON" tools/train_dl_model.py \
+            --csv          "$TRAIN_CSV" \
+            --window-k     5 \
+            --horizon-rows "$HORIZON_ROWS" \
+            --epochs       200 \
+            --output       "$MODEL_OUTPUT"
+    fi
+    echo "[run_edge] ONNX model written to $MODEL_OUTPUT"
+    echo "[run_edge] ACTION REQUIRED: set 'enabled: true' in configs/edge_node.yml → proactive: section, then restart."
+    exit 0
+fi
+
+# --- Normal pipeline path below this point ---
 
 case "$LOAD_POLICY" in
     actual|predict_no_base|predict_with_base) ;;
@@ -273,21 +339,31 @@ if [[ "$CALIBRATE" -eq 1 ]]; then
 
     else
         # DL model
-        if [[ "$LOAD_POLICY" == "predict_no_base" ]]; then
-            DL_TARGET="delta_load"
-        else
-            DL_TARGET="gpu_percent"
-        fi
         HORIZON_ROWS=$(python3 -c "import math; print(max(1, round(10 / ${COLLECT_INTERVAL})))")
-        echo "[run_edge] Running train_dl_model.py (target=$DL_TARGET, window_k=5, horizon_rows=${HORIZON_ROWS})"
-        mkdir -p "$(dirname "$MODEL_OUTPUT")"
-        "$PYTHON" tools/train_dl_model.py \
-            --csv          "$COLLECT_OUTPUT" \
-            --target       "$DL_TARGET" \
-            --window-k     5 \
-            --horizon-rows "$HORIZON_ROWS" \
-            --epochs       200 \
-            --output       "$MODEL_OUTPUT"
+        if [[ "$LOAD_POLICY" == "predict_no_base" ]]; then
+            # predict_no_base trains on delta_load explicitly
+            echo "[run_edge] Running train_dl_model.py (target=delta_load, window_k=5, horizon_rows=${HORIZON_ROWS})"
+            mkdir -p "$(dirname "$MODEL_OUTPUT")"
+            "$PYTHON" tools/train_dl_model.py \
+                --csv          "$COLLECT_OUTPUT" \
+                --target       delta_load \
+                --window-k     5 \
+                --horizon-rows "$HORIZON_ROWS" \
+                --epochs       200 \
+                --output       "$MODEL_OUTPUT"
+        else
+            # predict_with_base / actual: let train_dl_model pick its canonical
+            # load_score target (load_score_smoothed → load_score_raw → load_score
+            # → actual_load → gpu_percent); do NOT force --target gpu_percent.
+            echo "[run_edge] Running train_dl_model.py (target=<auto>, window_k=5, horizon_rows=${HORIZON_ROWS})"
+            mkdir -p "$(dirname "$MODEL_OUTPUT")"
+            "$PYTHON" tools/train_dl_model.py \
+                --csv          "$COLLECT_OUTPUT" \
+                --window-k     5 \
+                --horizon-rows "$HORIZON_ROWS" \
+                --epochs       200 \
+                --output       "$MODEL_OUTPUT"
+        fi
         echo "[run_edge] ONNX model written to $MODEL_OUTPUT"
         echo "[run_edge] ACTION REQUIRED: set 'enabled: true' in configs/edge_node.yml → proactive: section, then restart."
     fi

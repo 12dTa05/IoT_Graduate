@@ -628,8 +628,12 @@ class HealthAgent:
                 # The legacy load_score is always present for backward-compat
                 # (reactive baseline used in Chart 2 comparison).
                 if self._proactive_model is not None:
+                    # Filter to cameras with fps > 0 — matches collector's
+                    # n_active_cameras definition in profile_collect.py.
+                    _active_ids = {k for k, v in fps_stats.items() if v > 0.0}
                     proactive_result = self._proactive_model.compute(
-                        metrics, feature_stats
+                        metrics,
+                        {k: v for k, v in feature_stats.items() if k in _active_ids},
                     )
                     payload.update(proactive_result)
 

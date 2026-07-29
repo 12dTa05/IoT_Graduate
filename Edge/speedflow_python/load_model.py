@@ -194,7 +194,17 @@ def compute_l_proactive(
 
 
 class DLPredictor:
-    """Small ONNX time-series predictor using 3 traffic features."""
+    """Small ONNX time-series predictor using 4 node-level traffic features.
+
+    Features (must match train_dl_model.py FEATURE_COLS order):
+        n_active_cameras        — sources with fps > 0 at sample time
+        n_track_total           — total tracked vehicles across all cameras
+        n_plate_total           — total plate detections across all cameras
+        stationary_fraction_mean — mean stationary fraction across all cameras
+    """
+
+    # Canonical feature order — must match train_dl_model.py FEATURE_COLS
+    _N_FEATURES = 4
 
     def __init__(self, dl_cfg: dict, edge_root: Optional[Path] = None) -> None:
         self._window_k = max(1, int(dl_cfg.get("window_k", 5)))
@@ -228,30 +238,43 @@ class DLPredictor:
             self._input_name = None
 
     @staticmethod
-    def _feature_means(feature_stats: Dict[str, Dict[str, float]]) -> Tuple[float, float, float]:
-        n_track_vals = []
-        n_plate_vals = []
+    def _node_features(feature_stats: Dict[str, Dict[str, float]]) -> tuple:
+        """Compute the 4 node-level features from per-camera feature_stats.
+
+        feature_stats must already be filtered to cameras with fps > 0 by
+        the caller (health_agent / run_python), matching the collector's
+        n_active_cameras definition.  len(feature_stats) is therefore
+        the correct active camera count.
+
+        Returns (n_active_cameras, n_track_total, n_plate_total, stationary_fraction_mean).
+        These must match train_dl_model.py FEATURE_COLS exactly.
+        """
+        n_active = len(feature_stats)
+        n_track_total = 0.0
+        n_plate_total = 0.0
         stat_vals = []
         for cam_feats in feature_stats.values():
-            n_track_vals.append(float(cam_feats.get("n_track", 0.0)))
-            n_plate_vals.append(float(cam_feats.get("n_plate", 0.0)))
+            n_track_total += float(cam_feats.get("n_track", 0.0))
+            n_plate_total += float(cam_feats.get("n_plate", 0.0))
             stat_vals.append(float(cam_feats.get("stationary_fraction", 0.0)))
-        n_track = sum(n_track_vals) / len(n_track_vals) if n_track_vals else 0.0
-        n_plate = sum(n_plate_vals) / len(n_plate_vals) if n_plate_vals else 0.0
-        stat = sum(stat_vals) / len(stat_vals) if stat_vals else 0.0
-        return n_track, n_plate, stat
+        stat_mean = sum(stat_vals) / len(stat_vals) if stat_vals else 0.0
+        return n_active, n_track_total, n_plate_total, stat_mean
 
     def predict(
         self,
         feature_stats: Dict[str, Dict[str, float]],
     ) -> Tuple[float, float, float, float]:
-        n_track, n_plate, stat = self._feature_means(feature_stats)
-        self._history.append([n_track, n_plate, stat])
+        n_active, n_track, n_plate, stat = self._node_features(feature_stats)
+        # ponytail: n_track_mean kept for heartbeat compat; divide if active > 0
+        n_track_mean = n_track / n_active if n_active else 0.0
+        n_plate_mean = n_plate / n_active if n_active else 0.0
+
+        self._history.append([n_active, n_track, n_plate, stat])
 
         if self._session is None or self._input_name is None:
-            return 0.0, n_track, n_plate, stat
+            return 0.0, n_track_mean, n_plate_mean, stat
         if len(self._history) < self._window_k:
-            return 0.0, n_track, n_plate, stat
+            return 0.0, n_track_mean, n_plate_mean, stat
 
         try:
             import numpy as np
@@ -260,7 +283,7 @@ class DLPredictor:
             pred = float(np.asarray(y).reshape(-1)[0])
         except Exception as exc:
             logger.debug("[DLPredictor] inference failed: %s", exc, exc_info=True)
-            return 0.0, n_track, n_plate, stat
+            return 0.0, n_track_mean, n_plate_mean, stat
 
         # DL output is already the selected target on the 0-100 load scale.
         # For predict_with_base, train on load_score/gpu_percent so base cost is
@@ -268,7 +291,7 @@ class DLPredictor:
         # target that excludes base cost. Do not add W_base here, or with-base
         # DL predictions double-count the idle pipeline workload.
         l_raw = min(1.0, max(0.0, pred / 100.0))
-        return l_raw, n_track, n_plate, stat
+        return l_raw, n_track_mean, n_plate_mean, stat
 
 
 # ---------------------------------------------------------------------------

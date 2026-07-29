@@ -469,12 +469,19 @@ class PeerOrchestrator:
     # Overload classification helper (proactive-aware)
     # ------------------------------------------------------------------
 
-    def _is_overloaded(self, load_score: float, risk_index: float) -> bool:
+    def _is_overload(self, load_score: float, risk_index: float) -> bool:
         """
-        Return True when this node (or a peer) should be considered overloaded.
+        Determine if this node (or a peer) should be considered overloaded.
 
-        When proactive.enabled is True, driven by cycle-smoothed risk_index (U)
-        against proactive.risk_threshold.
+        When proactive.enabled is True, use_index is driven by cycle-smoothed
+        risk_index (U) against proactive.risk_threshold.
+
+        Shadow mode (proactive.shadow_mode = true) emits proactive telemetry
+        (risk_index) while keeping ALL decisions on the legacy reactive path.
+        It returns load_score > overload_threshold BEFORE any proactive risk
+        or hard-fuse check — so the proactive predictor can be observed
+        side-by-side without affecting migration behaviour.  Hard fuse is
+        also bypassed: shadow mode is audit-only.
 
         A hard_fuse_threshold (default 0.95) forces overload regardless of
         proactive.enabled — it is a safety fuse against hardware saturation that
@@ -484,7 +491,12 @@ class PeerOrchestrator:
         Falls back to legacy load_score > overload_threshold when disabled.
         """
         proactive_cfg = self._cfg.get("proactive", {})
-        hard_fuse     = float(proactive_cfg.get("hard_fuse_threshold", 0.95))
+
+        # Shadow mode: telemetry only — strictly passive/reactive decisions
+        if proactive_cfg.get("shadow_mode", False):
+            return load_score > self._cfg.get("overload_threshold", 65.0)
+
+        hard_fuse = float(proactive_cfg.get("hard_fuse_threshold", 0.95))
 
         # Hard fuse — always active regardless of proactive.enabled
         if risk_index >= hard_fuse:

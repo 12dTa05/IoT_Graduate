@@ -9,21 +9,21 @@
 
 p2p:
   overload_threshold: 65.0      # load_score above this triggers RFO (legacy reactive path)
-  overload_duration_s: 35.0    # must be overloaded this long before RFO
-                                 # ≈ one red phase (30–45 s) — prevents migrating during
-                                 # normal peak-then-recover traffic-light cycles
-  cooldown_s: 120.0             # per-camera cooldown between migrations
-                                 # ≥ one full signal cycle (90 s) — prevents ping-pong
-                                 # where camera offloads every red and reclaims every green
+  overload_duration_s: 3.0     # must be overloaded this long before RFO
+                                  # short enough to act inside the horizon_s=6s
+                                  # window — avoids noise events while staying responsive
+  cooldown_s: 30.0              # per-camera cooldown between migrations
+                                  # prevents ping-pong while allowing rebalancing
+                                  # after migration effect is observable
   migration_timeout_s: 15.0    # wait for ADD ack before rollback (restored to safe default;
                                  # 2 s was too tight for slow RTSP sources across LAN)
   heartbeat_timeout_s: 5.0      # peer declared OFFLINE after this silence
-  vote_window_s: 3.0            # proposal collection duration
+  vote_window_s: 2.0            # proposal collection duration
   failover_jitter_max_s: 3.0    # random delay before failover ADD (race prevention)
   reclaim_margin: 15.0          # reclaim only when load < (overload_threshold - reclaim_margin)
-  reclaim_stable_s: 120.0      # load must stay below reclaim threshold this long before
-                                 # reclaiming — ≥ one full signal cycle to confirm genuine
-                                 # capacity recovery rather than a momentary green phase
+  reclaim_stable_s: 90.0        # load must stay below reclaim threshold this long before
+                                  # reclaiming — one full signal cycle to confirm genuine
+                                  # capacity recovery rather than a momentary green phase
 
   # epsilon-Constraint tiers (Pareto optimization)
   eps_fps_strict: 15.0          # Tier 0 — strict FPS floor
@@ -78,8 +78,8 @@ load_score:
   stream_bandwidth_threshold: 3   # active_cameras ≥ this → use bandwidth preset
 
   #[w_gpu, w_cpu, w_ram]
-  weights_normal:    [0.6, 0.25, 0.15]
-  weights_bandwidth: [0.55, 0.25, 0.20]
+  weights_normal:    [0.6, 0.3, 0.1]
+  weights_bandwidth: [0.55, 0.3, 0.15]
 
   # FPS-drop penalty cap (additive points on top of weighted hardware score)
   fps_penalty_max: 25.0
@@ -111,6 +111,8 @@ load_score:
 # ---------------------------------------------------------------------------
 proactive:
   enabled: false          # set true after running fit_coefficients.py
+  shadow_mode: true       # emit risk_index telemetry while keeping all decisions
+                          # strictly passive/reactive — audit-only side-channel
 
   # W_base: idle GPU load with an active Zenoh session but zero video sources.
   # Measure with: python3 tools/profile_collect.py --wbase
@@ -123,7 +125,7 @@ proactive:
   gamma:  0.0             # stationary_fraction coeff     — fill after Phase 1
 
   # Cycle-aware smoothing window (≈ one full traffic-light cycle)
-  cycle_window_s: 90.0    # seconds; adjust if local signal cycle differs
+  cycle_window_s: 6.0     # must match dl_model.horizon_s
 
   # Offload trigger threshold on the smoothed risk index U
   risk_threshold: 0.85    # U ≥ this → overload (replaces overload_threshold when enabled)
@@ -141,4 +143,4 @@ proactive:
   dl_model:
     model_path: "models/load_predictor.onnx"
     window_k: 5            # number of past feature windows in one input sample
-    horizon_s: 10          # informational; must match the trained model
+    horizon_s: 6           # must match train_dl_model.py --horizon-rows × HEALTH_INTERVAL

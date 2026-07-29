@@ -379,7 +379,12 @@ def _health_push_loop(peer_orch=None) -> None:
             }
 
             # ── Proactive model (payload parity with health_agent._run) ────
-            proactive_result = _proactive_model.compute(metrics, feature_stats)
+            # Filter to cameras with fps > 0 — matches collector's definition.
+            _active_ids = {k for k, v in fps_stats.items() if v > 0.0}
+            proactive_result = _proactive_model.compute(
+                metrics,
+                {k: v for k, v in feature_stats.items() if k in _active_ids},
+            )
             payload.update(proactive_result)
 
             # Keep local PeerOrchestrator state fresh without publishing a

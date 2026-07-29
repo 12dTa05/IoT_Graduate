@@ -32,9 +32,14 @@ Collection -> Training contract:
 Output CSV columns:
     ts, gpu_percent, cpu_percent, ram_percent, gpu_temp_c,
     fps_avg,
+    n_active_cameras,
     n_track_total, n_track_sq_total, n_plate_total, stationary_fraction_mean,
     load_score        (composite health_agent._compute_load_score: 0–100),
     delta_load        (gpu_percent - W_base; only populated if --wbase-ref given)
+
+n_active_cameras is the count of cameras/sources that have fps > 0 at sample time.
+It is used as a node-level model feature alongside the traffic aggregates so the
+DL predictor can account for scale without per-camera padding.
 """
 
 from __future__ import annotations
@@ -119,6 +124,7 @@ FIELDNAMES = [
     "ts",
     "gpu_percent", "cpu_percent", "ram_percent", "gpu_temp_c",
     "fps_avg",
+    "n_active_cameras",
     "n_track_total", "n_track_sq_total", "n_plate_total",
     "stationary_fraction_mean",
     "load_score",
@@ -156,11 +162,18 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
             fps_vals = [v for v in fps_dict.values() if v > 0.0]
             fps_avg  = sum(fps_vals) / len(fps_vals) if fps_vals else 0.0
 
-            # Aggregate features across all active cameras for this node
+            # n_active_cameras: sources that are delivering frames (fps > 0)
+            n_active_cameras = len(fps_vals)
+
+            # Aggregate features across active cameras only (fps > 0),
+            # matching the runtime DLPredictor's filtered feature_stats.
+            _active_ids = {k for k, v in fps_dict.items() if v > 0.0}
             n_track_total     = 0.0
             n_plate_total     = 0.0
             stat_frac_vals    = []
-            for cam_feats in feat_dict.values():
+            for cam_id, cam_feats in feat_dict.items():
+                if cam_id not in _active_ids:
+                    continue
                 n_track_total  += cam_feats.get("n_track",             0.0)
                 n_plate_total  += cam_feats.get("n_plate",             0.0)
                 stat_frac_vals.append(cam_feats.get("stationary_fraction", 0.0))
@@ -178,6 +191,7 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
                 "ram_percent":             hw["ram_percent"],
                 "gpu_temp_c":              hw["gpu_temp_c"],
                 "fps_avg":                 round(fps_avg,      2),
+                "n_active_cameras":        n_active_cameras,
                 "n_track_total":           round(n_track_total, 2),
                 "n_track_sq_total":        round(n_track_total ** 2, 2),
                 "n_plate_total":           round(n_plate_total, 2),
