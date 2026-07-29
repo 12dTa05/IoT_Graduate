@@ -6,7 +6,13 @@ osd-mode=2
 display-font-size=12
 
 [roi-filtering-stream-0]
-enable=0
-roi-RF=576;20;1340;10;1920;1054;0;1051
+enable=1
+roi-RF=656;26;1176;32;1592;1016;72;1000
+inverse-roi=0
+class-id=-1
+
+[roi-filtering-stream-1]
+enable=1
+roi-RF=656;26;1176;32;1592;1016;72;1000
 inverse-roi=0
 class-id=-1
