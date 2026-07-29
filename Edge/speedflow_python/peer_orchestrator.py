@@ -469,7 +469,7 @@ class PeerOrchestrator:
     # Overload classification helper (proactive-aware)
     # ------------------------------------------------------------------
 
-    def _is_overload(self, load_score: float, risk_index: float) -> bool:
+    def _is_overloaded(self, load_score: float, risk_index: float) -> bool:
         """
         Determine if this node (or a peer) should be considered overloaded.
 
