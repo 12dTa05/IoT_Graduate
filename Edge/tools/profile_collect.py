@@ -6,7 +6,7 @@ Phase 1 — Offline System Profiling (data collection for coefficient regression
 
 Reads the live feature + FPS file written by SpeedProbe and the hardware metrics
 from jtop in lock-step, producing a time-stamped CSV suitable for
-fit_coefficients.py.
+fit_coefficients.py AND train_dl_model.py.
 
 Usage (run on the target Jetson while the DeepStream pipeline is active):
 
@@ -19,12 +19,21 @@ Usage (run on the target Jetson while the DeepStream pipeline is active):
 The script also measures W_base: if --wbase is passed, launch the pipeline with
 zero video sources, run for --wbase-duration seconds, and record the idle GPU/CPU/
 RAM mean as the base load.  Example:
-    python3 tools/profile_collect.py --wbase --wbase-duration 60 --output logs/wbase.csv
+    python3 tools/profile_collect.py --wbase --wbase-duration 60 --output logs/wbase.txt
+
+Collection -> Training contract:
+  • load_score IS the training target — composite health_agent._compute_load_score
+    (weighted GPU/CPU/RAM + FPS-drop penalty, scale 0-100). Every row has it.
+  • FPS serves as the QoS validation signal (compare trained model predictions
+    against TARGET_FPS at runtime).
+  • Raw gpu_percent remains diagnostic only; use --target gpu_percent in
+    train_dl_model.py if you want a raw-load model instead.
 
 Output CSV columns:
     ts, gpu_percent, cpu_percent, ram_percent, gpu_temp_c,
     fps_avg,
     n_track_total, n_track_sq_total, n_plate_total, stationary_fraction_mean,
+    load_score        (composite health_agent._compute_load_score: 0–100),
     delta_load        (gpu_percent - W_base; only populated if --wbase-ref given)
 """
 
@@ -42,7 +51,7 @@ _EDGE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_EDGE_DIR))
 
 from speedflow_python.settings import FPS_STATS_FILE
-from health_agent import _read_fps_stats, _read_feature_stats
+from health_agent import _read_fps_stats, _read_feature_stats, _compute_load_score
 
 # ---------------------------------------------------------------------------
 # jtop helper — graceful fallback if jtop unavailable
@@ -112,6 +121,7 @@ FIELDNAMES = [
     "fps_avg",
     "n_track_total", "n_track_sq_total", "n_plate_total",
     "stationary_fraction_mean",
+    "load_score",
     "delta_load",
 ]
 
@@ -159,6 +169,8 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
                          if stat_frac_vals else 0.0)
             delta = round(hw["gpu_percent"] - wbase_ref, 2)
 
+            load_score, _preset = _compute_load_score(hw, fps_dict)
+
             writer.writerow({
                 "ts":                      round(ts, 3),
                 "gpu_percent":             hw["gpu_percent"],
@@ -170,6 +182,7 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
                 "n_track_sq_total":        round(n_track_total ** 2, 2),
                 "n_plate_total":           round(n_plate_total, 2),
                 "stationary_fraction_mean": round(stat_mean,  3),
+                "load_score":              load_score,
                 "delta_load":              delta,
             })
             rows_written += 1

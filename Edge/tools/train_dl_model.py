@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """Train a tiny 3-feature load predictor and export ONNX.
 
-Input features per time window:
-  [n_track_mean, n_plate_mean, stationary_fraction_mean]
+Input:  profile CSV produced by tools/profile_collect.py.
+Output: models/load_predictor.onnx (3-feature sliding-window MLP).
 
-The script accepts CSVs from the existing profiling tools. It prefers exact
-mean columns, but falls back to total columns when needed.
+Collection -> Training contract:
+  • The collector writes load_score (composite health_agent._compute_load_score:
+    weighted GPU/CPU/RAM + FPS-drop penalty, scale 0-100).
+  • This script *defaults* to load_score as the prediction target.
+    load_score IS the QoS-aware composite — it captures both resource load AND
+    pipeline throughput (FPS) in a single value.
+  • Use --target to override (accepts any column in the CSV).
+  • GPU performance validation: check FPS at runtime against TARGET_FPS.
+    Raw gpu_percent is only a diagnostic/metric — use --target gpu_percent
+    if you deliberately want a raw-load model.
 
-Target convention:
-  * LOAD_POLICY=predict_with_base: train with a target that already includes
-    idle/base pipeline cost, e.g. load_score or gpu_percent.
-  * LOAD_POLICY=predict_no_base: train with a delta-load target that excludes
-    base workload, e.g. actual_load_minus_wbase.
+Fallback convention: if a CSV lacks load_score (legacy datasets), the script
+falls through: actual_load -> gpu_percent. This is backward-compatible with
+older calibration CSV formats.
 
-Runtime DLPredictor does not add W_base post-hoc because the base/no-base
-meaning is defined by the training target itself.
+Runtime DLPredictor does not add W_base post-hoc; the training target already
+determines what the model predicts (raw or composite load).
 """
 
 from __future__ import annotations
@@ -29,7 +35,9 @@ FEATURE_ALIASES = {
     "n_plate_mean": ["n_plate_mean", "n_plate_total"],
     "stationary_fraction_mean": ["stationary_fraction_mean", "stationary_fraction"],
 }
-TARGET_ALIASES = ["actual_load", "load_score", "gpu_percent"]
+TARGET_ALIASES = ["load_score", "actual_load", "gpu_percent"]
+# load_score is the canonical composite target (GPU/CPU/RAM + FPS penalty).
+# actual_load and gpu_percent are legacy fallbacks for CSVs without load_score.
 
 
 def _pick_column(columns, names: List[str], label: str) -> str:
@@ -79,7 +87,8 @@ def main() -> None:
     ap.add_argument("--csv", type=Path, required=True)
     ap.add_argument("--output", type=Path, default=Path("models/load_predictor.onnx"))
     ap.add_argument("--target", default=None,
-                    help="Target column. Default: first of actual_load, load_score, gpu_percent")
+                    help="Target column. Default: load_score (composite QoS load). "
+                         "Falls back: actual_load -> gpu_percent if column missing.")
     ap.add_argument("--window-k", type=int, default=5)
     ap.add_argument("--horizon-rows", type=int, default=1,
                     help="Predict this many rows ahead; use rows equivalent to your horizon_s")

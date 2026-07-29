@@ -114,7 +114,7 @@ proactive:
 
   # W_base: idle GPU load with an active Zenoh session but zero video sources.
   # Measure with: python3 tools/profile_collect.py --wbase
-  w_base: 12.0            # placeholder — replace with measured value
+  w_base: 0.0            # placeholder — replace with measured value
 
   # Regression coefficients (α₂ = 0.0 if linear model chosen by held-out RMSE)
   alpha1: 0.0             # N_track linear coefficient   — fill after Phase 1
