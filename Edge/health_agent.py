@@ -80,7 +80,7 @@ def _read_feature_stats() -> Dict[str, Dict[str, float]]:
     Read per-camera proactive features written by SpeedProbe._fps_writer_loop.
 
     Returns {camera_id: {n_track, n_plate, stationary_fraction}} or {} on error.
-    Gracefully returns empty dict when running without the DeepStream pipeline
+    Gracefully returns empty when running without the DeepStream pipeline
     (e.g., during offline calibration or health-agent-only mode).
     """
     try:
@@ -92,6 +92,24 @@ def _read_feature_stats() -> Dict[str, Dict[str, float]]:
     except Exception as exc:
         logger.debug("Failed to read feature stats: %s", exc)
         return {}
+
+
+def _read_offload_crops() -> dict:
+    """
+    Read _offload_crops snapshot written by SpeedProbe._fps_writer_loop.
+
+    Returns {processed_count, received_per_s, ts} or {"received_per_s": 0.0}
+    when the file is missing/offload receiver is absent.
+    """
+    try:
+        with open(FPS_STATS_FILE, "r") as f:
+            data = json.load(f)
+        return data.get("_offload_crops", {"received_per_s": 0.0})
+    except (FileNotFoundError, KeyError):
+        return {"received_per_s": 0.0}
+    except Exception as exc:
+        logger.debug("Failed to read offload crops: %s", exc)
+        return {"received_per_s": 0.0}
 
 
 # ---------------------------------------------------------------------------
@@ -173,57 +191,37 @@ except OSError:
     _EDGE_CFG_MTIME = 0.0
 
 
-def _select_omega(metrics: dict, n_active_cameras: int) -> tuple:
-    """
-    Select adaptive ω weight triple (w_gpu, w_cpu, w_ram) based on context.
-
-    Presets (from edge_node.yml load_score section):
-      bandwidth — when active camera count ≥ stream_bandwidth_threshold
-      normal    — default
-
-    NOTE: The 'thermal' preset has been removed.  Thermal stress is now handled
-    exclusively by Θ_thermal inside H_reactive (load_model.py), which applies a
-    smooth ramp from 75→90°C.  Keeping both mechanisms double-counts the same
-    signal.  The load_score baseline uses only bandwidth/normal omega.
-
-    Returns (w_gpu, w_cpu, w_ram, preset_name).
-    """
-    _maybe_reload_edge_cfg()
-    ls_cfg = _EDGE_CFG.get("load_score", {})
-
-    bw_thresh   = int(ls_cfg.get("stream_bandwidth_threshold", 3))
-    w_normal    = ls_cfg.get("weights_normal",    [0.3, 0.3, 0.4])
-    w_bandwidth = ls_cfg.get("weights_bandwidth", [0.2, 0.3, 0.5])
-
-    if n_active_cameras >= bw_thresh:
-        return float(w_bandwidth[0]), float(w_bandwidth[1]), float(w_bandwidth[2]), "bandwidth"
-    return float(w_normal[0]), float(w_normal[1]), float(w_normal[2]), "normal"
-
-
 def _compute_load_score(metrics: dict, fps_stats: dict) -> tuple:
     """
-    Compute load score with adaptive ω weights.
+    FPS-dominant load score with a lightweight hardware base and a configurable
+    hardware saturation safety fuse.
 
     Formula:
-        base    = w_gpu * GPU_% + w_cpu * CPU_% + w_ram * RAM_%
-        penalty = max(0, (TARGET_FPS - avg_fps) / TARGET_FPS * fps_penalty_max)
-        score   = min(100, base + penalty)
+        base    = w_gpu * GPU% + w_cpu * CPU% + w_ram * RAM%     (diagnostic whisper)
+        penalty = drop_frac * fps_penalty_max                     (dominant signal)
+        fuse    = hw_fuse_bonus when ANY of {GPU,CPU,RAM} >= hw_fuse_threshold, else 0
+        score   = min(100.0, base + penalty + fuse)
 
-    Returns (score: float, preset: str) where preset is the weight regime name.
-    The preset is included in the heartbeat so peers can see which regime each
-    node is operating in — this is the paper's "WAN context adaptation".
+    Hardware weights are intentionally tiny (0.05 each) — a diagnostic baseline
+    that prevents a node with excellent FPS from appearing idle when its GPU
+    happens to be 0 %.  The FPS drop is the real signal.
+
+    Returns (score: float, "fps_dominant") — a single stable preset string so
+    the heartbeat field stays consistent; no bandwidth/normal switching.
     """
     _maybe_reload_edge_cfg()
     ls_cfg = _EDGE_CFG.get("load_score", {})
-    fps_penalty_max = float(ls_cfg.get("fps_penalty_max", 30.0))
-
-    n_active = len([v for v in fps_stats.values() if v > 0.0])
-    w_gpu, w_cpu, w_ram, preset = _select_omega(metrics, n_active)
+    w_gpu  = float(ls_cfg.get("weight_gpu",  0.05))
+    w_cpu  = float(ls_cfg.get("weight_cpu",  0.05))
+    w_ram  = float(ls_cfg.get("weight_ram",  0.05))
+    fps_penalty_max = float(ls_cfg.get("fps_penalty_max", 80.0))
+    hw_fuse_threshold = float(ls_cfg.get("hw_fuse_threshold", 90.0))
+    hw_fuse_bonus     = float(ls_cfg.get("hw_fuse_bonus",     25.0))
 
     base = (
-        w_gpu * metrics["gpu_percent"] +
-        w_cpu * metrics["cpu_percent"] +
-        w_ram * metrics["ram_percent"]
+        w_gpu * metrics.get("gpu_percent", 0.0) +
+        w_cpu * metrics.get("cpu_percent", 0.0) +
+        w_ram * metrics.get("ram_percent", 0.0)
     )
 
     active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
@@ -232,13 +230,23 @@ def _compute_load_score(metrics: dict, fps_stats: dict) -> tuple:
     elif fps_stats:
         avg_fps = 0.0
     else:
-        avg_fps = TARGET_FPS   # no data → no penalty
+        avg_fps = TARGET_FPS   # no cameras → no penalty
 
     fps_drop = max(0.0, TARGET_FPS - avg_fps)
     penalty  = (fps_drop / TARGET_FPS) * fps_penalty_max
 
-    score = min(100.0, base + penalty)
-    return round(score, 1), preset
+    # Hardware saturation safety fuse — one-shot bonus when any single metric
+    # crosses the threshold (GPU, CPU, or RAM).  This catches the case where
+    # the pipeline is thrashing a hardware ceiling but FPS hasn't collapsed yet,
+    # e.g. a GPU at 92 % delivering 25 fps because DeepStream absorbs drops.
+    fuse = 0.0
+    if (metrics.get("gpu_percent", 0.0) >= hw_fuse_threshold or
+        metrics.get("cpu_percent", 0.0) >= hw_fuse_threshold or
+        metrics.get("ram_percent", 0.0) >= hw_fuse_threshold):
+        fuse = hw_fuse_bonus
+
+    score = min(100.0, base + penalty + fuse)
+    return round(score, 1), "fps_dominant"
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +589,8 @@ class HealthAgent:
                 metrics       = self._collect_metrics()
                 fps_stats     = _read_fps_stats()
                 feature_stats = _read_feature_stats()
+                offload_crops = _read_offload_crops()
+                offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
                 load_score, omega_preset = _compute_load_score(metrics, fps_stats)
 
                 # BUG-I fix: exclude 0-fps cameras from avg_fps, matching the
@@ -634,6 +644,7 @@ class HealthAgent:
                     proactive_result = self._proactive_model.compute(
                         metrics,
                         {k: v for k, v in feature_stats.items() if k in _active_ids},
+                        offload_crops_received_per_s=offload_crops_received_per_s,
                     )
                     payload.update(proactive_result)
 

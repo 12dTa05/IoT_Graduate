@@ -194,17 +194,17 @@ def compute_l_proactive(
 
 
 class DLPredictor:
-    """Small ONNX time-series predictor using 4 node-level traffic features.
+    """Small ONNX time-series predictor using node-level traffic features.
 
     Features (must match train_dl_model.py FEATURE_COLS order):
-        n_active_cameras        — sources with fps > 0 at sample time
-        n_track_total           — total tracked vehicles across all cameras
-        n_plate_total           — total plate detections across all cameras
-        stationary_fraction_mean — mean stationary fraction across all cameras
+        n_active_cameras          — sources with fps > 0 at sample time
+        n_track_total             — total tracked vehicles across all cameras
+        n_plate_total             — total plate detections across all cameras
+        stationary_fraction_mean  — mean stationary fraction across all cameras
+        offload_crops_received_per_s — crops RECEIVED by this node per second
     """
 
-    # Canonical feature order — must match train_dl_model.py FEATURE_COLS
-    _N_FEATURES = 4
+    _N_FEATURES = 5
 
     def __init__(self, dl_cfg: dict, edge_root: Optional[Path] = None) -> None:
         self._window_k = max(1, int(dl_cfg.get("window_k", 5)))
@@ -238,15 +238,19 @@ class DLPredictor:
             self._input_name = None
 
     @staticmethod
-    def _node_features(feature_stats: Dict[str, Dict[str, float]]) -> tuple:
-        """Compute the 4 node-level features from per-camera feature_stats.
+    def _node_features(
+        feature_stats: Dict[str, Dict[str, float]],
+        offload_crops_received_per_s: float = 0.0,
+    ) -> tuple:
+        """Compute node-level features from per-camera feature_stats.
 
         feature_stats must already be filtered to cameras with fps > 0 by
-        the caller (health_agent / run_python), matching the collector's
-        n_active_cameras definition.  len(feature_stats) is therefore
-        the correct active camera count.
+        the in-flight caller (health_agent / run_python), matching the
+        collector's n_active_cameras definition.  len(feature_stats) is
+        therefore the correct active camera count.
 
-        Returns (n_active_cameras, n_track_total, n_plate_total, stationary_fraction_mean).
+        Returns (n_active_cameras, n_track_total, n_plate_total,
+                 stationary_fraction_mean, offload_crops_received_per_s).
         These must match train_dl_model.py FEATURE_COLS exactly.
         """
         n_active = len(feature_stats)
@@ -258,18 +262,22 @@ class DLPredictor:
             n_plate_total += float(cam_feats.get("n_plate", 0.0))
             stat_vals.append(float(cam_feats.get("stationary_fraction", 0.0)))
         stat_mean = sum(stat_vals) / len(stat_vals) if stat_vals else 0.0
-        return n_active, n_track_total, n_plate_total, stat_mean
+        offload_rate = round(float(offload_crops_received_per_s), 3)
+        return n_active, n_track_total, n_plate_total, stat_mean, offload_rate
 
     def predict(
         self,
         feature_stats: Dict[str, Dict[str, float]],
+        offload_crops_received_per_s: float = 0.0,
     ) -> Tuple[float, float, float, float]:
-        n_active, n_track, n_plate, stat = self._node_features(feature_stats)
+        n_active, n_track, n_plate, stat, offload_rate = self._node_features(
+            feature_stats, offload_crops_received_per_s,
+        )
         # ponytail: n_track_mean kept for heartbeat compat; divide if active > 0
         n_track_mean = n_track / n_active if n_active else 0.0
         n_plate_mean = n_plate / n_active if n_active else 0.0
 
-        self._history.append([n_active, n_track, n_plate, stat])
+        self._history.append([n_active, n_track, n_plate, stat, offload_rate])
 
         if self._session is None or self._input_name is None:
             return 0.0, n_track_mean, n_plate_mean, stat
@@ -431,6 +439,7 @@ class ProactiveModel:
         metrics:       dict,
         feature_stats: Dict[str, Dict[str, float]],
         ts:            Optional[float] = None,
+        offload_crops_received_per_s: float = 0.0,
     ) -> dict:
         """
         Run one compute cycle.
@@ -439,6 +448,7 @@ class ProactiveModel:
                        {gpu_percent, cpu_percent, ram_percent, gpu_temp_c, ...}
         feature_stats: from _read_feature_stats()
                        {camera_id: {n_track, n_plate, stationary_fraction}}
+        offload_crops_received_per_s: node-level crop receive rate (0 if absent)
 
         Returns a dict with all proactive fields.  If enabled=False the dict
         only contains proactive_enabled=False; caller can merge safely without
@@ -453,7 +463,8 @@ class ProactiveModel:
 
         # Raw tiers
         if self._model_type == "dl" and self._dl_predictor is not None:
-            l_raw, n_track_mean, n_plate_mean, stat_frac = self._dl_predictor.predict(feature_stats)
+            l_raw, n_track_mean, n_plate_mean, stat_frac = \
+                self._dl_predictor.predict(feature_stats, offload_crops_received_per_s)
         else:
             l_raw, n_track_mean, n_plate_mean, stat_frac = compute_l_proactive(
                 feature_stats, self._cfg, policy=self._policy

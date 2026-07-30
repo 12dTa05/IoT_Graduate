@@ -188,6 +188,7 @@ class SpeedProbe:
         self.publisher     = None
         # OffloadPublisher for Level 2/3 crop sending (set via set_offload_publisher)
         self._offload_pub  = None
+        self._offload_rcv  = None
 
         try:
             os.makedirs(str(SNAP_DIR), exist_ok=True)
@@ -279,6 +280,13 @@ class SpeedProbe:
         """
         self._offload_pub = pub
 
+    def set_offload_receiver(self, rcv) -> None:
+        """
+        Store the OffloadReceiver so the FPS writer can query its processed count
+        and surface offload_crops_received_per_s in the telemetry snapshot.
+        """
+        self._offload_rcv = rcv
+
     def inject_offload_result(self, result: dict) -> None:
         """
         Thread-safe entry point for OffloadReceiver to push decoded plate text
@@ -358,6 +366,8 @@ class SpeedProbe:
             return dict(self._feature_cache)
 
     def _fps_writer_loop(self) -> None:
+        _prev_offload_count: int = 0
+        _prev_offload_ts: float = 0.0
         while self._fps_writer_running:
             time.sleep(2.0)
             try:
@@ -372,6 +382,26 @@ class SpeedProbe:
                 # Feature entries nested under a "_features" key so readers
                 # that only care about FPS are unaffected.
                 out["_features"] = feats
+
+                # ── Offload receiver processed count ──────────────────────
+                # Surfaces the monotonic count and a rate sampled over the
+                # 2 s health interval.  Readers (profile_collect, health_agent,
+                # run_python) use _offload_crops to get offload_crops_received_per_s.
+                if self._offload_rcv is not None:
+                    now_ts = time.time()
+                    count = self._offload_rcv.offload_processed_count
+                    if _prev_offload_ts > 0:
+                        dt = max(0.001, now_ts - _prev_offload_ts)
+                        rate = (count - _prev_offload_count) / dt
+                    else:
+                        rate = 0.0
+                    _prev_offload_count = count
+                    _prev_offload_ts = now_ts
+                    out["_offload_crops"] = {
+                        "processed_count": count,
+                        "received_per_s":  round(max(0.0, rate), 3),
+                        "ts":              now_ts,
+                    }
 
                 with open(FPS_STATS_FILE, "w") as f:
                     json.dump(out, f)

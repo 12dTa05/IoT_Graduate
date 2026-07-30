@@ -8,7 +8,8 @@
 # ============================================================
 
 p2p:
-  overload_threshold: 65.0      # load_score above this triggers RFO (legacy reactive path)
+  overload_threshold: 55.0      # load_score above this triggers RFO; aligns with L3 /
+                                  # ≈22 FPS under the FPS-dominant score
   overload_duration_s: 3.0     # must be overloaded this long before RFO
                                   # short enough to act inside the horizon_s=6s
                                   # window — avoids noise events while staying responsive
@@ -39,7 +40,7 @@ p2p:
     1: 30.0
     2: 25.0
     3: 20.5
-    4: 12.5
+    4: 15.5
 
   # ---------------------------------------------------------------------------
   # Multi-level offload (Levels 1–3 from the paper)
@@ -53,9 +54,9 @@ p2p:
   offload_level: 3
 
   # Load thresholds that trigger each escalation step
-  offload_level3_threshold: 65.0   # ≥ this load → try plate-crop offload first
-  offload_level2_threshold: 72.0   # ≥ this load → escalate to vehicle-crop offload
-  offload_level1_threshold: 80.0   # ≥ this load → escalate to full stream migration (DEBUG: lowered for testing)
+  offload_level3_threshold: 55.0   # ≈ 21 FPS → try plate-crop offload first
+  offload_level2_threshold: 64.0   # ≈ 19 FPS → escalate to vehicle-crop offload
+  offload_level1_threshold: 79.0   # ≈ 17 FPS → escalate to full stream migration
 
   # Cooldown between level changes for the same camera (seconds)
   offload_level_cooldown_s: 12.0
@@ -65,24 +66,35 @@ p2p:
   lpd_engine_path: "models/lpd.engine"
 
 # ---------------------------------------------------------------------------
-# Load-score adaptive ω weights
-# Two presets remain after thermal unification (thermal is now handled
-# exclusively by Θ_thermal in load_model.py — smooth ramp 75→90°C).
+# Load score — FPS-dominant with lightweight hardware baseline
 #
-#   normal    — default balanced weights
-#   bandwidth — shift weight when running many cameras (≥ stream_bandwidth_threshold)
+# Formula (see health_agent._compute_load_score):
+#   base  = w_gpu*GPU% + w_cpu*CPU% + w_ram*RAM%   (diagnostic whisper)
+#   penalty = (TARGET_FPS - avg_fps)/TARGET_FPS × fps_penalty_max   (dominant)
+#   fuse    = hw_fuse_bonus when ANY {GPU, CPU, RAM} ≥ hw_fuse_threshold
+#   score   = min(100, base + penalty + fuse)
 #
-# weight order: [w_gpu, w_cpu, w_ram]  (should sum to 1.0)
+# Hardware weights are tiny: they keep a node with perfect FPS from reading
+# 0 %, but FPS drop is the primary signal.  The fuse fires once when a
+# hardware ceiling is reached (e.g. GPU at 92 % with FPS still high) to
+# ensure the orchestrator sees it before FPS collapses.
+#
+# Returns preset = "fps_dominant" for every cycle — no bandwidth/normal
+# switching; single stable regime name.
 # ---------------------------------------------------------------------------
 load_score:
-  stream_bandwidth_threshold: 3   # active_cameras ≥ this → use bandwidth preset
+  # Hardware whisper weights (diagnostic baseline, FPS dominates)
+  weight_gpu: 0.05
+  weight_cpu: 0.05
+  weight_ram: 0.05
 
-  #[w_gpu, w_cpu, w_ram]
-  weights_normal:    [0.6, 0.3, 0.1]
-  weights_bandwidth: [0.55, 0.3, 0.15]
+  # FPS-drop penalty cap — additive points when fps < TARGET_FPS
+  fps_penalty_max: 200.0
 
-  # FPS-drop penalty cap (additive points on top of weighted hardware score)
-  fps_penalty_max: 25.0
+  # Hardware saturation safety fuse — adds hw_fuse_bonus when ANY single
+  # metric (GPU, CPU, or RAM) reaches/exceeds this threshold.
+  hw_fuse_threshold: 90.0
+  hw_fuse_bonus: 25.0
 
 # ---------------------------------------------------------------------------
 # Proactive load model — Vehicle-Driven Proactive Load Profiling

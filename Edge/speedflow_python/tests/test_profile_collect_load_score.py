@@ -53,26 +53,27 @@ def test_no_cameras_no_penalty():
 def test_typical_load_spot_check():
     """Known inputs → score matches formula: base + penalty, clamped to 100.
 
-    With normal weights [0.3, 0.3, 0.4] and one active camera:
-      base = 0.3*50 + 0.3*30 + 0.4*20 = 15 + 9 + 8 = 32
+    New FPS-dominant weights [0.05, 0.05, 0.05], fps_penalty_max = 80:
+      base = 0.05*50 + 0.05*30 + 0.05*20 = 2.5 + 1.5 + 1.0 = 5.0
       avg_fps = (25+25)/2 = 25, TARGET_FPS = 25 → penalty = 0
-      score = 32.0
+      fuse = 0 (no metric ≥ 90)
+      score = 5.0
     """
     score, _ = _compute_load_score(
         _metrics(gpu=50, cpu=30, ram=20),
         _fps(cam_01=25.0, cam_02=25.0),
     )
-    assert abs(score - 32.0) < 0.5
+    assert abs(score - 5.0) < 0.5
 
 
 def test_fps_penalty():
     """FPS below target introduces a penalty above base."""
     score, _ = _compute_load_score(
         _metrics(gpu=50, cpu=30, ram=20),
-        _fps(cam_01=15.0),  # TARGET_FPS=25 → 10/25 * fps_penalty_max (30) = 12 point penalty
+        _fps(cam_01=15.0),  # TARGET_FPS=25 → 10/25 * 80 = 32.0 point penalty
     )
-    # base = 0.3*50 + 0.3*30 + 0.4*20 = 32, penalty = 12, total = 44
-    assert abs(score - 44.0) < 0.5
+    # base = 0.05*50 + 0.05*30 + 0.05*20 = 5.0, penalty = 32.0, total = 37.0
+    assert abs(score - 37.0) < 0.5
 
 
 def test_score_clamped_to_100():
@@ -97,10 +98,11 @@ def test_collected_row_matches_shared_function():
     assert isinstance(expected_score, float)
     assert 0.0 <= expected_score <= 100.0
 
-    # avg_fps = (25+22)/2 = 23.5, penalty = (25-23.5)/25 * 30 = 1.8
-    # base = 0.3*60 + 0.3*40 + 0.4*30 = 18 + 12 + 12 = 42
-    # total = 43.8
-    assert abs(expected_score - 43.8) < 1.0
+    # avg_fps = (25+22)/2 = 23.5, penalty = (25-23.5)/25 * 80 = 4.8
+    # base = 0.05*60 + 0.05*40 + 0.05*30 = 3.0 + 2.0 + 1.5 = 6.5
+    # fuse = 0 (no metric ≥ 90)
+    # total = 11.3
+    assert abs(expected_score - 11.3) < 1.0
 
 
 # ---------------------------------------------------------------------------

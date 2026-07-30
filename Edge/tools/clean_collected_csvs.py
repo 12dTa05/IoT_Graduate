@@ -22,7 +22,8 @@ PERF_HEADER = frozenset({
     "ts", "gpu_percent", "cpu_percent", "ram_percent", "gpu_temp_c",
     "fps_avg", "n_active_cameras",
     "n_track_total", "n_track_sq_total", "n_plate_total",
-    "stationary_fraction_mean", "load_score", "delta_load",
+    "stationary_fraction_mean", "offload_crops_received_per_s",
+    "load_score", "delta_load",
 })
 
 OUT_HEADER = [
@@ -30,7 +31,8 @@ OUT_HEADER = [
     "gpu_percent", "cpu_percent", "ram_percent", "gpu_temp_c",
     "fps_avg", "n_active_cameras",
     "n_track_total", "n_track_sq_total", "n_plate_total",
-    "stationary_fraction_mean", "load_score_raw", "delta_load",
+    "stationary_fraction_mean", "offload_crops_received_per_s",
+    "load_score_raw", "delta_load",
     "load_score_smoothed", "fps_deficit", "fps_drop", "fps_severe_drop",
 ]
 
@@ -119,6 +121,7 @@ def process_file(path: pathlib.Path) -> tuple[list[dict], str]:
             "n_track_sq_total": r.get("n_track_sq_total", "").strip(),
             "n_plate_total": r.get("n_plate_total", "").strip(),
             "stationary_fraction_mean": r.get("stationary_fraction_mean", "").strip(),
+            "offload_crops_received_per_s": r.get("offload_crops_received_per_s", "").strip(),
             "delta_load": _float_or_none(r.get("delta_load", "")),
             "load_score_raw": load,
             "load_score_smoothed": None,  # filled below

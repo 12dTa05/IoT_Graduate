@@ -92,6 +92,7 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
         probe.set_offload_publisher(offload_pub)
     if offload_rcv is not None:
         offload_rcv.set_result_handler(probe.inject_offload_result)
+        probe.set_offload_receiver(offload_rcv)
     if zenoh_pub is not None:
         probe.set_publisher(zenoh_pub)
 
@@ -286,6 +287,7 @@ def _health_push_loop(peer_orch=None) -> None:
         _compute_load_score     as _compute_load_fn,
         _read_fps_stats         as _read_fps_fn,
         _read_feature_stats     as _read_feat_fn,
+        _read_offload_crops     as _read_offload_fn,
         _maybe_reload_edge_cfg  as _reload_edge_cfg,
         get_edge_cfg            as _get_edge_cfg,
         open_jtop_session,
@@ -352,6 +354,8 @@ def _health_push_loop(peer_orch=None) -> None:
             metrics       = collect_metrics(_jtop_session)
             fps_stats     = _read_fps_fn()
             feature_stats = _read_feat_fn()
+            offload_crops = _read_offload_fn()
+            offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
             load_score, omega_preset = _compute_load_fn(metrics, fps_stats)
 
             active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
@@ -378,12 +382,13 @@ def _health_push_loop(peer_orch=None) -> None:
                 },
             }
 
-            # ── Proactive model (payload parity with health_agent._run) ────
+            # ── Proactive model (feed_relevant offline crop receive rate) ────
             # Filter to cameras with fps > 0 — matches collector's definition.
             _active_ids = {k for k, v in fps_stats.items() if v > 0.0}
             proactive_result = _proactive_model.compute(
                 metrics,
                 {k: v for k, v in feature_stats.items() if k in _active_ids},
+                offload_crops_received_per_s=offload_crops_received_per_s,
             )
             payload.update(proactive_result)
 

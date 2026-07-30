@@ -494,7 +494,7 @@ class PeerOrchestrator:
 
         # Shadow mode: telemetry only — strictly passive/reactive decisions
         if proactive_cfg.get("shadow_mode", False):
-            return load_score > self._cfg.get("overload_threshold", 65.0)
+            return load_score > self._cfg.get("overload_threshold", 42.0)
 
         hard_fuse = float(proactive_cfg.get("hard_fuse_threshold", 0.95))
 
@@ -507,7 +507,7 @@ class PeerOrchestrator:
             return risk_index >= threshold
 
         # Legacy path
-        return load_score > self._cfg.get("overload_threshold", 65.0)
+        return load_score > self._cfg.get("overload_threshold", 42.0)
 
     # ------------------------------------------------------------------
     # Overload trigger score helper (for log messages + RFO payload)

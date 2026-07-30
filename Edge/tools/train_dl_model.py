@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Train a 4-feature node-level load predictor and export ONNX.
+"""Train a node-level load predictor and export ONNX.
 
 Input:  raw collector CSV from profile_collect.py, or cleaned CSV from
         Edge/tools/clean_collected_csvs.py (both accepted).
-Output: models/load_predictor.onnx (4-feature sliding-window MLP).
+Output: models/load_predictor.onnx (node-level sliding-window MLP).
 
 Model input features (node-level, no per-camera division):
-    n_active_cameras        — number of sources delivering frames (fps > 0)
-    n_track_total           — total tracked vehicles across all cameras
-    n_plate_total           — total plate detections across all cameras
-    stationary_fraction_mean — mean fraction of stationary vehicles
+    n_active_cameras             — number of sources delivering frames (fps > 0)
+    n_track_total                — total tracked vehicles across all cameras
+    n_plate_total                — total plate detections across all cameras
+    stationary_fraction_mean     — mean fraction of stationary vehicles
+    offload_crops_received_per_s — crops RECEIVED by this node per second
 
-Runtime DLPredictor uses the same four features in the same order.
+Runtime DLPredictor uses the same features in the same order.
+Input dimensionality is derived from FEATURE_COLS; no hardcoded stale values.
 Do not pass --camera-count; per-camera division is not used.
 """
 
@@ -27,6 +29,7 @@ FEATURE_COLS = [
     "n_track_total",
     "n_plate_total",
     "stationary_fraction_mean",
+    "offload_crops_received_per_s",
 ]
 N_FEATURES = len(FEATURE_COLS)
 
@@ -91,9 +94,8 @@ def _make_windows(df, feature_cols, target_col: str, window_k: int, horizon_rows
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
-            "Train/export 4-feature node-level load predictor ONNX.\n\n"
-            "Features: n_active_cameras, n_track_total, n_plate_total, "
-            "stationary_fraction_mean.\n"
+            "Train/export node-level load predictor ONNX.\n\n"
+            "Features: see FEATURE_COLS (derived dimensionality, no hardcoded 4).\n"
             "No per-camera division is applied; totals are node-level inputs."
         )
     )

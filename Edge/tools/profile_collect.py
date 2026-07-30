@@ -56,7 +56,7 @@ _EDGE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_EDGE_DIR))
 
 from speedflow_python.settings import FPS_STATS_FILE
-from health_agent import _read_fps_stats, _read_feature_stats, _compute_load_score
+from health_agent import _read_fps_stats, _read_feature_stats, _read_offload_crops, _compute_load_score
 
 # ---------------------------------------------------------------------------
 # jtop helper — graceful fallback if jtop unavailable
@@ -127,6 +127,7 @@ FIELDNAMES = [
     "n_active_cameras",
     "n_track_total", "n_track_sq_total", "n_plate_total",
     "stationary_fraction_mean",
+    "offload_crops_received_per_s",
     "load_score",
     "delta_load",
 ]
@@ -158,6 +159,8 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
             hw = _read_hw(jtop)
             fps_dict  = _read_fps_stats()
             feat_dict = _read_feature_stats()
+            offload_crops = _read_offload_crops()
+            offload_rate = round(float(offload_crops.get("received_per_s", 0.0)), 3)
 
             fps_vals = [v for v in fps_dict.values() if v > 0.0]
             fps_avg  = sum(fps_vals) / len(fps_vals) if fps_vals else 0.0
@@ -196,6 +199,7 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
                 "n_track_sq_total":        round(n_track_total ** 2, 2),
                 "n_plate_total":           round(n_plate_total, 2),
                 "stationary_fraction_mean": round(stat_mean,  3),
+                "offload_crops_received_per_s": offload_rate,
                 "load_score":              load_score,
                 "delta_load":              delta,
             })
