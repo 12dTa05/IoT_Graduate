@@ -61,23 +61,51 @@ def test_all_cameras_above_target():
 
 
 def test_fps_score_is_dominant_no_hardware_bonus():
-    """Hardware metrics are NOT additive: 95% GPU alone with 27 FPS → score 0 (no floor triggered because no hardware emergency). Wait, 95 >= 90 triggers floor. Let's test: 95% GPU but fps=27 → floor 75.0"""
+    """Hardware metrics are NOT additive: GPU>=90 with healthy FPS (>=25, margin 2) → pure FPS score, no floor."""
 
-    # 95% GPU triggers hardware emergency → floor 75.0, fps_score=0, so max(0, 75) = 75
+    # 95% GPU but fps=27.0 (>= TARGET_FPS - 2 = 25) → pure fps_score=0, no floor
     score, _ = _compute_load_score(
         _metrics(gpu=95, cpu=30, ram=30),
         _fps(cam_01=27.0),
     )
-    assert abs(score - 75.0) < 0.5  # hw floor overrides fps_score=0
+    assert score == 0.0  # healthy FPS, transient GPU spike ignored
+
+    # 95% GPU with fps=25.0 (>= 25, at margin boundary) → pure fps_score, no floor
+    score_b, _ = _compute_load_score(
+        _metrics(gpu=95, cpu=30, ram=30),
+        _fps(cam_01=25.0),
+    )
+    # fps=25 between (27,0) and (22,57): 57 * 2 / 5 = 22.8
+    assert abs(score_b - 22.8) < 0.5  # no floor, pure fps_score
 
 
-def test_hardware_floor_at_fps22():
-    """Hardware emergency floor does not lower a legitimate score.  fps=22 gives fps_score=57, floor=75, max=75."""
+def test_hardware_floor_cpu_saturated_fps22():
+    """CPU >= threshold + degraded fps=22 (< 25) → floor 75.  GPU excluded from floor."""
     score, _ = _compute_load_score(
-        _metrics(gpu=92, cpu=30, ram=30),
+        _metrics(gpu=30, cpu=92, ram=30),
         _fps(cam_01=22.0),
     )
-    assert abs(score - 75.0) < 0.5  # hw floor dominates fps_score=57
+    # fps_score=57, fps_clamped 22 < 25, cpu >= 90 → floor → max(57, 75) = 75
+    assert abs(score - 75.0) < 0.5
+
+
+def test_hardware_floor_ram_saturated_fps22():
+    """RAM >= h_f with degraded fps=22 → floor 75. RAM triggers floor, GPU does not."""
+    score, _ = _compute_load_score(
+        _metrics(gpu=30, cpu=30, ram=92),
+        _fps(cam_01=22.0),
+    )
+    assert abs(score - 75.0) < 0.5
+
+
+def test_gpu_saturated_never_triggers_floor():
+    """GPU=95 + degraded fps=22 → pure FPS score 57, NO floor (GPU excluded)."""
+    score, _ = _compute_load_score(
+        _metrics(gpu=95, cpu=30, ram=30),
+        _fps(cam_01=22.0),
+    )
+    # fps=22 → fps_score=57; cpu & ram below threshold → no floor
+    assert abs(score - 57.0) < 0.5
 
 
 def test_no_hardware_emergency_normal_fps():
@@ -153,6 +181,46 @@ def test_interpolation_mid():
     assert abs(score - 28.5) < 0.5
 
 
+def test_gpu_saturated_healthy_fps_no_floor():
+    """GPU >= 90 with 27 FPS (healthy) → pure FPS score 0, no emergency floor."""
+    score, _ = _compute_load_score(
+        _metrics(gpu=95, cpu=50, ram=50),
+        _fps(cam_01=27.0),
+    )
+    # fps_clamped=27 >= 25, so floor does NOT fire even though GPU >= 90
+    assert score == 0.0, f"Expected 0 (healthy FPS ignores GPU spike), got {score}"
+
+
+def test_gpu_saturated_healthy_25_fps_no_floor():
+    """GPU >= 90 with 25 FPS (>= TARGET_FPS-2, boundary) → pure FPS score, no floor."""
+    score, _ = _compute_load_score(
+        _metrics(gpu=95, cpu=50, ram=50),
+        _fps(cam_01=25.0),
+    )
+    # fps=25: 57 * 2 / 5 = 22.8 — pure FPS score, no floor
+    assert abs(score - 22.8) < 0.5, f"Expected ~22.8 (FPS score), got {score}"
+
+
+def test_degraded_fps_no_cpu_ram_saturation_no_floor():
+    """Degraded fps with CPU+RAM below threshold → pure FPS score, no floor.
+       GPU=95 is ignored — it is burst-aliased and never triggers the floor."""
+    score, _ = _compute_load_score(
+        _metrics(gpu=95, cpu=50, ram=50),
+        _fps(cam_01=17.0),
+    )
+    # fps=17 → fps_score=75; cpu=50, ram=50 < 90 → no floor → 75.0
+    assert abs(score - 75.0) < 0.5, f"Expected 75 (FPS score only), got {score}"
+
+
+def test_degraded_fps_cpu_ram_both_saturated_floor():
+    """CPU >= 90 AND ram >= 90 + degraded fps=17 → floor 75."""
+    score, _ = _compute_load_score(
+        _metrics(gpu=30, cpu=91, ram=93),
+        _fps(cam_01=17.0),
+    )
+    assert score >= 75.0, f"Expected >= 75 with CPU+RAM sat, got {score}"
+
+
 # ---------------------------------------------------------------------------
 # no test for edge_node.yml mtime since it's mocked and file doesn't exist yet
 # ---------------------------------------------------------------------------
@@ -165,7 +233,9 @@ if __name__ == "__main__":
         test_no_cameras_no_penalty,
         test_all_cameras_above_target,
         test_fps_score_is_dominant_no_hardware_bonus,
-        test_hardware_floor_at_fps22,
+        test_hardware_floor_cpu_saturated_fps22,
+        test_hardware_floor_ram_saturated_fps22,
+        test_gpu_saturated_never_triggers_floor,
         test_no_hardware_emergency_normal_fps,
         test_score_clamped_to_100,
         test_anchor_27_fps_zero,
@@ -175,6 +245,10 @@ if __name__ == "__main__":
         test_anchor_zero_fps,
         test_anchor_exact_upper_bound,
         test_interpolation_mid,
+        test_gpu_saturated_healthy_fps_no_floor,
+        test_gpu_saturated_healthy_25_fps_no_floor,
+        test_degraded_fps_no_cpu_ram_saturation_no_floor,
+        test_degraded_fps_cpu_ram_both_saturated_floor,
     ]
 
     passed = failed = 0

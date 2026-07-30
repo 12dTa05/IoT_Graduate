@@ -185,6 +185,14 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
                          if stat_frac_vals else 0.0)
             delta = round(hw["gpu_percent"] - wbase_ref, 2)
 
+            # ponytail: skip rows when no active cameras — pipeline transition
+            # snapshots are already filtered by clean_collected_csvs.py.
+            if n_active_cameras == 0:
+                elapsed = time.monotonic() - t0
+                sleep_s = max(0.0, interval - elapsed)
+                time.sleep(sleep_s)
+                continue
+
             load_score, _preset = _compute_load_score(hw, fps_dict)
 
             writer.writerow({

@@ -205,9 +205,12 @@ def _compute_load_score(metrics: dict, fps_stats: dict) -> tuple:
         Linear interpolation between anchors.
 
     Hardware emergency floor:
-        If ANY of {GPU, CPU, RAM} >= hw_fuse_threshold (default 90):
+        (GPU utilization is burst-aliased — it must NOT participate in
+         the floor at any FPS.  FPS anchors are the GPU saturation signal.)
+        If CPU >= hw_fuse_threshold (default 90) OR RAM >= hw_fuse_threshold
+        AND fps_clamped < TARGET_FPS - 2.0:
             score = max(fps_score, hw_fuse_score_floor)  (default floor 75.0)
-        This ensures hardware saturation triggers at least L1 but never 100.
+        Transient hardware saturation with healthy FPS does NOT trigger the floor.
 
     Weight components are removed: only the anchored FPS curve + hardware
     floor drive the score.  Hardware metrics are safety status, not bonuses.
@@ -245,13 +248,22 @@ def _compute_load_score(metrics: dict, fps_stats: dict) -> tuple:
         fps_score = 75.0 + (100.0 - 75.0) * (17.0 - fps_clamped) / (17.0 - 0.0)
 
     # ── Hardware emergency floor ──────────────────────────────
+    # ponytail: GPU utilization is burst-aliased across sample intervals;
+    #           the floor MUST NOT gate on it.  FPS loss is the GPU saturation
+    #           signal — an anchored FPS score already captures the impact.
+    #           Only sustained CPU or RAM pressure + degraded FPS triggers
+    #           the floor.
     hw_saturated = (
-        metrics.get("gpu_percent", 0.0) >= hw_fuse_threshold or
         metrics.get("cpu_percent", 0.0) >= hw_fuse_threshold or
         metrics.get("ram_percent", 0.0) >= hw_fuse_threshold
     )
 
-    if hw_saturated:
+    # ponytail: hardware saturation alone is not an emergency; the floor
+    #           only fires when FPS is actually degraded (TARGET_FPS - 2 margin).
+    #           Healthy FPS with transient GPU spikes stays pure FPS score.
+    fps_emergency = fps_clamped < TARGET_FPS - 2.0
+
+    if hw_saturated and fps_emergency:
         score = max(fps_score, hw_fuse_score_floor)
     else:
         score = fps_score

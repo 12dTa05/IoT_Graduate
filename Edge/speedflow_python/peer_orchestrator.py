@@ -1229,23 +1229,14 @@ class PeerOrchestrator:
                 logger.error("[PeerOrch] Decision missing cam_config for '%s'", camera_id)
                 return
             add_cmd = {**cam_config, "cmd": "ADD"}
-            # Fix #9: when WE are the winner, dispatch the ADD directly to the
-            # camera_manager instead of relying on ZenohCommandSubscriber being
-            # alive.  We still also publish to the control key so that any
-            # external subscriber (e.g. the ZenohCommandSubscriber) can act too,
-            # but the orchestrator itself handles it immediately via the shared
-            # camera_manager reference, making the ADD robust.
+            # ZenohCommandSubscriber is the single owner of ADD/ACK: it
+            # processes the ADD, waits for the stream to reach PLAYING,
+            # and publishes peers/vote/ack/{cam}.  Publishing directly to
+            # peers/control/{winner} routes through Zenoh — which loops
+            # back to our own subscriber when we are the winner.
             winner_key = f"peers/control/{winner}"
             self._session.put(winner_key, msgpack.packb(add_cmd, use_bin_type=True))
-            logger.info("[PeerOrch] ADD command sent to '%s' for '%s'", winner, camera_id)
-
-            # Direct dispatch — works even when ZenohCommandSubscriber is absent
-            if self._camera_manager is not None:
-                try:
-                    self._camera_manager.handle_add_command(add_cmd)
-                    logger.info("[PeerOrch] Direct ADD dispatched to camera_manager for '%s'", camera_id)
-                except Exception as exc:
-                    logger.warning("[PeerOrch] Direct ADD dispatch failed for '%s': %s", camera_id, exc)
+            logger.info("[PeerOrch] ADD command published for '%s' to '%s'", camera_id, winner)
 
         elif from_node == self._node_id:
             # --- I AM REQUESTER: wait for ack then REMOVE ---
