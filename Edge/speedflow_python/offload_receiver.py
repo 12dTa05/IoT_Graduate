@@ -339,18 +339,14 @@ class OffloadReceiver:
         self._processed = 0
         self._errors    = 0
 
+        # Result subscription used when this node sends crops to a peer.
+        self._result_handler: Optional[Any] = None
+        self._result_sub_declared = False
+
     @property
     def offload_processed_count(self) -> int:
         """Monotonic count of successfully handled crop items. Thread-safe (int)."""
         return self._processed
-
-        # ── Sender-side result handler ──────────────────────────────────────
-        # When this node ACTS AS SENDER (offloads crops to a peer), the peer
-        # publishes results on offload/results/{peer}/{us}.  We subscribe to
-        # offload/results/*/{my_node_id} and forward decoded payloads to the
-        # registered callback (probe.inject_offload_result).
-        self._result_handler: Optional[Any] = None   # callable(result_dict) or None
-        self._result_sub_declared = False
 
     # ------------------------------------------------------------------
     # Lifecycle
