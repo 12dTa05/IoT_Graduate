@@ -40,11 +40,7 @@ import msgpack
 from .zenoh_session import make_session
 
 # Settings loaded from Edge/.env
-try:
-    from .settings import ROOT as _ROOT
-except ImportError:
-    # Standalone execution fallback (tests)
-    _ROOT = Path(__file__).resolve().parents[1]
+from .settings import ROOT as _ROOT
 
 logging.basicConfig(
     level=logging.INFO,
@@ -203,6 +199,12 @@ class PeerOrchestrator:
         # Cameras migrated away due to overload: camera_id → winner_node_id
         # Used to reclaim cameras when this node's load drops below threshold.
         self._migrated_out: Dict[str, str] = {}
+
+        # ponytail: rate-limit blocked-decision diagnostics so they don't spew
+        # every 1-second tick.  Keys are short reason strings; value is the Unix
+        # timestamp of the last log.  Cooldown = 15 s (half a typical vote window);
+        # increase to 30 s if log volume is still too high.
+        self._blocked_logged_at: Dict[str, float] = {}
 
         # Timestamp when load first dropped below reclaim threshold (for stability check)
         self._reclaim_eligible_since: Optional[float] = None
@@ -478,7 +480,7 @@ class PeerOrchestrator:
 
         Shadow mode (proactive.shadow_mode = true) emits proactive telemetry
         (risk_index) while keeping ALL decisions on the legacy reactive path.
-        It returns load_score > overload_threshold BEFORE any proactive risk
+        It returns load_score >= overload_threshold BEFORE any proactive risk
         or hard-fuse check — so the proactive predictor can be observed
         side-by-side without affecting migration behaviour.  Hard fuse is
         also bypassed: shadow mode is audit-only.
@@ -488,13 +490,13 @@ class PeerOrchestrator:
         load_score alone may under-report (e.g. when thermal throttling has just
         started and the jtop reading hasn't caught up).
 
-        Falls back to legacy load_score > overload_threshold when disabled.
+        Falls back to legacy load_score >= overload_threshold when disabled.
         """
         proactive_cfg = self._cfg.get("proactive", {})
 
         # Shadow mode: telemetry only — strictly passive/reactive decisions
         if proactive_cfg.get("shadow_mode", False):
-            return load_score > self._cfg.get("overload_threshold", 42.0)
+            return load_score >= self._cfg.get("overload_threshold", 42.0)
 
         hard_fuse = float(proactive_cfg.get("hard_fuse_threshold", 0.95))
 
@@ -507,7 +509,7 @@ class PeerOrchestrator:
             return risk_index >= threshold
 
         # Legacy path
-        return load_score > self._cfg.get("overload_threshold", 42.0)
+        return load_score >= self._cfg.get("overload_threshold", 42.0)
 
     # ------------------------------------------------------------------
     # Overload trigger score helper (for log messages + RFO payload)
@@ -818,11 +820,24 @@ class PeerOrchestrator:
 
         cam_to_offload = self._pick_camera_to_offload(state)
         if not cam_to_offload:
+            if self._maybe_log_block("no_cam", now):
+                logger.warning(
+                    "[PeerOrch] Overloaded (load=%.1f, over_thresh) but no eligible camera to "
+                    "offload (active=%d, fps_data=%d) — cannot escalate",
+                    load, len(state.active_cameras),
+                    len(state.fps_per_camera) if state.fps_per_camera else 0,
+                )
             return
 
         # Check level-change cooldown for this camera
         last_change = self._offload_level_changed_at.get(cam_to_offload, 0.0)
         if now - last_change < level_cd:
+            if self._maybe_log_block("lvl_cd", now):
+                logger.info(
+                    "[PeerOrch] Overload but level-change cooldown active for '%s' "
+                    "(%.1fs elapsed, need %.1fs) — offload blocked",
+                    cam_to_offload, now - last_change, level_cd,
+                )
             return
 
         current_level = self.get_offload_level(cam_to_offload)
@@ -830,8 +845,34 @@ class PeerOrchestrator:
         # Escalation ladder: 3 → 2 → 1
         if load >= thr1 and global_offload >= 1:
             # Full stream migration (Level 1) — existing RFO path.
-            # Fix #6: clear any fine-grained offload first so a camera cannot
-            # simultaneously be at Level 2/3 AND undergoing Level 1 migration.
+            # Guard: check vote-in-progress and per-camera migration cooldown
+            # BEFORE clearing any fine-grained offload so Level 2/3 survives
+            # when L1 is blocked.
+            with self._lock:
+                already_voting = bool(self._vote_in_progress)
+            if already_voting:
+                if self._maybe_log_block("l1_vote", now):
+                    logger.warning(
+                        "[PeerOrch] L1 blocked: vote in progress for '%s' — "
+                        "retaining Level %d offload for '%s'",
+                        self._vote_in_progress,
+                        self.get_offload_level(cam_to_offload),
+                        cam_to_offload,
+                    )
+                return
+            last_mig = self._cam_cooldown.get(cam_to_offload, 0.0)
+            if now - last_mig < cfg.get("cooldown_s", 45.0):
+                if self._maybe_log_block("l1_cooldown", now):
+                    logger.warning(
+                        "[PeerOrch] L1 blocked: migration cooldown active for '%s' "
+                        "(%.1f s elapsed, need %.1f s) — retaining Level %d offload",
+                        cam_to_offload,
+                        now - last_mig,
+                        cfg.get("cooldown_s", 45.0),
+                        self.get_offload_level(cam_to_offload),
+                    )
+                return
+            # Actually going to trigger L1 — clear fine-grained offload first
             if self.get_offload_level(cam_to_offload) in (2, 3):
                 self.set_offload_level(cam_to_offload, 0)
             logger.warning(
@@ -839,22 +880,21 @@ class PeerOrchestrator:
                 "Level 1 stream migration for '%s'.",
                 load, thr1, cam_to_offload,
             )
-            last_mig = self._cam_cooldown.get(cam_to_offload, 0.0)
-            trigger  = "fps_drop" if (state.avg_fps and
-                                      state.avg_fps < cfg.get("eps_fps_strict", 18.0)
-                                      ) else "load_score"
-            with self._lock:
-                already_voting = bool(self._vote_in_progress)
-            if already_voting:
-                logger.debug("[PeerOrch] Vote already in progress for %s, skipping L1 trigger",
-                             self._vote_in_progress)
-            elif now - last_mig >= cfg.get("cooldown_s", 45.0):
-                logger.warning("[PeerOrch] RFO trigger: %s reason=%s", cam_to_offload, trigger)
-                self._trigger_rfo(cam_to_offload, relaxation_tier=0)
+            trigger = "fps_drop" if (state.avg_fps and
+                                     state.avg_fps < cfg.get("eps_fps_strict", 18.0)
+                                     ) else "load_score"
+            logger.warning("[PeerOrch] RFO trigger: %s reason=%s", cam_to_offload, trigger)
+            self._trigger_rfo(cam_to_offload, relaxation_tier=0)
 
         elif load >= thr2 and global_offload >= 2:
             best_peer = self._pick_best_peer(for_offload_level=2)
             if not best_peer:
+                if self._maybe_log_block("no_peer_l2", now):
+                    logger.warning(
+                        "[PeerOrch] Overloaded (load=%.1f ≥ L2=%.1f) but no suitable "
+                        "peer for Level 2 crop offload — offload blocked",
+                        load, thr2,
+                    )
                 return
             if current_level != 2:
                 logger.warning(
@@ -867,6 +907,12 @@ class PeerOrchestrator:
         elif load >= thr3 and global_offload >= 3:
             best_peer = self._pick_best_peer(for_offload_level=3)
             if not best_peer:
+                if self._maybe_log_block("no_peer_l3", now):
+                    logger.warning(
+                        "[PeerOrch] Overloaded (load=%.1f ≥ L3=%.1f) but no suitable "
+                        "peer for Level 3 plate-crop offload — offload blocked",
+                        load, thr3,
+                    )
                 return
             if current_level != 3:
                 logger.warning(
@@ -1619,6 +1665,20 @@ class PeerOrchestrator:
         except Exception as exc:
             logger.error("Failed to load camera config for '%s': %s", camera_id, exc)
             return None
+
+    # ponytail: single rate-limiter for blocked-decision diagnostics so they
+    # don't spew every 1-second tick.  Each "block reason" key gets logged at
+    # most once every BLOCK_LOG_COOLDOWN seconds (default 15 s).  Increase to
+    # 30 s if still too noisy.
+    BLOCKED_LOG_COOLDOWN = 15.0
+
+    def _maybe_log_block(self, reason: str, now: float) -> bool:
+        """Return True the first time `reason` fires or after its cooldown expires."""
+        last = self._blocked_logged_at.get(reason, 0.0)
+        if now - last >= self.BLOCKED_LOG_COOLDOWN:
+            self._blocked_logged_at[reason] = now
+            return True
+        return False
 
     def _get_camera_uri(self, camera_id: str) -> Optional[str]:
         """Get RTSP URI of camera from cameras.yml."""

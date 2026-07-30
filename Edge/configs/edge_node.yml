@@ -8,11 +8,11 @@
 # ============================================================
 
 p2p:
-  overload_threshold: 57.0      # load_score above this triggers RFO; L3 anchor
+  overload_threshold: 57.0      # load_score at or above this triggers RFO; L3 anchor
                                    # (22 FPS → score 57) under FPS-dominant piecewise curve
-  overload_duration_s: 3.0     # must be overloaded this long before RFO
-                                  # short enough to act inside the horizon_s=6s
-                                  # window — avoids noise events while staying responsive
+  overload_duration_s: 7.0     # must be overloaded this long before RFO
+                                   # slightly exceeds one traffic-light cycle (6s)
+                                   # to filter transient GPU bursts with healthy FPS
   cooldown_s: 30.0              # per-camera cooldown between migrations
                                   # prevents ping-pong while allowing rebalancing
                                   # after migration effect is observable
