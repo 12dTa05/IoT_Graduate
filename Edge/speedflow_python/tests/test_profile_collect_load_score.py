@@ -2,7 +2,8 @@
 Edge/speedflow_python/tests/test_profile_collect_load_score.py
 
 Verify that the collector records the same load_score that health_agent's
-shared _compute_load_score produces. Hardware-free — mock data only.
+shared _compute_load_score produces.  Hardware-free — mock data only.
+Tests the bounded piecewise-linear FPS anchors + hardware emergency floor.
 
 Run from Edge/:
     python3 -m pytest speedflow_python/tests/test_profile_collect_load_score.py -v
@@ -45,68 +46,115 @@ def test_compute_load_score_returns_tuple():
 
 
 def test_no_cameras_no_penalty():
-    """With all-zero hardware and no cameras → score = 0.0."""
+    """With all-zero hardware and no cameras → score = 0.0 (preset TARGET_FPS)."""
     score, _ = _compute_load_score(_metrics(), {})
     assert score == 0.0
 
 
-def test_typical_load_spot_check():
-    """Known inputs → score matches formula: base + penalty, clamped to 100.
-
-    New FPS-dominant weights [0.05, 0.05, 0.05], fps_penalty_max = 80:
-      base = 0.05*50 + 0.05*30 + 0.05*20 = 2.5 + 1.5 + 1.0 = 5.0
-      avg_fps = (25+25)/2 = 25, TARGET_FPS = 25 → penalty = 0
-      fuse = 0 (no metric ≥ 90)
-      score = 5.0
-    """
+def test_all_cameras_above_target():
+    """avg_fps >= TARGET_FPS (27) → score 0."""
     score, _ = _compute_load_score(
-        _metrics(gpu=50, cpu=30, ram=20),
-        _fps(cam_01=25.0, cam_02=25.0),
+        _metrics(gpu=50, cpu=40, ram=30),
+        _fps(cam_01=27.0, cam_02=27.5),
     )
-    assert abs(score - 5.0) < 0.5
+    assert score == 0.0
 
 
-def test_fps_penalty():
-    """FPS below target introduces a penalty above base."""
+def test_fps_score_is_dominant_no_hardware_bonus():
+    """Hardware metrics are NOT additive: 95% GPU alone with 27 FPS → score 0 (no floor triggered because no hardware emergency). Wait, 95 >= 90 triggers floor. Let's test: 95% GPU but fps=27 → floor 75.0"""
+
+    # 95% GPU triggers hardware emergency → floor 75.0, fps_score=0, so max(0, 75) = 75
     score, _ = _compute_load_score(
-        _metrics(gpu=50, cpu=30, ram=20),
-        _fps(cam_01=15.0),  # TARGET_FPS=25 → 10/25 * 80 = 32.0 point penalty
+        _metrics(gpu=95, cpu=30, ram=30),
+        _fps(cam_01=27.0),
     )
-    # base = 0.05*50 + 0.05*30 + 0.05*20 = 5.0, penalty = 32.0, total = 37.0
-    assert abs(score - 37.0) < 0.5
+    assert abs(score - 75.0) < 0.5  # hw floor overrides fps_score=0
+
+
+def test_hardware_floor_at_fps22():
+    """Hardware emergency floor does not lower a legitimate score.  fps=22 gives fps_score=57, floor=75, max=75."""
+    score, _ = _compute_load_score(
+        _metrics(gpu=92, cpu=30, ram=30),
+        _fps(cam_01=22.0),
+    )
+    assert abs(score - 75.0) < 0.5  # hw floor dominates fps_score=57
+
+
+def test_no_hardware_emergency_normal_fps():
+    """No hardware saturation → pure FPS score.  fps=25 should be between 0 and 57."""
+    score, _ = _compute_load_score(
+        _metrics(gpu=60, cpu=40, ram=50),
+        _fps(cam_01=25.0),
+    )
+    # Between anchor (27,0) and (22,57): interpolated
+    expected = 57.0 * (27.0 - 25.0) / (27.0 - 22.0)  # = 57 * 2 / 5 = 22.8
+    assert abs(score - 22.8) < 0.5
 
 
 def test_score_clamped_to_100():
     """Score is always ≤ 100."""
     score, _ = _compute_load_score(
         _metrics(gpu=100, cpu=100, ram=100),
-        _fps(cam_01=100.0),  # fps above target → no penalty
+        _fps(cam_01=0.0),
     )
+    # fps=0 → fps_score = 100, hw saturated → floor 75 → max(100,75) = 100
     assert score <= 100.0
-
-
-def test_collected_row_matches_shared_function():
-    """The central proof: a row that profile_collect would log (same hw + fps)
-    matches _compute_load_score output exactly."""
-    hw = {"gpu_percent": 60.0, "cpu_percent": 40.0, "ram_percent": 30.0, "gpu_temp_c": 72.0}
-    fps = {"cam_01": 25.0, "cam_02": 22.0}
-
-    expected_score, expected_preset = _compute_load_score(hw, fps)
-
-    # profile_collect calls _compute_load_score(hw, fps_dict) directly — no
-    # recalculation layer — so the score it writes IS this return value.
-    assert isinstance(expected_score, float)
-    assert 0.0 <= expected_score <= 100.0
-
-    # avg_fps = (25+22)/2 = 23.5, penalty = (25-23.5)/25 * 80 = 4.8
-    # base = 0.05*60 + 0.05*40 + 0.05*30 = 3.0 + 2.0 + 1.5 = 6.5
-    # fuse = 0 (no metric ≥ 90)
-    # total = 11.3
-    assert abs(expected_score - 11.3) < 1.0
+    assert score >= 0.0
 
 
 # ---------------------------------------------------------------------------
-# Runner
+# anchor exact tests
+# ---------------------------------------------------------------------------
+
+def test_anchor_27_fps_zero():
+    """FPS >= 27 → score 0 (no hardware crisis)."""
+    score, _ = _compute_load_score(_metrics(gpu=30, cpu=20, ram=10), _fps(cam_01=27.0))
+    assert score == 0.0, f"Expected 0, got {score}"
+
+    score_b, _ = _compute_load_score(_metrics(gpu=30, cpu=20, ram=10), _fps(cam_01=28.0))
+    assert score_b == 0.0, f"Clamped input 28→27, got {score_b}"
+
+
+def test_anchor_22_fps():
+    """F(22) = 57 (L3 threshold)."""
+    score, _ = _compute_load_score(_metrics(gpu=30, cpu=20, ram=10), _fps(cam_01=22.0))
+    assert abs(score - 57.0) < 0.05, f"Expected 57, got {score}"
+
+
+def test_anchor_19_fps():
+    """F(19) = 65 (L2 threshold)."""
+    score, _ = _compute_load_score(_metrics(gpu=30, cpu=20, ram=10), _fps(cam_01=19.0))
+    assert abs(score - 65.0) < 0.05, f"Expected 65, got {score}"
+
+
+def test_anchor_17_fps():
+    """F(17) = 75 (L1 threshold)."""
+    score, _ = _compute_load_score(_metrics(gpu=30, cpu=20, ram=10), _fps(cam_01=17.0))
+    assert abs(score - 75.0) < 0.05, f"Expected 75, got {score}"
+
+
+def test_anchor_zero_fps():
+    """F(0) = 100."""
+    score, _ = _compute_load_score(_metrics(gpu=30, cpu=20, ram=10), _fps(cam_01=0.0))
+    assert abs(score - 100.0) < 0.05, f"Expected 100, got {score}"
+
+
+def test_anchor_exact_upper_bound():
+    """all cameras above 27 (clamped) → 0."""
+    score, _ = _compute_load_score(_metrics(gpu=30, cpu=20, ram=10),
+                                    _fps(cam_01=27.0, cam_02=27.0))
+    assert score == 0.0
+
+
+def test_interpolation_mid():
+    """F(24.5) midpoint between 27->0 and 22->57: 28.5."""
+    score, _ = _compute_load_score(_metrics(gpu=30, cpu=20, ram=10), _fps(cam_01=24.5))
+    expected = 57.0 * (27.0 - 24.5) / (27.0 - 22.0)  # = 28.5
+    assert abs(score - 28.5) < 0.5
+
+
+# ---------------------------------------------------------------------------
+# no test for edge_node.yml mtime since it's mocked and file doesn't exist yet
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -115,10 +163,18 @@ if __name__ == "__main__":
     tests = [
         test_compute_load_score_returns_tuple,
         test_no_cameras_no_penalty,
-        test_typical_load_spot_check,
-        test_fps_penalty,
+        test_all_cameras_above_target,
+        test_fps_score_is_dominant_no_hardware_bonus,
+        test_hardware_floor_at_fps22,
+        test_no_hardware_emergency_normal_fps,
         test_score_clamped_to_100,
-        test_collected_row_matches_shared_function,
+        test_anchor_27_fps_zero,
+        test_anchor_22_fps,
+        test_anchor_19_fps,
+        test_anchor_17_fps,
+        test_anchor_zero_fps,
+        test_anchor_exact_upper_bound,
+        test_interpolation_mid,
     ]
 
     passed = failed = 0

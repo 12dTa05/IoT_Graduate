@@ -8,8 +8,8 @@
 # ============================================================
 
 p2p:
-  overload_threshold: 55.0      # load_score above this triggers RFO; aligns with L3 /
-                                  # ≈22 FPS under the FPS-dominant score
+  overload_threshold: 57.0      # load_score above this triggers RFO; L3 anchor
+                                   # (22 FPS → score 57) under FPS-dominant piecewise curve
   overload_duration_s: 3.0     # must be overloaded this long before RFO
                                   # short enough to act inside the horizon_s=6s
                                   # window — avoids noise events while staying responsive
@@ -22,6 +22,7 @@ p2p:
   vote_window_s: 2.0            # proposal collection duration
   failover_jitter_max_s: 3.0    # random delay before failover ADD (race prevention)
   reclaim_margin: 15.0          # reclaim only when load < (overload_threshold - reclaim_margin)
+                                   # 57 - 15 = 42; enables reclaim once score drops below 42
   reclaim_stable_s: 90.0        # load must stay below reclaim threshold this long before
                                   # reclaiming — one full signal cycle to confirm genuine
                                   # capacity recovery rather than a momentary green phase
@@ -54,9 +55,11 @@ p2p:
   offload_level: 3
 
   # Load thresholds that trigger each escalation step
-  offload_level3_threshold: 55.0   # ≈ 21 FPS → try plate-crop offload first
-  offload_level2_threshold: 64.0   # ≈ 19 FPS → escalate to vehicle-crop offload
-  offload_level1_threshold: 79.0   # ≈ 17 FPS → escalate to full stream migration
+  # Anchors from the FPS-dominant piecewise-linear curve:
+  #   avg_fps 22 → score 57  (L3) · avg_fps 19 → score 65 (L2) · avg_fps 17 → score 75 (L1)
+  offload_level3_threshold: 57.0   # L3: crop offload → plate-crop offload first
+  offload_level2_threshold: 65.0   # L2: vehicle-crop offload when load worsens
+  offload_level1_threshold: 75.0   # L1: fall-stream RTSP migration at critical load
 
   # Cooldown between level changes for the same camera (seconds)
   offload_level_cooldown_s: 12.0
@@ -66,35 +69,41 @@ p2p:
   lpd_engine_path: "models/lpd.engine"
 
 # ---------------------------------------------------------------------------
-# Load score — FPS-dominant with lightweight hardware baseline
+# Load score — FPS-dominant piecewise-linear curve + hardware emergency floor
 #
-# Formula (see health_agent._compute_load_score):
-#   base  = w_gpu*GPU% + w_cpu*CPU% + w_ram*RAM%   (diagnostic whisper)
-#   penalty = (TARGET_FPS - avg_fps)/TARGET_FPS × fps_penalty_max   (dominant)
-#   fuse    = hw_fuse_bonus when ANY {GPU, CPU, RAM} ≥ hw_fuse_threshold
-#   score   = min(100, base + penalty + fuse)
+# FPS score (bounded, input FPS clamped to [0, TARGET_FPS=27]):
+#   avg_fps >= 27  →   0
+#   avg_fps  = 22  →  57  (L3/overload threshold)
+#   avg_fps  = 19  →  65  (L2)
+#   avg_fps  = 17  →  75  (L1)
+#   avg_fps <=  0  → 100
+#   Linear interpolation between anchors.
 #
-# Hardware weights are tiny: they keep a node with perfect FPS from reading
-# 0 %, but FPS drop is the primary signal.  The fuse fires once when a
-# hardware ceiling is reached (e.g. GPU at 92 % with FPS still high) to
-# ensure the orchestrator sees it before FPS collapses.
+# Hardware emergency floor:
+#   If ANY of {GPU, CPU, RAM} >= hw_fuse_threshold (90):
+#       score = max(fps_score, hw_fuse_score_floor) (75.0 = L1)
+#   This ensures hardware saturation immediately triggers Level 1 but
+#   never falsely reports score 100.
 #
-# Returns preset = "fps_dominant" for every cycle — no bandwidth/normal
-# switching; single stable regime name.
+# Hardware weights are removed from the score entirely — only the
+# anchored FPS curve + floor drive the value.  Hardware metrics are
+# safety status, not additive bonuses.
+#
+# Returns preset = "fps_dominant" every cycle — stable preset string.
 # ---------------------------------------------------------------------------
 load_score:
-  # Hardware whisper weights (diagnostic baseline, FPS dominates)
-  weight_gpu: 0.05
-  weight_cpu: 0.05
-  weight_ram: 0.05
+  # Anchor points are hardcoded in the piecewise linear function
+  # (health_agent._compute_load_score).  This file carries only the
+  # tuneable hardware-fuse parameters.
 
-  # FPS-drop penalty cap — additive points when fps < TARGET_FPS
-  fps_penalty_max: 200.0
-
-  # Hardware saturation safety fuse — adds hw_fuse_bonus when ANY single
-  # metric (GPU, CPU, or RAM) reaches/exceeds this threshold.
+  # Hardware saturation threshold — when ANY single metric (GPU, CPU,
+  # or RAM) reaches/exceeds this threshold, the emergency floor activates.
   hw_fuse_threshold: 90.0
-  hw_fuse_bonus: 25.0
+
+  # Emergency floor — score cannot drop below this while any hardware
+  # metric is saturated.  Set to 75.0 (L1 threshold) so hardware crisis
+  # immediately triggers full-stream migration (L1) but not 100.
+  hw_fuse_score_floor: 75.0
 
 # ---------------------------------------------------------------------------
 # Proactive load model — Vehicle-Driven Proactive Load Profiling

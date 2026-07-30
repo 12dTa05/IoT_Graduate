@@ -193,59 +193,69 @@ except OSError:
 
 def _compute_load_score(metrics: dict, fps_stats: dict) -> tuple:
     """
-    FPS-dominant load score with a lightweight hardware base and a configurable
-    hardware saturation safety fuse.
+    FPS-dominant load score with piecewise-linear FPS anchors and a configurable
+    hardware emergency floor.
 
-    Formula:
-        base    = w_gpu * GPU% + w_cpu * CPU% + w_ram * RAM%     (diagnostic whisper)
-        penalty = drop_frac * fps_penalty_max                     (dominant signal)
-        fuse    = hw_fuse_bonus when ANY of {GPU,CPU,RAM} >= hw_fuse_threshold, else 0
-        score   = min(100.0, base + penalty + fuse)
+    FPS score (bounded piecewise-linear, input clamped to [0, TARGET_FPS=27]):
+        avg_fps >= 27  →   0
+        avg_fps  = 22  →  57
+        avg_fps  = 19  →  65
+        avg_fps  = 17  →  75
+        avg_fps <=  0  → 100
+        Linear interpolation between anchors.
 
-    Hardware weights are intentionally tiny (0.05 each) — a diagnostic baseline
-    that prevents a node with excellent FPS from appearing idle when its GPU
-    happens to be 0 %.  The FPS drop is the real signal.
+    Hardware emergency floor:
+        If ANY of {GPU, CPU, RAM} >= hw_fuse_threshold (default 90):
+            score = max(fps_score, hw_fuse_score_floor)  (default floor 75.0)
+        This ensures hardware saturation triggers at least L1 but never 100.
 
-    Returns (score: float, "fps_dominant") — a single stable preset string so
-    the heartbeat field stays consistent; no bandwidth/normal switching.
+    Weight components are removed: only the anchored FPS curve + hardware
+    floor drive the score.  Hardware metrics are safety status, not bonuses.
+
+    Returns (score: float, "fps_dominant") — single stable preset string.
     """
     _maybe_reload_edge_cfg()
     ls_cfg = _EDGE_CFG.get("load_score", {})
-    w_gpu  = float(ls_cfg.get("weight_gpu",  0.05))
-    w_cpu  = float(ls_cfg.get("weight_cpu",  0.05))
-    w_ram  = float(ls_cfg.get("weight_ram",  0.05))
-    fps_penalty_max = float(ls_cfg.get("fps_penalty_max", 80.0))
-    hw_fuse_threshold = float(ls_cfg.get("hw_fuse_threshold", 90.0))
-    hw_fuse_bonus     = float(ls_cfg.get("hw_fuse_bonus",     25.0))
+    hw_fuse_threshold   = float(ls_cfg.get("hw_fuse_threshold",   90.0))
+    hw_fuse_score_floor = float(ls_cfg.get("hw_fuse_score_floor", 75.0))
 
-    base = (
-        w_gpu * metrics.get("gpu_percent", 0.0) +
-        w_cpu * metrics.get("cpu_percent", 0.0) +
-        w_ram * metrics.get("ram_percent", 0.0)
-    )
-
+    # ── FPS score (piecewise linear) ──────────────────────────
     active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
     if active_fps_vals:
         avg_fps = sum(active_fps_vals) / len(active_fps_vals)
     elif fps_stats:
         avg_fps = 0.0
     else:
-        avg_fps = TARGET_FPS   # no cameras → no penalty
+        avg_fps = TARGET_FPS   # no cameras → no penalty → 0
 
-    fps_drop = max(0.0, TARGET_FPS - avg_fps)
-    penalty  = (fps_drop / TARGET_FPS) * fps_penalty_max
+    fps_clamped = max(0.0, min(TARGET_FPS, avg_fps))
 
-    # Hardware saturation safety fuse — one-shot bonus when any single metric
-    # crosses the threshold (GPU, CPU, or RAM).  This catches the case where
-    # the pipeline is thrashing a hardware ceiling but FPS hasn't collapsed yet,
-    # e.g. a GPU at 92 % delivering 25 fps because DeepStream absorbs drops.
-    fuse = 0.0
-    if (metrics.get("gpu_percent", 0.0) >= hw_fuse_threshold or
+    # Anchor points: (fps, score)
+    # ponytail: inline list is clearer than a dict-of-tuples loop;
+    #           add anchors only when the curve needs more resolution.
+    if fps_clamped >= TARGET_FPS:
+        fps_score = 0.0
+    elif fps_clamped >= 22.0:
+        fps_score = 57.0 * (TARGET_FPS - fps_clamped) / (TARGET_FPS - 22.0)
+    elif fps_clamped >= 19.0:
+        fps_score = 57.0 + (65.0 - 57.0) * (22.0 - fps_clamped) / (22.0 - 19.0)
+    elif fps_clamped >= 17.0:
+        fps_score = 65.0 + (75.0 - 65.0) * (19.0 - fps_clamped) / (19.0 - 17.0)
+    else:
+        fps_score = 75.0 + (100.0 - 75.0) * (17.0 - fps_clamped) / (17.0 - 0.0)
+
+    # ── Hardware emergency floor ──────────────────────────────
+    hw_saturated = (
+        metrics.get("gpu_percent", 0.0) >= hw_fuse_threshold or
         metrics.get("cpu_percent", 0.0) >= hw_fuse_threshold or
-        metrics.get("ram_percent", 0.0) >= hw_fuse_threshold):
-        fuse = hw_fuse_bonus
+        metrics.get("ram_percent", 0.0) >= hw_fuse_threshold
+    )
 
-    score = min(100.0, base + penalty + fuse)
+    if hw_saturated:
+        score = max(fps_score, hw_fuse_score_floor)
+    else:
+        score = fps_score
+
     return round(score, 1), "fps_dominant"
 
 
