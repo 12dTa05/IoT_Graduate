@@ -38,6 +38,11 @@ set -euo pipefail
 EDGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$EDGE_DIR"
 
+mkdir -p logs
+RUN_LOG="${RUN_LOG:-logs/run_$(date +%Y%m%d_%H%M%S).log}"
+exec > >(tee -a "$RUN_LOG") 2>&1
+echo "[run_edge] Runtime log: $RUN_LOG"
+
 PYTHON="${PYTHON:-python3}"
 MODE="${MODE:-rtsp_push}"
 LOAD_POLICY="${LOAD_POLICY:-actual}"
