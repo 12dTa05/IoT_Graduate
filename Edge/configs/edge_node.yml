@@ -21,9 +21,9 @@ p2p:
   heartbeat_timeout_s: 5.0      # peer declared OFFLINE after this silence
   vote_window_s: 2.0            # proposal collection duration
   failover_jitter_max_s: 3.0    # random delay before failover ADD (race prevention)
-  reclaim_margin: 15.0          # reclaim only when load < (overload_threshold - reclaim_margin)
+  reclaim_margin: 7.0          # reclaim only when load < (overload_threshold - reclaim_margin)
                                    # 57 - 15 = 42; enables reclaim once score drops below 42
-  reclaim_stable_s: 90.0        # load must stay below reclaim threshold this long before
+  reclaim_stable_s: 15.0        # load must stay below reclaim threshold this long before
                                   # reclaiming — one full signal cycle to confirm genuine
                                   # capacity recovery rather than a momentary green phase
 
