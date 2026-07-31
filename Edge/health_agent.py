@@ -46,70 +46,85 @@ logger = logging.getLogger("health_agent")
 
 
 # ---------------------------------------------------------------------------
+# Unified Payload Reader
+# ---------------------------------------------------------------------------
+
+def _read_payload() -> Optional[dict]:
+    """
+    Read and parse the unified JSON payload written atomically by SpeedProbe.
+    Returns the full parsed dict or None on any error (missing file, partial
+    JSON, parse error).
+    """
+    try:
+        with open(FPS_STATS_FILE, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _payload_parts(
+    payload: Optional[dict],
+) -> tuple:
+    """
+    Safely extract the three telemetry parts from a single payload dict.
+    Returns (fps_stats, feature_stats, offload_crops) with safe defaults.
+    """
+    if payload is None:
+        return {}, {}, {"received_per_s": 0.0}
+    fps_stats = {k: v for k, v in payload.items()
+                 if not k.startswith("_") and isinstance(v, (int, float))}
+    feature_stats = payload.get("_features", {})
+    offload_crops = payload.get("_offload_crops", {"received_per_s": 0.0})
+    return fps_stats, feature_stats, offload_crops
+
+
+def _read_pipeline_snapshot() -> tuple:
+    """
+    Read the pipeline JSON once and return all three parts.
+    Returns (fps_stats, feature_stats, offload_crops).
+
+    Callers that need all three should use this instead of three separate
+    wrapper calls to avoid mixing across writer flushes.
+    """
+    return _payload_parts(_read_payload())
+
+
+# ---------------------------------------------------------------------------
 # FPS Reader (read JSON file written by SpeedProbe)
 # ---------------------------------------------------------------------------
 
 def _read_fps_stats() -> Dict[str, float]:
     """
-    Read JSON file written by SpeedProbe containing FPS per camera.
-    Return dict {camera_id: fps} or empty dict if file doesn't exist.
-
-    File format:
-        {
-            "cam_01": 24.7,
-            "cam_02": 25.1,
-            "_updated_at": 1714739900.12,
-            "_features": {"cam_01": {"n_track": 8.2, ...}, ...}
-        }
+    Read FPS per camera from the unified payload.
+    Return dict {camera_id: fps} or empty dict on error.
+    Delegates to _read_payload() for safe single-read.
     """
-    try:
-        with open(FPS_STATS_FILE, "r") as f:
-            data = json.load(f)
-        # Filter out meta-keys that are not cameras
-        return {k: v for k, v in data.items()
-                if not k.startswith("_") and isinstance(v, (int, float))}
-    except FileNotFoundError:
-        return {}
-    except Exception as exc:
-        logger.debug("Failed to read FPS stats: %s", exc)
-        return {}
+    fps_stats, _, _ = _payload_parts(_read_payload())
+    return fps_stats
 
 
 def _read_feature_stats() -> Dict[str, Dict[str, float]]:
     """
-    Read per-camera proactive features written by SpeedProbe._fps_writer_loop.
+    Read per-camera proactive features from the unified payload.
+    Delegates to _read_payload() for safe single-read.
 
     Returns {camera_id: {n_track, n_plate, stationary_fraction}} or {} on error.
-    Gracefully returns empty when running without the DeepStream pipeline
-    (e.g., during offline calibration or health-agent-only mode).
     """
-    try:
-        with open(FPS_STATS_FILE, "r") as f:
-            data = json.load(f)
-        return data.get("_features", {})
-    except FileNotFoundError:
-        return {}
-    except Exception as exc:
-        logger.debug("Failed to read feature stats: %s", exc)
-        return {}
+    _, feature_stats, _ = _payload_parts(_read_payload())
+    return feature_stats
 
 
 def _read_offload_crops() -> dict:
     """
-    Read _offload_crops snapshot written by SpeedProbe._fps_writer_loop.
+    Read _offload_crops snapshot from the unified payload.
+    Delegates to _read_payload() for safe single-read.
 
-    Returns {processed_count, received_per_s, ts} or {"received_per_s": 0.0}
-    when the file is missing/offload receiver is absent.
+    Returns {processed_count, received_per_s, ts} or {"received_per_s": 0.0}.
     """
-    try:
-        with open(FPS_STATS_FILE, "r") as f:
-            data = json.load(f)
-        return data.get("_offload_crops", {"received_per_s": 0.0})
-    except (FileNotFoundError, KeyError):
-        return {"received_per_s": 0.0}
-    except Exception as exc:
-        logger.debug("Failed to read offload crops: %s", exc)
-        return {"received_per_s": 0.0}
+    _, _, offload_crops = _payload_parts(_read_payload())
+    return offload_crops
 
 
 # ---------------------------------------------------------------------------
@@ -609,9 +624,7 @@ class HealthAgent:
                             logger.info("[HealthAgent] Zenoh reconnected successfully.")
 
                 metrics       = self._collect_metrics()
-                fps_stats     = _read_fps_stats()
-                feature_stats = _read_feature_stats()
-                offload_crops = _read_offload_crops()
+                fps_stats, feature_stats, offload_crops = _read_pipeline_snapshot()
                 offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
                 load_score, omega_preset = _compute_load_score(metrics, fps_stats)
 

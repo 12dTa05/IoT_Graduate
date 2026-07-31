@@ -2,11 +2,14 @@
 """
 Edge/tools/profile_collect.py
 
-Phase 1 — Offline System Profiling (data collection for coefficient regression).
+System profiling data collector — records hardware metrics and pipeline
+telemetry snapshots to a time-stamped CSV for load-model coefficient regression
+and DL model training.
 
-Reads the live feature + FPS file written by SpeedProbe and the hardware metrics
-from jtop in lock-step, producing a time-stamped CSV suitable for
-fit_coefficients.py AND train_dl_model.py.
+Reads the unified pipeline payload (written atomically by SpeedProbe) and
+hardware metrics from jtop in lock-step.  Only writes a new CSV row when the
+pipeline payload advances to a fresh sequence number, normalises the
+interleaved FPS + features to a single writer window, and skips warmup data.
 
 Usage (run on the target Jetson while the DeepStream pipeline is active):
 
@@ -14,7 +17,7 @@ Usage (run on the target Jetson while the DeepStream pipeline is active):
 
     --output    Path to output CSV (default: logs/calibration.csv)
     --duration  Collection window in seconds (default: 600 = 10 min)
-    --interval  Sampling interval in seconds (default: 2.0, matches HEALTH_INTERVAL)
+    --interval  Polling interval in seconds (default: 2.0)
 
 The script also measures W_base: if --wbase is passed, launch the pipeline with
 zero video sources, run for --wbase-duration seconds, and record the idle GPU/CPU/
@@ -22,8 +25,9 @@ RAM mean as the base load.  Example:
     python3 tools/profile_collect.py --wbase --wbase-duration 60 --output logs/wbase.txt
 
 Collection -> Training contract:
-  • load_score IS the training target — composite health_agent._compute_load_score
-    (weighted GPU/CPU/RAM + FPS-drop penalty, scale 0-100). Every row has it.
+  • load_score is retained as a runtime/control diagnostic (fps-dominant anchored
+    curve + HW emergency floor, scale 0-100).  Future ML labels derive separately
+    from raw QoS metrics after calibrated collection.
   • FPS serves as the QoS validation signal (compare trained model predictions
     against TARGET_FPS at runtime).
   • Raw gpu_percent remains diagnostic only; use --target gpu_percent in
@@ -31,15 +35,16 @@ Collection -> Training contract:
 
 Output CSV columns:
     ts, gpu_percent, cpu_percent, ram_percent, gpu_temp_c,
+    session_id, sequence,
+    pipeline_window_started_monotonic, pipeline_window_ended_monotonic,
+    pipeline_window_duration_s, pipeline_updated_at,
     fps_avg,
     n_active_cameras,
-    n_track_total, n_track_sq_total, n_plate_total, stationary_fraction_mean,
-    load_score        (composite health_agent._compute_load_score: 0–100),
-    delta_load        (gpu_percent - W_base; only populated if --wbase-ref given)
-
-n_active_cameras is the count of cameras/sources that have fps > 0 at sample time.
-It is used as a node-level model feature alongside the traffic aggregates so the
-DL predictor can account for scale without per-camera padding.
+    n_track_total, n_plate_total,
+    stationary_fraction_mean,
+    offload_crops_received_per_s,
+    load_score,
+    delta_load
 """
 
 from __future__ import annotations
@@ -56,7 +61,7 @@ _EDGE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_EDGE_DIR))
 
 from speedflow_python.settings import FPS_STATS_FILE
-from health_agent import _read_fps_stats, _read_feature_stats, _read_offload_crops, _compute_load_score
+from health_agent import _read_payload, _compute_load_score
 
 # ---------------------------------------------------------------------------
 # jtop helper — graceful fallback if jtop unavailable
@@ -123,9 +128,12 @@ def _read_hw(jtop_session) -> dict:
 FIELDNAMES = [
     "ts",
     "gpu_percent", "cpu_percent", "ram_percent", "gpu_temp_c",
+    "session_id", "sequence",
+    "pipeline_window_started_monotonic", "pipeline_window_ended_monotonic",
+    "pipeline_window_duration_s", "pipeline_updated_at",
     "fps_avg",
     "n_active_cameras",
-    "n_track_total", "n_track_sq_total", "n_plate_total",
+    "n_track_total", "n_plate_total",
     "stationary_fraction_mean",
     "offload_crops_received_per_s",
     "load_score",
@@ -145,7 +153,21 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
     deadline = time.monotonic() + duration
     rows_written = 0
 
-    print(f"[profile_collect] Collecting {duration:.0f}s → {output}  (Ctrl+C to stop early)")
+    # ── Session tracking for integrity ─────────────────────────────────────
+    # Two-phase commit: candidate session must produce advancing sequences
+    # through the warmup period before it becomes the committed session.
+    # After commitment, session changes are rejected.
+    #
+    # Candidate state (not yet committed — can reset on session change):
+    _cand_session_id: str = ""
+    _cand_first_ts: float = 0.0
+    _cand_last_seq: int = -1
+    #
+    # Committed state (locked after first row written):
+    _committed_session_id: str = ""
+    _committed_last_seq: int = -1
+
+    print(f"[profile_collect] Collecting {duration:.0f}s -> {output}  (Ctrl+C to stop early)")
 
     with open(output, "a", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=FIELDNAMES)
@@ -154,68 +176,140 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
 
         while time.monotonic() < deadline:
             t0 = time.monotonic()
+
+            # 1) Read the unified pipeline payload exactly once per loop
+            payload = _read_payload()
+            if payload is None:
+                # No payload yet — wait and retry
+                elapsed = time.monotonic() - t0
+                time.sleep(max(0.0, interval - elapsed))
+                continue
+
+            # 2) Extract snapshot identity from _telemetry nested dict
+            telemetry = payload.get("_telemetry", {})
+            sess_id = telemetry.get("session_id", "")
+            seq     = telemetry.get("sequence", -1)
+            if seq == -1 or not sess_id:
+                # Invalid/incomplete payload
+                elapsed = time.monotonic() - t0
+                time.sleep(max(0.0, interval - elapsed))
+                continue
+
+            # ── Phase: not yet committed ? manage candidate ───────────────
+            if _committed_session_id == "":
+                # 3a) Candidate session changed → reset candidate tracking
+                if sess_id != _cand_session_id:
+                    _cand_session_id = sess_id
+                    _cand_first_ts   = time.time()
+                    _cand_last_seq   = -1
+
+                # 3b) Requirement: candidate must have an advancing sequence
+                #     (fresh pipeline, not a stale payload). Non-advancing
+                #     seqs are silently ignored during candidate phase.
+                if seq <= _cand_last_seq:
+                    elapsed = time.monotonic() - t0
+                    time.sleep(max(0.0, interval - elapsed))
+                    continue
+                _cand_last_seq = seq
+
+                # 3c) Warmup gate: require at least 6 s of elapsed wall time
+                #     since the candidate session's first payload was observed.
+                cand_age_s = time.time() - _cand_first_ts
+                if cand_age_s < 6.0:
+                    elapsed = time.monotonic() - t0
+                    time.sleep(max(0.0, interval - elapsed))
+                    continue
+
+                # 3d) Candidate has survived warmup with advancing seqs →
+                #     COMMIT this session.  We now write the first row.
+                _committed_session_id = _cand_session_id
+                _committed_last_seq   = seq
+            # ── Phase: committed ──────────────────────────────────────────
+            else:
+                # 4a) Session changed → reject (pipeline restarted mid-collection)
+                if sess_id != _committed_session_id:
+                    elapsed = time.monotonic() - t0
+                    time.sleep(max(0.0, interval - elapsed))
+                    continue
+
+                # 4b) Sequence dedup — only strictly advancing seqs accepted
+                if seq <= _committed_last_seq:
+                    elapsed = time.monotonic() - t0
+                    time.sleep(max(0.0, interval - elapsed))
+                    continue
+
+                # 4c) Advance committed sequence
+                _committed_last_seq = seq
             ts = time.time()
 
+            # 6) Sample hardware ONCE only after accepting the snapshot
             hw = _read_hw(jtop)
-            fps_dict  = _read_fps_stats()
-            feat_dict = _read_feature_stats()
-            offload_crops = _read_offload_crops()
-            offload_rate = round(float(offload_crops.get("received_per_s", 0.0)), 3)
 
-            fps_vals = [v for v in fps_dict.values() if v > 0.0]
-            fps_avg  = sum(fps_vals) / len(fps_vals) if fps_vals else 0.0
-
-            # n_active_cameras: sources that are delivering frames (fps > 0)
+            # 7) Compute FPS average from payload
+            fps_vals = [v for k, v in payload.items()
+                        if not k.startswith("_") and isinstance(v, (int, float)) and v > 0.0]
+            fps_avg = sum(fps_vals) / len(fps_vals) if fps_vals else 0.0
             n_active_cameras = len(fps_vals)
 
-            # Aggregate features across active cameras only (fps > 0),
-            # matching the runtime DLPredictor's filtered feature_stats.
-            _active_ids = {k for k, v in fps_dict.items() if v > 0.0}
-            n_track_total     = 0.0
-            n_plate_total     = 0.0
-            stat_frac_vals    = []
+            # 8) Aggregate features across active cameras
+            feat_dict = payload.get("_features", {})
+            _active_ids = {k for k, v in payload.items()
+                           if not k.startswith("_") and isinstance(v, (int, float)) and v > 0.0}
+            n_track_total  = 0.0
+            n_plate_total  = 0.0
+            stat_frac_vals = []
             for cam_id, cam_feats in feat_dict.items():
                 if cam_id not in _active_ids:
                     continue
-                n_track_total  += cam_feats.get("n_track",             0.0)
-                n_plate_total  += cam_feats.get("n_plate",             0.0)
+                n_track_total  += cam_feats.get("n_track", 0.0)
+                n_plate_total  += cam_feats.get("n_plate", 0.0)
                 stat_frac_vals.append(cam_feats.get("stationary_fraction", 0.0))
-
             stat_mean = (sum(stat_frac_vals) / len(stat_frac_vals)
                          if stat_frac_vals else 0.0)
+
+            # 9) Offload rate from the same payload
+            offload_crops = payload.get("_offload_crops", {})
+            offload_rate = round(float(offload_crops.get("received_per_s", 0.0)), 3)
+
             delta = round(hw["gpu_percent"] - wbase_ref, 2)
 
-            # ponytail: skip rows when no active cameras — pipeline transition
-            # snapshots are already filtered by clean_collected_csvs.py.
-            if n_active_cameras == 0:
-                elapsed = time.monotonic() - t0
-                sleep_s = max(0.0, interval - elapsed)
-                time.sleep(sleep_s)
-                continue
-
+            # 10) Compute load_score from the payload fps
+            # Build fps_dict as health_agent expects: {cam_id: float}
+            fps_dict = {k: v for k, v in payload.items()
+                        if not k.startswith("_") and isinstance(v, (int, float))}
             load_score, _preset = _compute_load_score(hw, fps_dict)
 
+            # 11) Snapshot metadata from _telemetry (already extracted above)
+            win_started = telemetry.get("pipeline_window_started_monotonic", 0.0)
+            win_ended   = telemetry.get("pipeline_window_ended_monotonic", 0.0)
+            win_dur     = telemetry.get("pipeline_window_duration_s", 0.0)
+            updated_at  = payload.get("_updated_at", 0.0)
+
             writer.writerow({
-                "ts":                      round(ts, 3),
-                "gpu_percent":             hw["gpu_percent"],
-                "cpu_percent":             hw["cpu_percent"],
-                "ram_percent":             hw["ram_percent"],
-                "gpu_temp_c":              hw["gpu_temp_c"],
-                "fps_avg":                 round(fps_avg,      2),
-                "n_active_cameras":        n_active_cameras,
-                "n_track_total":           round(n_track_total, 2),
-                "n_track_sq_total":        round(n_track_total ** 2, 2),
-                "n_plate_total":           round(n_plate_total, 2),
-                "stationary_fraction_mean": round(stat_mean,  3),
-                "offload_crops_received_per_s": offload_rate,
-                "load_score":              load_score,
-                "delta_load":              delta,
+                "ts":                                 round(ts, 3),
+                "gpu_percent":                        hw["gpu_percent"],
+                "cpu_percent":                        hw["cpu_percent"],
+                "ram_percent":                        hw["ram_percent"],
+                "gpu_temp_c":                         hw["gpu_temp_c"],
+                "session_id":                         sess_id,
+                "sequence":                           seq,
+                "pipeline_window_started_monotonic":  round(win_started, 3),
+                "pipeline_window_ended_monotonic":    round(win_ended, 3),
+                "pipeline_window_duration_s":         round(win_dur, 3),
+                "pipeline_updated_at":                round(updated_at, 3),
+                "fps_avg":                            round(fps_avg, 2),
+                "n_active_cameras":                   n_active_cameras,
+                "n_track_total":                      round(n_track_total, 2),
+                "n_plate_total":                      round(n_plate_total, 2),
+                "stationary_fraction_mean":           round(stat_mean, 3),
+                "offload_crops_received_per_s":       offload_rate,
+                "load_score":                         load_score,
+                "delta_load":                         delta,
             })
             rows_written += 1
 
             elapsed = time.monotonic() - t0
-            sleep_s = max(0.0, interval - elapsed)
-            time.sleep(sleep_s)
+            time.sleep(max(0.0, interval - elapsed))
 
     if jtop:
         try: jtop.close()
@@ -253,7 +347,7 @@ def measure_wbase(output: Path, duration: float, interval: float) -> float:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Profile data collector for Phase-1 regression")
+    ap = argparse.ArgumentParser(description="System profiling data collector for load-model regression")
     ap.add_argument("--output",         type=Path, default=Path("logs/calibration.csv"))
     ap.add_argument("--duration",       type=float, default=600.0,
                     help="Collection duration in seconds (default 600)")

@@ -22,6 +22,7 @@ import os
 import queue
 import time
 import threading
+import uuid
 from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple
 
@@ -223,12 +224,12 @@ class SpeedProbe:
         # arrive faster than frames.
         self._offload_result_q: queue.Queue = queue.Queue(maxsize=256)
 
-        # FPS counter — sliding 1-second window per camera_id
-        self._fps_timestamps: Dict[str, deque] = defaultdict(
-            lambda: deque(maxlen=300)
-        )
-        self._fps_stats_lock  = threading.Lock()
-        self._fps_stats_cache: Dict[str, float] = {}
+        # ── Unified telemetry counters (reset on every writer flush) ───────
+        # Per-camera FPS frame counters — incremented in _tick_fps, drained
+        # by the writer thread so fps = frames/window_duration within the
+        # SAME actual writer window.
+        self._fps_frame_count: Dict[str, int] = defaultdict(int)
+        self._fps_frame_lock = threading.Lock()
 
         # ── Proactive feature cache (per camera, updated every frame) ──────
         # Written on the GLib/GStreamer thread; read by the FPS writer thread
@@ -249,8 +250,19 @@ class SpeedProbe:
             lambda: {"n_track_sum": 0.0, "n_plate_sum": 0.0,
                      "n_stationary_sum": 0.0, "frame_count": 0.0}
         )
-        # Published snapshot — what the writer thread serialises to disk
-        self._feature_cache: Dict[str, Dict[str, float]] = {}
+
+        # ── Telemetry session ──────────────────────────────────────────────
+        self._session_id = uuid.uuid4().hex[:12]
+        self._seq: int = 0
+        self._window_started_mono: Optional[float] = None
+
+        # Published FPS snapshot for get_fps_stats() API compatibility.
+        # Populated by the writer thread after each flush.
+        self._fps_stats_cache: Dict[str, float] = {}
+        self._fps_stats_lock = threading.Lock()
+
+        # Feature snapshot cache for get_feature_stats() API compatibility.
+        self._feature_snapshot_cache: Dict[str, Dict[str, float]] = {}
 
         self._fps_writer_running = True
         self._fps_writer_thread  = threading.Thread(
@@ -303,16 +315,12 @@ class SpeedProbe:
     # ------------------------------------------------------------------
 
     def _tick_fps(self, camera_id: str) -> None:
-        now    = time.monotonic()
-        dq     = self._fps_timestamps[camera_id]
-        dq.append(now)
-        cutoff = now - 1.0
-        while dq and dq[0] < cutoff:
-            dq.popleft()
-        with self._fps_stats_lock:
-            self._fps_stats_cache[camera_id] = float(len(dq))
+        """Increment per-camera frame counter for the current writer window."""
+        with self._fps_frame_lock:
+            self._fps_frame_count[camera_id] += 1
 
     def get_fps_stats(self) -> Dict[str, float]:
+        """Return the last-published FPS snapshot — API-compatible."""
         with self._fps_stats_lock:
             return dict(self._fps_stats_cache)
 
@@ -363,30 +371,63 @@ class SpeedProbe:
     def get_feature_stats(self) -> Dict[str, Dict[str, float]]:
         """Return the last-published per-camera feature snapshot."""
         with self._feature_lock:
-            return dict(self._feature_cache)
+            return dict(self._feature_snapshot_cache)
 
     def _fps_writer_loop(self) -> None:
         _prev_offload_count: int = 0
         _prev_offload_ts: float = 0.0
         while self._fps_writer_running:
+            window_started = time.monotonic()
+            # Record the window start so FPS = frames / window_duration uses
+            # the same interval the features accumulated over.
+            with self._fps_frame_lock:
+                self._window_started_mono = window_started
+
             time.sleep(2.0)
+
+            window_ended = time.monotonic()
+            window_dur   = max(0.001, window_ended - window_started)
+
             try:
-                fps   = self.get_fps_stats()
+                # ── Drain per-camera FPS frame counters (reset-per-window) ─
+                with self._fps_frame_lock:
+                    frame_counts = dict(self._fps_frame_count)
+                    self._fps_frame_count.clear()
+
+                # Compute fps = frames / window_duration for each camera
+                fps: Dict[str, float] = {}
+                for cam_id, n_frames in frame_counts.items():
+                    fps[cam_id] = round(n_frames / window_dur, 1)
+
+                # ── Drain proactive features ───────────────────────────────
                 feats = self._flush_features()
 
-                # Build unified payload: fps_per_camera + per-camera features
-                out: Dict = {"_updated_at": time.time()}
-                # FPS entries (bare floats, backward-compat)
+                # Update API-compatible caches
+                with self._fps_stats_lock:
+                    self._fps_stats_cache = fps
+                with self._feature_lock:
+                    self._feature_snapshot_cache = feats
+
+                # ── Advance sequence ───────────────────────────────────────
+                self._seq += 1
+
+                # ── Build unified atomic payload ───────────────────────────
+                out: Dict = {
+                    "_updated_at":    time.time(),
+                    "_telemetry": {
+                        "session_id":                        self._session_id,
+                        "sequence":                          self._seq,
+                        "pipeline_window_started_monotonic": window_started,
+                        "pipeline_window_ended_monotonic":   window_ended,
+                        "pipeline_window_duration_s":        round(window_dur, 3),
+                    },
+                    "_features":       feats,
+                }
+                # FPS entries (bare floats, backward-compat for direct key lookup)
                 for cam_id, f in fps.items():
                     out[cam_id] = f
-                # Feature entries nested under a "_features" key so readers
-                # that only care about FPS are unaffected.
-                out["_features"] = feats
 
-                # ── Offload receiver processed count ──────────────────────
-                # Surfaces the monotonic count and a rate sampled over the
-                # 2 s health interval.  Readers (profile_collect, health_agent,
-                # run_python) use _offload_crops to get offload_crops_received_per_s.
+                # ── Offload receiver processed count ───────────────────────
                 if self._offload_rcv is not None:
                     now_ts = time.time()
                     count = self._offload_rcv.offload_processed_count
@@ -403,19 +444,29 @@ class SpeedProbe:
                         "ts":              now_ts,
                     }
 
-                with open(FPS_STATS_FILE, "w") as f:
-                    json.dump(out, f)
+                # ── Atomic write: temp file + os.replace ───────────────────
+                tmp_path = FPS_STATS_FILE + ".tmp"
+                try:
+                    with open(tmp_path, "w") as f:
+                        json.dump(out, f)
+                    os.replace(tmp_path, FPS_STATS_FILE)
+                except OSError as exc:
+                    logger.warning(
+                        "[FPSWriter] atomic write failed — retrying: %s",
+                        exc,
+                    )
             except Exception as exc:
-                logger.debug(
-                    "[FPSWriter] write failed — retrying next cycle: %s",
+                logger.warning(
+                    "[FPSWriter] writer failed — retrying next cycle: %s",
                     exc,
                     exc_info=True,
                 )
 
     def _flush_features(self) -> Dict[str, Dict[str, float]]:
         """
-        Drain accumulators, compute per-camera averages, update cache.
+        Drain accumulators, compute per-camera averages.
         Returns a snapshot dict {camera_id: {n_track, n_plate, stationary_fraction}}.
+        Accumulators are reset after draining.
         """
         snapshot: Dict[str, Dict[str, float]] = {}
         with self._feature_lock:
@@ -436,7 +487,6 @@ class SpeedProbe:
                 # Reset accumulator for next window
                 acc["n_track_sum"] = acc["n_plate_sum"] = \
                     acc["n_stationary_sum"] = acc["frame_count"] = 0.0
-            self._feature_cache = dict(snapshot)
         return snapshot
 
     def stop_fps_writer(self) -> None:
