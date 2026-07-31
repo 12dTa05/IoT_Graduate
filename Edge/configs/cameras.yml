@@ -31,7 +31,7 @@ cameras:
     uri: "rtsp://192.168.212.20:8554/cam1"
     enabled: true
     name: "Camera 01"
-    fps: 25.0
+    fps: 30.0
     speed_limit_kmh: 80.0
     homography:
       source_points:
@@ -52,7 +52,7 @@ cameras:
     uri: "rtsp://192.168.212.20:8554/cam2"
     enabled: true
     name: "Camera02 - Điểm đo phía Nam"
-    fps: 25.0
+    fps: 30.0
     speed_limit_kmh: 80.0
     homography:
       source_points:
