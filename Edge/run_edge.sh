@@ -6,6 +6,7 @@
 #   ./run_edge.sh --mode display
 #   ./run_edge.sh --mode rtsp_push --rtsp-push-url rtsp://host:8554/jetson_A
 #   ./run_edge.sh --load-policy predict_with_base --load-model formula
+#   ./run_edge.sh --telemetry-interval 0.5   # snapshot cadence (default: 1.0 s)
 #
 # Collect calibration data while the pipeline runs, then stop automatically:
 #   ./run_edge.sh --collect
@@ -47,6 +48,7 @@ PYTHON="${PYTHON:-python3}"
 MODE="${MODE:-rtsp_push}"
 LOAD_POLICY="${LOAD_POLICY:-actual}"
 LOAD_MODEL="${LOAD_MODEL:-formula}"
+TELEMETRY_INTERVAL="${TELEMETRY_INTERVAL:-1.0}"
 
 # --collect defaults
 COLLECT=0
@@ -76,6 +78,9 @@ while [[ $# -gt 0 ]]; do
         --load-model)
             [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --load-model requires a value" >&2; exit 1; }
             LOAD_MODEL="$2"; shift 2 ;;
+        --telemetry-interval)
+            [[ $# -lt 2 ]] && { echo "[run_edge] ERROR: --telemetry-interval requires a value" >&2; exit 1; }
+            TELEMETRY_INTERVAL="$2"; shift 2 ;;
         --collect)
             COLLECT=1; shift ;;
         --calibrate)
@@ -182,8 +187,14 @@ case "$LOAD_MODEL" in
         exit 1 ;;
 esac
 
-export LOAD_POLICY LOAD_MODEL
-echo "[run_edge] LOAD_POLICY=$LOAD_POLICY  LOAD_MODEL=$LOAD_MODEL"
+if ! [[ "$TELEMETRY_INTERVAL" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || \
+   ! awk "BEGIN { exit !($TELEMETRY_INTERVAL > 0) }"; then
+    echo "[run_edge] ERROR: --telemetry-interval must be a positive number" >&2
+    exit 1
+fi
+
+export LOAD_POLICY LOAD_MODEL TELEMETRY_INTERVAL
+echo "[run_edge] LOAD_POLICY=$LOAD_POLICY  LOAD_MODEL=$LOAD_MODEL  TELEMETRY_INTERVAL=${TELEMETRY_INTERVAL}s"
 
 # ---------------------------------------------------------------------------
 # Cleanup: kill all tracked child processes on Ctrl+C / EXIT

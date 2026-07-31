@@ -127,6 +127,14 @@ SNAP_DIR  = ROOT / _get("SNAP_DIR")
 SNAP_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------------------------------------
+# Telemetry writer cadence
+# -----------------------------------------------------------
+# How often the FPS/feature snapshot is flushed to FPS_STATS_FILE.
+# Default: 1.0 s.  Override per-run via TELEMETRY_INTERVAL env var
+# (set by run_edge.sh --telemetry-interval <seconds>).
+TELEMETRY_INTERVAL: float = float(os.environ.get("TELEMETRY_INTERVAL", "1.0"))
+
+# -----------------------------------------------------------
 # Detection / Speed thresholds
 # -----------------------------------------------------------
 SPEED_LIMIT_KMH      = _get("SPEED_LIMIT_KMH", float)

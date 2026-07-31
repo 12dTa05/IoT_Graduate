@@ -39,7 +39,7 @@ from .settings import (
     JPEG_QUALITY, SNAP_DIR, MAX_SNAPSHOT_PER_ID,
     MIN_WORLD_DISPL_M, MAX_ABS_KMH,
     BBOX_AREA_JUMP, MIN_DET_CONF, MEDIAN_WINDOW, LICENSE_PLATE_CLASS_IDS,
-    FPS_STATS_FILE, NODE_ID,
+    FPS_STATS_FILE, NODE_ID, TELEMETRY_INTERVAL,
 )
 from .draw import add_polygon_display
 from .camera_config import CameraManager, CameraConfig
@@ -383,7 +383,7 @@ class SpeedProbe:
             with self._fps_frame_lock:
                 self._window_started_mono = window_started
 
-            time.sleep(2.0)
+            time.sleep(TELEMETRY_INTERVAL)
 
             window_ended = time.monotonic()
             window_dur   = max(0.001, window_ended - window_started)
