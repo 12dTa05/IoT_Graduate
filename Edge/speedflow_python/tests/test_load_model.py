@@ -1,12 +1,10 @@
 """
 Edge/speedflow_python/tests/test_load_model.py
 
-Unit tests for speedflow_python/load_model.py.
-No hardware dependencies — pure function tests only.
+Unit tests for load_model.py — pure functions + mock-ONNX DLPredictor.
+No hardware, no GStreamer, no onnxruntime installed.
 
-Run from Edge/:
-    python3 -m pytest speedflow_python/tests/test_load_model.py -v
-or standalone:
+Standalone:
     python3 speedflow_python/tests/test_load_model.py
 """
 
@@ -15,9 +13,6 @@ import time
 import importlib.util
 from pathlib import Path
 
-# Import load_model directly from its file so this test has zero hardware
-# dependencies (no GStreamer, no DeepStream, no dotenv, no jtop).
-# We bypass speedflow_python/__init__.py which eagerly imports core_pipeline.
 _LM_PATH = Path(__file__).resolve().parents[1] / "load_model.py"
 _spec = importlib.util.spec_from_file_location("load_model", _LM_PATH)
 _lm   = importlib.util.module_from_spec(_spec)
@@ -29,14 +24,13 @@ compute_l_proactive = _lm.compute_l_proactive
 fuse                = _lm.fuse
 CycleSmoother       = _lm.CycleSmoother
 ProactiveModel      = _lm.ProactiveModel
-_DEFAULT_CFG        = _lm._DEFAULT_CFG
+DLPredictor         = _lm.DLPredictor
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _cfg(**overrides) -> dict:
-    """Build a minimal proactive config dict with optional overrides."""
     base = {
         "enabled":        True,
         "w_base":         10.0,
@@ -69,38 +63,35 @@ def _metrics(gpu=0.0, cpu=0.0, ram=0.0, temp=0.0) -> dict:
             "ram_percent": ram, "gpu_temp_c":  temp}
 
 
+def _fps(**cams) -> dict:
+    return cams
+
+
 # ---------------------------------------------------------------------------
 # 1. theta_thermal
 # ---------------------------------------------------------------------------
 
 def test_theta_below_t_low():
-    cfg = _cfg()
-    assert theta_thermal(60.0, cfg) == 1.0
+    assert theta_thermal(60.0, _cfg()) == 1.0
 
 def test_theta_at_t_low():
-    cfg = _cfg()
-    assert theta_thermal(75.0, cfg) == 1.0
+    assert theta_thermal(75.0, _cfg()) == 1.0
 
 def test_theta_above_t_high():
-    cfg = _cfg()
-    assert theta_thermal(95.0, cfg) == 1.25
+    assert theta_thermal(95.0, _cfg()) == 1.25
 
 def test_theta_at_t_high():
-    cfg = _cfg()
-    assert theta_thermal(90.0, cfg) == 1.25
+    assert theta_thermal(90.0, _cfg()) == 1.25
 
 def test_theta_midpoint():
-    cfg = _cfg()
-    # At 82.5°C (midway between 75 and 90) → multiplier = 1.125
-    result = theta_thermal(82.5, cfg)
+    result = theta_thermal(82.5, _cfg())
     assert abs(result - 1.125) < 1e-6
 
 def test_theta_monotone():
     cfg = _cfg()
-    temps = [70, 75, 80, 82, 85, 88, 90, 95]
-    values = [theta_thermal(float(t), cfg) for t in temps]
-    for i in range(len(values) - 1):
-        assert values[i] <= values[i + 1], f"Not monotone at index {i}"
+    vals = [theta_thermal(float(t), cfg) for t in (70, 75, 80, 82, 85, 88, 90, 95)]
+    for i in range(len(vals) - 1):
+        assert vals[i] <= vals[i + 1]
 
 
 # ---------------------------------------------------------------------------
@@ -108,65 +99,51 @@ def test_theta_monotone():
 # ---------------------------------------------------------------------------
 
 def test_h_zero_utilisation():
-    h = compute_h_reactive(0, 0, 0, 60.0, _cfg())
-    assert h == 0.0
+    assert compute_h_reactive(0, 0, 0, 60.0, _cfg()) == 0.0
 
 def test_h_gpu_dominates():
-    # GPU=80%, CPU=20%, RAM=10%, no thermal
     h = compute_h_reactive(80, 20, 10, 60.0, _cfg())
     assert abs(h - 0.80) < 1e-6
 
 def test_h_thermal_amplifies():
-    # GPU=80% at 90°C → 0.80 × 1.25 = 1.0 (clamped)
     h = compute_h_reactive(80, 0, 0, 90.0, _cfg())
     assert h == 1.0
 
 def test_h_clamped_to_1():
-    h = compute_h_reactive(100, 100, 100, 95.0, _cfg())
-    assert h == 1.0
+    assert compute_h_reactive(100, 100, 100, 95.0, _cfg()) == 1.0
 
 def test_h_ram_dominates():
-    h = compute_h_reactive(10, 20, 90, 60.0, _cfg())
-    assert abs(h - 0.90) < 1e-6
+    assert abs(compute_h_reactive(10, 20, 90, 60.0, _cfg()) - 0.90) < 1e-6
 
 
 # ---------------------------------------------------------------------------
-# 3. compute_l_proactive
+# 3. compute_l_proactive (formula path)
 # ---------------------------------------------------------------------------
 
 def test_l_zero_features():
-    # W_base=10 / 100 = 0.10
     l, nt, np_, sf = compute_l_proactive({}, _cfg())
     assert abs(l - 0.10) < 1e-6
 
 def test_l_track_contribution():
-    # W_base=10, alpha1=1.0, N_track=5 → (10 + 5) / 100 = 0.15
     l, _, _, _ = compute_l_proactive(_feats(n_track=5.0), _cfg())
     assert abs(l - 0.15) < 1e-6
 
 def test_l_plate_contribution():
-    # W_base=10, beta=2.0, N_plate=10 → (10 + 20) / 100 = 0.30
     l, _, _, _ = compute_l_proactive(_feats(n_plate=10.0), _cfg())
     assert abs(l - 0.30) < 1e-6
 
 def test_l_stationary_contribution():
-    # W_base=10, gamma=5.0, S=1.0 → (10 + 5) / 100 = 0.15
     l, _, _, _ = compute_l_proactive(_feats(stat_frac=1.0), _cfg())
     assert abs(l - 0.15) < 1e-6
 
 def test_l_clamped_to_1():
-    # Very high counts push L above 1 → must be clamped
-    l, _, _, _ = compute_l_proactive(_feats(n_track=1000.0), _cfg())
-    assert l == 1.0
+    assert compute_l_proactive(_feats(n_track=1000.0), _cfg())[0] == 1.0
 
 def test_l_clamped_to_0():
-    # Negative w_base should not produce negative L
     cfg = _cfg(w_base=-50.0, alpha1=0.0, beta=0.0, gamma=0.0)
-    l, _, _, _ = compute_l_proactive(_feats(), cfg)
-    assert l == 0.0
+    assert compute_l_proactive(_feats(), cfg)[0] == 0.0
 
 def test_l_quadratic():
-    # alpha2=0.5, N_track=4 → W_base + 1×4 + 0.5×16 = 10+4+8=22 → 0.22
     cfg = _cfg(alpha2=0.5)
     l, _, _, _ = compute_l_proactive(_feats(n_track=4.0), cfg)
     assert abs(l - 0.22) < 1e-6
@@ -180,7 +157,7 @@ def test_l_feature_means_returned():
 
 
 # ---------------------------------------------------------------------------
-# 4. fuse (noisy-OR)
+# 4. fuse
 # ---------------------------------------------------------------------------
 
 def test_fuse_both_zero():
@@ -190,7 +167,6 @@ def test_fuse_both_one():
     assert fuse(1.0, 1.0) == 1.0
 
 def test_fuse_one_saturated():
-    # If either tier saturates → U → 1
     assert fuse(1.0, 0.0) == 1.0
     assert fuse(0.0, 1.0) == 1.0
 
@@ -198,11 +174,9 @@ def test_fuse_symmetry():
     assert abs(fuse(0.3, 0.7) - fuse(0.7, 0.3)) < 1e-9
 
 def test_fuse_formula():
-    # U = 1 - (1-0.4)(1-0.6) = 1 - 0.6×0.4 = 1 - 0.24 = 0.76
     assert abs(fuse(0.4, 0.6) - 0.76) < 1e-9
 
 def test_fuse_clamping():
-    # Inputs outside [0,1] should be clamped
     assert fuse(-0.5, 1.5) == 1.0
     assert fuse(0.0, -0.1) == 0.0
 
@@ -225,24 +199,20 @@ def test_fuse_monotone_in_h():
 
 def test_smoother_single_value():
     s = CycleSmoother(window_s=90.0)
-    result = s.update(0.6)
-    assert abs(result - 0.6) < 1e-9
+    assert abs(s.update(0.6) - 0.6) < 1e-9
 
 def test_smoother_average():
     s = CycleSmoother(window_s=90.0)
     t0 = time.time()
     s.update(0.2, ts=t0)
     s.update(0.4, ts=t0 + 1.0)
-    result = s.update(0.6, ts=t0 + 2.0)
-    assert abs(result - 0.4) < 1e-9
+    assert abs(s.update(0.6, ts=t0 + 2.0) - 0.4) < 1e-9
 
 def test_smoother_evicts_old():
     s = CycleSmoother(window_s=10.0)
     t0 = time.time()
     s.update(1.0, ts=t0)
-    # Push a value 15 s later — old one is outside the 10-s window
-    result = s.update(0.0, ts=t0 + 15.0)
-    assert result == 0.0
+    assert s.update(0.0, ts=t0 + 15.0) == 0.0
 
 def test_smoother_reset():
     s = CycleSmoother(window_s=90.0)
@@ -251,12 +221,11 @@ def test_smoother_reset():
     assert s.mean() == 0.0
 
 def test_smoother_mean_without_push():
-    s = CycleSmoother(window_s=90.0)
-    assert s.mean() == 0.0
+    assert CycleSmoother(window_s=90.0).mean() == 0.0
 
 
 # ---------------------------------------------------------------------------
-# 6. ProactiveModel integration
+# 6. ProactiveModel formula integration
 # ---------------------------------------------------------------------------
 
 def test_model_disabled_returns_flag():
@@ -292,28 +261,22 @@ def test_model_high_load_high_risk():
     assert result["risk_index"] > 0.9
 
 def test_model_zero_load_low_risk():
-    # Only W_base contributes; hardware all zero; risk should be modest
     cfg = _cfg(w_base=5.0, alpha1=0.0, beta=0.0, gamma=0.0)
     model = ProactiveModel(cfg)
     result = model.compute(_metrics(), {})
-    # L = 5/100 = 0.05, H = 0.0, U = 1-(0.95)(1.0) = 0.05
     assert result["risk_index"] < 0.10
 
 def test_model_smoothing_damps_spike():
-    """A single spike in L should not immediately push U to its peak."""
     cfg = _cfg(cycle_window_s=90.0)
     model = ProactiveModel(cfg)
     t0 = time.time()
-    # 10 cycles at low load
     for i in range(10):
         model.compute(_metrics(gpu=10), _feats(n_track=2), ts=t0 + i * 2.0)
-    # One spike
     spike = model.compute(
         _metrics(gpu=99, cpu=99, ram=99, temp=92),
         _feats(n_track=50, n_plate=30, stat_frac=1.0),
         ts=t0 + 20.0,
     )
-    # Smoothed U should be lower than instantaneous U
     assert spike["risk_index"] < spike["risk_index_instant"]
 
 def test_model_reload_cfg():
@@ -323,8 +286,243 @@ def test_model_reload_cfg():
     assert model.enabled
 
 
+# ===================================================================
+# 7. DLPredictor — 10-feature future-FPS ONNX contract
+#    Training contract: 5-row × 1.0s history, horizons=[6,10]s
+# ===================================================================
+
+
+def test_dl_feature_order():
+    """10 features in documented order: n_active, n_track, n_plate, stationary,
+       fps_avg, gpu, cpu, ram, gpu_temp, offload_rate."""
+    result = DLPredictor._node_features(
+        {"cam_a": {"n_track": 3, "n_plate": 2, "stationary_fraction": 0.5}},
+        fps_stats={"cam_a": 24.0},
+        metrics={"gpu_percent": 70, "cpu_percent": 40,
+                 "ram_percent": 55, "gpu_temp_c": 78.0},
+        offload_crops_received_per_s=1.5,
+    )
+    expected = (1, 3.0, 2.0, 0.5, 24.0, 70.0, 40.0, 55.0, 78.0, 1.5)
+    assert result == expected, f"feature order mismatch: {result}"
+
+
+def test_dl_feature_names():
+    assert DLPredictor._N_FEATURES == 10
+    assert DLPredictor._FEATURE_NAMES[0] == "n_active"
+    assert DLPredictor._FEATURE_NAMES[4] == "fps_avg"
+    assert DLPredictor._FEATURE_NAMES[5] == "gpu"
+    assert DLPredictor._FEATURE_NAMES[8] == "gpu_temp"
+    assert DLPredictor._FEATURE_NAMES[9] == "offload_rate"
+
+
+def test_dl_default_window_k():
+    """Default window_k=5 from dl_model config when not specified."""
+    predictor = DLPredictor({"model_path": ""})
+    assert predictor._window_k == 5
+
+
+def test_dl_default_sample_interval():
+    """Default sample_interval_s=1.0 matches HEALTH_INTERVAL."""
+    predictor = DLPredictor({"model_path": ""})
+    assert abs(predictor._sample_interval_s - 1.0) < 1e-9
+
+
+def test_dl_default_horizon_index():
+    """Default horizon_index=0 selects t+6s."""
+    predictor = DLPredictor({"model_path": ""})
+    assert predictor._horizon_index == 0
+
+
+def test_dl_bad_sample_interval():
+    """sample_interval_s <= 0 raises ValueError."""
+    for bad_val in (0.0, -1.0):
+        raised = False
+        try:
+            DLPredictor({"model_path": "", "sample_interval_s": bad_val})
+        except ValueError as e:
+            raised = True
+            assert "sample_interval_s" in str(e)
+        assert raised, f"Expected ValueError for sample_interval_s={bad_val}"
+
+
+def test_dl_configurable_sample_interval():
+    """Positive sample_interval_s is stored."""
+    predictor = DLPredictor({"model_path": "", "sample_interval_s": 5.0})
+    assert abs(predictor._sample_interval_s - 5.0) < 1e-9
+
+
+def test_dl_no_session_returns_zero():
+    """No ONNX session loaded → predict returns score 0 for 5-sample history."""
+    predictor = DLPredictor({"window_k": 5, "model_path": ""})
+    # fill enough history
+    for _ in range(5):
+        predictor._history.append([0.0] * 10)
+    r = predictor.predict({}, _fps(cam_a=25.0), _metrics())
+    assert r[0] == 0.0
+
+
+def test_dl_insufficient_history():
+    """window_k=5 but only 2 rows → returns score 0 (cold-start guard)."""
+    predictor = DLPredictor({"window_k": 5, "model_path": ""})
+    predictor._session = object()
+    predictor._input_name = "features"
+    predictor._window_k = 5
+    predictor._history.clear()
+    predictor.predict({}, _fps(cam_a=25.0), _metrics())
+    r = predictor.predict({}, _fps(cam_a=25.0), _metrics())
+    assert r[0] == 0.0
+
+
+def test_dl_history_grows_per_cycle():
+    """Each predict() appends one history row (one row per health cycle)."""
+    predictor = DLPredictor({"window_k": 5, "model_path": ""})
+    assert len(predictor._history) == 0
+    predictor.predict(_feats(), _fps(cam_01=20.0), _metrics())
+    assert len(predictor._history) == 1
+    predictor.predict(_feats(), _fps(cam_01=20.0), _metrics())
+    assert len(predictor._history) == 2
+
+def test_dl_five_sample_history():
+    """5-cycle accumulation at 2.0s each = 10s effective history."""
+    predictor = DLPredictor({"window_k": 5, "model_path": "",
+                             "sample_interval_s": 2.0})
+    assert predictor._window_k == 5
+    assert abs(predictor._sample_interval_s - 2.0) < 1e-9
+    # feed exactly 5 rows
+    for i in range(5):
+        predictor._history.append([float(i)] * 10)
+    assert len(predictor._history) == 5
+    # 6th row pushes the 1st out
+    predictor.predict(_feats(), _fps(cam_01=20.0), _metrics())
+    assert len(predictor._history) == 5
+
+def test_dl_history_deque_maxlen():
+    """History deque respects window_k maxlen."""
+    predictor = DLPredictor({"window_k": 3, "model_path": ""})
+    for i in range(6):
+        predictor._history.append([float(i)] * 10)
+    assert len(predictor._history) == 3
+    assert predictor._history[0][0] == 3.0  # oldest remaining
+
+
+# --- fps_to_score anchors ---
+
+def test_fps_anchor_27():
+    pc = DLPredictor({"window_k": 1, "model_path": ""})
+    assert pc._fps_to_score(27.0) == 0.0
+
+def test_fps_anchor_22():
+    pc = DLPredictor({"window_k": 1, "model_path": ""})
+    assert abs(pc._fps_to_score(22.0) - 0.57) < 1e-6
+
+def test_fps_anchor_19():
+    pc = DLPredictor({"window_k": 1, "model_path": ""})
+    assert abs(pc._fps_to_score(19.0) - 0.65) < 1e-6
+
+def test_fps_anchor_17():
+    pc = DLPredictor({"window_k": 1, "model_path": ""})
+    assert abs(pc._fps_to_score(17.0) - 0.75) < 1e-6
+
+def test_fps_anchor_0():
+    pc = DLPredictor({"window_k": 1, "model_path": ""})
+    assert abs(pc._fps_to_score(0.0) - 1.0) < 1e-6
+
+def test_fps_above_27_clamped():
+    pc = DLPredictor({"window_k": 1, "model_path": ""})
+    assert pc._fps_to_score(30.0) == 0.0
+
+def test_fps_negative_clamped():
+    pc = DLPredictor({"window_k": 1, "model_path": ""})
+    assert abs(pc._fps_to_score(-5.0) - 1.0) < 1e-6
+
+def test_fps_interpolation_24_5():
+    # 24.5 between (27,0) and (22,57): 57 * 2.5/5 = 28.5 → 0.285
+    pc = DLPredictor({"window_k": 1, "model_path": ""})
+    assert abs(pc._fps_to_score(24.5) - 0.285) < 1e-4
+
+def test_fps_interpolation_20_5():
+    # 20.5 between (22,57) and (19,65): 65+(57-65)*1.5/3 = 61 → 0.61
+    pc = DLPredictor({"window_k": 1, "model_path": ""})
+    assert abs(pc._fps_to_score(20.5) - 0.61) < 1e-3
+
+
+# --- mock ONNX inference ---
+
+class MagicSession:
+    def get_inputs(self):
+        return [MagicInput("features")]
+    def run(self, _outputs, _feed):
+        return [__import__("numpy").array([[22.0]], dtype="float32")]
+
+class MagicInput:
+    def __init__(self, name):
+        self.name = name
+
+
+def test_dl_mock_inference():
+    """Mock session returning FPS=22 → score 0.57."""
+    predictor = DLPredictor({"window_k": 1, "model_path": "x"})
+    predictor._session = MagicSession()
+    predictor._input_name = "features"
+    predictor._window_k = 1
+    # already one row in history
+    predictor.predict({}, {"cam_a": 22.0}, _metrics())
+    r = predictor.predict({}, {"cam_a": 22.0}, _metrics())
+    assert abs(r[0] - 0.57) < 0.01
+
+
+def test_dl_horizon_index():
+    """Mock returns [fps_0=30, fps_1=22]; horizon_index=1 picks t+10s → 22 FPS → 0.57.
+       Mimics 2-horizon ONNX: [t+6s, t+10s]."""
+    import numpy as np
+
+    class MultiHorizonSession:
+        def get_inputs(self):
+            return [type("I", (), {"name": "features"})()]
+        def run(self, _o, _f):
+            return [np.array([[30.0, 22.0]], dtype=np.float32)]
+
+    predictor = DLPredictor({"window_k": 1, "horizon_index": 1, "model_path": "o"})
+    predictor._session = MultiHorizonSession()
+    predictor._input_name = "input"
+    predictor._history.append([0.0] * 10)
+    r = predictor.predict({}, {"cam_a": 20.0}, {"gpu_percent": 50})
+    assert abs(r[0] - 0.57) < 0.01
+
+
+def test_dl_horizon_index_zero():
+    """horizon_index=0 picks t+6s."""
+    predictor = DLPredictor({"window_k": 1, "horizon_index": 0, "model_path": ""})
+    assert predictor._horizon_index == 0
+
+
+def test_dl_horizon_index_out_of_range_clamped():
+    """horizon_index beyond output shape is clamped by predict() at runtime."""
+    predictor = DLPredictor({"window_k": 1, "horizon_index": 99, "model_path": ""})
+
+
+def test_fps_stats_passed_to_node_features():
+    """DLPredictor._node_features aggregates fps_stats into avg fps."""
+    result = DLPredictor._node_features(
+        {"cam_a": {"n_track": 1, "n_plate": 0, "stationary": 0}},
+        fps_stats={"cam_a": 24, "cam_b": 20},
+        metrics={},
+        offload_crops_received_per_s=0,
+    )
+    # fps_avg = avg(24,20) = 22, rest unset → 0
+    assert result[4] == 22.0  # fps_avg is index 4
+
+
+def test_dl_predict_returns_four_tuple():
+    """Ensure predict() returns (float, float, float, float)."""
+    predictor = DLPredictor({"window_k": 1, "model_path": ""})
+    r = predictor.predict({}, {"a": 22.0}, _metrics())
+    assert isinstance(r, tuple) and len(r) == 4
+    assert all(isinstance(v, float) for v in r)
+
+
 # ---------------------------------------------------------------------------
-# Runner
+# Standalone runner
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -353,6 +551,21 @@ if __name__ == "__main__":
         test_model_risk_index_in_range, test_model_high_load_high_risk,
         test_model_zero_load_low_risk, test_model_smoothing_damps_spike,
         test_model_reload_cfg,
+        # DLPredictor 10-feature contract
+        test_dl_default_window_k, test_dl_default_sample_interval,
+        test_dl_default_horizon_index, test_dl_bad_sample_interval,
+        test_dl_configurable_sample_interval,
+        test_dl_feature_order, test_dl_feature_names,
+        test_dl_no_session_returns_zero, test_dl_insufficient_history,
+        test_dl_history_grows_per_cycle,
+        test_dl_five_sample_history, test_dl_history_deque_maxlen,
+        test_fps_anchor_27, test_fps_anchor_22, test_fps_anchor_19,
+        test_fps_anchor_17, test_fps_anchor_0,
+        test_fps_above_27_clamped, test_fps_negative_clamped,
+        test_fps_interpolation_24_5, test_fps_interpolation_20_5,
+        test_dl_mock_inference, test_dl_horizon_index,
+        test_dl_horizon_index_zero, test_dl_horizon_index_out_of_range_clamped,
+        test_fps_stats_passed_to_node_features, test_dl_predict_returns_four_tuple,
     ]
 
     passed = failed = 0

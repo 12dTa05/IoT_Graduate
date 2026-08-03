@@ -7,9 +7,16 @@ Produces <case>_clean.csv (per-case) and load_prediction_clean.csv (combined).
 
 Expected input schema (profile_collect.py output):
     ts, gpu_percent, cpu_percent, ram_percent, gpu_temp_c,
-    fps_avg, n_active_cameras,
+    session_id, sequence,
+    pipeline_window_started_monotonic, pipeline_window_ended_monotonic,
+    pipeline_window_duration_s, pipeline_updated_at,
+    fps_avg, n_active_cameras, (input_fps_avg),
     n_track_total, n_track_sq_total, n_plate_total,
-    stationary_fraction_mean, load_score, delta_load
+    stationary_fraction_mean, offload_crops_received_per_s,
+    load_score, delta_load
+
+Note: input_fps_avg is optional; legacy CSVs missing it are accepted and
+the field is preserved as empty in output.
 """
 
 import argparse
@@ -20,6 +27,9 @@ from collections import deque
 
 PERF_HEADER = frozenset({
     "ts", "gpu_percent", "cpu_percent", "ram_percent", "gpu_temp_c",
+    "session_id", "sequence",
+    "pipeline_window_started_monotonic", "pipeline_window_ended_monotonic",
+    "pipeline_window_duration_s", "pipeline_updated_at",
     "fps_avg", "n_active_cameras",
     "n_track_total", "n_track_sq_total", "n_plate_total",
     "stationary_fraction_mean", "offload_crops_received_per_s",
@@ -29,14 +39,14 @@ PERF_HEADER = frozenset({
 OUT_HEADER = [
     "case_name", "sample_index", "ts", "elapsed_s",
     "gpu_percent", "cpu_percent", "ram_percent", "gpu_temp_c",
-    "fps_avg", "n_active_cameras",
+    "fps_avg", "n_active_cameras", "input_fps_avg",
     "n_track_total", "n_track_sq_total", "n_plate_total",
     "stationary_fraction_mean", "offload_crops_received_per_s",
     "load_score_raw", "delta_load",
     "load_score_smoothed", "fps_deficit", "fps_drop", "fps_severe_drop",
 ]
 
-TARGET_FPS = 25.0
+TARGET_FPS = 27.0
 
 
 def _float_or_none(raw: str) -> float | None:
@@ -117,6 +127,7 @@ def process_file(path: pathlib.Path) -> tuple[list[dict], str]:
             "gpu_temp_c": _float_or_none(r.get("gpu_temp_c", "")),
             "fps_avg": fps,
             "n_active_cameras": r.get("n_active_cameras", "").strip(),
+            "input_fps_avg": r.get("input_fps_avg", "").strip(),
             "n_track_total": r.get("n_track_total", "").strip(),
             "n_track_sq_total": r.get("n_track_sq_total", "").strip(),
             "n_plate_total": r.get("n_plate_total", "").strip(),

@@ -35,6 +35,7 @@ from speedflow_python.settings import (
     ADVERTISE_IP,
     LOAD_POLICY,
     LOAD_MODEL,
+    TELEMETRY_INTERVAL,
 )
 
 logging.basicConfig(
@@ -43,6 +44,22 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("health_agent")
+
+
+# ---------------------------------------------------------------------------
+# Payload freshness/integrity tracking (module-level state)
+# ---------------------------------------------------------------------------
+# Committed pipeline session_id and last seen sequence number.
+# Reset on session change (pipeline restart) or when the payload goes stale
+# beyond the operational window.
+_state_session_id: str = ""
+_state_last_seq: int = -1
+
+# ponytail: bounded age derived from 1s operational cadence.
+# 3 * max(TELEMETRY_INTERVAL, HEALTH_INTERVAL) gives ~3 s of headroom
+# for a 1 s cadence.  If the atomic payload writer stalls for 3+ s,
+# report the pipeline as unavailable rather than replaying stale data.
+_STALE_MAX_AGE_S = 3.0 * max(TELEMETRY_INTERVAL, HEALTH_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
@@ -64,12 +81,75 @@ def _read_payload() -> Optional[dict]:
         return None
 
 
+def _validate_payload(payload: Optional[dict]) -> bool:
+    """
+    Freshness + integrity check on a payload dict.
+    Rejects:
+      - None / empty dict
+      - Missing or empty _telemetry.session_id
+      - Missing or non-integer _telemetry.sequence
+      - Stale _updated_at (older than _STALE_MAX_AGE_S relative to now)
+
+    Only advances _state_last_seq when session matches the committed session.
+    Session changes are accepted (pipeline restart) — the first valid payload
+    of a new session resets both session_id and last_seq.
+    """
+    global _state_session_id, _state_last_seq
+
+    if not payload:
+        return False
+
+    telemetry = payload.get("_telemetry")
+    if not isinstance(telemetry, dict):
+        return False
+
+    sess_id = telemetry.get("session_id")
+    seq = telemetry.get("sequence")
+    if not isinstance(sess_id, str) or not sess_id:
+        return False
+    if not isinstance(seq, int) or seq < 0:
+        return False
+
+    # Staleness: reject if _updated_at is too old
+    updated_at = payload.get("_updated_at")
+    if not isinstance(updated_at, (int, float)):
+        return False
+    if time.time() - updated_at > _STALE_MAX_AGE_S:
+        logger.debug(
+            "[HealthAgent] Stale payload: _updated_at=%.1f age=%.1fs > %.1fs",
+            updated_at, time.time() - updated_at, _STALE_MAX_AGE_S,
+        )
+        return False
+
+    # Sequence advancement tracking
+    if sess_id != _state_session_id:
+        # New session (pipeline restart) — reset
+        _state_session_id = sess_id
+        _state_last_seq = seq
+        return True
+
+    # Same session: must strictly advance
+    if seq <= _state_last_seq:
+        logger.debug(
+            "[HealthAgent] Non-advancing seq: got %d, last %d (session %s)",
+            seq, _state_last_seq, sess_id,
+        )
+        return False
+
+    _state_last_seq = seq
+    return True
+
+
 def _payload_parts(
     payload: Optional[dict],
 ) -> tuple:
     """
     Safely extract the three telemetry parts from a single payload dict.
     Returns (fps_stats, feature_stats, offload_crops) with safe defaults.
+
+    Caller must have validated payload freshness via _validate_payload()
+    before calling this function.  An invalid payload passed here will
+    produce an empty fps_stats dict (score 100 = unavailable).
     """
     if payload is None:
         return {}, {}, {"received_per_s": 0.0}
@@ -82,13 +162,19 @@ def _payload_parts(
 
 def _read_pipeline_snapshot() -> tuple:
     """
-    Read the pipeline JSON once and return all three parts.
-    Returns (fps_stats, feature_stats, offload_crops).
+    Read the pipeline JSON once, validate freshness/integrity, return all parts.
 
-    Callers that need all three should use this instead of three separate
-    wrapper calls to avoid mixing across writer flushes.
+    Returns (valid: bool, fps_stats, feature_stats, offload_crops).
+
+    When valid=False:
+      fps_stats is {} and the caller must not use telemetry-derived
+      values (fps_stats, features, offload rate) for load scoring or
+      payload publishing.  Callers report the pipeline as unavailable.
     """
-    return _payload_parts(_read_payload())
+    payload = _read_payload()
+    if not _validate_payload(payload):
+        return False, {}, {}, {}
+    return True, *_payload_parts(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -241,10 +327,11 @@ def _compute_load_score(metrics: dict, fps_stats: dict) -> tuple:
     active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
     if active_fps_vals:
         avg_fps = sum(active_fps_vals) / len(active_fps_vals)
-    elif fps_stats:
-        avg_fps = 0.0
     else:
-        avg_fps = TARGET_FPS   # no cameras → no penalty → 0
+        # No active cameras: startup, missing payload, all cameras idle.
+        # Report explicitly unavailable (score 100 = worst) rather than
+        # healthy TARGET_FPS, so the dashboard shows "unavailable" not "0% load".
+        return 100.0, "fps_dominant"
 
     fps_clamped = max(0.0, min(TARGET_FPS, avg_fps))
 
@@ -623,20 +710,40 @@ class HealthAgent:
                         if self._session:
                             logger.info("[HealthAgent] Zenoh reconnected successfully.")
 
-                metrics       = self._collect_metrics()
-                fps_stats, feature_stats, offload_crops = _read_pipeline_snapshot()
-                offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
-                load_score, omega_preset = _compute_load_score(metrics, fps_stats)
+                metrics = self._collect_metrics()
 
-                # BUG-I fix: exclude 0-fps cameras from avg_fps, matching the
-                # exclusion applied in _compute_load_score() so the reported
-                # avg_fps is consistent with the load_score value.
-                active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
-                avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
+                snapshot_valid, fps_stats, feature_stats, offload_crops = \
+                    _read_pipeline_snapshot()
+
+                # ── Pipeline unavailable guard ─────────────────────────
+                # When snapshot is invalid (stale, missing telemetry,
+                # non-advancing seq), do NOT convert garbage into a
+                # healthy TARGET_FPS score.  Report unavailable
+                # (load_score 100 = worst) + empty pipeline section.
+                if snapshot_valid:
+                    load_score, omega_preset = _compute_load_score(metrics, fps_stats)
+                    offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
+                    # BUG-I fix: exclude 0-fps cameras from avg_fps,
+                    # matching the exclusion applied in _compute_load_score()
+                    # so the reported avg_fps is consistent with the load_score value.
+                    active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
+                    avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
+                    active_cameras = [k for k, v in fps_stats.items() if v > 0.0]
+                else:
+                    load_score, omega_preset = 100.0, "fps_dominant"
+                    offload_crops_received_per_s = 0.0
+                    active_fps_vals = []
+                    avg_fps = None
+                    active_cameras = []
+                    # Zero out telemetry so downstream code (proactive model,
+                    # logging) sees empty inputs, not stale data.
+                    fps_stats = {}
+                    feature_stats = {}
+                    offload_crops = {"received_per_s": 0.0}
 
                 # Consume one-shot warmup_ms written by run_python.py after
-                # pipeline.set_state(PLAYING).  Reset after reading so it
-                # only appears in the first heartbeat following a cold start.
+                # pipeline.set_state(PLAYING).  After the first heartbeat
+                # it appears in, reset so it only fires once per cold-start.
                 warmup_ms = self._warmup_ms
                 self._warmup_ms = None
 
@@ -645,22 +752,17 @@ class HealthAgent:
                     "node_id":       NODE_ID,
                     "timestamp":     time.time(),
                     "load_score":    load_score,
-                    "omega_preset":  omega_preset,   # adaptive weight regime name
+                    "omega_preset":  omega_preset,
                     "gpu_percent":   metrics["gpu_percent"],
                     "cpu_percent":   metrics["cpu_percent"],
                     "ram_percent":   metrics["ram_percent"],
                     "gpu_temp_c":    metrics["gpu_temp_c"],
                     "power_mw":      metrics["power_mw"],
-                    # Metric source ("jtop" or "jtop_unavailable") so the dashboard
-                    # can render GPU%/Temp as "N/A" instead of a misleading 0.0.
                     "source":        metrics.get("source", "jtop"),
                     "pipeline": {
                         "fps_per_camera": fps_stats,
                         "avg_fps":        avg_fps,
-                        # BUG-15 fix: only include cameras actively producing
-                        # frames — 0-FPS entries are stale/removed cameras.
-                        "active_cameras": [k for k, v in fps_stats.items() if v > 0.0],
-                        # Used by peers for failover ADD commands when this node dies.
+                        "active_cameras": active_cameras,
                         "camera_configs": self._cam_configs_cache,
                     },
                 }
@@ -669,17 +771,14 @@ class HealthAgent:
                     payload["warmup_ms"] = warmup_ms
 
                 # ── Proactive model ────────────────────────────────────────
-                # Compute and merge proactive fields when enabled.
-                # The legacy load_score is always present for backward-compat
-                # (reactive baseline used in Chart 2 comparison).
-                if self._proactive_model is not None:
-                    # Filter to cameras with fps > 0 — matches collector's
-                    # n_active_cameras definition in profile_collect.py.
+                # Skip when snapshot is invalid — no features to compute on.
+                if snapshot_valid and self._proactive_model is not None:
                     _active_ids = {k for k, v in fps_stats.items() if v > 0.0}
                     proactive_result = self._proactive_model.compute(
                         metrics,
                         {k: v for k, v in feature_stats.items() if k in _active_ids},
                         offload_crops_received_per_s=offload_crops_received_per_s,
+                        fps_stats={k: v for k, v in fps_stats.items() if k in _active_ids},
                     )
                     payload.update(proactive_result)
 

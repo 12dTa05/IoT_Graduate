@@ -15,7 +15,7 @@ import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
 
-from .core_pipeline import build_pipeline, dynamic_add_stream, dynamic_remove_stream
+from .core_pipeline import build_pipeline, dynamic_add_stream, dynamic_remove_stream, _InputCounter
 from .camera_config import CameraManager
 from .probes import SpeedProbe, ROIFilterProbe
 from .plate_preprocessor import PlatePreprocessorProbe
@@ -45,7 +45,8 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
                   peer_orch=None,
                   offload_pub=None,
                   offload_rcv=None,
-                  zenoh_pub=None) -> SpeedProbe:
+                  zenoh_pub=None,
+                  input_counter: _InputCounter = None) -> SpeedProbe:
     """
     Attach ROI filter, plate preprocessor, and speed probe to *pipeline*.
     Returns the SpeedProbe instance.
@@ -88,6 +89,8 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
 
     # 3. Speed + LPR probe (pass peer_orch so it can query offload levels)
     probe = SpeedProbe(camera_manager, peer_orch=peer_orch)
+    if input_counter is not None:
+        probe.set_input_counter(input_counter)
     if offload_pub is not None:
         probe.set_offload_publisher(offload_pub)
     if offload_rcv is not None:
@@ -121,7 +124,8 @@ def _attach_camera_manager(
     pipeline: Gst.Pipeline,
     streammux: Gst.Element,
     source_bins: dict,
-    tiler: Gst.Element = None
+    tiler: Gst.Element = None,
+    input_counter: _InputCounter = None,
 ):
     """
     Hooks up the CameraManager to safely add/remove streams dynamically.
@@ -142,7 +146,7 @@ def _attach_camera_manager(
     def on_add(cam_cfg):
         current_n = streammux.get_property("batch-size")
         print(f"[Dynamic] Adding camera '{cam_cfg.camera_id}' (source_id={cam_cfg.source_id})")
-        dynamic_add_stream(pipeline, streammux, cam_cfg, tiler, source_bins, current_n)
+        dynamic_add_stream(pipeline, streammux, cam_cfg, tiler, source_bins, current_n, input_counter)
         # Register mapping immediately after successful add.
         # This function runs in GLib Main Loop → safe, no lock needed.
         source_id_to_cam_id[cam_cfg.source_id] = cam_cfg.camera_id
@@ -217,17 +221,20 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
+    input_counter = _InputCounter()
+
     ret_build = build_pipeline(
         camera_configs=configs,
         sink_type="display",
         mux_width=args.width,
         mux_height=args.height,
+        input_counter=input_counter,
     )
     pipeline, nvdsosd, streammux, source_bins = ret_build
     tiler = pipeline.get_by_name("tiler")
 
-    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
-    _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
+    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, input_counter=input_counter)
+    _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler, input_counter=input_counter)
 
     t0_playing = time.monotonic()
     ret = pipeline.set_state(Gst.State.PLAYING)
@@ -246,16 +253,19 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
+    input_counter = _InputCounter()
+
     ret_build = build_pipeline(
         camera_configs=configs,
         sink_type="file",
         mux_width=args.width,
         mux_height=args.height,
+        input_counter=input_counter,
     )
     pipeline, nvdsosd, streammux, source_bins = ret_build
 
-    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
-    _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, None)
+    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, input_counter=input_counter)
+    _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, None, input_counter=input_counter)
 
     print(f"[Python File Mode] Processing multi-streams to output files...")
     ret = pipeline.set_state(Gst.State.PLAYING)
@@ -350,12 +360,26 @@ def _health_push_loop(peer_orch=None) -> None:
 
             # Use health_agent's metric collection via standalone function
             metrics       = collect_metrics(_jtop_session)
-            fps_stats, feature_stats, offload_crops = _read_pipeline()
-            offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
-            load_score, omega_preset = _compute_load_fn(metrics, fps_stats)
+            snapshot_valid, fps_stats, feature_stats, offload_crops = _read_pipeline()
 
-            active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
-            avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
+            # ── Pipeline unavailable guard ──────────────────────────────
+            # Match health_agent's contract: invalid snapshot →
+            # load_score 100 (unavailable), skip proactive computation.
+            if snapshot_valid:
+                load_score, omega_preset = _compute_load_fn(metrics, fps_stats)
+                offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
+                active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
+                avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
+                active_cameras = [k for k, v in fps_stats.items() if v > 0.0]
+            else:
+                load_score, omega_preset = 100.0, "fps_dominant"
+                offload_crops_received_per_s = 0.0
+                active_fps_vals = []
+                avg_fps = None
+                active_cameras = []
+                fps_stats = {}
+                feature_stats = {}
+                offload_crops = {"received_per_s": 0.0}
 
             payload = {
                 "type":         "health",
@@ -372,21 +396,22 @@ def _health_push_loop(peer_orch=None) -> None:
                 "pipeline": {
                     "fps_per_camera":  fps_stats,
                     "avg_fps":         avg_fps,
-                    # BUG-15 fix: only report cameras that are actively producing frames
-                    "active_cameras":  [k for k, v in fps_stats.items() if v > 0.0],
+                    "active_cameras":  active_cameras,
                     "camera_configs":  _cam_configs,
                 },
             }
 
-            # ── Proactive model (feed_relevant offline crop receive rate) ────
-            # Filter to cameras with fps > 0 — matches collector's definition.
-            _active_ids = {k for k, v in fps_stats.items() if v > 0.0}
-            proactive_result = _proactive_model.compute(
-                metrics,
-                {k: v for k, v in feature_stats.items() if k in _active_ids},
-                offload_crops_received_per_s=offload_crops_received_per_s,
-            )
-            payload.update(proactive_result)
+            # ── Proactive model ──────────────────────────────────────
+            # Skip when snapshot is invalid — no features to compute on.
+            if snapshot_valid:
+                _active_ids = {k for k, v in fps_stats.items() if v > 0.0}
+                proactive_result = _proactive_model.compute(
+                    metrics,
+                    {k: v for k, v in feature_stats.items() if k in _active_ids},
+                    offload_crops_received_per_s=offload_crops_received_per_s,
+                    fps_stats={k: v for k, v in fps_stats.items() if k in _active_ids},
+                )
+                payload.update(proactive_result)
 
             # Keep local PeerOrchestrator state fresh without publishing a
             # duplicate peers/status/<NODE_ID> heartbeat in the default
@@ -455,6 +480,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
     _last_probe = None
 
     while True:
+        input_counter = _InputCounter()
         ret_build = build_pipeline(
             camera_configs=camera_manager.get_enabled_configs(),
             sink_type="rtsp_push",
@@ -462,12 +488,13 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             mux_height=args.height,
             rtsp_push_url=rtsp_url,
             bitrate=S.RTSP_PUSH_BITRATE,
+            input_counter=input_counter,
         )
         pipeline, nvdsosd, streammux, source_bins = ret_build
         tiler = pipeline.get_by_name("tiler")
 
-        _last_probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
-        _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
+        _last_probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, input_counter=input_counter)
+        _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler, input_counter=input_counter)
 
         ret = pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:

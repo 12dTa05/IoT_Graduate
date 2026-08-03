@@ -9,6 +9,9 @@ Implements:
   Θ_thermal    — smooth thermal ramp replacing the discrete omega-thermal preset
   CycleSmoother — sliding-window averager aligned to the traffic-light period
   fuse()        — noisy-OR risk combination U = 1-(1-L̂)(1-Ĥ)
+DLPredictor   — ONNX future-FPS forecaster (trained at 1.0s cadence,
+                   HEALTH_INTERVAL=1.0s, 5-row × 1.0s history, outputs
+                   [t+6s, t+10s]; horizon_index=0 selects t+6s)
 
 All parameters are read from the 'proactive' section of edge_node.yml, loaded
 once at construction time and refreshable via reload_cfg().
@@ -27,9 +30,19 @@ Design principles
 * When proactive.enabled is False the module is imported but fuse() is never
   called — the legacy load_score path is untouched.
 
+DL prediction contract
+-----------------------
+Trainer (tools/train_fps_forecaster.py) aggregates raw 0.5s rows to 1.0s
+       cadence, builds windows of 5 rows (5 s effective history), and predicts FPS
+       at t+6s and t+10s.  Deployment feeds one row per HEALTH_INTERVAL (=1.0s) into
+       DLPredictor, which fires inference once it has window_k rows.  No time
+       resampling runs on the edge — the trainer handles aggregation at train time.
+       horizon_index=0 selects t+6s.
+horizon_index=0 selects t+6s.
+
 Zenoh heartbeat additions
 --------------------------
-The health payload gains five new fields when proactive.enabled is True:
+The health payload gains these fields when proactive.enabled is True:
   l_proactive         float [0,1]  raw (non-smoothed) proactive index
   h_reactive          float [0,1]  raw reactive index
   risk_index          float [0,1]  cycle-smoothed noisy-OR U
@@ -194,23 +207,57 @@ def compute_l_proactive(
 
 
 class DLPredictor:
-    """Small ONNX time-series predictor using node-level traffic features.
+    """ONNX time-series predictor: raw 10-feature → predicted FPS → piecewise score.
 
-    Features (must match train_dl_model.py FEATURE_COLS order):
-        n_active_cameras          — sources with fps > 0 at sample time
-        n_track_total             — total tracked vehicles across all cameras
-        n_plate_total             — total plate detections across all cameras
-        stationary_fraction_mean  — mean stationary fraction across all cameras
-        offload_crops_received_per_s — crops RECEIVED by this node per second
+    Training contract (tools/train_fps_forecaster.py):
+      - source_interval_s=0.5: raw pipeline writes 2 rows/s.
+      - sample_interval_s=1.0: model trained at 1.0s cadence (matches HEALTH_INTERVAL).
+      - history=5: 5 rows × 1.0s = 5s lookback per input sample.
+      - horizons=[6.0, 10.0]: ONNX outputs [FPS@t+6s, FPS@t+10s].
+      - horizon_index=0: deployment selects t+6s.
+
+    Feature vector (order must match the ONNX input):
+      [n_active_cameras, n_track_total, n_plate_total, stationary_fraction_mean,
+       avg_fps, gpu_pct, cpu_pct, ram_pct, gpu_temp_c, offload_crops_received_per_s]
+
+    History is accumulated one row per health cycle (caller appends each cycle).
+    Prediction fires once window_k rows have been collected; returns score 0.0
+    before the window is full (cold-start).
+
+    No time-resampling code lives here — the trainer aggregates upstream.
+    The configured horizon_index (default 0) selects which forecast step.
+
+    Predicted raw FPS is mapped to a normalised proactive score [0,1] via a
+    piecewise-linear curve matching runtime load-score anchors:
+        27 → 0,  22 → 57,  19 → 65,  17 → 75,  0 → 100  (score = piecewise(fps)/100).
     """
 
-    _N_FEATURES = 5
+    _N_FEATURES = 10
+    _FEATURE_NAMES = [
+        "n_active", "n_track", "n_plate", "stationary",
+        "fps_avg", "gpu", "cpu", "ram", "gpu_temp", "offload_rate",
+    ]
+
+    # Piecewise FPS→load_score (0-100 scale)
+    _FPS_ANCHORS = [(27, 0), (22, 57), (19, 65), (17, 75), (0, 100)]
 
     def __init__(self, dl_cfg: dict, edge_root: Optional[Path] = None) -> None:
         self._window_k = max(1, int(dl_cfg.get("window_k", 5)))
+        self._horizon_index = max(0, int(dl_cfg.get("horizon_index", 0)))
         self._history: collections.deque = collections.deque(maxlen=self._window_k)
         self._session = None
         self._input_name = None
+
+        # sample_interval_s is informational — no resampling happens here;
+        # the trainer aggregates to this cadence and health_agent calls at
+        # HEALTH_INTERVAL which must match.
+        si = float(dl_cfg.get("sample_interval_s", 1.0))
+        if si <= 0.0:
+            raise ValueError(
+                f"dl_model.sample_interval_s must be > 0, got {si}"
+            )
+        self._sample_interval_s = si
+
         model_path = str(dl_cfg.get("model_path", "")).strip()
         self._model_path = self._resolve_path(model_path, edge_root)
         if self._model_path:
@@ -238,46 +285,70 @@ class DLPredictor:
             self._input_name = None
 
     @staticmethod
+    def _fps_to_score(predicted_fps: float) -> float:
+        """Piecewise-linear FPS→load_score (0-100), then normalised to [0,1]."""
+        fps = max(0.0, predicted_fps)
+        anchors = DLPredictor._FPS_ANCHORS
+        for (x_hi, y_hi), (x_lo, y_lo) in zip(anchors, anchors[1:]):
+            if fps >= x_lo:
+                # linear interpolation between anchors
+                if x_hi == x_lo:
+                    return y_lo / 100.0
+                score = y_lo + (y_hi - y_lo) * (fps - x_lo) / (x_hi - x_lo)
+                return min(1.0, max(0.0, score / 100.0))
+        return 1.0  # fps <= 0 → 100/100
+
+    @staticmethod
     def _node_features(
         feature_stats: Dict[str, Dict[str, float]],
+        fps_stats: Optional[Dict[str, float]] = None,
+        metrics: Optional[dict] = None,
         offload_crops_received_per_s: float = 0.0,
     ) -> tuple:
-        """Compute node-level features from per-camera feature_stats.
+        """Build the 10-element feature row from runtime inputs.
 
-        feature_stats must already be filtered to cameras with fps > 0 by
-        the in-flight caller (health_agent / run_python), matching the
-        collector's n_active_cameras definition.  len(feature_stats) is
-        therefore the correct active camera count.
-
-        Returns (n_active_cameras, n_track_total, n_plate_total,
-                 stationary_fraction_mean, offload_crops_received_per_s).
-        These must match train_dl_model.py FEATURE_COLS exactly.
+        feature_stats: per-camera {n_track, n_plate, stationary_fraction}
+        fps_stats:     per-camera {cam_id: fps} — caller computes avg_fps
+        metrics:       {gpu_percent, cpu_percent, ram_percent, gpu_temp_c}
         """
         n_active = len(feature_stats)
-        n_track_total = 0.0
-        n_plate_total = 0.0
-        stat_vals = []
-        for cam_feats in feature_stats.values():
-            n_track_total += float(cam_feats.get("n_track", 0.0))
-            n_plate_total += float(cam_feats.get("n_plate", 0.0))
-            stat_vals.append(float(cam_feats.get("stationary_fraction", 0.0)))
-        stat_mean = sum(stat_vals) / len(stat_vals) if stat_vals else 0.0
-        offload_rate = round(float(offload_crops_received_per_s), 3)
-        return n_active, n_track_total, n_plate_total, stat_mean, offload_rate
+        n_track = sum(float(c.get("n_track", 0)) for c in feature_stats.values())
+        n_plate = sum(float(c.get("n_plate", 0)) for c in feature_stats.values())
+        stat_vals = [float(c.get("stationary_fraction", 0)) for c in feature_stats.values()]
+        stat = sum(stat_vals) / len(stat_vals) if stat_vals else 0.0
+
+        # aggregate FPS: average across cameras, clamped at 27 (target)
+        fps = 0.0
+        if fps_stats:
+            vals = list(fps_stats.values())
+            fps = sum(vals) / len(vals) if vals else 0.0
+
+        m = metrics or {}
+        gpu = float(m.get("gpu_percent", 0.0))
+        cpu = float(m.get("cpu_percent", 0.0))
+        ram = float(m.get("ram_percent", 0.0))
+        gpu_temp = float(m.get("gpu_temp_c", 0.0))
+        offload = round(float(offload_crops_received_per_s), 3)
+
+        return (int(n_active), n_track, n_plate, stat,
+                fps, round(gpu, 2), round(cpu, 2), round(ram, 2),
+                round(gpu_temp, 2), offload)
 
     def predict(
         self,
         feature_stats: Dict[str, Dict[str, float]],
+        fps_stats: Optional[Dict[str, float]] = None,
+        metrics: Optional[dict] = None,
         offload_crops_received_per_s: float = 0.0,
     ) -> Tuple[float, float, float, float]:
-        n_active, n_track, n_plate, stat, offload_rate = self._node_features(
-            feature_stats, offload_crops_received_per_s,
-        )
-        # ponytail: n_track_mean kept for heartbeat compat; divide if active > 0
+        """Run one prediction cycle. Returns (l_raw, n_track_mean, n_plate_mean, stat_frac)."""
+        features = self._node_features(feature_stats, fps_stats, metrics, offload_crops_received_per_s)  # type: ignore[arg-type]
+        n_active, n_track, n_plate, stat = features[0], features[1], features[2], features[3]
+
         n_track_mean = n_track / n_active if n_active else 0.0
         n_plate_mean = n_plate / n_active if n_active else 0.0
 
-        self._history.append([n_active, n_track, n_plate, stat, offload_rate])
+        self._history.append(list(features))
 
         if self._session is None or self._input_name is None:
             return 0.0, n_track_mean, n_plate_mean, stat
@@ -288,17 +359,14 @@ class DLPredictor:
             import numpy as np
             x = np.asarray([list(self._history)], dtype=np.float32)
             y = self._session.run(None, {self._input_name: x})[0]
-            pred = float(np.asarray(y).reshape(-1)[0])
+            flat = np.asarray(y).reshape(-1)
+            idx = min(self._horizon_index, len(flat) - 1)
+            fps_pred = float(flat[idx])
         except Exception as exc:
             logger.debug("[DLPredictor] inference failed: %s", exc, exc_info=True)
             return 0.0, n_track_mean, n_plate_mean, stat
 
-        # DL output is already the selected target on the 0-100 load scale.
-        # For predict_with_base, train on load_score/gpu_percent so base cost is
-        # included in the target. For predict_no_base, train on a delta-load
-        # target that excludes base cost. Do not add W_base here, or with-base
-        # DL predictions double-count the idle pipeline workload.
-        l_raw = min(1.0, max(0.0, pred / 100.0))
+        l_raw = self._fps_to_score(fps_pred)
         return l_raw, n_track_mean, n_plate_mean, stat
 
 
@@ -440,6 +508,7 @@ class ProactiveModel:
         feature_stats: Dict[str, Dict[str, float]],
         ts:            Optional[float] = None,
         offload_crops_received_per_s: float = 0.0,
+        fps_stats:     Optional[Dict[str, float]] = None,
     ) -> dict:
         """
         Run one compute cycle.
@@ -449,6 +518,7 @@ class ProactiveModel:
         feature_stats: from _read_feature_stats()
                        {camera_id: {n_track, n_plate, stationary_fraction}}
         offload_crops_received_per_s: node-level crop receive rate (0 if absent)
+        fps_stats:     per-camera FPS dict for DL predictor feature row
 
         Returns a dict with all proactive fields.  If enabled=False the dict
         only contains proactive_enabled=False; caller can merge safely without
@@ -464,7 +534,12 @@ class ProactiveModel:
         # Raw tiers
         if self._model_type == "dl" and self._dl_predictor is not None:
             l_raw, n_track_mean, n_plate_mean, stat_frac = \
-                self._dl_predictor.predict(feature_stats, offload_crops_received_per_s)
+                self._dl_predictor.predict(
+                    feature_stats,
+                    fps_stats=fps_stats,
+                    metrics=metrics,
+                    offload_crops_received_per_s=offload_crops_received_per_s,
+                )
         else:
             l_raw, n_track_mean, n_plate_mean, stat_frac = compute_l_proactive(
                 feature_stats, self._cfg, policy=self._policy

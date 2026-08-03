@@ -15,6 +15,7 @@ Architecture:
 """
 import logging
 import os
+import threading
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -52,6 +53,32 @@ def is_file_uri(uri: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Input FPS counter — thread-safe, passed from caller into source bins
+# ---------------------------------------------------------------------------
+
+class _InputCounter:
+    """Per-camera frame counter incremented by source-bin BUFFER probes.
+
+    ponytail: single dict + single lock.  Drained atomically by the
+    SpeedProbe writer loop every 1 s.  If throughput requires per-key
+    sharding, shard by camera_id prefix.
+    """
+    def __init__(self):
+        self._counts: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def increment(self, camera_id: str) -> None:
+        with self._lock:
+            self._counts[camera_id] = self._counts.get(camera_id, 0) + 1
+
+    def drain(self) -> dict[str, int]:
+        with self._lock:
+            result = dict(self._counts)
+            self._counts.clear()
+        return result
+
+
+# ---------------------------------------------------------------------------
 # Source bin factory
 # ---------------------------------------------------------------------------
 
@@ -59,6 +86,7 @@ def _make_source_bin(
     pipeline: Gst.Pipeline,
     streammux: Gst.Element,
     cam_cfg: CameraConfig,
+    input_counter: _InputCounter = None,
 ) -> Gst.Element:
     """
     Create a source bin for one camera and connect it to streammux.
@@ -100,9 +128,22 @@ def _make_source_bin(
             pipeline.add(conv)
             q.sync_state_with_parent()
             conv.sync_state_with_parent()
+
+            # Attach BUFFER probe on uridecodebin's video pad before the
+            # leaky queue so that every frame emitted by the source is
+            # counted, even when the queue drops under backpressure.
+            if input_counter is not None:
+                _cam_id = cam_cfg.camera_id
+                def _input_fps_probe(_pad, _info, cnt=input_counter, cid=_cam_id):
+                    cnt.increment(cid)
+                    return Gst.PadProbeReturn.OK
+                pad.add_probe(Gst.PadProbeType.BUFFER, _input_fps_probe, None)
+
             pad.link(q.get_static_pad("sink"))
             gst_link(q, conv)
-            conv.get_static_pad("src").link(sinkpad)
+            conv_src_pad = conv.get_static_pad("src")
+            conv_src_pad.link(sinkpad)
+
             logger.info(
                 "[Pipeline] Camera '%s' (source_id=%d) linked → sink_%d",
                 cam_cfg.camera_id, source_id, source_id,
@@ -198,6 +239,7 @@ def build_pipeline(
     mux_width: int = 1920,
     mux_height: int = 1080,
     analytics_config: str = None,
+    input_counter: _InputCounter = None,
     **kwargs,
 ):
     """
@@ -366,7 +408,7 @@ def build_pipeline(
     # ── Add source bins (N cameras) ───────────────────────────────────────────
     source_bins: dict[str, Gst.Element] = {}
     for cam_cfg in camera_configs:
-        src = _make_source_bin(pipeline, streammux, cam_cfg)
+        src = _make_source_bin(pipeline, streammux, cam_cfg, input_counter)
         source_bins[cam_cfg.camera_id] = src
 
     logger.info(
@@ -388,6 +430,7 @@ def dynamic_add_stream(
     tiler: Gst.Element,
     source_bins: dict,
     current_n: int,
+    input_counter: _InputCounter = None,
 ) -> Gst.Element:
     # 1. Increase muxer batch-size
     streammux.set_property("batch-size", current_n + 1)
@@ -399,7 +442,7 @@ def dynamic_add_stream(
         _add_file_recording_branch(pipeline, demux, cam_cfg, sync=True)
     
     # 2. Add and start the new source
-    src = _make_source_bin(pipeline, streammux, cam_cfg)
+    src = _make_source_bin(pipeline, streammux, cam_cfg, input_counter)
     src.sync_state_with_parent()
 
     source_bins[cam_cfg.camera_id] = src

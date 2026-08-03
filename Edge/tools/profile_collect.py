@@ -64,6 +64,71 @@ from speedflow_python.settings import FPS_STATS_FILE
 from health_agent import _read_payload, _compute_load_score
 
 # ---------------------------------------------------------------------------
+# Snapshot validity gate (pure helpers — no jtop / probe imports)
+# ---------------------------------------------------------------------------
+# The unified payload written atomically by SpeedProbe has the shape:
+#   {
+#     "_updated_at":                       <unix wall time>,
+#     "_telemetry": {
+#         "session_id":                    <hex str>,
+#         "sequence":                      <monotone int>,
+#         "pipeline_window_started_monotonic": <float>,
+#         "pipeline_window_ended_monotonic":   <float>,
+#         "pipeline_window_duration_s":        <float>,
+#     },
+#     "_features":  {cam_id: {...}},       # per-camera feature dict
+#     <cam_id>: <fps float>,               # backward-compat direct key
+#     "_offload_crops": {...},             # offload-receiver counters
+#   }
+#
+# The collector accepts at most one CSV row per strictly-advancing
+# (session_id, sequence) pair, and never writes fabricated values for a
+# missing/malformed/stale snapshot — such samples are skipped.
+
+# Operational polling cadence (seconds).  Snapshots older than this relative
+# to read time are treated as stale and dropped.
+CADENCE_S = 1.0
+
+
+def _extract_telemetry(payload) -> tuple | None:
+    """
+    Return (session_id, sequence) for a well-formed snapshot, else None.
+    Rejects missing/non-dict _telemetry, missing/empty session_id, and a
+    missing or non-non-negative-int sequence.  Returns None exactly when the
+    snapshot identity cannot be trusted — never fabricates a fallback.
+    """
+    if not isinstance(payload, dict):
+        return None
+    telemetry = payload.get("_telemetry")
+    if not isinstance(telemetry, dict):
+        return None
+    sess_id = telemetry.get("session_id")
+    seq     = telemetry.get("sequence")
+    if not isinstance(sess_id, str) or not sess_id:
+        return None
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+        return None
+    return sess_id, seq
+
+
+def _is_fresh(payload, now: float, max_age_s: float = CADENCE_S) -> bool:
+    """
+    True when _updated_at is present, numeric, and within max_age_s of `now`.
+    A missing/malformed _updated_at is treated as stale (not fresh) so we
+    never collect a snapshot whose age is unknown.
+    """
+    updated_at = payload.get("_updated_at") if isinstance(payload, dict) else None
+    if not isinstance(updated_at, (int, float)) or isinstance(updated_at, bool):
+        return False
+    return (now - float(updated_at)) <= max_age_s
+
+
+def _skip(interval: float, t0: float) -> None:
+    """Sleep the remainder of this poll cycle; helper to keep loops terse."""
+    time.sleep(max(0.0, interval - (time.monotonic() - t0)))
+
+
+# ---------------------------------------------------------------------------
 # jtop helper — graceful fallback if jtop unavailable
 # ---------------------------------------------------------------------------
 
@@ -132,6 +197,7 @@ FIELDNAMES = [
     "pipeline_window_started_monotonic", "pipeline_window_ended_monotonic",
     "pipeline_window_duration_s", "pipeline_updated_at",
     "fps_avg",
+    "input_fps_avg",
     "n_active_cameras",
     "n_track_total", "n_plate_total",
     "stationary_fraction_mean",
@@ -180,19 +246,24 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
             # 1) Read the unified pipeline payload exactly once per loop
             payload = _read_payload()
             if payload is None:
-                # No payload yet — wait and retry
-                elapsed = time.monotonic() - t0
-                time.sleep(max(0.0, interval - elapsed))
+                # No payload has been written yet — wait and retry, write nothing
+                _skip(interval, t0)
                 continue
 
-            # 2) Extract snapshot identity from _telemetry nested dict
-            telemetry = payload.get("_telemetry", {})
-            sess_id = telemetry.get("session_id", "")
-            seq     = telemetry.get("sequence", -1)
-            if seq == -1 or not sess_id:
-                # Invalid/incomplete payload
-                elapsed = time.monotonic() - t0
-                time.sleep(max(0.0, interval - elapsed))
+            # 2) Validity gate 1 — identity metadata (missing/malformed).
+            #    Skip the sample entirely; never write a fabricated row.
+            identity = _extract_telemetry(payload)
+            if identity is None:
+                _skip(interval, t0)
+                continue
+            sess_id, seq = identity
+
+            # 2b) Validity gate 2 — freshness at the 1s cadence.  A payload
+            #     older than CADENCE_S (or with an unknown age) is stale by
+            #     definition; a zero-fps snapshot is a real measurement, but a
+            #     stale one is not collectible state, so it is skipped.
+            if not _is_fresh(payload, time.time()):
+                _skip(interval, t0)
                 continue
 
             # ── Phase: not yet committed ? manage candidate ───────────────
@@ -251,7 +322,17 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
             fps_avg = sum(fps_vals) / len(fps_vals) if fps_vals else 0.0
             n_active_cameras = len(fps_vals)
 
-            # 8) Aggregate features across active cameras
+            # 8) Compute input FPS average from the same snapshot
+            input_fps_dict = payload.get("_input_fps", {})
+            if isinstance(input_fps_dict, dict) and input_fps_dict:
+                input_fps_vals = [v for v in input_fps_dict.values()
+                                  if isinstance(v, (int, float))]
+                input_fps_avg = (sum(input_fps_vals) / len(input_fps_vals)
+                                 if input_fps_vals else 0.0)
+            else:
+                input_fps_avg = 0.0
+
+            # 9) Aggregate features across active cameras
             feat_dict = payload.get("_features", {})
             _active_ids = {k for k, v in payload.items()
                            if not k.startswith("_") and isinstance(v, (int, float)) and v > 0.0}
@@ -267,22 +348,23 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
             stat_mean = (sum(stat_frac_vals) / len(stat_frac_vals)
                          if stat_frac_vals else 0.0)
 
-            # 9) Offload rate from the same payload
+            # 10) Offload rate from the same payload
             offload_crops = payload.get("_offload_crops", {})
             offload_rate = round(float(offload_crops.get("received_per_s", 0.0)), 3)
 
             delta = round(hw["gpu_percent"] - wbase_ref, 2)
 
-            # 10) Compute load_score from the payload fps
+            # 11) Compute load_score from the payload fps
             # Build fps_dict as health_agent expects: {cam_id: float}
             fps_dict = {k: v for k, v in payload.items()
                         if not k.startswith("_") and isinstance(v, (int, float))}
             load_score, _preset = _compute_load_score(hw, fps_dict)
 
-            # 11) Snapshot metadata from _telemetry (already extracted above)
-            win_started = telemetry.get("pipeline_window_started_monotonic", 0.0)
-            win_ended   = telemetry.get("pipeline_window_ended_monotonic", 0.0)
-            win_dur     = telemetry.get("pipeline_window_duration_s", 0.0)
+            # 12) Snapshot metadata directly from the gate-verified payload
+            tmeta = payload["_telemetry"]  # safe — _extract_telemetry confirmed a dict
+            win_started = tmeta.get("pipeline_window_started_monotonic", 0.0)
+            win_ended   = tmeta.get("pipeline_window_ended_monotonic", 0.0)
+            win_dur     = tmeta.get("pipeline_window_duration_s", 0.0)
             updated_at  = payload.get("_updated_at", 0.0)
 
             writer.writerow({
@@ -298,6 +380,7 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
                 "pipeline_window_duration_s":         round(win_dur, 3),
                 "pipeline_updated_at":                round(updated_at, 3),
                 "fps_avg":                            round(fps_avg, 2),
+                "input_fps_avg":                       round(input_fps_avg, 2),
                 "n_active_cameras":                   n_active_cameras,
                 "n_track_total":                      round(n_track_total, 2),
                 "n_plate_total":                      round(n_plate_total, 2),
@@ -351,8 +434,8 @@ def main() -> None:
     ap.add_argument("--output",         type=Path, default=Path("logs/calibration.csv"))
     ap.add_argument("--duration",       type=float, default=600.0,
                     help="Collection duration in seconds (default 600)")
-    ap.add_argument("--interval",       type=float, default=2.0,
-                    help="Sampling interval in seconds (default 2.0)")
+    ap.add_argument("--interval",       type=float, default=1.0,
+                    help="Sampling interval in seconds (default 1.0)")
     ap.add_argument("--wbase",          action="store_true",
                     help="Measure W_base instead of collecting calibration data")
     ap.add_argument("--wbase-duration", type=float, default=60.0,
@@ -362,6 +445,17 @@ def main() -> None:
     ap.add_argument("--wbase-ref",      type=float, default=0.0,
                     help="Known W_base GPU%% to subtract as delta_load")
     args = ap.parse_args()
+
+    # profile_collect cadence is 1.0 s, enforced at the CLI
+    if abs(args.interval - 1.0) > 1e-9:
+        print(
+            "[profile_collect] ERROR: --interval must be 1.0 second. "
+            "The entire telemetry stack (SpeedProbe, health agent, "
+            "proactive model) operates on a 1 s cadence — mismatched "
+            "collector interval would produce non-stationary rows.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if args.wbase:
         measure_wbase(args.wbase_output, args.wbase_duration, args.interval)

@@ -127,12 +127,29 @@ SNAP_DIR  = ROOT / _get("SNAP_DIR")
 SNAP_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------------------------------------
-# Telemetry writer cadence
 # -----------------------------------------------------------
-# How often the FPS/feature snapshot is flushed to FPS_STATS_FILE.
-# Default: 1.0 s.  Override per-run via TELEMETRY_INTERVAL env var
-# (set by run_edge.sh --telemetry-interval <seconds>).
+# Telemetry writer cadence (1-second windows)
+# -----------------------------------------------------------
+# FPS/feature snapshot is flushed to FPS_STATS_FILE every
+# TELEMETRY_INTERVAL seconds.  Both input and output FPS counters
+# are drained in the same atomic payload window.
+# Default: 1.0 s.  Override per-run via TELEMETRY_INTERVAL env var.
+# Both cadences MUST be exactly 1.0 — the profile collector, proactive
+# model, SpeedProbe poll, and health-load loop all assume a 1 s cadence.
+# Changing either value breaks the fabric and produces non-stationary data.
 TELEMETRY_INTERVAL: float = float(os.environ.get("TELEMETRY_INTERVAL", "1.0"))
+
+if abs(HEALTH_INTERVAL - 1.0) > 1e-9:
+    raise RuntimeError(
+        f"HEALTH_INTERVAL must be 1.0 second (got {HEALTH_INTERVAL!r}). "
+        f"Set HEALTH_INTERVAL=1.0 in {_env_path}"
+    )
+if abs(TELEMETRY_INTERVAL - 1.0) > 1e-9:
+    raise RuntimeError(
+        f"TELEMETRY_INTERVAL must be 1.0 second (got {TELEMETRY_INTERVAL!r}). "
+        f"Set TELEMETRY_INTERVAL=1.0 in {_env_path}, or remove it to accept"
+        f" the default"
+    )
 
 # -----------------------------------------------------------
 # Detection / Speed thresholds

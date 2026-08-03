@@ -216,6 +216,12 @@ class SpeedProbe:
         # Key: camera_id (str), Value: unix timestamp (float)
         self._first_valid_speed_ts: dict = {}
 
+        # ── Input FPS counter (set by run_python via set_input_counter) ────
+        # The same _InputCounter instance is shared with all source-bin
+        # BUFFER probes; each probe calls increment() per frame.  The writer
+        # loop drains counts here into _input_fps in the atomic payload.
+        self._input_counter: object = None
+
         # ── Offload result injector ────────────────────────────────────────
         # offload_receiver.py feeds decoded plate results into this queue.
         # Drained at the top of every osd_sink_pad_buffer_probe call so results
@@ -298,6 +304,14 @@ class SpeedProbe:
         and surface offload_crops_received_per_s in the telemetry snapshot.
         """
         self._offload_rcv = rcv
+
+    def set_input_counter(self, counter) -> None:
+        """
+        Wire a shared _InputCounter so the FPS writer drains per-camera
+        input-frame counts into _input_fps in each telemetry window.
+        Called by run_python.py after creating the counter and pipeline.
+        """
+        self._input_counter = counter
 
     def inject_offload_result(self, result: dict) -> None:
         """
@@ -426,6 +440,19 @@ class SpeedProbe:
                 # FPS entries (bare floats, backward-compat for direct key lookup)
                 for cam_id, f in fps.items():
                     out[cam_id] = f
+
+                # ── Drain input FPS counts from source-bin probes ──────────
+                if self._input_counter is not None:
+                    raw_counts = self._input_counter.drain()
+                    input_fps: Dict[str, float] = {}
+                    for cam_id, n in raw_counts.items():
+                        input_fps[cam_id] = round(n / window_dur, 1)
+                    out["_input_fps"] = input_fps
+                    # Also populate zero entries for cameras we have output fps
+                    # for but no input (e.g., camera just removed)
+                    for cam_id in fps:
+                        if cam_id not in input_fps:
+                            input_fps[cam_id] = 0.0
 
                 # ── Offload receiver processed count ───────────────────────
                 if self._offload_rcv is not None:

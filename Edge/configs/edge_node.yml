@@ -146,7 +146,7 @@ proactive:
   gamma:  0.0             # stationary_fraction coeff     — fill after Phase 1
 
   # Cycle-aware smoothing window (≈ one full traffic-light cycle)
-  cycle_window_s: 6.0     # must match dl_model.horizon_s
+  cycle_window_s: 6.0
 
   # Offload trigger threshold on the smoothed risk index U
   risk_threshold: 0.85    # U ≥ this → overload (replaces overload_threshold when enabled)
@@ -161,7 +161,18 @@ proactive:
     max_mult: 1.25         # ≈ Jetson thermal throttle factor (~20–25% clock cut)
 
   # Deep-learning predictor (used when LOAD_MODEL=dl)
+  # Training contract (tools/train_fps_forecaster.py):
+  #   source_interval_s=0.5  → raw pipeline writes 2 rows/s
+  #   sample_interval_s=2.0  → model trained at 2.0s cadence (matches HEALTH_INTERVAL)
+  #   history=5               → 5 rows × 2.0s = 10 s lookback
+  #   horizons=[6.0, 10.0]   → ONNX outputs [FPS@t+6s, FPS@t+10s]
+  #   horizon_index=0        → use first output (t+6s)
+  #
+  # Feature vector (10 features):
+  #   [n_active, n_track, n_plate, stationary, fps_avg, gpu, cpu, ram, gpu_temp, offload_rate]
   dl_model:
-    model_path: "models/load_predictor.onnx"
-    window_k: 5            # number of past feature windows in one input sample
-    horizon_s: 6           # must match train_dl_model.py --horizon-rows × HEALTH_INTERVAL
+    model_path:        ""        # e.g. "models/future_fps_predictor.onnx" — train artifact not yet produced
+    window_k:           5        # deployment-side history length (must match trainer's --history)
+    sample_interval_s:  2.0      # cadence in seconds (must match HEALTH_INTERVAL + trainer's --sample-interval)
+    horizons_s:         [6, 10]  # forecast horizons (must match trainer's --horizons)
+    horizon_index:      0        # which horizon to use: 0 = t+6s, 1 = t+10s

@@ -829,18 +829,50 @@ class PeerOrchestrator:
                 )
             return
 
-        # Check level-change cooldown for this camera
-        last_change = self._offload_level_changed_at.get(cam_to_offload, 0.0)
-        if now - last_change < level_cd:
-            if self._maybe_log_block("lvl_cd", now):
-                logger.info(
-                    "[PeerOrch] Overload but level-change cooldown active for '%s' "
-                    "(%.1fs elapsed, need %.1fs) — offload blocked",
-                    cam_to_offload, now - last_change, level_cd,
-                )
-            return
-
         current_level = self.get_offload_level(cam_to_offload)
+
+        # Determine intended target level (0 = clear, 1 = L1 migration, 2 = L2, 3 = L3)
+        if load >= thr1 and global_offload >= 1:
+            intended_level = 1
+        elif load >= thr2 and global_offload >= 2:
+            intended_level = 2
+        elif load >= thr3 and global_offload >= 3:
+            intended_level = 3
+        else:
+            intended_level = 0
+
+        # Escalation-aware cooldown: when moving toward greater urgency
+        # (numeric level decreases, e.g. 3→2, 3→1, 2→1) use a shorter
+        # bounded wait so offload reacts faster under worsening load.
+        # Preserve full cooldown for same-level, de-escalation (0→1 becomes
+        # L1-migration path which uses per-camera migration cooldown), and
+        # clear/recovery (level→0).
+        last_change = self._offload_level_changed_at.get(cam_to_offload, 0.0)
+        if (current_level in (2, 3)
+                and intended_level in (1, 2)
+                and intended_level < current_level):
+            esc_cd = min(
+                cfg.get("escalation_cooldown_s", 5),
+                level_cd,
+            )
+            if now - last_change < esc_cd:
+                if self._maybe_log_block("lvl_cd_esc", now):
+                    logger.info(
+                        "[PeerOrch] Overload but escalation cooldown active for '%s' "
+                        "(%.1fs elapsed, need %.1fs, current=%d→intended=%d) — offload blocked",
+                        cam_to_offload, now - last_change, esc_cd,
+                        current_level, intended_level,
+                    )
+                return
+        else:
+            if now - last_change < level_cd:
+                if self._maybe_log_block("lvl_cd", now):
+                    logger.info(
+                        "[PeerOrch] Overload but level-change cooldown active for '%s' "
+                        "(%.1fs elapsed, need %.1fs, level=%d) — offload blocked",
+                        cam_to_offload, now - last_change, level_cd, current_level,
+                    )
+                return
 
         # Escalation ladder: 3 → 2 → 1
         if load >= thr1 and global_offload >= 1:
