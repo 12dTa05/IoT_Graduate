@@ -283,6 +283,16 @@ class CameraManager:
             )
             return False
 
+        # Gate against max_streams: count currently enabled cameras.
+        enabled_count = len(self.get_enabled_configs())
+        if enabled_count >= self._max_streams:
+            logger.error(
+                "[CameraManager] ADD rejected for source_id=%d ('%s'): "
+                "max_streams=%d reached (%d active).",
+                source_id, cam_id, self._max_streams, enabled_count,
+            )
+            return False
+
         homo_cfg = cmd["homography"]
         src_pts  = np.array(homo_cfg["source_points"], dtype=np.float32)
         tw       = int(homo_cfg["target_width"])
@@ -408,8 +418,33 @@ class CameraManager:
         if not to_add_ids and not to_remove_ids:
             return None
 
+        # Gate reload against max_streams: only add streams that fit within
+        # the configured limit.  This prevents a config-file change from
+        # silently overflowing the muxer batch-size past what the Jetson can
+        # handle.  Streams that can't fit are left disabled and a clear
+        # warning is logged.
+        # Use the pre-reload running set.  self._configs already contains
+        # new_configs here, so counting it would include pending additions
+        # and subtract removals a second time.
+        current_active = len(old_enabled) - len(to_remove_ids)
+        allowed_add = max(0, self._max_streams - current_active)
+        add_list = [new_enabled[sid] for sid in sorted(to_add_ids) if sid in new_enabled]
+        if len(add_list) > allowed_add:
+            overflow = add_list[allowed_add:]
+            add_list = add_list[:allowed_add]
+            for config in overflow:
+                config.enabled = False
+            with self._lock:
+                self._rebuild_lookup()
+            logger.warning(
+                "[CameraManager] max_streams=%d limits ADD to %d stream(s); "
+                "dropped %d: %s",
+                self._max_streams, allowed_add,
+                len(overflow), [c.camera_id for c in overflow],
+            )
+
         delta = StreamDelta(
-            to_add=[new_enabled[sid] for sid in to_add_ids if sid in new_enabled],
+            to_add=add_list,
             to_remove=list(to_remove_ids),
         )
         logger.info(

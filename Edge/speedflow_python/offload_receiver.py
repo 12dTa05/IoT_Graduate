@@ -174,7 +174,7 @@ class _TRTEngine:
 # Preprocessing helpers
 # ---------------------------------------------------------------------------
 
-def _preprocess_lpr(crop_bgr: np.ndarray, target_h: int = 48, target_w: int = 168) -> np.ndarray:
+def _preprocess_lpr(crop_bgr: np.ndarray, target_h: int = 48, target_w: int = 96) -> np.ndarray:
     """
     Resize + normalise a plate crop to the LPR model input format.
     Matches the preprocessing used during LPRNet training:
@@ -188,7 +188,7 @@ def _preprocess_lpr(crop_bgr: np.ndarray, target_h: int = 48, target_w: int = 16
     return np.expand_dims(img, axis=0)           # (1, 3, H, W)
 
 
-def _preprocess_lpd(crop_bgr: np.ndarray, target_size: int = 416) -> np.ndarray:
+def _preprocess_lpd(crop_bgr: np.ndarray, target_size: int = 640) -> np.ndarray:
     """
     Resize a vehicle crop for the LPD detector input.
     Returns float32 CHW normalised array, shape (1, 3, target_size, target_size).

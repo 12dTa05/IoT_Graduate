@@ -6,14 +6,14 @@ License Plate Preprocessing Probe.
 Improves plate detection and OCR accuracy by enhancing vehicle crop quality
 *before* the buffer reaches SGIE1 (LPD).
 
-What changed vs the original:
-  - preprocess_image and _estimate_motion_blur now delegate to sf.enhance_bgr_inplace
-    and sf.estimate_motion_blur (C/OpenCV compiled in speedflow_cpp.so).
-  - The Python side keeps only the GStreamer/pyds loop and the
-    bgr→rgba writeback — all pixel arithmetic is in C.
-  - Full Python / OpenCV fallback preserved for machines without the .so.
+All pixel arithmetic is delegated to speedflow_cpp.so (sf.enhance_bgr_inplace
+and sf.estimate_motion_blur).  The Python side keeps only the GStreamer/pyds
+loop and the BGR→RGBA writeback — no Python/OpenCV enhancement fallback.
 
-Enhancement pipeline (unchanged in semantics):
+If the native .so is not available, speedflow_c raises a RuntimeError at
+import time with build instructions.
+
+Enhancement pipeline:
   1. Bilateral filter  – edge-preserving denoise
   2. Sharpening kernel – adaptive to motion blur level
   3. CLAHE             – contrast enhancement on L channel of LAB
@@ -30,36 +30,21 @@ from . import speedflow_c as sf
 
 
 class PlatePreprocessorProbe:
-    """
-    Preprocessing probe attached BEFORE SGIE1 (License Plate Detector).
+    """Preprocessing probe attached BEFORE SGIE1 (License Plate Detector).
 
     Enhancement runs on vehicle bounding-box crops only, so CPU load scales
     with the number of detected vehicles — not with frame resolution.
 
-    When speedflow_cpp.so is available, sf.enhance_bgr_inplace is called
-    instead of the Python OpenCV chain, eliminating GIL contention and
-    per-call Python overhead.
+    All pixel arithmetic is handled by sf.enhance_bgr_inplace (C/OpenCV)
+    which eliminates GIL contention and per-call Python overhead.
     """
 
     VEHICLE_CLASS_IDS = {2, 3, 5, 7}
 
-    def __init__(
-        self,
-        enable_sharpening: bool = True,
-        enable_contrast:   bool = True,
-        enable_denoise:    bool = True,
-        adaptive_mode:     bool = True,
-    ) -> None:
-        self.enable_sharpening = enable_sharpening
-        self.enable_contrast   = enable_contrast
-        self.enable_denoise    = enable_denoise
-        self.adaptive_mode     = adaptive_mode
-        self.processed_count   = 0
-
-        # Kernels kept for the Python fallback path only
-        self._k_light  = np.array([[ 0,-1, 0],[-1, 5,-1],[ 0,-1, 0]], dtype=np.float32)
-        self._k_medium = np.array([[-1,-1,-1],[-1, 9,-1],[-1,-1,-1]], dtype=np.float32)
-        self._k_strong = np.array([[-1,-2,-1],[-2,13,-2],[-1,-2,-1]], dtype=np.float32)
+    def __init__(self, **kwargs) -> None:
+        # ponytail: kwargs ignored — native .so is mandatory, no need for
+        # enable_sharpening/enable_contrast/enable_denoise toggles.
+        self.processed_count = 0
 
     # ------------------------------------------------------------------
     # GStreamer probe callback
@@ -106,7 +91,7 @@ class PlatePreprocessorProbe:
                             frame_bgr, obj_meta, w_frame, h_frame
                         )
                         if crop is not None and crop.size > 0:
-                            # Enhance in-place via C extension (or Python fallback)
+                            # Enhance in-place via C extension
                             self.preprocess_image_inplace(crop)
                             # crop is a view; write the enhanced pixels back
                             frame_bgr[y:y2, x:x2] = crop
@@ -144,26 +129,23 @@ class PlatePreprocessorProbe:
         """
         Enhance *crop* in-place.  crop must be (H, W, 3) BGR uint8 C-contiguous.
 
-        Uses sf.enhance_bgr_inplace (C) when the extension is available;
-        falls back to the original Python/OpenCV chain otherwise.
-        The motion level is auto-detected when adaptive_mode is True.
+        Delegates entirely to sf.enhance_bgr_inplace (C++). Motion level is
+        auto-detected when the argument is 'medium'.
         """
         if crop is None or crop.size == 0:
             return
 
-        if self.adaptive_mode and motion_level == "medium":
+        # Convert string level to int (0/1/2) via motion-blur estimation
+        if motion_level == "medium":
             motion_int = sf.estimate_motion_blur(crop)   # 0/1/2
         else:
-            motion_int = {"low": 0, "medium": 1, "high": 2}.get(motion_level, 1)
+            motion_int = {"low": 0, "high": 2}.get(motion_level, 1)
 
-        if sf.is_available():
-            # Make contiguous if needed (should already be, but be safe)
-            buf = np.ascontiguousarray(crop, dtype=np.uint8)
-            sf.enhance_bgr_inplace(buf, motion_int)
-            if buf.ctypes.data != crop.ctypes.data:
-                np.copyto(crop, buf)
-        else:
-            self._enhance_python(crop, motion_int)
+        # Make contiguous if needed (should already be, but be safe)
+        buf = np.ascontiguousarray(crop, dtype=np.uint8)
+        sf.enhance_bgr_inplace(buf, motion_int)
+        if buf.ctypes.data != crop.ctypes.data:
+            np.copyto(crop, buf)
 
     # Kept for backward compatibility in test code that calls the old API
     def preprocess_image(self, image_bgr: np.ndarray,
@@ -172,36 +154,6 @@ class PlatePreprocessorProbe:
         out = np.ascontiguousarray(image_bgr, dtype=np.uint8)
         self.preprocess_image_inplace(out, motion_level)
         return out
-
-    # ------------------------------------------------------------------
-    # Python/OpenCV fallback enhancement  (used when .so not loaded)
-    # ------------------------------------------------------------------
-
-    def _enhance_python(self, crop: np.ndarray, motion_int: int) -> None:
-        """Full Python/OpenCV pipeline — modifies crop in-place."""
-        if motion_int == 0:
-            d, sigma, clip = 3, 30, 1.5
-            kernel = self._k_light
-        elif motion_int == 2:
-            d, sigma, clip = 7, 70, 2.5
-            kernel = self._k_strong
-        else:
-            d, sigma, clip = 5, 50, 2.0
-            kernel = self._k_medium
-
-        out = crop
-        if self.enable_denoise:
-            out = cv2.bilateralFilter(out, d, sigma, sigma)
-        if self.enable_sharpening:
-            out = cv2.filter2D(out, -1, kernel)
-        if self.enable_contrast:
-            lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB)
-            l, a, b = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
-            l = clahe.apply(l)
-            out = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-
-        np.copyto(crop, out)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -216,6 +168,3 @@ class PlatePreprocessorProbe:
         if x >= x2 or y >= y2:
             return None, 0, 0, 0, 0
         return frame_bgr[y:y2, x:x2], x, y, x2, y2
-
-
-

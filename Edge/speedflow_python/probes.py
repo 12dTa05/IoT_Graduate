@@ -196,8 +196,17 @@ class SpeedProbe:
         except OSError as exc:
             logger.warning("[SpeedProbe] cannot create SNAP_DIR %s: %s", SNAP_DIR, exc)
 
-        # License plate collection (20 raw frames ≈ 5 SGIE runs × 4 frames)
-        self.PLATE_DETECTION_FRAMES      = 20
+        # License plate accumulation window.
+        # Adaptive per-camera: ~0.67 s of video, bounded [10, 40] frames.
+        #   • 0.67 s  ≃ a typical "all plates should appear" interval
+        #     (5 SGIE inference runs at 4-frame batch → 20 frames on a
+        #     30-fps camera), scaled to each camera's actual frame rate.
+        #   • Lower-bound 10 frames — prevents thrashing on very-low-fps
+        #     cameras (e.g. 5 fps doorbell).  Less than 10 produces
+        #     unreliable OCR readings.
+        #   • Upper-bound 40 frames — avoids keeping stale history on
+        #     60-fps sources (5 SGIE cycles ≈ 20 frames is quite enough;
+        #     40 is a generous ceiling).
         self.plate_detection_start_frame = {}
         self.plate_candidates            = defaultdict(list)
         self.plate_locked                = {}
@@ -904,7 +913,9 @@ class SpeedProbe:
                     frames_in_window = (frame_number
                                         - self.plate_detection_start_frame[stid])
 
-                    if frames_in_window < self.PLATE_DETECTION_FRAMES:
+                    # Per-camera adaptive window: 0.67 s × fps, clamped [10, 40]
+                    plate_detection_frames = max(10, min(40, int(round(cam_cfg.fps * 0.67))))
+                    if frames_in_window < plate_detection_frames:
                         plate_text = self._extract_lpr_text(plate_info["obj_meta"])
                         if plate_text:
                             bb = plate_info["bbox"]

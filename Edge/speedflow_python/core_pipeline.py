@@ -429,23 +429,44 @@ def dynamic_add_stream(
     cam_cfg: CameraConfig,
     tiler: Gst.Element,
     source_bins: dict,
-    current_n: int,
     input_counter: _InputCounter = None,
 ) -> Gst.Element:
-    # 1. Increase muxer batch-size
-    streammux.set_property("batch-size", current_n + 1)
+    # 1. Read current batch-size from the live streammux rather than trusting
+    #    a caller-supplied value that may have been stale before GLib idle_add
+    #    dispatched this callback.
+    old_batch_size = streammux.get_property("batch-size")
+
+    # 2. Increase muxer batch-size BEFORE creating any sources/recording
+    #    branches so that if creation fails we can roll the batch-size back
+    #    to its previous value and leave the pipeline unchanged.
+    streammux.set_property("batch-size", old_batch_size + 1)
 
     # File mode uses nvstreamdemux branches. Dynamic ADD must create the
     # matching branch before frames for the new source_id start flowing.
     demux = pipeline.get_by_name("demux")
-    if demux is not None:
-        _add_file_recording_branch(pipeline, demux, cam_cfg, sync=True)
-    
-    # 2. Add and start the new source
-    src = _make_source_bin(pipeline, streammux, cam_cfg, input_counter)
-    src.sync_state_with_parent()
+    recording_added = False
+    try:
+        if demux is not None:
+            _add_file_recording_branch(pipeline, demux, cam_cfg, sync=True)
+            recording_added = True
+
+        # 3. Add and start the new source
+        src = _make_source_bin(pipeline, streammux, cam_cfg, input_counter)
+        src.sync_state_with_parent()
+    except Exception:
+        # Rollback: restore batch-size and tear down any partially-created
+        # recording branch so the pipeline returns to the state it was in
+        # before this call.
+        streammux.set_property("batch-size", old_batch_size)
+        if recording_added:
+            _remove_file_recording_branch(pipeline, cam_cfg.source_id)
+        raise
 
     source_bins[cam_cfg.camera_id] = src
+    logger.info(
+        "[Pipeline] Added stream '%s' (source_id=%d), batch-size %d → %d",
+        cam_cfg.camera_id, cam_cfg.source_id, old_batch_size, old_batch_size + 1,
+    )
     return src
 
 
@@ -458,11 +479,19 @@ def dynamic_remove_stream(
     source_id: int,
     tiler: Gst.Element,
     source_bins: dict,
-    current_n: int,
 ) -> None:
     src = source_bins.get(camera_id)
     if not src:
         return
+
+    # Jetson removal risk (known limitation):
+    # The BLOCK_DOWNSTREAM + idle_add pattern is the documented GStreamer-safe
+    # way to remove a src pad from a running nvstreammux.  However, DeepStream
+    # 6.x on Jetson may still log harmless pad-spurious warnings or, in rare
+    # cases, trigger a short-lived mux hiccup on the remaining streams because
+    # nvstreammux doesn't entirely isolate per-sink-pad internal state.  No
+    # async retry or pad-blocking refinements are added here — those belong
+    # to a separate runtime/native/probes change by other writers.
 
     from gi.repository import GLib
 
@@ -507,9 +536,11 @@ def dynamic_remove_stream(
         if camera_id in source_bins:
             del source_bins[camera_id]
 
-        new_n = max(1, current_n - 1)
-        
-        # Decrease batch-size
+        # Read current batch-size from the live muxer and decrease it.
+        # Reading here (inside the GLib idle callback) rather than from the
+        # caller guarantees the value reflects any intervening adds/removes.
+        old_n = streammux.get_property("batch-size")
+        new_n = max(1, old_n - 1)
         streammux.set_property("batch-size", new_n)
         
         # Note: Do not change tiler rows/cols to avoid VIC error on Jetson

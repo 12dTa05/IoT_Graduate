@@ -6,7 +6,7 @@
 #   ./run_edge.sh --mode display
 #   ./run_edge.sh --mode rtsp_push --rtsp-push-url rtsp://host:8554/jetson_A
 #   ./run_edge.sh --load-policy predict_with_base --load-model formula
-#   ./run_edge.sh --telemetry-interval 0.5   # snapshot cadence (default: 1.0 s)
+#   ./run_edge.sh --telemetry-interval 1.0   # the only supported cadence
 #
 # Collect calibration data while the pipeline runs, then stop automatically:
 #   ./run_edge.sh --collect
@@ -48,7 +48,8 @@ PYTHON="${PYTHON:-python3}"
 MODE="${MODE:-rtsp_push}"
 LOAD_POLICY="${LOAD_POLICY:-actual}"
 LOAD_MODEL="${LOAD_MODEL:-formula}"
-TELEMETRY_INTERVAL="${TELEMETRY_INTERVAL:-1.0}"
+# ponytail: 1.0 s is locked — the single operational cadence.
+TELEMETRY_INTERVAL="1.0"
 
 # --collect defaults
 COLLECT=0
@@ -187,9 +188,9 @@ case "$LOAD_MODEL" in
         exit 1 ;;
 esac
 
-if ! [[ "$TELEMETRY_INTERVAL" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || \
-   ! awk "BEGIN { exit !($TELEMETRY_INTERVAL > 0) }"; then
-    echo "[run_edge] ERROR: --telemetry-interval must be a positive number" >&2
+# ponytail: single 1.0 s cadence — reject any override attempt.
+if [[ "$TELEMETRY_INTERVAL" != "1.0" ]]; then
+    echo "[run_edge] ERROR: --telemetry-interval only accepts 1.0 (full cadence)" >&2
     exit 1
 fi
 
@@ -197,16 +198,54 @@ export LOAD_POLICY LOAD_MODEL TELEMETRY_INTERVAL
 echo "[run_edge] LOAD_POLICY=$LOAD_POLICY  LOAD_MODEL=$LOAD_MODEL  TELEMETRY_INTERVAL=${TELEMETRY_INTERVAL}s"
 
 # ---------------------------------------------------------------------------
-# Cleanup: kill all tracked child processes on Ctrl+C / EXIT
+# Cleanup: SIGTERM → bounded grace → SIGKILL each tracked child.
 # ---------------------------------------------------------------------------
 _pids=()
+_cleanup_done=0  # re-entrancy guard
+
 _cleanup() {
+    # ponytail: prevent recursive/double-run from nested signals.
+    if [[ $_cleanup_done -ne 0 ]]; then
+        return 0
+    fi
+    _cleanup_done=1
+    # Clear traps so a second signal during cleanup does not re-enter.
+    trap - EXIT INT TERM
+
     echo ""
-    echo "[run_edge] Stopping all processes..."
+    echo "[run_edge] Stopping all processes (SIGTERM)..."
     for pid in "${_pids[@]}"; do
         kill "$pid" 2>/dev/null || true
     done
-    wait 2>/dev/null || true
+
+    # Bounded grace period (3 s) for orderly shutdown.
+    local deadline=$(($(date +%s) + 3))
+    local alive=1
+    while [[ $(date +%s) -lt $deadline ]]; do
+        alive=0
+        for pid in "${_pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                alive=1
+                break
+            fi
+        done
+        [[ $alive -eq 0 ]] && break
+        sleep 0.2
+    done
+
+    if [[ $alive -ne 0 ]]; then
+        echo "[run_edge] Grace period expired — sending SIGKILL."
+        for pid in "${_pids[@]}"; do
+            kill -9 "$pid" 2>/dev/null || true
+        done
+        for pid in "${_pids[@]}"; do
+            wait "$pid" 2>/dev/null || true
+        done
+    else
+        for pid in "${_pids[@]}"; do
+            wait "$pid" 2>/dev/null || true
+        done
+    fi
     echo "[run_edge] Done."
 }
 trap _cleanup EXIT INT TERM

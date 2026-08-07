@@ -144,9 +144,8 @@ def _attach_camera_manager(
     }
 
     def on_add(cam_cfg):
-        current_n = streammux.get_property("batch-size")
         print(f"[Dynamic] Adding camera '{cam_cfg.camera_id}' (source_id={cam_cfg.source_id})")
-        dynamic_add_stream(pipeline, streammux, cam_cfg, tiler, source_bins, current_n, input_counter)
+        dynamic_add_stream(pipeline, streammux, cam_cfg, tiler, source_bins, input_counter)
         # Register mapping immediately after successful add.
         # This function runs in GLib Main Loop → safe, no lock needed.
         source_id_to_cam_id[cam_cfg.source_id] = cam_cfg.camera_id
@@ -163,9 +162,8 @@ def _attach_camera_manager(
             )
             return
 
-        current_n = streammux.get_property("batch-size")
         print(f"[Dynamic] Removing camera '{cam_id}' (source_id={source_id})")
-        dynamic_remove_stream(pipeline, streammux, cam_id, source_id, tiler, source_bins, current_n)
+        dynamic_remove_stream(pipeline, streammux, cam_id, source_id, tiler, source_bins)
 
         # Clean up key after successful removal.
         # Prevents memory leak during continuous operation over months
@@ -348,6 +346,9 @@ def _health_push_loop(peer_orch=None) -> None:
     # WebSocket; health_agent.py is the single external telemetry owner.
     _jtop_session = open_jtop_session()
 
+    # ponytail: monotonic deadline sleep so work duration doesn't extend period.
+    _next_deadline = _time.monotonic()
+
     while True:
         try:
             # Periodically refresh camera configs to pick up dynamic changes
@@ -435,7 +436,13 @@ def _health_push_loop(peer_orch=None) -> None:
             _logging.getLogger("health_push").warning(
                 "[HealthPush] Exception in health loop (will retry): %s", _exc, exc_info=True
             )
-        _time.sleep(HEALTH_INTERVAL)
+        # ponytail: deadline sleep — work duration does not extend the period.
+        _next_deadline += HEALTH_INTERVAL
+        _remaining = _next_deadline - _time.monotonic()
+        if _remaining > 0:
+            _time.sleep(_remaining)
+        else:
+            _next_deadline = _time.monotonic()
 
 
 
@@ -543,8 +550,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
                             sid = cfg.source_id
                             break
                     if sid is not None:
-                        current_n = streammux.get_property("batch-size")
-                        dynamic_remove_stream(pipeline, streammux, cam_id, sid, tiler, source_bins, current_n)
+                        dynamic_remove_stream(pipeline, streammux, cam_id, sid, tiler, source_bins)
                     return  # don't quit the pipeline
 
                 _error_flag[0] = True

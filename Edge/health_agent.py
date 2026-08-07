@@ -546,7 +546,7 @@ class HealthAgent:
             if not _ok_event.is_set():
                 logger.warning(
                     "[HealthAgent] jtop ok() did not return within 10 s "
-                    "(hardware unresponsive?) — falling back to psutil."
+                    "(hardware unresponsive?) — using zero metrics."
                 )
                 try:
                     j.close()
@@ -690,6 +690,9 @@ class HealthAgent:
         _cfg_reload_interval = 30.0
         self._last_cfg_reload = 0.0
 
+        # ponytail: monotonic deadline sleep so work duration doesn't extend the period.
+        _next_deadline = time.monotonic()
+
         while self._running:
             try:
                 if time.monotonic() - self._last_cfg_reload >= _cfg_reload_interval:
@@ -816,7 +819,14 @@ class HealthAgent:
             except Exception as exc:
                 logger.error("[HealthAgent] Error in collect loop: %s", exc)
 
-            time.sleep(HEALTH_INTERVAL)
+            # ponytail: deadline sleep — work duration does not extend the period.
+            _next_deadline += HEALTH_INTERVAL
+            _remaining = _next_deadline - time.monotonic()
+            if _remaining > 0:
+                time.sleep(_remaining)
+            else:
+                # Overran the interval — reset to next cycle to avoid burst.
+                _next_deadline = time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -829,11 +839,15 @@ def open_jtop_session():
     """
     Open and return a persistent jtop session.
     Identical to HealthAgent._open_jtop() — run_python.py can call this
-    directly to avoid the HealthAgent.__new__ stub pattern.
+    directly without instantiating a full HealthAgent.
     Returns the jtop object or None.
     """
-    _h = HealthAgent()
-    return HealthAgent._open_jtop(_h)
+    # ponytail: use a bare object with _open_jtop as an unbound method
+    # instead of creating a throwaway HealthAgent() that opens MonitorClient,
+    # builds ProactiveModel, etc.
+    class _Stub:
+        _open_jtop = HealthAgent._open_jtop
+    return _Stub()._open_jtop()
 
 
 def collect_metrics(jtop_session):
@@ -843,9 +857,11 @@ def collect_metrics(jtop_session):
     returned by open_jtop_session().
     If jtop_session is None, returns all-zero fallback metrics.
     """
-    _h = HealthAgent()
-    _h._jtop = jtop_session
-    return HealthAgent._collect_metrics(_h)
+    # ponytail: stub so _collect_metrics uses its jtop without a full HealthAgent.
+    class _Stub:
+        _jtop = jtop_session
+        _collect_metrics = HealthAgent._collect_metrics
+    return _Stub()._collect_metrics()
 
 
 # ---------------------------------------------------------------------------
