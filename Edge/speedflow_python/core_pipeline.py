@@ -134,7 +134,7 @@ def _make_source_bin(
             # counted, even when the queue drops under backpressure.
             if input_counter is not None:
                 _cam_id = cam_cfg.camera_id
-                def _input_fps_probe(_pad, _info, cnt=input_counter, cid=_cam_id):
+                def _input_fps_probe(_pad, _info, _user_data, cnt=input_counter, cid=_cam_id):
                     cnt.increment(cid)
                     return Gst.PadProbeReturn.OK
                 pad.add_probe(Gst.PadProbeType.BUFFER, _input_fps_probe, None)
