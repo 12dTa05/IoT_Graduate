@@ -198,17 +198,10 @@ export LOAD_POLICY LOAD_MODEL TELEMETRY_INTERVAL
 echo "[run_edge] LOAD_POLICY=$LOAD_POLICY  LOAD_MODEL=$LOAD_MODEL  TELEMETRY_INTERVAL=${TELEMETRY_INTERVAL}s"
 
 # ---------------------------------------------------------------------------
-# Cleanup only the process groups created by this invocation.
+# Cleanup every Edge command started by run_edge.sh.
 # ---------------------------------------------------------------------------
 _pids=()
 _cleanup_done=0  # re-entrancy guard
-
-_start_child() {
-    # A child session keeps Ctrl+C cleanup scoped to this run, including any
-    # descendants it creates, without touching another Edge invocation.
-    setsid "$@" &
-    _pids+=("$!")
-}
 
 _cleanup() {
     # ponytail: prevent recursive/double-run from nested signals.
@@ -220,38 +213,24 @@ _cleanup() {
     trap - EXIT INT TERM
 
     echo ""
-    echo "[run_edge] Stopping this run's process groups (SIGINT)..."
-    for pid in "${_pids[@]}"; do
-        kill -INT -- "-$pid" 2>/dev/null || true
-    done
+    echo "[run_edge] Stopping Edge processes..."
+    pkill -f "health_agent.py" 2>/dev/null || true
+    pkill -f "main.py" 2>/dev/null || true
+    pkill -f "tools/profile_collect.py" 2>/dev/null || true
 
-    # Let Python/GStreamer handle KeyboardInterrupt before forcing shutdown.
+    # Give Python and GStreamer a bounded grace period before forcing exit.
     local deadline=$(($(date +%s) + 3))
-    local alive=1
-    while [[ $(date +%s) -lt $deadline ]]; do
-        alive=0
-        for pid in "${_pids[@]}"; do
-            if kill -0 -- "-$pid" 2>/dev/null; then
-                alive=1
-                break
-            fi
-        done
-        [[ $alive -eq 0 ]] && break
+    while [[ $(date +%s) -lt $deadline ]] && {
+        pgrep -f "health_agent.py" >/dev/null ||
+        pgrep -f "main.py" >/dev/null ||
+        pgrep -f "tools/profile_collect.py" >/dev/null
+    }; do
         sleep 0.2
     done
 
-    if [[ $alive -ne 0 ]]; then
-        echo "[run_edge] Grace period expired — sending SIGTERM."
-        for pid in "${_pids[@]}"; do
-            kill -TERM -- "-$pid" 2>/dev/null || true
-        done
-        sleep 1
-        for pid in "${_pids[@]}"; do
-            if kill -0 -- "-$pid" 2>/dev/null; then
-                kill -KILL -- "-$pid" 2>/dev/null || true
-            fi
-        done
-    fi
+    pkill -KILL -f "health_agent.py" 2>/dev/null || true
+    pkill -KILL -f "main.py" 2>/dev/null || true
+    pkill -KILL -f "tools/profile_collect.py" 2>/dev/null || true
     for pid in "${_pids[@]}"; do
         wait "$pid" 2>/dev/null || true
     done
@@ -289,7 +268,8 @@ _STEP2_LABEL="STEP 2"
 [[ "$CALIBRATE" -eq 1 ]] && _STEP2_LABEL="STEP 2/6"
 echo ""
 echo "[run_edge] ── ${_STEP2_LABEL}: Starting health_agent.py ──"
-_start_child "$PYTHON" health_agent.py
+"$PYTHON" health_agent.py &
+_pids+=("$!")
 HEALTH_PID=${_pids[-1]}
 
 # Give health_agent time to connect to Zenoh and the monitoring server
@@ -302,10 +282,11 @@ _STEP3_LABEL="STEP 3"
 [[ "$CALIBRATE" -eq 1 ]] && _STEP3_LABEL="STEP 3/6"
 echo "[run_edge] ── ${_STEP3_LABEL}: Starting pipeline (mode=$MODE) ──"
 if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
-    _start_child "$PYTHON" main.py --mode "$MODE"
+    "$PYTHON" main.py --mode "$MODE" &
 else
-    _start_child "$PYTHON" main.py "${EXTRA_ARGS[@]}"
+    "$PYTHON" main.py "${EXTRA_ARGS[@]}" &
 fi
+_pids+=("$!")
 PIPELINE_PID=${_pids[-1]}
 echo "[run_edge] health_agent PID=$HEALTH_PID  |  pipeline PID=$PIPELINE_PID"
 
@@ -330,12 +311,13 @@ if [[ "$COLLECT" -eq 1 ]]; then
 
     mkdir -p "$(dirname "$COLLECT_OUTPUT")"
     echo "[run_edge] Collecting → $COLLECT_OUTPUT  (${COLLECT_DURATION}s, interval=${COLLECT_INTERVAL}s, wbase_ref=${COLLECT_WBASE_REF})"
-    _start_child "$PYTHON" tools/profile_collect.py \
+    "$PYTHON" tools/profile_collect.py \
         --output    "$COLLECT_OUTPUT" \
         --duration  "$COLLECT_DURATION" \
         --interval  "$COLLECT_INTERVAL" \
-        --wbase-ref "$COLLECT_WBASE_REF"
-    COLLECT_PID=${_pids[-1]}
+        --wbase-ref "$COLLECT_WBASE_REF" &
+    COLLECT_PID=$!
+    _pids+=("$COLLECT_PID")
     echo "[run_edge] profile_collect PID=$COLLECT_PID"
 
     if [[ "$CALIBRATE" -ne 1 ]]; then
@@ -366,9 +348,8 @@ while true; do
     if [[ -n "$COLLECT_PID" ]] && ! kill -0 "$COLLECT_PID" 2>/dev/null; then
         echo "[run_edge] Collection complete → $COLLECT_OUTPUT"
         echo "[run_edge] Stopping pipeline and health_agent..."
-        # Stop their whole sessions, not only the Python parent PID.
-        kill -INT -- "-$PIPELINE_PID" 2>/dev/null || true
-        kill -INT -- "-$HEALTH_PID"   2>/dev/null || true
+        kill "$PIPELINE_PID" 2>/dev/null || true
+        kill "$HEALTH_PID"   2>/dev/null || true
         wait "$PIPELINE_PID" 2>/dev/null || true
         wait "$HEALTH_PID"   2>/dev/null || true
         # Remove from _pids so _cleanup doesn't double-kill
