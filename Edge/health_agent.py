@@ -400,6 +400,7 @@ class HealthAgent:
         # edge_node.yml is read after the process fully starts.
         self._proactive_model = None
         self._cam_configs_cache: Dict[str, dict] = {}
+        self._max_streams = 8   # from cameras.yml; fallback count of concurrent streams
         self._last_cfg_reload = 0.0
 
     def _reload_cam_configs(self) -> Dict[str, dict]:
@@ -410,6 +411,12 @@ class HealthAgent:
             cam_yml = Path(__file__).resolve().parent / "configs" / "cameras.yml"
             with open(cam_yml, "r", encoding="utf-8") as f:
                 raw = yaml.safe_load(f) or {}
+
+            # max_streams sourced from cameras.yml; malformed values fall back to 8
+            try:
+                self._max_streams = int(raw.get("max_streams", 8) or 8)
+            except (TypeError, ValueError):
+                self._max_streams = 8
 
             result: Dict[str, dict] = {}
             for cam_id, cfg in raw.get("cameras", {}).items():
@@ -767,6 +774,7 @@ class HealthAgent:
                         "avg_fps":        avg_fps,
                         "active_cameras": active_cameras,
                         "camera_configs": self._cam_configs_cache,
+                        "max_streams":    int(self._max_streams or 8),
                     },
                 }
 

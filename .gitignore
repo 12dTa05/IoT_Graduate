@@ -6,6 +6,8 @@ Edge/__pycache__
 Edge/speedflow_python/__pycache__
 Edge/speedflow_python/tests/__pycache__
 Edge/tools/__pycache__
+Edge/tests/__pycache__
+Edge/.pytest_cache
 
 Server/__pycache__
 
@@ -13,9 +15,8 @@ Camera/videos/videos
 Camera/videos/ground_truth.csv
 Camera/videos/sim_cameras.yml
 
-Videos4Data
+.pytest_cache
 .slim/deepwork/
 
-docs
 DoAn
 data/*

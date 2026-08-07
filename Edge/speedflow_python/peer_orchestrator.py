@@ -313,6 +313,11 @@ class PeerOrchestrator:
             self._self_state.active_cameras = list(pipeline.get("active_cameras", []))
             self._self_state.camera_configs = pipeline.get("camera_configs", {})
             self._self_state.last_seen = time.time()
+            # max_streams sourced from health payload; malformed values fall back to 8
+            try:
+                self._self_state.max_streams = int(pipeline.get("max_streams", 8) or 8)
+            except (TypeError, ValueError):
+                self._self_state.max_streams = 8
 
             overloaded = self._is_overloaded(
                 self._self_state.load_score, self._self_state.risk_index
@@ -458,6 +463,11 @@ class PeerOrchestrator:
             peer.active_cameras = list(pipeline.get("active_cameras", []))
             peer.camera_configs = pipeline.get("camera_configs", peer.camera_configs)
             peer.last_seen = time.time()
+            # max_streams from peer health payload; malformed values fall back to 8
+            try:
+                peer.max_streams = int(pipeline.get("max_streams", 8) or 8)
+            except (TypeError, ValueError):
+                peer.max_streams = 8
 
             # Track overload onset using same proactive-aware helper
             overloaded = self._is_overloaded(peer.load_score, peer.risk_index)
