@@ -244,8 +244,8 @@ ok ".env written for $NODE_ID"
 # Mapping:
 #   jetson_A: source_id 0→cam_01 (rtsp://$ADVERTISE_IP:8554/cam1)
 #             source_id 1→cam_02 (rtsp://$ADVERTISE_IP:8554/cam2)
-#   jetson_B: source_id 0→cam_03 (rtsp://$ADVERTISE_IP:8554/cam3)
-#             source_id 1→cam_04 (rtsp://$ADVERTISE_IP:8554/cam4)
+#   jetson_B: source_id 2→cam_03 (rtsp://$ADVERTISE_IP:8554/cam3)
+#             source_id 3→cam_04 (rtsp://$ADVERTISE_IP:8554/cam4)
 # ──────────────────────────────────────────────────────────────
 CAMERAS_YML="$SCRIPT_DIR/configs/cameras.yml"
 mkdir -p "$(dirname "$CAMERAS_YML")"
