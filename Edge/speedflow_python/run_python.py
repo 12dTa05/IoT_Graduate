@@ -361,7 +361,7 @@ def _health_push_loop(peer_orch=None) -> None:
 
             # Use health_agent's metric collection via standalone function
             metrics       = collect_metrics(_jtop_session)
-            snapshot_valid, fps_stats, feature_stats, offload_crops = _read_pipeline()
+            snapshot_valid, fps_stats, feature_stats, offload_crops, _input_fps = _read_pipeline()
 
             # ── Pipeline unavailable guard ──────────────────────────────
             # Match health_agent's contract: invalid snapshot →
