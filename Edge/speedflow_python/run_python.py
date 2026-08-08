@@ -293,6 +293,8 @@ def _health_push_loop(peer_orch=None) -> None:
     # functions so adaptive omega weights and the correct CPU formula are used.
     from health_agent import (
         _compute_load_score      as _compute_load_fn,
+        _detect_source_starved,
+        _derive_camera_workload,
         _read_pipeline_snapshot  as _read_pipeline,
         _maybe_reload_edge_cfg   as _reload_edge_cfg,
         get_edge_cfg             as _get_edge_cfg,
@@ -367,7 +369,15 @@ def _health_push_loop(peer_orch=None) -> None:
             # Match health_agent's contract: invalid snapshot →
             # load_score 100 (unavailable), skip proactive computation.
             if snapshot_valid:
-                load_score, omega_preset = _compute_load_fn(metrics, fps_stats)
+                source_starved_cameras = _detect_source_starved(
+                    fps_stats, _input_fps, _get_edge_cfg()
+                )
+                camera_workload = _derive_camera_workload(
+                    feature_stats, fps_stats, source_starved_cameras
+                )
+                load_score, omega_preset = _compute_load_fn(
+                    metrics, fps_stats, source_starved_cameras
+                )
                 offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
                 active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
                 avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
@@ -381,6 +391,8 @@ def _health_push_loop(peer_orch=None) -> None:
                 fps_stats = {}
                 feature_stats = {}
                 offload_crops = {"received_per_s": 0.0}
+                source_starved_cameras = set()
+                camera_workload = {}
 
             payload = {
                 "type":         "health",
@@ -399,6 +411,8 @@ def _health_push_loop(peer_orch=None) -> None:
                     "avg_fps":         avg_fps,
                     "active_cameras":  active_cameras,
                     "camera_configs":  _cam_configs,
+                    "camera_workload": camera_workload,
+                    "source_starved_cameras": sorted(source_starved_cameras),
                 },
             }
 
