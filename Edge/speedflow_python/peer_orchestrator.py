@@ -24,6 +24,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import logging
+import math
 import os
 import random
 import socket
@@ -61,7 +62,7 @@ class PeerState:
     gpu_percent: float = 0.0
     cpu_percent: float = 0.0
     ram_percent: float = 0.0
-    gpu_temp_c: float = 0.0
+    gpu_temp_c: Optional[float] = 0.0
     avg_fps: Optional[float] = None
     fps_per_camera: Dict[str, float] = field(default_factory=dict)
     active_cameras: List[str] = field(default_factory=list)
@@ -73,6 +74,76 @@ class PeerState:
     # Proactive model output — populated when proactive.enabled is True.
     # Defaults to 0.0 (no risk) so legacy comparisons (load_score only) are unaffected.
     risk_index: float = 0.0
+    # Per-camera workload (n_track + n_plate) from health payload.
+    # L1 offload picks min workload; L2/L3 pick max workload.
+    # Empty dict is the safe default when payload is missing/malformed.
+    camera_workload: Dict[str, float] = field(default_factory=dict)
+    # Camera IDs reported as source-starved by the health agent.
+    # These are excluded from offload candidate selection (fail safe).
+    source_starved_cameras: List[str] = field(default_factory=list)
+
+
+def _parse_camera_workload(raw) -> Dict[str, float]:
+    """Parse camera_workload from a health payload; malformed → {}.
+
+    Accepts only finite, non-negative numeric values keyed by str camera_id.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, float] = {}
+    for k, v in raw.items():
+        if (isinstance(k, str)
+                and isinstance(v, (int, float))
+                and not isinstance(v, bool)
+                and math.isfinite(v)
+                and v >= 0):
+            out[k] = float(v)
+    return out
+
+
+def _parse_starved_cameras(raw) -> List[str]:
+    """Parse source_starved_cameras from a health payload; malformed → []."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [c for c in raw if isinstance(c, str)]
+
+
+def _thermal_admission_ok(gpu_temp_c, therm_cfg) -> bool:
+    """
+    Shared thermal-admission gate for BOTH roles.
+
+    Used by the sender side (_pick_best_peer, checking a peer before
+    offloading to it) and the receiver side (_evaluate_and_bid, checking
+    this node's own temperature before bidding on an RFO), so the rules
+    cannot drift apart. Config is the `p2p.thermal` section of
+    Edge/configs/edge_node.yml.
+
+    Returns True when the (peer or self) node may accept offload work.
+    An absent thermal section leaves behaviour unchanged (always accept).
+    """
+    if not therm_cfg:
+        return True
+    if not therm_cfg.get("admission_enabled", True):
+        return True
+    max_t = float(therm_cfg.get("max_gpu_temp_c", 85.0))
+    if gpu_temp_c is None or not isinstance(gpu_temp_c, (int, float)):
+        # Unknown / missing measurement. Default (conservative) policy
+        # rejects so we never send work to a node whose thermal state is
+        # unknown; permissive accepts on the assumption it is otherwise
+        # healthy. Both behaviours are explicit config.
+        policy = therm_cfg.get("invalid_policy", "conservative")
+        if policy == "permissive":
+            return True  # accept despite missing data
+        # reject_invalid=True → reject (return False)
+        # reject_invalid=False → accept (return True)
+        return not bool(therm_cfg.get("reject_invalid", True))
+    if gpu_temp_c <= 0:
+        # Zero or negative is almost certainly a sensor failure
+        policy = therm_cfg.get("invalid_policy", "conservative")
+        return policy != "conservative"
+    if gpu_temp_c > max_t:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -200,11 +271,22 @@ class PeerOrchestrator:
         # Used to reclaim cameras when this node's load drops below threshold.
         self._migrated_out: Dict[str, str] = {}
 
+        # Reclaim post-return observation window: camera_id → timestamp of reclaim
+        # completion.  Prevents the reclaimed camera from being immediately
+        # migrated away again during its transient FPS warm-up window on this node.
+        self._reclaim_completed_at: Dict[str, float] = {}
+
         # ponytail: rate-limit blocked-decision diagnostics so they don't spew
         # every 1-second tick.  Keys are short reason strings; value is the Unix
         # timestamp of the last log.  Cooldown = 15 s (half a typical vote window);
         # increase to 30 s if log volume is still too high.
         self._blocked_logged_at: Dict[str, float] = {}
+
+        # ponytail: single settle deadline that suppresses ALL L3/L2/L1 overload
+        # actions after a migration completes or reclaim ADD is initiated.
+        # Stale/draining FPS samples can otherwise escalate the node during the
+        # transition.  Configurable via p2p.transition_settle_s (default 5.0 s).
+        self._transition_settle_until: float = 0.0
 
         # Timestamp when load first dropped below reclaim threshold (for stability check)
         self._reclaim_eligible_since: Optional[float] = None
@@ -307,11 +389,18 @@ class PeerOrchestrator:
             self._self_state.gpu_temp_c  = payload.get("gpu_temp_c",  0.0)
             self._self_state.risk_index  = payload.get("risk_index",  0.0)
 
-            pipeline = payload.get("pipeline", {})
+            pipeline = payload.get("pipeline", {}) or {}
             self._self_state.avg_fps = pipeline.get("avg_fps")
             self._self_state.fps_per_camera = pipeline.get("fps_per_camera", {})
             self._self_state.active_cameras = list(pipeline.get("active_cameras", []))
             self._self_state.camera_configs = pipeline.get("camera_configs", {})
+            # Backwards-compatible: missing or malformed mapping → empty dict.
+            self._self_state.camera_workload = _parse_camera_workload(
+                pipeline.get("camera_workload", {})
+            )
+            self._self_state.source_starved_cameras = _parse_starved_cameras(
+                pipeline.get("source_starved_cameras", [])
+            )
             self._self_state.last_seen = time.time()
             # max_streams sourced from health payload; malformed values fall back to 8
             try:
@@ -421,10 +510,17 @@ class PeerOrchestrator:
                 self._self_state.ram_percent = payload.get("ram_percent", 0.0)
                 self._self_state.gpu_temp_c  = payload.get("gpu_temp_c",  0.0)
                 self._self_state.risk_index  = payload.get("risk_index",  0.0)
-                pipeline = payload.get("pipeline", {})
+                pipeline = payload.get("pipeline", {}) or {}
                 self._self_state.avg_fps = pipeline.get("avg_fps")
                 self._self_state.fps_per_camera = pipeline.get("fps_per_camera", {})
                 self._self_state.active_cameras = list(pipeline.get("active_cameras", []))
+                # Backwards-compatible: missing or malformed mapping → empty.
+                self._self_state.camera_workload = _parse_camera_workload(
+                    pipeline.get("camera_workload", {})
+                )
+                self._self_state.source_starved_cameras = _parse_starved_cameras(
+                    pipeline.get("source_starved_cameras", [])
+                )
 
                 # Overload onset: use risk_index when proactive mode is active,
                 # otherwise fall back to the legacy load_score threshold.
@@ -457,11 +553,18 @@ class PeerOrchestrator:
             peer.gpu_temp_c  = payload.get("gpu_temp_c",  0.0)
             peer.risk_index  = payload.get("risk_index",  0.0)
 
-            pipeline = payload.get("pipeline", {})
+            pipeline = payload.get("pipeline", {}) or {}
             peer.avg_fps        = pipeline.get("avg_fps")
             peer.fps_per_camera = pipeline.get("fps_per_camera", {})
             peer.active_cameras = list(pipeline.get("active_cameras", []))
             peer.camera_configs = pipeline.get("camera_configs", peer.camera_configs)
+            # Backwards-compatible: missing or malformed mapping → empty.
+            peer.camera_workload = _parse_camera_workload(
+                pipeline.get("camera_workload", {})
+            )
+            peer.source_starved_cameras = _parse_starved_cameras(
+                pipeline.get("source_starved_cameras", [])
+            )
             peer.last_seen = time.time()
             # max_streams from peer health payload; malformed values fall back to 8
             try:
@@ -738,11 +841,8 @@ class PeerOrchestrator:
                 logger.warning("[PeerOrch] Reclaim: cannot get config for '%s', skipping", camera_id)
                 continue
 
-            # Make-before-Break:
-            #   Step 1 — ADD to self first, wait for stream PLAYING ack
-            #   Step 2 — Only then REMOVE from holder
-            # This reuses the same _pending_acks + _wait_and_remove mechanism
-            # used by normal RFO migration.
+            # Make-before-Break: Step 1 — ADD to self first, wait for stream PLAYING ack
+            # Step 2 — Only then REMOVE from holder
             add_cmd = {**cam_config, "cmd": "ADD"}
             self._pubs["control"].put(msgpack.packb(add_cmd, use_bin_type=True))
             logger.info(
@@ -750,6 +850,15 @@ class PeerOrchestrator:
                 "ADD '%s' back to self (was held by '%s'), waiting for ack...",
                 load, reclaim_threshold, camera_id, holder_node,
             )
+
+            # Record reclaim start: this camera is ineligible for offload until
+            # its FPS stabilises after returning home.
+            self._reclaim_completed_at[camera_id] = now
+
+            # Suppress overload decisions for the settle window once reclaim
+            # ADD is initiated: incoming stream warm-up FPS can look like a
+            # fresh overload and re-escalate the node moments after reclaim.
+            self._transition_settle_until = now + cfg.get("transition_settle_s", 5.0)
 
             # Spin up a thread that waits for the local ADD ack then removes holder
             threading.Thread(
@@ -800,6 +909,8 @@ class PeerOrchestrator:
                 overload_since=self._self_state.overload_since,
                 penalty_until=self._self_state.penalty_until,
                 risk_index=self._self_state.risk_index,
+                camera_workload=dict(self._self_state.camera_workload),
+                source_starved_cameras=list(self._self_state.source_starved_cameras),
             )
 
         if state.overload_since is None:
@@ -809,6 +920,37 @@ class PeerOrchestrator:
             logger.debug("[PeerOrch] Overload too recent (%.1fs < %.1fs)",
                         now - state.overload_since, cfg.get("overload_duration_s", 10.0))
             return
+
+        # ── Decision suppression: pending-ack & post-migration settle ──
+        # While a make-before-break migration is in flight (pending ack), no
+        # L3/L2/L1 action is allowed — stale FPS samples could escalate the
+        # node prematurely.  After a migration completes or reclaim ADD is
+        # initiated, a configurable settle window (`transition_settle_s`,
+        # default 5.0 s) holds all overload decisions so draining samples
+        # cannot trigger a second migration before the pipeline stabilises.
+        with self._lock:
+            has_pending = bool(self._pending_acks)
+        if has_pending:
+            if self._maybe_log_block("pending_ack", now):
+                logger.warning(
+                    "[PeerOrch] Overload check BLOCKED: %d pending ack(s) "
+                    "still in flight — waiting for migration completion "
+                    "before issuing any L3/L2/L1 action.",
+                    len(self._pending_acks),
+                )
+            return
+
+        settle_remaining = self._transition_settle_until - now
+        if settle_remaining > 0:
+            if self._maybe_log_block("settle", now):
+                logger.warning(
+                    "[PeerOrch] Overload check BLOCKED: post-migration "
+                    "settle window active (%.1f s remaining). No L3/L2/L1 "
+                    "actions until settle expires.",
+                    settle_remaining,
+                )
+            return
+        # ── End decision suppression ──
 
         # Use effective load (risk_index×100 when proactive, else load_score)
         # for threshold comparisons so Level 1/2/3 boundaries are consistent
@@ -828,7 +970,23 @@ class PeerOrchestrator:
             self._trigger_level1_if_due(state, now, cfg)
             return
 
-        cam_to_offload = self._pick_camera_to_offload(state)
+        # Determine intended target level (0 = clear, 1 = L1 migration, 2 = L2, 3 = L3)
+        # FIRST, so camera selection can differ per level (L1 → lightest, L2/L3 → heaviest).
+        if load >= thr1 and global_offload >= 1:
+            intended_level = 1
+        elif load >= thr2 and global_offload >= 2:
+            intended_level = 2
+        elif load >= thr3 and global_offload >= 3:
+            intended_level = 3
+        else:
+            # Load dropped below all thresholds — clear fine-grained offload
+            for cam_id in list(state.active_cameras):
+                cl = self.get_offload_level(cam_id)
+                if cl in (2, 3):
+                    self.set_offload_level(cam_id, 0)
+            return
+
+        cam_to_offload = self._pick_camera_to_offload(state, level=intended_level)
         if not cam_to_offload:
             if self._maybe_log_block("no_cam", now):
                 logger.warning(
@@ -839,17 +997,19 @@ class PeerOrchestrator:
                 )
             return
 
-        current_level = self.get_offload_level(cam_to_offload)
+        # Transition guard: this camera was recently reclaimed and its FPS is
+        # still stabilising.  Re-escalating it would immediately undo reclaim.
+        reclaim_age = now - self._reclaim_completed_at.get(cam_to_offload, 0.0)
+        reclaim_stable_s = cfg.get("reclaim_stable_s", 20.0)
+        if reclaim_age < reclaim_stable_s:
+            logger.info(
+                "[PeerOrch] Transition guard: '%s' was reclaimed %.0fs ago "
+                "(need %.0fs) — skipping offload to avoid re-escalation.",
+                cam_to_offload, reclaim_age, reclaim_stable_s,
+            )
+            return
 
-        # Determine intended target level (0 = clear, 1 = L1 migration, 2 = L2, 3 = L3)
-        if load >= thr1 and global_offload >= 1:
-            intended_level = 1
-        elif load >= thr2 and global_offload >= 2:
-            intended_level = 2
-        elif load >= thr3 and global_offload >= 3:
-            intended_level = 3
-        else:
-            intended_level = 0
+        current_level = self.get_offload_level(cam_to_offload)
 
         # Escalation-aware cooldown: when moving toward greater urgency
         # (numeric level decreases, e.g. 3→2, 3→1, 2→1) use a shorter
@@ -964,15 +1124,6 @@ class PeerOrchestrator:
                 )
                 self.set_offload_level(cam_to_offload, 3, target_node=best_peer)
 
-        else:
-            # Load dropped below all thresholds — clear fine-grained offload
-            if current_level in (2, 3):
-                logger.info(
-                    "[PeerOrch] Load=%.1f below thresholds. Clearing offload for '%s'.",
-                    load, cam_to_offload,
-                )
-                self.set_offload_level(cam_to_offload, 0)
-
     def _trigger_level1_if_due(self, state, now: float, cfg: dict) -> None:
         """Legacy Level-1 overload trigger (existing behaviour, unchanged).
         NOTE: `state` is already a consistent snapshot captured by _check_self_overload.
@@ -986,7 +1137,7 @@ class PeerOrchestrator:
                              self._vote_in_progress)
                 return
 
-        cam_to_offload = self._pick_camera_to_offload(state)
+        cam_to_offload = self._pick_camera_to_offload(state, level=1)
         if not cam_to_offload:
             logger.debug("[PeerOrch] No camera to offload (all inactive or locked)")
             return
@@ -1016,8 +1167,15 @@ class PeerOrchestrator:
         a streammux slot.
         Returns None if no suitable peer is found.
         """
-        now     = time.time()
+        now = time.time()
         timeout = self._cfg.get("heartbeat_timeout_s", 15.0)
+
+        # Thermal admission gate: reject peers with unsafe or ambiguous
+        # temperatures before evaluating load score. Configurable via
+        # Edge/configs/edge_node.yml p2p.thermal section.
+        # Reuses the shared _thermal_admission_ok so sender and receiver
+        # rules cannot drift.
+        therm_cfg = self._cfg.get("thermal")
         best_id : Optional[str] = None
         best_load = float("inf")
 
@@ -1028,6 +1186,14 @@ class PeerOrchestrator:
                 if now - peer.last_seen > timeout:
                     continue
                 if for_offload_level <= 1 and len(peer.active_cameras) >= peer.max_streams:
+                    continue
+                if not _thermal_admission_ok(peer.gpu_temp_c, therm_cfg):
+                    logger.info(
+                        "[PeerOrch] Peer '%s' rejected by thermal gate: "
+                        "gpu_temp_c=%s (max=%.1f)",
+                        nid, peer.gpu_temp_c,
+                        self._cfg.get("thermal", {}).get("max_gpu_temp_c", 85.0),
+                    )
                     continue
                 if now < peer.penalty_until:
                     continue
@@ -1196,6 +1362,21 @@ class PeerOrchestrator:
         with self._self_lock:
             current_streams = len(self._self_state.active_cameras)
             self_load = self._self_state.load_score
+            self_temp = self._self_state.gpu_temp_c
+
+        # ε0 — Thermal admission gate for THIS node (receiver).
+        # Same rule as _pick_best_peer's sender-side gate: do not bid when
+        # this node is too hot or has an unknown reading under a conservative
+        # policy. Accepting a stream onto a throttled node helps nobody.
+        therm_cfg = self._cfg.get("thermal")
+        if not _thermal_admission_ok(self_temp, therm_cfg):
+            logger.info(
+                "[PeerOrch] RFO rejected for '%s': ε0 (thermal-self) — "
+                "gpu_temp_c=%s (max=%.1f)",
+                camera_id, self_temp,
+                therm_cfg.get("max_gpu_temp_c", 85.0) if therm_cfg else 85.0,
+            )
+            return
 
         # ε1 — Capacity constraint
         eps_streams_max = self._cfg.get("eps_streams_max", 4)
@@ -1405,6 +1586,12 @@ class PeerOrchestrator:
         )
         # Store migration-complete timestamp so _update_blind_spot can reference it
         self._migration_complete_ts[camera_id] = time.time()
+
+        # Suppress overload decisions for the settle window so stale/draining
+        # FPS samples on the reduced pipeline cannot trigger a second offload.
+        self._transition_settle_until = time.time() + self._cfg.get(
+            "transition_settle_s", 5.0,
+        )
 
         logger.info(
             "[PeerOrch] Migration DONE in %.0fms: '%s' → %s",
@@ -1729,9 +1916,24 @@ class PeerOrchestrator:
             return cfg.get("uri")
         return None
 
-    def _pick_camera_to_offload(self, state: PeerState) -> Optional[str]:
+    def _pick_camera_to_offload(self, state: PeerState, level: int) -> Optional[str]:
         """
-        Select camera to offload — prioritize camera with highest FPS.
+        Select camera to offload based on intended offload level.
+
+        Level 1 (full-stream migration): choose the **lightest** eligible camera
+        (min workload) — migrate the easiest stream, keep heavy cameras local.
+
+        Level 2 / Level 3 (crop offload): choose the **heaviest** eligible camera
+        (max workload) — offload the most impactful camera to a peer as crop work.
+
+        Workload comes from the health payload's camera_workload mapping
+        (n_track + n_plate per camera) — NOT output FPS, which is a poor proxy
+        for processing cost.  A candidate must have a finite, non-negative
+        workload; cameras with missing evidence are skipped.  If no candidate
+        has workload evidence, return None (fail safe) — never rank on FPS.
+
+        Source-starved cameras (health agent reports them starved) and cameras
+        within the reclaim post-return observation window are ineligible.
 
         Never offload the last camera — node must keep at least 1 camera
         to continue operation. If only 1 camera remains and still overloaded,
@@ -1744,10 +1946,33 @@ class PeerOrchestrator:
                     state.active_cameras[0],
                 )
             return None
-        if state.fps_per_camera:
-            return max(
-                (c for c in state.active_cameras if c in state.fps_per_camera),
-                key=lambda c: state.fps_per_camera.get(c, 0),
-                default=state.active_cameras[-1],
-            )
-        return state.active_cameras[-1]
+
+        now = time.time()
+        reclaim_stability = self._cfg.get("reclaim_stability_s", 30.0)
+        starved = set(state.source_starved_cameras or [])
+
+        # Workload evidence must come from the health payload. Require a
+        # finite, non-negative workload per camera; missing/malformed values
+        # are skipped (fail safe). Do NOT fall back to output FPS.
+        workload = state.camera_workload or {}
+        eligible = {
+            c: float(workload[c])
+            for c in state.active_cameras
+            if c not in starved
+            and now - self._reclaim_completed_at.get(c, 0.0) >= reclaim_stability
+            and c in workload
+            and isinstance(workload[c], (int, float))
+            and not isinstance(workload[c], bool)
+            and math.isfinite(workload[c])
+            and workload[c] >= 0
+        }
+
+        if not eligible:
+            return None
+
+        if level == 1:
+            # L1 migration: lightest camera = min workload
+            return min(eligible, key=lambda c: eligible[c])
+        else:
+            # L2/L3 crop offload: heaviest camera = max workload
+            return max(eligible, key=lambda c: eligible[c])

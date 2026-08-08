@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sys
 import time
 import threading
@@ -160,11 +161,146 @@ def _payload_parts(
     return fps_stats, feature_stats, offload_crops
 
 
+def _detect_source_starved(
+    fps_stats: dict,
+    input_fps: dict,
+    edge_cfg: dict,
+) -> set:
+    """
+    Detect cameras whose source (upstream feed) is starved.
+
+    A camera is source-starved ONLY when BOTH conditions hold:
+      1. Input rate is absent/zero or materially below the expected source rate.
+      2. Output rate is also absent/low (not a pure output transient).
+
+    When _input_fps is unavailable (empty/missing/malformed), returns an empty
+    set — preserving current FPS-score behaviour exactly.
+
+    Malformed fps_stats values (None, string, bool, NaN, inf, negative) are
+    treated as unavailable (0.0) — the camera is still evaluated with its
+    paired input_fps value, so a valid input alone cannot induce starvation.
+
+    Malformed config scalars fall back to defaults (expected_source_rate=25.0,
+    starved_threshold_ratio=0.2).  An unusable threshold (≤0, NaN, inf) causes
+    an early empty-set return — nothing is starvable.
+
+    Configuration (edge_node.yml, ``source_starved`` section):
+      expected_source_rate   float   default 25.0  (fps, matches cameras.yml)
+      starved_threshold_ratio float  default 0.2   (below 20 % = starved → 5.0 fps)
+    """
+    if not isinstance(input_fps, dict) or not input_fps:
+        return set()
+
+    # ponytail: guard against non-dict callers before any .get/.items
+    if not isinstance(fps_stats, dict):
+        fps_stats = {}
+    if not isinstance(edge_cfg, dict):
+        edge_cfg = {}
+
+    sc_cfg = edge_cfg.get("source_starved", {})
+    if not isinstance(sc_cfg, dict):
+        sc_cfg = {}
+
+    # ── Safe config scalars: malformed → default; negative/non-finite → default ──
+    def _safe_cfg_float(v, default):
+        """Convert *v* to a non-negative finite float; any malformed input → *default*."""
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return default
+        if isinstance(v, (int, float)):
+            if math.isfinite(v) and v >= 0.0:
+                return float(v)
+            return default
+        if isinstance(v, str):
+            try:
+                fv = float(v)
+                if math.isfinite(fv) and fv >= 0.0:
+                    return fv
+            except (ValueError, TypeError):
+                pass
+        return default
+
+    expected = _safe_cfg_float(sc_cfg.get("expected_source_rate"), 25.0)
+    ratio    = _safe_cfg_float(sc_cfg.get("starved_threshold_ratio"), 0.2)
+    threshold = expected * ratio
+
+    # ponytail: unusable threshold → nothing is starvable (defensible empty)
+    if not (math.isfinite(threshold) and threshold > 0.0):
+        return set()
+
+    # ── Safe FPS values: malformed → 0.0 (unavailable) ──
+    def _safe_fps(v):
+        """Convert *v* to a non-negative finite float; any malformed input → 0.0."""
+        if v is None:
+            return 0.0
+        if isinstance(v, bool):
+            return 0.0
+        if isinstance(v, (int, float)):
+            if math.isfinite(v) and v >= 0.0:
+                return float(v)
+            return 0.0
+        if isinstance(v, str):
+            try:
+                fv = float(v)
+                if math.isfinite(fv) and fv >= 0.0:
+                    return fv
+            except (ValueError, TypeError):
+                pass
+        return 0.0
+
+    starved: set = set()
+    for cam_id in set(fps_stats) | set(input_fps):
+        in_fps  = _safe_fps(input_fps.get(cam_id))
+        out_fps = _safe_fps(fps_stats.get(cam_id))
+        if in_fps < threshold and out_fps < threshold:
+            starved.add(cam_id)
+
+    return starved
+
+
+def _derive_camera_workload(
+    feature_stats: dict,
+    fps_stats: dict,
+    starved_cams: set = None,
+) -> dict:
+    """
+    Derive per-camera workload {camera_id: n_track + n_plate} from the same
+    telemetry window's _features snapshot.
+
+    Only active (fps > 0), non-source-starved cameras are included.
+    A camera is skipped — never crashes the payload builder — when its
+    n_track/n_plate are missing, non-numeric, bool, non-finite, or negative.
+    """
+    result: Dict[str, float] = {}
+    starved = starved_cams or set()
+
+    for cam_id, feats in feature_stats.items():
+        if not isinstance(feats, dict) or cam_id in starved:
+            continue
+        fps = fps_stats.get(cam_id, 0.0)
+        if not isinstance(fps, (int, float)) or fps <= 0.0:
+            continue  # inactive camera
+        n_track = feats.get("n_track")
+        n_plate = feats.get("n_plate")
+        if not isinstance(n_track, (int, float)) or isinstance(n_track, bool):
+            continue
+        if not isinstance(n_plate, (int, float)) or isinstance(n_plate, bool):
+            continue
+        if not math.isfinite(n_track) or n_track < 0:
+            continue
+        if not math.isfinite(n_plate) or n_plate < 0:
+            continue
+        result[cam_id] = n_track + n_plate
+
+    return result
+
+
 def _read_pipeline_snapshot() -> tuple:
     """
     Read the pipeline JSON once, validate freshness/integrity, return all parts.
 
-    Returns (valid: bool, fps_stats, feature_stats, offload_crops).
+    Returns (valid: bool, fps_stats, feature_stats, offload_crops, input_fps).
 
     When valid=False:
       fps_stats is {} and the caller must not use telemetry-derived
@@ -173,8 +309,11 @@ def _read_pipeline_snapshot() -> tuple:
     """
     payload = _read_payload()
     if not _validate_payload(payload):
-        return False, {}, {}, {}
-    return True, *_payload_parts(payload)
+        return False, {}, {}, {}, {}
+    input_fps = payload.get("_input_fps", {})
+    if not isinstance(input_fps, dict):
+        input_fps = {}
+    return True, *_payload_parts(payload), input_fps
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +431,11 @@ except OSError:
     _EDGE_CFG_MTIME = 0.0
 
 
-def _compute_load_score(metrics: dict, fps_stats: dict) -> tuple:
+def _compute_load_score(
+    metrics: dict,
+    fps_stats: dict,
+    source_starved_cameras: set = None,
+) -> tuple:
     """
     FPS-dominant load score with piecewise-linear FPS anchors and a configurable
     hardware emergency floor.
@@ -313,18 +456,28 @@ def _compute_load_score(metrics: dict, fps_stats: dict) -> tuple:
             score = max(fps_score, hw_fuse_score_floor)  (default floor 75.0)
         Transient hardware saturation with healthy FPS does NOT trigger the floor.
 
+    source_starved_cameras:
+        Optional set of camera_ids confirmed as source-starved. These cameras
+        are excluded from the FPS average (treated like zero-FPS cameras).
+        When None or empty, behaviour is unchanged from the prior release.
+
     Weight components are removed: only the anchored FPS curve + hardware
     floor drive the score.  Hardware metrics are safety status, not bonuses.
 
     Returns (score: float, "fps_dominant") — single stable preset string.
     """
+    _starved = source_starved_cameras or set()
+
     _maybe_reload_edge_cfg()
     ls_cfg = _EDGE_CFG.get("load_score", {})
     hw_fuse_threshold   = float(ls_cfg.get("hw_fuse_threshold",   90.0))
     hw_fuse_score_floor = float(ls_cfg.get("hw_fuse_score_floor", 75.0))
 
     # ── FPS score (piecewise linear) ──────────────────────────
-    active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
+    active_fps_vals = [
+        v for k, v in fps_stats.items()
+        if v > 0.0 and k not in _starved
+    ]
     if active_fps_vals:
         avg_fps = sum(active_fps_vals) / len(active_fps_vals)
     else:
@@ -722,7 +875,7 @@ class HealthAgent:
 
                 metrics = self._collect_metrics()
 
-                snapshot_valid, fps_stats, feature_stats, offload_crops = \
+                snapshot_valid, fps_stats, feature_stats, offload_crops, input_fps = \
                     _read_pipeline_snapshot()
 
                 # ── Pipeline unavailable guard ─────────────────────────
@@ -731,7 +884,12 @@ class HealthAgent:
                 # healthy TARGET_FPS score.  Report unavailable
                 # (load_score 100 = worst) + empty pipeline section.
                 if snapshot_valid:
-                    load_score, omega_preset = _compute_load_score(metrics, fps_stats)
+                    starved_cams = _detect_source_starved(
+                        fps_stats, input_fps, get_edge_cfg()
+                    )
+                    load_score, omega_preset = _compute_load_score(
+                        metrics, fps_stats, source_starved_cameras=starved_cams
+                    )
                     offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
                     # BUG-I fix: exclude 0-fps cameras from avg_fps,
                     # matching the exclusion applied in _compute_load_score()
@@ -740,6 +898,7 @@ class HealthAgent:
                     avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
                     active_cameras = [k for k, v in fps_stats.items() if v > 0.0]
                 else:
+                    starved_cams = set()
                     load_score, omega_preset = 100.0, "fps_dominant"
                     offload_crops_received_per_s = 0.0
                     active_fps_vals = []
@@ -757,6 +916,13 @@ class HealthAgent:
                 warmup_ms = self._warmup_ms
                 self._warmup_ms = None
 
+                # Active, non-source-starved cameras only.  Empty in the
+                # invalid-snapshot branch (feature_stats/fps_stats are {}) —
+                # nothing to derive from, matching the unavailable report.
+                camera_workload = _derive_camera_workload(
+                    feature_stats, fps_stats, starved_cams
+                )
+
                 payload = {
                     "type":          "health",
                     "node_id":       NODE_ID,
@@ -773,6 +939,8 @@ class HealthAgent:
                         "fps_per_camera": fps_stats,
                         "avg_fps":        avg_fps,
                         "active_cameras": active_cameras,
+                        "source_starved_cameras": sorted(starved_cams),
+                        "camera_workload": camera_workload,
                         "camera_configs": self._cam_configs_cache,
                         "max_streams":    int(self._max_streams or 8),
                     },

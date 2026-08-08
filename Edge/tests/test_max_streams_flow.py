@@ -36,9 +36,15 @@ def _install_host_stubs():
         package.__path__ = [str(EDGE / "speedflow_python")]
         sys.modules["speedflow_python"] = package
 
-    if "speedflow_python.settings" not in sys.modules:
+    # A sibling host test (test_profile_collect_load_score.py) may have left a
+    # ROOT-less speedflow_python.settings stub in sys.modules. Re-stamp the
+    # full attr set onto whatever module is present so imports of this module
+    # work regardless of test order.
+    settings = sys.modules.get("speedflow_python.settings")
+    if settings is None:
         settings = types.ModuleType("speedflow_python.settings")
-        for key, value in {
+        sys.modules["speedflow_python.settings"] = settings
+    for key, value in {
             "ROOT": EDGE,
             "NODE_ID": "host-test",
             "HEALTH_INTERVAL": 1.0,
@@ -52,7 +58,13 @@ def _install_host_stubs():
             "TELEMETRY_INTERVAL": 1.0,
         }.items():
             setattr(settings, key, value)
-        sys.modules["speedflow_python.settings"] = settings
+
+    # test_profile_collect_load_score replaces yaml.safe_load with a None
+    # stub at import-time. _reload_cam_configs needs the real parser, so
+    # restore it if stubbed.
+    y = sys.modules.get("yaml")
+    if y is not None and y.safe_load("a: 1") is None:
+        del sys.modules["yaml"]
 
     if "speedflow_python.zenoh_session" not in sys.modules:
         session = types.ModuleType("speedflow_python.zenoh_session")

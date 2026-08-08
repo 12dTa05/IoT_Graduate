@@ -453,6 +453,457 @@ def test_profile_collect_cadence_guard_in_source():
 
 
 # ---------------------------------------------------------------------------
+# source_starved_cameras exclusion tests
+# ---------------------------------------------------------------------------
+
+# Reuse the already-loaded stubbed health_agent module.
+_detect_source_starved = _ha._detect_source_starved
+_derive_camera_workload = _ha._derive_camera_workload
+
+
+def test_starvation_both_input_and_output_below_threshold():
+    """
+    Both input and output FPS below expected → classified as starved.
+    Default threshold = 25.0 * 0.2 = 5.0 fps.
+    """
+    starved = _detect_source_starved(
+        {"camA": 3.0, "camB": 25.0},
+        {"camA": 2.0, "camB": 25.0},
+        {},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_zero_input_zero_output():
+    """0 input + 0 output → starved."""
+    starved = _detect_source_starved(
+        {"camA": 0.0, "camB": 25.0}, {"camA": 0.0, "camB": 25.0}, {},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_output_only_transient_not_classified():
+    """Healthy input, low output → NOT starved (transient)."""
+    starved = _detect_source_starved(
+        {"camA": 0.5, "camB": 25.0}, {"camA": 25.0, "camB": 25.0}, {},
+    )
+    assert starved == set()
+
+
+def test_starvation_missing_input_suspends_decision():
+    """Unavailable _input_fps → empty set, backward-compat."""
+    assert _detect_source_starved({"camA": 0.0}, {}, {}) == set()
+    assert _detect_source_starved({"camA": 0.0}, None, {}) == set()
+
+
+def test_starved_camera_excluded_from_load_score():
+    """
+    starved cam excluded → only healthy cam drives score.
+    Without exclusion: avg = (3+27)/2 = 15 → score ≈ 75
+    With exclusion:    avg = 27/1    = 27 → score  = 0
+    """
+    score_no_excl, _ = _compute_load_score(_metrics(), _fps(camA=3.0, camB=27.0))
+    score_excl, _ = _compute_load_score(
+        _metrics(), _fps(camA=3.0, camB=27.0), source_starved_cameras={"camA"},
+    )
+    # without exclusion both cameras count: avg=15 → in [0,17] band → score ≈ 79
+    assert score_no_excl > 50, "both cameras should degrade score"
+    assert score_excl == 0.0
+
+
+def test_starved_camera_all_starved_reports_unavailable():
+    """All cameras starved → score 100 (unavailable, same as zero cameras)."""
+    score, _ = _compute_load_score(
+        _metrics(), _fps(camA=2.0, camB=3.0), source_starved_cameras={"camA", "camB"},
+    )
+    assert score == 100.0
+
+
+def test_starved_camera_empty_set_preserves_legacy_behavior():
+    """Empty starved set → identical to passing no kwarg."""
+    score_old, _ = _compute_load_score(_metrics(), _fps(camA=22.0))
+    score_new, _ = _compute_load_score(
+        _metrics(), _fps(camA=22.0), source_starved_cameras=set(),
+    )
+    assert abs(score_old - score_new) < 0.01
+
+
+def test_starvation_configurable_threshold():
+    """edge_node.yml thresholds are honoured."""
+    cfg_loose = {"source_starved": {"expected_source_rate": 25.0,
+                                    "starved_threshold_ratio": 0.1}}
+    # threshold 2.5 → 3.0 fps not starved
+    starved = _detect_source_starved({"camA": 3.0}, {"camA": 3.0}, cfg_loose)
+    assert starved == set()
+
+    cfg_tight = {"source_starved": {"expected_source_rate": 50.0,
+                                    "starved_threshold_ratio": 0.1}}
+    # threshold 5.0 → 3.0 fps starved
+    starved = _detect_source_starved({"camA": 3.0}, {"camA": 3.0}, cfg_tight)
+    assert starved == {"camA"}
+
+
+def test_starvation_backward_compat_kwarg_optional():
+    """Calling _compute_load_score without the kwarg is fine (3rd param optional)."""
+    score, _ = _compute_load_score(_metrics(), _fps(camA=27.0))
+    assert score == 0.0
+
+
+def test_starvation_union_iterates_over_input_and_output_cameras():
+    """
+    Camera present in _input_fps but not in fps_stats is still classified
+    if both input and output are below threshold.
+    """
+    starved = _detect_source_starved(
+        {"camB": 25.0},               # camA absent from output
+        {"camA": 2.0, "camB": 25.0},  # camA has starved input
+        {},
+    )
+    # camA: input=2.0 < 5.0 AND output absent (0.0) → starved
+    assert "camA" in starved
+    assert "camB" not in starved
+
+
+# ---------------------------------------------------------------------------
+# camera_workload derivation (n_track + n_plate, active non-starved only)
+# ---------------------------------------------------------------------------
+
+def test_camera_workload_normal_mapping():
+    """Active cameras map to n_track + n_plate; inactive (fps 0) are dropped."""
+    wl = _derive_camera_workload(
+        {"camA": {"n_track": 5, "n_plate": 3}, "camB": {"n_track": 1.5, "n_plate": 0}},
+        {"camA": 27.0, "camB": 25.0},
+        set(),
+    )
+    assert wl == {"camA": 8, "camB": 1.5}
+
+
+def test_camera_workload_zero_values_still_mapped():
+    """Valid zero n_track/n_plate → workload 0 (camera is still active)."""
+    wl = _derive_camera_workload(
+        {"camA": {"n_track": 0, "n_plate": 0}},
+        {"camA": 27.0},
+        set(),
+    )
+    assert wl == {"camA": 0}
+
+
+def test_camera_workload_malformed_values_ignored():
+    """String / None / bool / NaN / negative fields skip the camera, no crash."""
+    wl = _derive_camera_workload(
+        {
+            "camA": {"n_track": "10", "n_plate": 3},          # non-numeric
+            "camB": {"n_track": 5, "n_plate": None},          # missing field
+            "camC": {"n_track": float("nan"), "n_plate": 1},  # non-finite
+            "camD": {"n_track": 5, "n_plate": -2},            # negative
+            "camE": {"n_track": True, "n_plate": 1},          # bool (int subclass)
+            "camF": {"n_track": float("inf"), "n_plate": 1},  # non-finite
+            "camG": "not-a-dict",                             # malformed entry
+            "camH": {"n_track": 5, "n_plate": 4},             # valid
+        },
+        {f"cam{c}": 27.0 for c in "ABCDEFGH"},
+        set(),
+    )
+    assert wl == {"camH": 9}
+
+
+def test_camera_workload_starved_and_inactive_omitted():
+    """Starved camera and inactive (fps 0 / missing fps) camera are omitted."""
+    wl = _derive_camera_workload(
+        {
+            "camA": {"n_track": 5, "n_plate": 3},  # active healthy
+            "camB": {"n_track": 5, "n_plate": 3},  # starved
+            "camC": {"n_track": 5, "n_plate": 3},  # inactive (fps 0)
+            "camD": {"n_track": 5, "n_plate": 3},  # not in fps_stats at all
+        },
+        {"camA": 27.0, "camB": 27.0, "camC": 0.0},
+        {"camB"},
+    )
+    assert wl == {"camA": 8}
+
+
+def test_camera_workload_empty_feature_stats():
+    """No features → empty workload dict (never raises)."""
+    assert _derive_camera_workload({}, {}, set()) == {}
+
+
+# ---------------------------------------------------------------------------
+# _detect_source_starved hardening — malformed values/config must never raise
+# ---------------------------------------------------------------------------
+
+def test_starvation_fps_stats_none():
+    """fps_stats=None → treated as {}, no crash."""
+    starved = _detect_source_starved(None, {"camA": 2.0}, {})
+    # camA: out=0.0 (absent) + in=2.0 < 5.0 → starved
+    assert starved == {"camA"}
+
+
+def test_starvation_fps_stats_string():
+    """fps_stats="bad" → treated as {}, no crash."""
+    starved = _detect_source_starved("bad", {"camA": 2.0}, {})
+    assert starved == {"camA"}
+
+
+def test_starvation_fps_stats_contains_none_value():
+    """None value in fps_stats → 0.0, still evaluated."""
+    starved = _detect_source_starved(
+        {"camA": None, "camB": 25.0},
+        {"camA": 2.0,  "camB": 25.0},
+        {},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_fps_stats_contains_string_value():
+    """String value in fps_stats → 0.0, no crash."""
+    starved = _detect_source_starved(
+        {"camA": "offline", "camB": 25.0},
+        {"camA": 2.0,        "camB": 25.0},
+        {},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_fps_stats_contains_bool_value():
+    """bool value in fps_stats (int subclass trap) → 0.0, no crash."""
+    starved = _detect_source_starved(
+        {"camA": True, "camB": 25.0},
+        {"camA": 2.0,  "camB": 25.0},
+        {},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_fps_stats_contains_nan():
+    """NaN in fps_stats → 0.0, no crash."""
+    starved = _detect_source_starved(
+        {"camA": float("nan"), "camB": 25.0},
+        {"camA": 2.0,           "camB": 25.0},
+        {},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_fps_stats_contains_inf():
+    """inf in fps_stats → 0.0 (not usable), no crash."""
+    starved = _detect_source_starved(
+        {"camA": float("inf"), "camB": 25.0},
+        {"camA": 2.0,           "camB": 25.0},
+        {},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_fps_stats_contains_negative():
+    """Negative value in fps_stats → 0.0, no crash."""
+    starved = _detect_source_starved(
+        {"camA": -5.0, "camB": 25.0},
+        {"camA": 2.0,  "camB": 25.0},
+        {},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_fps_stats_contains_list():
+    """Non-scalar list value in fps_stats → 0.0, no crash."""
+    starved = _detect_source_starved(
+        {"camA": [1, 2, 3], "camB": 25.0},
+        {"camA": 2.0,        "camB": 25.0},
+        {},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_input_fps_contains_none_value():
+    """None in input_fps → 0.0, still evaluated with output."""
+    starved = _detect_source_starved(
+        {"camA": 2.0,  "camB": 25.0},
+        {"camA": None, "camB": 25.0},
+        {},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_input_fps_contains_string_value():
+    """String in input_fps → 0.0, no crash."""
+    starved = _detect_source_starved(
+        {"camA": 2.0,        "camB": 25.0},
+        {"camA": "offline",  "camB": 25.0},
+        {},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_input_fps_contains_nan():
+    """NaN in input_fps → 0.0, no crash."""
+    starved = _detect_source_starved(
+        {"camA": 2.0,           "camB": 25.0},
+        {"camA": float("nan"),  "camB": 25.0},
+        {},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_input_fps_contains_inf():
+    """inf in input_fps → 0.0, no crash."""
+    starved = _detect_source_starved(
+        {"camA": 2.0,           "camB": 25.0},
+        {"camA": float("inf"),  "camB": 25.0},
+        {},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_input_fps_contains_negative():
+    """Negative in input_fps → 0.0, no crash."""
+    starved = _detect_source_starved(
+        {"camA": 2.0,  "camB": 25.0},
+        {"camA": -5.0, "camB": 25.0},
+        {},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_edge_cfg_none():
+    """edge_cfg=None → defaults used, no crash."""
+    starved = _detect_source_starved(
+        {"camA": 2.0}, {"camA": 2.0}, None,
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_edge_cfg_expected_source_rate_none():
+    """expected_source_rate=None → default 25.0 used."""
+    starved = _detect_source_starved(
+        {"camA": 4.0}, {"camA": 4.0},
+        {"source_starved": {"expected_source_rate": None}},
+    )
+    # threshold defaults: 25*0.2=5 → 4.0 < 5.0 → starved
+    assert starved == {"camA"}
+
+
+def test_starvation_edge_cfg_expected_source_rate_nan():
+    """expected_source_rate=NaN → default 25.0 used."""
+    starved = _detect_source_starved(
+        {"camA": 4.0}, {"camA": 4.0},
+        {"source_starved": {"expected_source_rate": float("nan")}},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_edge_cfg_expected_source_rate_string():
+    """expected_source_rate="bad" → default 25.0 used."""
+    starved = _detect_source_starved(
+        {"camA": 4.0}, {"camA": 4.0},
+        {"source_starved": {"expected_source_rate": "bad"}},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_edge_cfg_expected_source_rate_negative():
+    """expected_source_rate=-10 → default 25.0 used, no crash."""
+    starved = _detect_source_starved(
+        {"camA": 4.0}, {"camA": 4.0},
+        {"source_starved": {"expected_source_rate": -10}},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_edge_cfg_ratio_none():
+    """starved_threshold_ratio=None → default 0.2 used."""
+    starved = _detect_source_starved(
+        {"camA": 4.0}, {"camA": 4.0},
+        {"source_starved": {"starved_threshold_ratio": None}},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_edge_cfg_ratio_nan():
+    """starved_threshold_ratio=NaN → default 0.2 used."""
+    starved = _detect_source_starved(
+        {"camA": 4.0}, {"camA": 4.0},
+        {"source_starved": {"starved_threshold_ratio": float("nan")}},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_edge_cfg_ratio_string():
+    """starved_threshold_ratio="bad" → default 0.2 used."""
+    starved = _detect_source_starved(
+        {"camA": 4.0}, {"camA": 4.0},
+        {"source_starved": {"starved_threshold_ratio": "bad"}},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_edge_cfg_ratio_negative():
+    """starved_threshold_ratio=-0.5 → default 0.2 used, no crash."""
+    starved = _detect_source_starved(
+        {"camA": 4.0}, {"camA": 4.0},
+        {"source_starved": {"starved_threshold_ratio": -0.5}},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_edge_cfg_source_starved_not_dict():
+    """source_starved section is a string → defaults, no crash."""
+    starved = _detect_source_starved(
+        {"camA": 4.0}, {"camA": 4.0},
+        {"source_starved": "bad"},
+    )
+    assert starved == {"camA"}
+
+
+def test_starvation_unusable_threshold_returns_empty():
+    """Config yields threshold=0 or negative → defensible empty set."""
+    # expected=0 → threshold=0 → nothing below 0
+    starved = _detect_source_starved(
+        {"camA": 0.0}, {"camA": 0.0},
+        {"source_starved": {"expected_source_rate": 0.0}},
+    )
+    assert starved == set()
+
+    # ratio=0 → threshold=0
+    starved = _detect_source_starved(
+        {"camA": 0.0}, {"camA": 0.0},
+        {"source_starved": {"starved_threshold_ratio": 0.0}},
+    )
+    assert starved == set()
+
+
+def test_starvation_mixed_malformed_both_sides():
+    """Mixed malformed values in both fps_stats and input_fps, no crash."""
+    starved = _detect_source_starved(
+        {"camA": float("nan"), "camB": "offline", "camC": 25.0, "camD": None},
+        {"camA": None,         "camB": True,      "camC": 25.0, "camD": float("inf")},
+        {"source_starved": {"expected_source_rate": "also_bad", "starved_threshold_ratio": float("nan")}},
+    )
+    # defaults: 25.0*0.2 = 5.0
+    # camA: out=0.0(nan), in=0.0(None) → 0<5 and 0<5 → starved
+    # camB: out=0.0(str), in=0.0(bool) → starved
+    # camC: out=25.0,     in=25.0     → not starved
+    # camD: out=0.0(None),in=0.0(inf) → starved
+    assert starved == {"camA", "camB", "camD"}
+
+
+def test_starvation_valid_behavior_preserved():
+    """Normal valid inputs still produce correct starvation detection."""
+    starved = _detect_source_starved(
+        {"camA": 3.0, "camB": 25.0},
+        {"camA": 2.0, "camB": 25.0},
+        {},
+    )
+    assert starved == {"camA"}
+
+    starved = _detect_source_starved(
+        {"camA": 0.5, "camB": 25.0},
+        {"camA": 25.0, "camB": 25.0},
+        {},
+    )
+    assert starved == set()
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -513,6 +964,51 @@ if __name__ == "__main__":
         test_health_interval_is_one_in_stub,
         test_telemetry_interval_is_one_in_stub,
         test_profile_collect_cadence_guard_in_source,
+        # source-starvation detection
+        test_starvation_both_input_and_output_below_threshold,
+        test_starvation_zero_input_zero_output,
+        test_starvation_output_only_transient_not_classified,
+        test_starvation_missing_input_suspends_decision,
+        test_starved_camera_excluded_from_load_score,
+        test_starved_camera_all_starved_reports_unavailable,
+        test_starved_camera_empty_set_preserves_legacy_behavior,
+        test_starvation_configurable_threshold,
+        test_starvation_backward_compat_kwarg_optional,
+        test_starvation_union_iterates_over_input_and_output_cameras,
+        # camera_workload derivation
+        test_camera_workload_normal_mapping,
+        test_camera_workload_zero_values_still_mapped,
+        test_camera_workload_malformed_values_ignored,
+        test_camera_workload_starved_and_inactive_omitted,
+        test_camera_workload_empty_feature_stats,
+        # _detect_source_starved hardening — malformed values/config
+        test_starvation_fps_stats_none,
+        test_starvation_fps_stats_string,
+        test_starvation_fps_stats_contains_none_value,
+        test_starvation_fps_stats_contains_string_value,
+        test_starvation_fps_stats_contains_bool_value,
+        test_starvation_fps_stats_contains_nan,
+        test_starvation_fps_stats_contains_inf,
+        test_starvation_fps_stats_contains_negative,
+        test_starvation_fps_stats_contains_list,
+        test_starvation_input_fps_contains_none_value,
+        test_starvation_input_fps_contains_string_value,
+        test_starvation_input_fps_contains_nan,
+        test_starvation_input_fps_contains_inf,
+        test_starvation_input_fps_contains_negative,
+        test_starvation_edge_cfg_none,
+        test_starvation_edge_cfg_expected_source_rate_none,
+        test_starvation_edge_cfg_expected_source_rate_nan,
+        test_starvation_edge_cfg_expected_source_rate_string,
+        test_starvation_edge_cfg_expected_source_rate_negative,
+        test_starvation_edge_cfg_ratio_none,
+        test_starvation_edge_cfg_ratio_nan,
+        test_starvation_edge_cfg_ratio_string,
+        test_starvation_edge_cfg_ratio_negative,
+        test_starvation_edge_cfg_source_starved_not_dict,
+        test_starvation_unusable_threshold_returns_empty,
+        test_starvation_mixed_malformed_both_sides,
+        test_starvation_valid_behavior_preserved,
     ]
 
     passed = failed = 0
