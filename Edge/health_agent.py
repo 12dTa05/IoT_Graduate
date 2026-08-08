@@ -435,10 +435,11 @@ def _compute_load_score(
     metrics: dict,
     fps_stats: dict,
     source_starved_cameras: set = None,
+    feature_stats: Optional[dict] = None,
 ) -> tuple:
     """
-    FPS-dominant load score with piecewise-linear FPS anchors and a configurable
-    hardware emergency floor.
+    FPS-dominant load score with piecewise-linear FPS anchors, a configurable
+    hardware emergency floor, and optional additive bonuses (workload + thermal).
 
     FPS score (bounded piecewise-linear, input clamped to [0, TARGET_FPS=27]):
         avg_fps >= 27  →   0
@@ -453,16 +454,28 @@ def _compute_load_score(
          the floor at any FPS.  FPS anchors are the GPU saturation signal.)
         If CPU >= hw_fuse_threshold (default 90) OR RAM >= hw_fuse_threshold
         AND fps_clamped < TARGET_FPS - 2.0:
-            score = max(fps_score, hw_fuse_score_floor)  (default floor 75.0)
+            score = max(composite, hw_fuse_score_floor)  (default floor 75.0)
         Transient hardware saturation with healthy FPS does NOT trigger the floor.
+
+    Conservative composite bonuses (config-driven via edge_node.yml
+    load_score.workload / load_score.thermal):
+        workload_bonus: total n_track + n_plate across active, non-source-starved
+                        cameras, linear ramp 0–max_bonus up to capacity.
+        thermal_bonus:  linear ramp on metrics['gpu_temp_c'] from onset_c
+                        (0 bonus) to critical_c (max_bonus), clamped.
+        composite = min(100, fps_score + workload_bonus + thermal_bonus)
+        then the hardware emergency floor is applied as before.
+        Absent / malformed sections = legacy FPS-only behaviour (bonus 0).
 
     source_starved_cameras:
         Optional set of camera_ids confirmed as source-starved. These cameras
         are excluded from the FPS average (treated like zero-FPS cameras).
         When None or empty, behaviour is unchanged from the prior release.
 
-    Weight components are removed: only the anchored FPS curve + hardware
-    floor drive the score.  Hardware metrics are safety status, not bonuses.
+    feature_stats:
+        Optional dict {camera_id: {n_track, n_plate, ...}} from the same
+        telemetry snapshot.  Only required when workload bonus is enabled;
+        absent/None = workload bonus 0 (no crash).
 
     Returns (score: float, "fps_dominant") — single stable preset string.
     """
@@ -502,28 +515,74 @@ def _compute_load_score(
     else:
         fps_score = 75.0 + (100.0 - 75.0) * (17.0 - fps_clamped) / (17.0 - 0.0)
 
-    # ── Hardware emergency floor ──────────────────────────────
-    # ponytail: GPU utilization is burst-aliased across sample intervals;
-    #           the floor MUST NOT gate on it.  FPS loss is the GPU saturation
-    #           signal — an anchored FPS score already captures the impact.
-    #           Only sustained CPU or RAM pressure + degraded FPS triggers
-    #           the floor.
-    hw_saturated = (
-        metrics.get("cpu_percent", 0.0) >= hw_fuse_threshold or
-        metrics.get("ram_percent", 0.0) >= hw_fuse_threshold
-    )
+    # ── Workload bonus (n_track + n_plate, active + non-starved only) ─
+    # Config-driven; absent/malformed section → 0 bonus (legacy).
+    workload_bonus = 0.0
+    wl_cfg = ls_cfg.get("workload", {})
+    if (isinstance(wl_cfg, dict) and wl_cfg.get("enabled") is True
+            and isinstance(feature_stats, dict)):
+        wl_total = sum(
+            _derive_camera_workload(feature_stats, fps_stats, _starved).values()
+        )
+        wl_cap  = _finite_positive(wl_cfg.get("capacity"))
+        wl_max  = _finite_positive(wl_cfg.get("max_bonus"))
+        if wl_cap is not None and wl_max is not None:
+            workload_bonus = min(wl_max, wl_max * wl_total / wl_cap)
+
+    # ── Thermal bonus (gpu_temp_c linear ramp) ───────────────────
+    # Config-driven; absent/malformed section → 0 bonus.
+    thermal_bonus = 0.0
+    th_cfg = ls_cfg.get("thermal", {})
+    if isinstance(th_cfg, dict) and th_cfg.get("enabled") is True:
+        temp_val  = _finite_nonneg(metrics.get("gpu_temp_c"))
+        onset     = _finite_nonneg(th_cfg.get("onset_c"))
+        critical  = _finite_nonneg(th_cfg.get("critical_c"))
+        th_max    = _finite_positive(th_cfg.get("max_bonus"))
+        if (temp_val is not None and onset is not None
+                and critical is not None and th_max is not None
+                and onset < critical):
+            if temp_val >= critical:
+                thermal_bonus = th_max
+            elif temp_val > onset:
+                thermal_bonus = th_max * (temp_val - onset) / (critical - onset)
+
+    # ── Composite + hardware emergency floor ────────────────────
+    composite = min(100.0, fps_score + workload_bonus + thermal_bonus)
 
     # ponytail: hardware saturation alone is not an emergency; the floor
     #           only fires when FPS is actually degraded (TARGET_FPS - 2 margin).
     #           Healthy FPS with transient GPU spikes stays pure FPS score.
+    hw_saturated = (
+        metrics.get("cpu_percent", 0.0) >= hw_fuse_threshold or
+        metrics.get("ram_percent", 0.0) >= hw_fuse_threshold
+    )
     fps_emergency = fps_clamped < TARGET_FPS - 2.0
 
     if hw_saturated and fps_emergency:
-        score = max(fps_score, hw_fuse_score_floor)
+        score = max(composite, hw_fuse_score_floor)
     else:
-        score = fps_score
+        score = composite
 
     return round(score, 1), "fps_dominant"
+
+
+# ── Config-safe float helpers used by _compute_load_score ──────
+def _finite_positive(v):
+    """Return float(v) for finite v > 0.0 (not bool); None otherwise."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)) and math.isfinite(v) and v > 0.0:
+        return float(v)
+    return None
+
+
+def _finite_nonneg(v):
+    """Return float(v) for finite numeric v (not bool); None otherwise."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)) and math.isfinite(v):
+        return float(v)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -888,7 +947,8 @@ class HealthAgent:
                         fps_stats, input_fps, get_edge_cfg()
                     )
                     load_score, omega_preset = _compute_load_score(
-                        metrics, fps_stats, source_starved_cameras=starved_cams
+                        metrics, fps_stats, source_starved_cameras=starved_cams,
+                        feature_stats=feature_stats,
                     )
                     offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
                     # BUG-I fix: exclude 0-fps cameras from avg_fps,

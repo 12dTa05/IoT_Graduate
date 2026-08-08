@@ -111,13 +111,31 @@ CADENCE_S = _pc.CADENCE_S
 # Load-score test helpers
 # ---------------------------------------------------------------------------
 
-def _metrics(gpu=0.0, cpu=0.0, ram=0.0) -> dict:
+def _metrics(gpu=0.0, cpu=0.0, ram=0.0, gpu_temp_c=0.0) -> dict:
     return {"gpu_percent": gpu, "cpu_percent": cpu,
-            "ram_percent": ram, "gpu_temp_c": 0.0}
+            "ram_percent": ram, "gpu_temp_c": gpu_temp_c}
 
 
 def _fps(**cams) -> dict:
     return cams
+
+
+def _feature_stats(**cams) -> dict:
+    return cams
+
+
+def _ha_cfg(workload=None, thermal=None, hw_fuse_threshold=90.0,
+            hw_fuse_score_floor=75.0):
+    """Build edge_node.yml 'load_score' subsection for stubbing."""
+    cfg = {
+        "hw_fuse_threshold": hw_fuse_threshold,
+        "hw_fuse_score_floor": hw_fuse_score_floor,
+    }
+    if workload is not None:
+        cfg["workload"] = workload
+    if thermal is not None:
+        cfg["thermal"] = thermal
+    return {"load_score": cfg}
 
 
 # ---------------------------------------------------------------------------
@@ -904,6 +922,258 @@ def test_starvation_valid_behavior_preserved():
 
 
 # ---------------------------------------------------------------------------
+# Conservative composite bonuses — workload + thermal (config-driven)
+# ---------------------------------------------------------------------------
+
+def test_bonus_legacy_no_config_section():
+    """No workload/thermal sections → bonus 0; score unchanged from legacy."""
+    _ha._EDGE_CFG = {}
+    try:
+        s_legacy, _ = _compute_load_score(_metrics(), _fps(camA=22.0))
+        s_feat, _ = _compute_load_score(
+            _metrics(), _fps(camA=22.0),
+            feature_stats={"camA": {"n_track": 50, "n_plate": 50}},
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert s_legacy == s_feat
+    assert abs(s_feat - 57.0) < 0.5
+
+
+def test_bonus_workload_normal_ramp():
+    """Workload bonus linear: half capacity → half max_bonus."""
+    _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0, "max_bonus": 10.0})
+    try:
+        # fps 0 (TARGET) → fps_score 0.0; workload 20 → bonus 5.0
+        score, preset = _compute_load_score(
+            _metrics(), _fps(camA=27.0),
+            feature_stats={"camA": {"n_track": 15, "n_plate": 5}},
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert preset == "fps_dominant"
+    assert abs(score - 5.0) < 0.05
+
+
+def test_bonus_workload_clamped_at_capacity():
+    """Above capacity → bonus clamped at max_bonus (not exploded)."""
+    _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0, "max_bonus": 10.0})
+    try:
+        s_at, _ = _compute_load_score(
+            _metrics(), _fps(camA=27.0),
+            feature_stats={"camA": {"n_track": 20, "n_plate": 20}},
+        )
+        s_over, _ = _compute_load_score(
+            _metrics(), _fps(camA=27.0),
+            feature_stats={"camA": {"n_track": 50, "n_plate": 50}},
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert abs(s_at - 10.0) < 0.05
+    assert abs(s_over - 10.0) < 0.05
+
+
+def test_bonus_workload_starved_camera_excluded():
+    """Starved cameras contribute zero workload."""
+    _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0, "max_bonus": 10.0})
+    try:
+        s_excl, _ = _compute_load_score(
+            _metrics(), _fps(camA=27.0, camB=27.0),
+            source_starved_cameras={"camB"},
+            feature_stats={
+                "camA": {"n_track": 10, "n_plate": 2},   # 12 → bonus 3.0
+                "camB": {"n_track": 30, "n_plate": 18},  # 48 starved → excluded
+            },
+        )
+        s_none, _ = _compute_load_score(
+            _metrics(), _fps(camA=27.0, camB=27.0),
+            feature_stats={
+                "camA": {"n_track": 10, "n_plate": 2},
+                "camB": {"n_track": 30, "n_plate": 18},
+            },
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert abs(s_excl - 3.0) < 0.05       # only camA's 12
+    assert s_excl < s_none                 # starved exclusion reduced bonus
+
+
+def test_bonus_workload_malformed_no_bonus():
+    """Malformed workload config/feature_stats → 0 bonus, no crash."""
+    good_feat = {"camA": {"n_track": 20, "n_plate": 20}}
+    for bad_cfg in [
+        {"enabled": True, "capacity": "abc", "max_bonus": 10.0},
+        {"enabled": True, "capacity": 40.0, "max_bonus": 0},
+        {"enabled": True, "capacity": -5.0, "max_bonus": 10.0},
+        {"enabled": True, "capacity": 40.0, "max_bonus": -1.0},
+    ]:
+        _ha._EDGE_CFG = _ha_cfg(workload=bad_cfg)
+        try:
+            score, _ = _compute_load_score(
+                _metrics(), _fps(camA=27.0), feature_stats=good_feat,
+            )
+        finally:
+            _ha._EDGE_CFG = {}
+        assert abs(score - 0.0) < 0.05, f"unexpected score={score} for cfg={bad_cfg}"
+
+    # workload section not a dict
+    _ha._EDGE_CFG = _ha_cfg(workload="garbage")
+    try:
+        score, _ = _compute_load_score(
+            _metrics(), _fps(camA=27.0), feature_stats=good_feat,
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert abs(score - 0.0) < 0.05
+
+    # feature_stats with malformed entries, no crash
+    _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0, "max_bonus": 10.0})
+    try:
+        score, _ = _compute_load_score(
+            _metrics(), _fps(camA=27.0),
+            feature_stats={"camA": "not_a_dict"},
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert abs(score - 0.0) < 0.05
+
+
+def test_bonus_workload_feature_stats_none_disabled():
+    """feature_stats=None → workload bonus 0, no crash even with cfg enabled."""
+    _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0, "max_bonus": 10.0})
+    try:
+        score, _ = _compute_load_score(_metrics(), _fps(camA=27.0))
+    finally:
+        _ha._EDGE_CFG = {}
+    assert abs(score - 0.0) < 0.05
+
+
+def test_bonus_thermal_normal_ramp():
+    """Thermal bonus linear from onset to critical, clamped."""
+    cfg = {"enabled": True, "onset_c": 70.0, "critical_c": 85.0, "max_bonus": 5.0}
+    _ha._EDGE_CFG = _ha_cfg(thermal=cfg)
+    try:
+        # temp = critical → full bonus
+        s_full, _ = _compute_load_score(
+            _metrics(gpu_temp_c=85.0), _fps(camA=27.0),
+        )
+        # temp <= onset → 0 bonus
+        s_zero, _ = _compute_load_score(
+            _metrics(gpu_temp_c=60.0), _fps(camA=27.0),
+        )
+        # temp = onset + epsilon → near 0
+        s_onset, _ = _compute_load_score(
+            _metrics(gpu_temp_c=70.0), _fps(camA=27.0),
+        )
+        # temp = midpoint 77.5 → 5 * 7.5/15 = 2.5
+        s_mid, _ = _compute_load_score(
+            _metrics(gpu_temp_c=78.0), _fps(camA=27.0),
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert abs(s_full - 5.0) < 0.05
+    assert abs(s_zero) < 0.05
+    assert abs(s_onset) < 0.05
+    # 5 * (78-70)/(85-70) = 5 * 8/15 ≈ 2.667
+    assert abs(s_mid - 2.667) < 0.05
+
+
+def test_bonus_thermal_malformed_no_bonus():
+    """Malformed thermal config/value → 0 bonus, no crash."""
+    for bad_cfg in [
+        {"enabled": True, "onset_c": 90.0, "critical_c": 70.0, "max_bonus": 5.0},  # inverted
+        {"enabled": True, "onset_c": 70.0, "critical_c": 70.0, "max_bonus": 5.0},  # onset == critical
+        {"enabled": True, "onset_c": 70.0, "critical_c": 85.0, "max_bonus": 0.0},  # zero bonus
+        {"enabled": True, "onset_c": "hot", "critical_c": 85.0, "max_bonus": 5.0},  # string
+        {"enabled": False, "onset_c": 70.0, "critical_c": 85.0, "max_bonus": 5.0},  # disabled
+    ]:
+        _ha._EDGE_CFG = _ha_cfg(thermal=bad_cfg)
+        try:
+            score, _ = _compute_load_score(
+                _metrics(gpu_temp_c=85.0), _fps(camA=27.0),
+            )
+        finally:
+            _ha._EDGE_CFG = {}
+        assert abs(score - 0.0) < 0.05, f"unexpected score={score} for cfg={bad_cfg}"
+
+    # thermal section not a dict
+    _ha._EDGE_CFG = _ha_cfg(thermal="garbage")
+    try:
+        score, _ = _compute_load_score(
+            _metrics(gpu_temp_c=85.0), _fps(camA=27.0),
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert abs(score - 0.0) < 0.05
+
+    # gpu_temp_c non-numeric
+    _ha._EDGE_CFG = _ha_cfg(
+        thermal={"enabled": True, "onset_c": 70.0, "critical_c": 85.0, "max_bonus": 5.0},
+    )
+    try:
+        score, _ = _compute_load_score(
+            {"gpu_percent": 0.0, "cpu_percent": 0.0, "ram_percent": 0.0, "gpu_temp_c": "hot"},
+            _fps(camA=27.0),
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert abs(score - 0.0) < 0.05
+
+
+def test_bonus_composite_capped_at_100():
+    """fps_score + bonuses cannot exceed 100."""
+    _ha._EDGE_CFG = _ha_cfg(
+        workload={"enabled": True, "capacity": 40.0, "max_bonus": 10.0},
+        thermal={"enabled": True, "onset_c": 70.0, "critical_c": 85.0, "max_bonus": 5.0},
+    )
+    try:
+        # fps 1.0 → fps_score ≈ 98.53 + 10 + 5 = 113.53 → capped 100
+        score, _ = _compute_load_score(
+            _metrics(gpu_temp_c=85.0), _fps(camA=1.0),
+            feature_stats={"camA": {"n_track": 20, "n_plate": 20}},
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert score <= 100.0
+    assert abs(score - 100.0) < 0.05
+
+
+def test_bonus_cpu_fuse_still_applies():
+    """CPU fuse floor still applies to composite with bonuses."""
+    _ha._EDGE_CFG = _ha_cfg(
+        workload={"enabled": True, "capacity": 40.0, "max_bonus": 10.0},
+    )
+    try:
+        # fps 22 → fps_score 57.0; workload 20 (half cap) → bonus 5.0
+        # composite = 62.0; cpu >= 90 + fps<25 → fuse → max(62, 75) = 75
+        score, _ = _compute_load_score(
+            _metrics(cpu=92.0), _fps(camA=22.0),
+            feature_stats={"camA": {"n_track": 15, "n_plate": 5}},
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert abs(score - 75.0) < 0.05
+
+
+def test_bonus_ram_fuse_still_applies():
+    """RAM fuse floor still applies to composite with bonuses."""
+    _ha._EDGE_CFG = _ha_cfg(
+        workload={"enabled": True, "capacity": 40.0, "max_bonus": 10.0},
+        thermal={"enabled": True, "onset_c": 70.0, "critical_c": 85.0, "max_bonus": 5.0},
+    )
+    try:
+        # fps 19 → fps_score 65.0; workload 8 → 2.0; thermal @75 → 5*(5/15)≈1.667
+        # composite ≈ 68.667; ram fuse → floor 75
+        score, _ = _compute_load_score(
+            _metrics(ram=92.0, gpu_temp_c=75.0), _fps(camA=19.0),
+            feature_stats={"camA": {"n_track": 3, "n_plate": 5}},
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert abs(score - 75.0) < 0.05
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -1009,6 +1279,18 @@ if __name__ == "__main__":
         test_starvation_unusable_threshold_returns_empty,
         test_starvation_mixed_malformed_both_sides,
         test_starvation_valid_behavior_preserved,
+        # conservative composite bonuses (workload + thermal)
+        test_bonus_legacy_no_config_section,
+        test_bonus_workload_normal_ramp,
+        test_bonus_workload_clamped_at_capacity,
+        test_bonus_workload_starved_camera_excluded,
+        test_bonus_workload_malformed_no_bonus,
+        test_bonus_workload_feature_stats_none_disabled,
+        test_bonus_thermal_normal_ramp,
+        test_bonus_thermal_malformed_no_bonus,
+        test_bonus_composite_capped_at_100,
+        test_bonus_cpu_fuse_still_applies,
+        test_bonus_ram_fuse_still_applies,
     ]
 
     passed = failed = 0

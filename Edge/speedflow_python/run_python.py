@@ -376,7 +376,8 @@ def _health_push_loop(peer_orch=None) -> None:
                     feature_stats, fps_stats, source_starved_cameras
                 )
                 load_score, omega_preset = _compute_load_fn(
-                    metrics, fps_stats, source_starved_cameras
+                    metrics, fps_stats, source_starved_cameras,
+                    feature_stats=feature_stats,
                 )
                 offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
                 active_fps_vals = [v for v in fps_stats.values() if v > 0.0]

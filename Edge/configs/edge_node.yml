@@ -96,14 +96,19 @@ p2p:
 #   Linear interpolation between anchors.
 #
 # Hardware emergency floor:
-#   If ANY of {GPU, CPU, RAM} >= hw_fuse_threshold (90):
+#   If ANY of {CPU, RAM} >= hw_fuse_threshold (90):
 #       score = max(fps_score, hw_fuse_score_floor) (75.0 = L1)
 #   This ensures hardware saturation immediately triggers Level 1 but
 #   never falsely reports score 100.
 #
-# Hardware weights are removed from the score entirely — only the
-# anchored FPS curve + floor drive the value.  Hardware metrics are
-# safety status, not additive bonuses.
+# Conservative composite bonuses (config-driven; disabled when their section
+# is absent or enabled is false):
+#   workload: n_track + n_plate of active non-starved cameras, linear
+#             ramp to capacity, clamped to max_bonus.
+#   thermal:  gpu_temp_c linear ramp onset_c -> critical_c, clamped
+#             to max_bonus.
+#   composite = min(100, fps_score + workload_bonus + thermal_bonus)
+#   then the hardware floor is applied as before.
 #
 # Returns preset = "fps_dominant" every cycle — stable preset string.
 # ---------------------------------------------------------------------------
@@ -120,6 +125,22 @@ load_score:
   # metric is saturated.  Set to 75.0 (L1 threshold) so hardware crisis
   # immediately triggers full-stream migration (L1) but not 100.
   hw_fuse_score_floor: 75.0
+
+  # Workload bonus — additive bonus derived from per-camera n_track+n_plate.
+  # Only active (fps > 0), non-source-starved cameras contribute.
+  # Linear from 0..capacity, clamped to max_bonus.
+  workload:
+    enabled: true
+    capacity: 40.0
+    max_bonus: 10.0
+
+  # Thermal bonus — additive bonus from GPU temperature.
+  # Linear ramp from onset_c to critical_c, clamped 0..max_bonus.
+  thermal:
+    enabled: true
+    onset_c: 70.0
+    critical_c: 85.0
+    max_bonus: 5.0
 
 # ---------------------------------------------------------------------------
 # Proactive load model — Vehicle-Driven Proactive Load Profiling
