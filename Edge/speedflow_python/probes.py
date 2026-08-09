@@ -268,6 +268,18 @@ class SpeedProbe:
         self._offload_gate_lock: threading.Lock = threading.Lock()
         self._offload_gate_counts: Dict[str, int] = defaultdict(int)
 
+        # ── Crop error type telemetry ─────────────────────────────────────
+        # Bounded breakdown of exception class names per offload level.
+        # Protected by _offload_gate_lock (same lock as gate counts).
+        # Max 16 distinct types per level; overflow still counted in total
+        # l*_crop_errors but no new type key is created.
+        self._l2_crop_error_types: Dict[str, int] = {}
+        self._l3_crop_error_types: Dict[str, int] = {}
+        # Per-level count for rate-limited warning (fires on 1, 101, 201, …)
+        # pony tail: separate counter from gate_inc so gate_inc stays unchanged.
+        self._l2_crop_error_total: int = 0
+        self._l3_crop_error_total: int = 0
+
         # ── Unified telemetry counters (reset on every writer flush) ───────
         # Per-camera FPS frame counters — incremented in _tick_fps, drained
         # by the writer thread so fps = frames/window_duration within the
@@ -382,6 +394,69 @@ class SpeedProbe:
         except Exception:
             return {}
 
+    # Bounded error-type telemetry for the L2/L3 crop exception paths.
+    # Used to diagnose a swallowed-at-debug crop failure on matched Jetson
+    # A+B: L2 active 1018 frames, l2_crop_errors 1018, l2_valid_crops 0.
+    # All access under _offload_gate_lock so the GStreamer callback and the
+    # writer thread can never raise; cap is 16 distinct class names per level.
+    _CROP_ERROR_TYPES_CAP: int = 16
+    # Warning fires on the 1st error and every 100th error per level.
+    _CROP_ERROR_WARN_EVERY: int = 100
+
+    def _record_crop_error_type(self, level: str, exc: Exception) -> None:
+        """
+        Record an exception class name for crop-error diagnosis.
+
+        Called from the L2/L3 crop exception handlers on the GStreamer thread.
+        Must never raise and must not spam: a warning is emitted on the first
+        error and every 100th error per level (type + message, no traceback).
+        """
+        exc_name = type(exc).__name__
+        should_warn = False
+        warn_total = 0
+        warn_name = exc_name
+        try:
+            with self._offload_gate_lock:
+                if level == "l2":
+                    types = self._l2_crop_error_types
+                    self._l2_crop_error_total += 1
+                    total = self._l2_crop_error_total
+                elif level == "l3":
+                    types = self._l3_crop_error_types
+                    self._l3_crop_error_total += 1
+                    total = self._l3_crop_error_total
+                else:
+                    return
+                if exc_name in types:
+                    types[exc_name] += 1
+                elif len(types) < self._CROP_ERROR_TYPES_CAP:
+                    types[exc_name] = 1
+                # else: cap reached — drop the new type name, total still
+                # recorded via l*_crop_errors gate counter.
+                if total == 1 or total % self._CROP_ERROR_WARN_EVERY == 0:
+                    should_warn = True
+                    warn_total = total
+                    warn_name = exc_name
+        except Exception:
+            return  # counters must never break the GStreamer probe
+
+        if should_warn:
+            logger.warning(
+                "[SpeedProbe] L%s crop offload error #%s: %s: %s",
+                level[-1], warn_total, warn_name, exc,
+            )
+
+    def _crop_error_types_copy(self) -> Dict[str, Dict[str, int]]:
+        """Snapshot of crop error-type dicts for the writer thread — never raises."""
+        try:
+            with self._offload_gate_lock:
+                return {
+                    "l2_crop_error_types": dict(self._l2_crop_error_types),
+                    "l3_crop_error_types": dict(self._l3_crop_error_types),
+                }
+        except Exception:
+            return {"l2_crop_error_types": {}, "l3_crop_error_types": {}}
+
     def _snapshot_offload_crops(self, prev_count: int, prev_ts: float):
         """
         Build the _offload_crops telemetry dict from the live offload
@@ -445,6 +520,11 @@ class SpeedProbe:
             "l3_valid_crops", "l3_crop_errors",
         ):
             offload_crops[name] = gate_counts.get(name, 0)
+
+        # Bounded crop error-type breakdowns — added to the snapshot so the
+        # swallowed-at-debug L2/L3 crop failure is visible at runtime.
+        for name, err_types in self._crop_error_types_copy().items():
+            offload_crops[name] = err_types
 
         # Rate (received_per_s) — backward-compat computation on the monotonic
         # processed counter.
@@ -1012,6 +1092,7 @@ class SpeedProbe:
                             self._gate_inc("l3_surface_unavailable")
                     except Exception as exc:
                         self._gate_inc("l3_crop_errors")
+                        self._record_crop_error_type("l3", exc)
                         logger.debug(
                             "[SpeedProbe] L3 plate crop offload error for camera=%s frame=%s: %s",
                             cam_cfg.camera_id, frame_number, exc, exc_info=True,
@@ -1101,6 +1182,7 @@ class SpeedProbe:
                         self._gate_inc("l2_surface_unavailable")
                 except Exception as exc:
                     self._gate_inc("l2_crop_errors")
+                    self._record_crop_error_type("l2", exc)
                     logger.debug(
                         "[SpeedProbe] L2 vehicle crop offload error for camera=%s frame=%s: %s",
                         cam_cfg.camera_id, frame_number, exc, exc_info=True,

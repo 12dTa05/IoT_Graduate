@@ -970,6 +970,108 @@ def test_gate_counters_snapshot_exposure():
 
 
 # ======================================================================
+# Crop error type telemetry tests
+# ======================================================================
+
+def test_crop_error_types_aggregation():
+    """_record_crop_error_type correctly counts per-exception-type."""
+    probe_mod = _load("probes", "speedflow_python/probes.py")
+    probe = _probe_with_fakes(probe_mod, orch_level=2)[0]
+
+    class _ErrA(Exception): pass
+    class _ErrB(Exception): pass
+
+    probe._record_crop_error_type("l2", _ErrA("a1"))
+    probe._record_crop_error_type("l2", _ErrA("a2"))
+    probe._record_crop_error_type("l2", _ErrB("b"))
+
+    crops, _, _ = probe._snapshot_offload_crops(0, 0.0)
+    types = crops.get("l2_crop_error_types", {})
+    assert types.get("_ErrA") == 2, f"expected _ErrA=2, got {types}"
+    assert types.get("_ErrB") == 1, f"expected _ErrB=1, got {types}"
+
+    # l3 independent: zero when never touched
+    assert crops.get("l3_crop_error_types", {}) == {}
+
+    probe.stop_fps_writer()
+    print("  PASS  test_crop_error_types_aggregation")
+
+
+def test_crop_error_types_cap():
+    """Crop error type dict is capped at 16 distinct class names."""
+    probe_mod = _load("probes", "speedflow_python/probes.py")
+    probe = _probe_with_fakes(probe_mod, orch_level=2)[0]
+
+    for i in range(22):
+        name = f"ErrType{i:03d}"
+        cls = type(name, (Exception,), {})
+        probe._record_crop_error_type("l2", cls(f"msg{i}"))
+
+    crops, _, _ = probe._snapshot_offload_crops(0, 0.0)
+    types = crops.get("l2_crop_error_types", {})
+    assert len(types) == 16, f"expected 16, got {len(types)}: {list(types)}"
+    assert "ErrType000" in types
+    assert "ErrType015" in types
+    # 17th onward not added
+    assert "ErrType016" not in types
+    assert "ErrType021" not in types
+
+    probe.stop_fps_writer()
+    print("  PASS  test_crop_error_types_cap")
+
+
+def test_crop_error_types_snapshot_exposure():
+    """_snapshot_offload_crops exposes l2/l3_crop_error_types as dicts."""
+    probe_mod = _load("probes", "speedflow_python/probes.py")
+    probe = _probe_with_fakes(probe_mod, orch_level=2)[0]
+
+    probe._record_crop_error_type("l2", ValueError("bad value"))
+    probe._record_crop_error_type("l3", TypeError("bad type"))
+
+    crops, _, _ = probe._snapshot_offload_crops(0, 0.0)
+    assert "l2_crop_error_types" in crops, "missing l2_crop_error_types in snapshot"
+    assert "l3_crop_error_types" in crops, "missing l3_crop_error_types in snapshot"
+    l2t = crops["l2_crop_error_types"]
+    l3t = crops["l3_crop_error_types"]
+    assert isinstance(l2t, dict)
+    assert isinstance(l3t, dict)
+    assert l2t.get("ValueError") == 1, f"got {l2t}"
+    assert l3t.get("TypeError") == 1, f"got {l3t}"
+
+    probe.stop_fps_writer()
+    print("  PASS  test_crop_error_types_snapshot_exposure")
+
+
+def test_crop_error_warning_rate_limit():
+    """Warning fires on 1st error and every 100th; no traceback spam."""
+    probe_mod = _load("probes", "speedflow_python/probes.py")
+    probe = _probe_with_fakes(probe_mod, orch_level=2)[0]
+
+    import logging
+    warn_msgs = []
+    probe_logger = logging.getLogger("speedflow_python.probes")
+    orig_warning = probe_logger.warning
+    try:
+        probe_logger.warning = lambda msg, *a, **kw: warn_msgs.append(
+            msg % a if a else msg
+        )
+
+        # 250 L2 errors → warnings at 1, 100, 200 (first + every 100th)
+        for i in range(250):
+            probe._record_crop_error_type("l2", RuntimeError(f"err{i}"))
+
+        assert len(warn_msgs) == 3, f"expected 3 warns, got {len(warn_msgs)}"
+        assert "error #1" in warn_msgs[0], warn_msgs[0]
+        assert "error #100" in warn_msgs[1], warn_msgs[1]
+        assert "error #200" in warn_msgs[2], warn_msgs[2]
+    finally:
+        probe_logger.warning = orig_warning
+
+    probe.stop_fps_writer()
+    print("  PASS  test_crop_error_warning_rate_limit")
+
+
+# ======================================================================
 # Main
 # ======================================================================
 
@@ -994,6 +1096,10 @@ if __name__ == "__main__":
         test_gate_counters_l3_valid_crop_put_path,
         test_gate_counters_l3_crop_errors,
         test_gate_counters_snapshot_exposure,
+        test_crop_error_types_aggregation,
+        test_crop_error_types_cap,
+        test_crop_error_types_snapshot_exposure,
+        test_crop_error_warning_rate_limit,
     ]
     passed = failed = 0
     for t in tests:
