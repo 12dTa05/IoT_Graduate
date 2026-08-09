@@ -563,3 +563,12 @@ def dynamic_remove_stream(
     else:
         # If no pad exists, clean up immediately
         GLib.idle_add(_cleanup_bin, None, None)
+
+
+def get_core_chain_order(sink_type: str) -> list[str]:
+    """Return expected core-element factory order for host-side tests."""
+    base = [
+        "nvstreammux", "nvinfer", "nvtracker", "nvinfer", "nvinfer",
+        "nvdsanalytics", "nvvideoconvert", "capsfilter",
+    ]
+    return base + (["nvmultistreamtiler"] if sink_type in ("display", "rtsp_push") else []) + ["nvdsosd"]
