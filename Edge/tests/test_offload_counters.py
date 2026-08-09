@@ -131,6 +131,10 @@ def _install_host_stubs():
     pyds = types.ModuleType("pyds")
     pyds.nvds_acquire_display_meta_from_pool = lambda *a, **k: None
     pyds.nvds_add_display_meta_to_frame = lambda *a, **k: None
+    # Minimal cast helpers so osd_sink_pad_buffer_probe can run on host.
+    pyds.gst_buffer_get_nvds_batch_meta = lambda _h: None   # overridden per test
+    pyds.NvDsFrameMeta  = types.SimpleNamespace(cast=lambda d: d)
+    pyds.NvDsObjectMeta = types.SimpleNamespace(cast=lambda d: d)
     sys.modules["pyds"] = pyds
 
     # speedflow_c stub: native .so not present on host. Fully replaced so a
@@ -618,6 +622,354 @@ def test_writer_surfaces_all_counters():
 
 
 # ======================================================================
+# Producer-gate counter fakes for invoking osd_sink_pad_buffer_probe
+# ======================================================================
+
+class _Rect:
+    def __init__(self, left=10, top=10, width=50, height=40):
+        self.left, self.top, self.width, self.height = left, top, width, height
+
+class _FontParams:
+    font_size = 10
+    font_name = "Serif"
+
+class _TextParams:
+    display_text = ""
+    font_params = _FontParams()
+
+class _ObjMeta:
+    def __init__(self, class_id, object_id, rect=None, conf=0.9):
+        self.class_id = class_id
+        self.object_id = object_id
+        self.rect_params = rect or _Rect()
+        self.confidence = conf
+        self.text_params = _TextParams()
+        # classifier_meta_list is checked only when _extract_lpr_text runs
+        # (L2 local accumulation path). For L3 and vehicle-only frames it is
+        # never touched.
+        self.classifier_meta_list = None
+
+class _LL:
+    """Fake linked-list node: .data + .next, for pyds frame/object lists."""
+    def __init__(self, items):
+        self._items = list(items)
+        self._i = 0
+
+    def __bool__(self):
+        return self._i < len(self._items)
+
+    @property
+    def data(self):
+        return self._items[self._i]
+
+    @property
+    def next(self):
+        self._i += 1
+        if self._i < len(self._items):
+            return self
+        return None
+
+class _FrameMeta:
+    """Pyds frame_meta fake. 'obj_meta_list', 'next' wired via _LL."""
+    def __init__(self, frame_num=1, source_id=0, objs=()):
+        self.frame_num = frame_num
+        self.source_id = source_id
+        self.ntp_timestamp = 0    # → falls back to time.time()
+        self.batch_id = 0
+        self.obj_meta_list = _LL(objs)
+
+class _BatchMeta:
+    """Minimal pyds batch_meta fake."""
+    def __init__(self, frame_meta):
+        self.frame_meta_list = _LL([frame_meta])
+
+class _FakeBuffer:
+    """Minimal Gst.Buffer fake so hash() is stable."""
+    pass
+
+class _FakeInfo:
+    def __init__(self, buf):
+        self._buf = buf
+    def get_buffer(self):
+        return self._buf
+
+class _FakeOrch:
+    """Fake PeerOrchestrator returning a fixed offload level + target."""
+    def __init__(self, level, target):
+        self._level  = level
+        self._target = target
+    def get_offload_level(self, camera_id):
+        return self._level
+    def get_offload_target(self, camera_id):
+        return self._target
+
+class _RecordingPub:
+    """Records put_plate / put_vehicle calls for test assertions."""
+    def __init__(self):
+        self.plate_calls = []
+        self.vehicle_calls = []
+    def put_plate(self, **kw):
+        self.plate_calls.append(kw)
+    def put_vehicle(self, **kw):
+        self.vehicle_calls.append(kw)
+
+
+def _probe_with_fakes(probe_mod, orch_level, orch_target="edge-02"):
+    """Construct a SpeedProbe wired with cam_mgr, peer_orch + publisher."""
+    import numpy as np
+    class _StubCamCfg:
+        camera_id = "cam_01"
+        roi_polygon = None
+        source_points = None
+        fps = 30.0
+        homo_matrix = np.eye(3, dtype=np.float32)
+        speed_limit_kmh = 50
+        min_track_age_frames = 15
+    class _StubCamMgr:
+        def get_config(self, source_id):
+            return _StubCamCfg()
+
+    probe = probe_mod.SpeedProbe(
+        camera_manager=_StubCamMgr(), cooldown_s=0.1,
+        peer_orch=_FakeOrch(orch_level, orch_target),
+    )
+    pub = _RecordingPub()
+    probe.set_offload_publisher(pub)
+    return probe, pub
+
+
+def _call_probe_frame(probe, objs, surface):
+    """Drive osd_sink_pad_buffer_probe once with fakes.
+
+    surface: numpy ndarray (→ valid crop), None (→ surface unavailable),
+             or 'raise' (→ exception path).
+    """
+    import pyds
+    frame_meta = _FrameMeta(objs=objs)
+    batch  = _BatchMeta(frame_meta)
+    buffer = _FakeBuffer()
+    info   = _FakeInfo(buffer)
+
+    pyds.gst_buffer_get_nvds_batch_meta = lambda h: batch
+
+    if isinstance(surface, str) and surface == "raise":
+        def _boom(*a, **k):
+            raise RuntimeError("surface fetch failed")
+        probe._get_frame_bgr_cached = _boom
+    else:
+        probe._get_frame_bgr_cached = lambda *a, **k: surface
+
+    probe.osd_sink_pad_buffer_probe(None, info, None)
+
+
+# ======================================================================
+# Gate counter tests (L2 / L3 producer-side)
+# ======================================================================
+
+def test_gate_counters_l2_active_no_objects():
+    """L2 active frame with zero vehicles → active=1, vehicle_objects=0."""
+    probe_mod = _load("probes", "speedflow_python/probes.py")
+    probe, pub = _probe_with_fakes(probe_mod, orch_level=2)
+
+    # Empty frame: no L2 harvest, but counted as active.
+    _call_probe_frame(probe, objs=[], surface=np.ones((120, 160, 3), dtype=np.uint8))
+
+    crops, _, _ = probe._snapshot_offload_crops(0, 0.0)
+    assert crops.get("l2_active_frames", 0) == 1
+    assert crops.get("l2_vehicle_objects", 0) == 0
+    assert crops.get("l2_valid_crops", 0) == 0
+    assert crops.get("l2_surface_unavailable", 0) == 0
+    assert crops.get("l2_crop_errors", 0) == 0
+    assert len(pub.vehicle_calls) == 0
+
+    probe.stop_fps_writer()
+    print("  PASS  test_gate_counters_l2_active_no_objects")
+
+
+def test_gate_counters_l2_surface_unavailable():
+    """L2 with a vehicle but surface returns None."""
+    probe_mod = _load("probes", "speedflow_python/probes.py")
+    probe, pub = _probe_with_fakes(probe_mod, orch_level=2)
+
+    veh = _ObjMeta(class_id=2, object_id=42, rect=_Rect(10, 10, 50, 40))
+    _call_probe_frame(probe, objs=[veh], surface=None)
+
+    crops, _, _ = probe._snapshot_offload_crops(0, 0.0)
+    assert crops.get("l2_active_frames", 0) == 1
+    assert crops.get("l2_vehicle_objects", 0) == 1
+    assert crops.get("l2_surface_unavailable", 0) == 1
+    assert crops.get("l2_valid_crops", 0) == 0
+    assert crops.get("l2_crop_errors", 0) == 0
+    assert len(pub.vehicle_calls) == 0
+
+    probe.stop_fps_writer()
+    print("  PASS  test_gate_counters_l2_surface_unavailable")
+
+
+def test_gate_counters_l2_valid_crop_put_path():
+    """L2 vehicle + valid surface → valid_crops=1, put_vehicle called."""
+    probe_mod = _load("probes", "speedflow_python/probes.py")
+    probe, pub = _probe_with_fakes(probe_mod, orch_level=2)
+
+    veh = _ObjMeta(class_id=2, object_id=42, rect=_Rect(10, 10, 50, 40))
+    _call_probe_frame(probe, objs=[veh],
+                       surface=np.ones((120, 160, 3), dtype=np.uint8))
+
+    crops, _, _ = probe._snapshot_offload_crops(0, 0.0)
+    assert crops.get("l2_active_frames", 0) == 1
+    assert crops.get("l2_vehicle_objects", 0) == 1
+    assert crops.get("l2_valid_crops", 0) == 1
+    assert crops.get("l2_surface_unavailable", 0) == 0
+    assert crops.get("l2_crop_errors", 0) == 0
+    assert len(pub.vehicle_calls) == 1
+
+    probe.stop_fps_writer()
+    print("  PASS  test_gate_counters_l2_valid_crop_put_path")
+
+
+def test_gate_counters_l2_crop_errors():
+    """L2 surface raises → crop_errors incremented."""
+    probe_mod = _load("probes", "speedflow_python/probes.py")
+    probe, pub = _probe_with_fakes(probe_mod, orch_level=2)
+
+    veh = _ObjMeta(class_id=2, object_id=42, rect=_Rect(10, 10, 50, 40))
+    _call_probe_frame(probe, objs=[veh], surface="raise")
+
+    crops, _, _ = probe._snapshot_offload_crops(0, 0.0)
+    assert crops.get("l2_active_frames", 0) == 1
+    assert crops.get("l2_vehicle_objects", 0) == 1
+    assert crops.get("l2_crop_errors", 0) == 1
+    assert crops.get("l2_valid_crops", 0) == 0
+    assert len(pub.vehicle_calls) == 0
+
+    probe.stop_fps_writer()
+    print("  PASS  test_gate_counters_l2_crop_errors")
+
+
+def test_gate_counters_l3_active_no_plates():
+    """L3 active frame with zero plates → active=1, plate_objects=0."""
+    probe_mod = _load("probes", "speedflow_python/probes.py")
+    probe, pub = _probe_with_fakes(probe_mod, orch_level=3)
+
+    # Vehicle present for association, but no plate objects → 0 plate_objects.
+    veh = _ObjMeta(class_id=2, object_id=42, rect=_Rect(10, 10, 50, 40))
+    _call_probe_frame(probe, objs=[veh], surface=np.ones((120, 160, 3), dtype=np.uint8))
+
+    crops, _, _ = probe._snapshot_offload_crops(0, 0.0)
+    assert crops.get("l3_active_frames", 0) == 1
+    assert crops.get("l3_plate_objects", 0) == 0
+    assert crops.get("l3_valid_crops", 0) == 0
+    assert crops.get("l3_surface_unavailable", 0) == 0
+    assert crops.get("l3_crop_errors", 0) == 0
+    assert len(pub.plate_calls) == 0
+
+    probe.stop_fps_writer()
+    print("  PASS  test_gate_counters_l3_active_no_plates")
+
+
+def test_gate_counters_l3_surface_unavailable():
+    """L3 plate + vehicle, surface None → surface_unavailable=1."""
+    probe_mod = _load("probes", "speedflow_python/probes.py")
+    probe, pub = _probe_with_fakes(probe_mod, orch_level=3)
+
+    # Plate bbox intersects the vehicle for association.
+    plate = _ObjMeta(class_id=0, object_id=99,
+                     rect=_Rect(20, 15, 30, 10), conf=0.8)
+    veh   = _ObjMeta(class_id=2, object_id=42,
+                     rect=_Rect(10, 10, 50, 40))
+    _call_probe_frame(probe, objs=[plate, veh], surface=None)
+
+    crops, _, _ = probe._snapshot_offload_crops(0, 0.0)
+    assert crops.get("l3_active_frames", 0) == 1
+    assert crops.get("l3_plate_objects", 0) == 1
+    assert crops.get("l3_surface_unavailable", 0) == 1
+    assert crops.get("l3_valid_crops", 0) == 0
+    assert crops.get("l3_crop_errors", 0) == 0
+    assert len(pub.plate_calls) == 0
+
+    probe.stop_fps_writer()
+    print("  PASS  test_gate_counters_l3_surface_unavailable")
+
+
+def test_gate_counters_l3_valid_crop_put_path():
+    """L3 plate + vehicle + valid surface → valid_crops=1, put_plate called."""
+    probe_mod = _load("probes", "speedflow_python/probes.py")
+    probe, pub = _probe_with_fakes(probe_mod, orch_level=3)
+
+    plate = _ObjMeta(class_id=0, object_id=99,
+                     rect=_Rect(20, 15, 30, 10), conf=0.8)
+    veh   = _ObjMeta(class_id=2, object_id=42,
+                     rect=_Rect(10, 10, 50, 40))
+    _call_probe_frame(probe, objs=[plate, veh],
+                       surface=np.ones((120, 160, 3), dtype=np.uint8))
+
+    crops, _, _ = probe._snapshot_offload_crops(0, 0.0)
+    assert crops.get("l3_active_frames", 0) == 1
+    assert crops.get("l3_plate_objects", 0) == 1
+    assert crops.get("l3_valid_crops", 0) == 1
+    assert crops.get("l3_surface_unavailable", 0) == 0
+    assert crops.get("l3_crop_errors", 0) == 0
+    assert len(pub.plate_calls) == 1
+
+    probe.stop_fps_writer()
+    print("  PASS  test_gate_counters_l3_valid_crop_put_path")
+
+
+def test_gate_counters_l3_crop_errors():
+    """L3 surface raises → crop_errors incremented."""
+    probe_mod = _load("probes", "speedflow_python/probes.py")
+    probe, pub = _probe_with_fakes(probe_mod, orch_level=3)
+
+    plate = _ObjMeta(class_id=0, object_id=99,
+                     rect=_Rect(20, 15, 30, 10), conf=0.8)
+    veh   = _ObjMeta(class_id=2, object_id=42,
+                     rect=_Rect(10, 10, 50, 40))
+    _call_probe_frame(probe, objs=[plate, veh], surface="raise")
+
+    crops, _, _ = probe._snapshot_offload_crops(0, 0.0)
+    assert crops.get("l3_active_frames", 0) == 1
+    assert crops.get("l3_plate_objects", 0) == 1
+    assert crops.get("l3_crop_errors", 0) == 1
+    assert crops.get("l3_valid_crops", 0) == 0
+    assert len(pub.plate_calls) == 0
+
+    probe.stop_fps_writer()
+    print("  PASS  test_gate_counters_l3_crop_errors")
+
+
+def test_gate_counters_snapshot_exposure():
+    """_snapshot_offload_crops exposes exactly 10 gate-counter keys
+    with correct values after increments."""
+    probe_mod = _load("probes", "speedflow_python/probes.py")
+    probe = _probe_with_fakes(probe_mod, orch_level=2)[0]
+
+    # Drive increments via _gate_inc → the writer can see them.
+    probe._gate_inc("l2_active_frames", 5)
+    probe._gate_inc("l2_vehicle_objects", 2)
+    probe._gate_inc("l3_valid_crops", 7)
+
+    crops, _, _ = probe._snapshot_offload_crops(0, 0.0)
+    assert crops.get("l2_active_frames", 0) == 5
+    assert crops.get("l2_vehicle_objects", 0) == 2
+    assert crops.get("l3_active_frames", 0) == 0
+    assert crops.get("l3_valid_crops", 0) == 7
+
+    # All 10 gate keys present (some may be 0)
+    expected_keys = {
+        "l2_active_frames", "l2_vehicle_objects", "l2_surface_unavailable",
+        "l2_valid_crops", "l2_crop_errors",
+        "l3_active_frames", "l3_plate_objects", "l3_surface_unavailable",
+        "l3_valid_crops", "l3_crop_errors",
+    }
+    for k in expected_keys:
+        assert k in crops, f"missing gate key '{k}' in snapshot"
+        assert isinstance(crops[k], int), f"gate {k} should be int, got {type(crops[k])}"
+
+    probe.stop_fps_writer()
+    print("  PASS  test_gate_counters_snapshot_exposure")
+
+
+# ======================================================================
 # Main
 # ======================================================================
 
@@ -633,6 +985,15 @@ if __name__ == "__main__":
         test_receiver_all_counter_accessors_exist,
         test_probe_results_received_counter,
         test_writer_surfaces_all_counters,
+        test_gate_counters_l2_active_no_objects,
+        test_gate_counters_l2_surface_unavailable,
+        test_gate_counters_l2_valid_crop_put_path,
+        test_gate_counters_l2_crop_errors,
+        test_gate_counters_l3_active_no_plates,
+        test_gate_counters_l3_surface_unavailable,
+        test_gate_counters_l3_valid_crop_put_path,
+        test_gate_counters_l3_crop_errors,
+        test_gate_counters_snapshot_exposure,
     ]
     passed = failed = 0
     for t in tests:

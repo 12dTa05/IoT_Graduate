@@ -242,6 +242,32 @@ class SpeedProbe:
         # (sender-probe side of the offload E2E loop). Thread-safe (int).
         self._results_received: int = 0
 
+        # ── Producer-gate counters for L2/L3 crop offload ──────────────────
+        # Lifetime, cumulative, lock-protected. Incremented on the
+        # GStreamer/GLib thread inside osd_sink_pad_buffer_probe; read by the
+        # FPS writer thread during the 1 s snapshot.  Each gate outcome is
+        # counted exactly when it happens — no per-frame logging.  Reading
+        # under the lock (dict copy) means a snapshot can never raise, even
+        # if a counter name is missing.
+        #
+        # Gate meaning:
+        #   l*_active_frames       — frames where the offload level matched
+        #                            (L2: vehicles, L3: plates) AND a publisher
+        #                            + target peer were configured
+        #   l*_object_*            — objects that reached the crop stage
+        #                            (L2: vehicles_in_frame; L3: plates after
+        #                            association/locked gates)
+        #   l*_surface_unavailable — frame surface fetch returned None
+        #   l*_valid_crops         — crops that passed size checks and were
+        #                            handed to put_plate/put_vehicle
+        #   l*_crop_errors         — exceptions during crop fetch/crop/put
+        #
+        # l*_valid_crops doubles as the publish-attempt counter: put_plate /
+        # put_vehicle is called exactly once per valid crop, so the sender's
+        # encoded/enqueued counters remain the unambiguous follow-through.
+        self._offload_gate_lock: threading.Lock = threading.Lock()
+        self._offload_gate_counts: Dict[str, int] = defaultdict(int)
+
         # ── Unified telemetry counters (reset on every writer flush) ───────
         # Per-camera FPS frame counters — incremented in _tick_fps, drained
         # by the writer thread so fps = frames/window_duration within the
@@ -337,6 +363,25 @@ class SpeedProbe:
         except queue.Full:
             pass   # discard stale result — next frame will get a fresher one
 
+    def _gate_inc(self, name: str, n: int = 1) -> None:
+        """
+        Increment a producer-gate counter (lifetime cumulative, thread-safe).
+        Called from the GStreamer thread; must never raise.
+        """
+        try:
+            with self._offload_gate_lock:
+                self._offload_gate_counts[name] += n
+        except Exception:
+            pass   # counters must never break the GStreamer probe
+
+    def _gate_counts_copy(self) -> Dict[str, int]:
+        """Snapshot of gate counters for the writer thread — never raises."""
+        try:
+            with self._offload_gate_lock:
+                return dict(self._offload_gate_counts)
+        except Exception:
+            return {}
+
     def _snapshot_offload_crops(self, prev_count: int, prev_ts: float):
         """
         Build the _offload_crops telemetry dict from the live offload
@@ -386,6 +431,20 @@ class SpeedProbe:
         # Sender-probe side: results successfully enqueued by OffloadReceiver
         # into the OSD result queue.
         offload_crops["results_received"] = self._results_received
+
+        # Producer-gate counters (L2/L3 crop offload) — cumulative lifetime
+        # counters incremented on the GStreamer thread. Read via a lock-held
+        # dict copy so the writer thread can never see a torn value.
+        gate_counts = self._gate_counts_copy()
+        for name in (
+            # L2 (vehicle crops)
+            "l2_active_frames", "l2_vehicle_objects", "l2_surface_unavailable",
+            "l2_valid_crops", "l2_crop_errors",
+            # L3 (plate crops)
+            "l3_active_frames", "l3_plate_objects", "l3_surface_unavailable",
+            "l3_valid_crops", "l3_crop_errors",
+        ):
+            offload_crops[name] = gate_counts.get(name, 0)
 
         # Rate (received_per_s) — backward-compat computation on the monotonic
         # processed counter.
@@ -917,6 +976,7 @@ class SpeedProbe:
             # ── Pass 2: License plate accumulation or Level-3 offload ────────
             # Level 3: plate crops are sent to the peer; local accumulation skipped.
             if offload_level == 3 and self._offload_pub is not None and offload_target:
+                self._gate_inc("l3_active_frames")
                 for plate_info in plates_in_frame:
                     vehicle_id = self._associate_plate_to_vehicle(
                         plate_info["bbox"], vehicles_in_frame
@@ -926,6 +986,8 @@ class SpeedProbe:
                     stid = (source_id, vehicle_id)
                     if stid in self.plate_locked:
                         continue
+                    # Reached the crop stage — a plate the origin would send.
+                    self._gate_inc("l3_plate_objects")
                     try:
                         frame_bgr_off = self._get_frame_bgr_cached(
                             gst_buffer, frame_meta, frame_bgr_cache)
@@ -937,6 +999,7 @@ class SpeedProbe:
                             ph = max(1, int(bb["height"]))
                             plate_crop = frame_bgr_off[py:py+ph, px:px+pw]
                             if plate_crop.size > 0:
+                                self._gate_inc("l3_valid_crops")
                                 self._offload_pub.put_plate(
                                     target_node=offload_target,
                                     stid=stid,
@@ -945,7 +1008,10 @@ class SpeedProbe:
                                     crop_bgr=plate_crop,
                                     confidence=plate_info.get("conf", 0.0),
                                 )
+                        else:
+                            self._gate_inc("l3_surface_unavailable")
                     except Exception as exc:
+                        self._gate_inc("l3_crop_errors")
                         logger.debug(
                             "[SpeedProbe] L3 plate crop offload error for camera=%s frame=%s: %s",
                             cam_cfg.camera_id, frame_number, exc, exc_info=True,
@@ -1011,6 +1077,9 @@ class SpeedProbe:
             # Level 2: send full vehicle crops to peer for LPD/LPR, while the
             # origin node keeps local speed/event processing below.
             if offload_level == 2 and self._offload_pub is not None and offload_target:
+                self._gate_inc("l2_active_frames")
+                # Objects that would be sent if the surface were available.
+                self._gate_inc("l2_vehicle_objects", len(vehicles_in_frame))
                 try:
                     frame_bgr_l2 = self._get_frame_bgr_cached(
                         gst_buffer, frame_meta, frame_bgr_cache)
@@ -1019,6 +1088,7 @@ class SpeedProbe:
                             stid = (source_id, tid)
                             veh_crop = self._crop_bbox(frame_bgr_l2, veh_info["obj_meta"])
                             if veh_crop is not None and veh_crop.size > 0:
+                                self._gate_inc("l2_valid_crops")
                                 self._offload_pub.put_vehicle(
                                     target_node=offload_target,
                                     stid=stid,
@@ -1027,7 +1097,10 @@ class SpeedProbe:
                                     crop_bgr=veh_crop,
                                     bbox_world_y=y_world_by_tid.get(tid, 0.0),
                                 )
+                    else:
+                        self._gate_inc("l2_surface_unavailable")
                 except Exception as exc:
+                    self._gate_inc("l2_crop_errors")
                     logger.debug(
                         "[SpeedProbe] L2 vehicle crop offload error for camera=%s frame=%s: %s",
                         cam_cfg.camera_id, frame_number, exc, exc_info=True,
