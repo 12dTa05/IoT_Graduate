@@ -375,7 +375,7 @@ def build_pipeline(
         analytics, preosd_convert, preosd_caps, nvdsosd,
     ]
     if is_tiled:
-        core_elements.insert(-3, tiler)  # Add tiler before preosd_convert
+        core_elements.insert(-1, tiler)  # Add tiler before nvdsosd, after RGBA caps
 
     for el in core_elements + sink_elements:
         pipeline.add(el)
@@ -384,7 +384,7 @@ def build_pipeline(
     if is_tiled:
         gst_link(
             streammux, pgie, tracker, sgie, sgie2,
-            analytics, tiler, preosd_convert, preosd_caps, nvdsosd,
+            analytics, preosd_convert, preosd_caps, tiler, nvdsosd,
         )
     else:
         gst_link(
@@ -563,12 +563,3 @@ def dynamic_remove_stream(
     else:
         # If no pad exists, clean up immediately
         GLib.idle_add(_cleanup_bin, None, None)
-
-
-def get_core_chain_order(sink_type: str) -> list[str]:
-    """Return expected core-element factory order for host-side tests."""
-    base = [
-        "nvstreammux", "nvinfer", "nvtracker", "nvinfer", "nvinfer",
-        "nvdsanalytics", "nvvideoconvert", "capsfilter",
-    ]
-    return base + (["nvmultistreamtiler"] if sink_type in ("display", "rtsp_push") else []) + ["nvdsosd"]
