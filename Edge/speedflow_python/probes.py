@@ -275,6 +275,10 @@ class SpeedProbe:
         # l*_crop_errors but no new type key is created.
         self._l2_crop_error_types: Dict[str, int] = {}
         self._l3_crop_error_types: Dict[str, int] = {}
+
+        # ── Load-score breakdown (set by health-push loop, read by writer) ──
+        self._load_score_breakdown: Optional[Dict] = None
+        self._lb_lock = threading.Lock()
         # Per-level count for rate-limited warning (fires on 1, 101, 201, …)
         # pony tail: separate counter from gate_inc so gate_inc stays unchanged.
         self._l2_crop_error_total: int = 0
@@ -362,6 +366,14 @@ class SpeedProbe:
         Called by run_python.py after creating the counter and pipeline.
         """
         self._input_counter = counter
+
+    def set_load_score_breakdown(self, breakdown: Dict) -> None:
+        """
+        Thread-safe setter for the latest load-score breakdown.
+        Called from the health push loop; writer reads it without blocking.
+        """
+        with self._lb_lock:
+            self._load_score_breakdown = breakdown
 
     def inject_offload_result(self, result: dict) -> None:
         """
@@ -675,6 +687,13 @@ class SpeedProbe:
                     offload_crops, _prev_offload_count, _prev_offload_ts = \
                         self._snapshot_offload_crops(_prev_offload_count, _prev_offload_ts)
                     out["_offload_crops"] = offload_crops
+
+                # ── Load-score breakdown (set by health-push loop) ─────────
+                # The writer may observe a value one tick old — acceptable,
+                # never block the writer on the health loop.
+                with self._lb_lock:
+                    if self._load_score_breakdown is not None:
+                        out["load_score_breakdown"] = dict(self._load_score_breakdown)
 
                 # ── Atomic write: temp file + os.replace ───────────────────
                 tmp_path = FPS_STATS_FILE + ".tmp"

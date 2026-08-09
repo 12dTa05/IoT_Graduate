@@ -36,6 +36,11 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+# Holder for the live SpeedProbe.  Set by the mode runners when a probe is
+# created (rtsp_push restarts create a fresh probe per iteration); read by
+# _health_push_loop each tick so it always feeds the current probe.
+ACTIVE_SPEED_PROBE: list = []
+
 # ---------------------------------------------------------------------------
 # Shared probe setup
 # ---------------------------------------------------------------------------
@@ -232,6 +237,8 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
     tiler = pipeline.get_by_name("tiler")
 
     probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, input_counter=input_counter)
+    ACTIVE_SPEED_PROBE.clear()
+    ACTIVE_SPEED_PROBE.append(probe)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler, input_counter=input_counter)
 
     t0_playing = time.monotonic()
@@ -263,6 +270,8 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
     pipeline, nvdsosd, streammux, source_bins = ret_build
 
     probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, input_counter=input_counter)
+    ACTIVE_SPEED_PROBE.clear()
+    ACTIVE_SPEED_PROBE.append(probe)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, None, input_counter=input_counter)
 
     print(f"[Python File Mode] Processing multi-streams to output files...")
@@ -292,12 +301,13 @@ def _health_push_loop(peer_orch=None) -> None:
     # Delegate metric collection and load-score computation to health_agent's
     # functions so adaptive omega weights and the correct CPU formula are used.
     from health_agent import (
-        _compute_load_score      as _compute_load_fn,
+        _compute_load_score           as _compute_load_fn,
+        _compute_load_score_breakdown as _compute_lb_fn,
         _detect_source_starved,
         _derive_camera_workload,
-        _read_pipeline_snapshot  as _read_pipeline,
-        _maybe_reload_edge_cfg   as _reload_edge_cfg,
-        get_edge_cfg             as _get_edge_cfg,
+        _read_pipeline_snapshot       as _read_pipeline,
+        _maybe_reload_edge_cfg        as _reload_edge_cfg,
+        get_edge_cfg                  as _get_edge_cfg,
         open_jtop_session,
         collect_metrics,
     )
@@ -351,6 +361,16 @@ def _health_push_loop(peer_orch=None) -> None:
     # ponytail: monotonic deadline sleep so work duration doesn't extend period.
     _next_deadline = _time.monotonic()
 
+    # Flat unavailable breakdown matching health_agent._compute_load_score_breakdown
+    # when fps_stats is invalid (non-dict or no active cams).
+    _UNAVAILABLE_BREAKDOWN = {
+        "fps_score": 100.0,
+        "workload_bonus": 0.0,
+        "thermal_bonus": 0.0,
+        "composite_score": 100.0,
+        "load_score": 100.0,
+    }
+
     while True:
         try:
             # Periodically refresh camera configs to pick up dynamic changes
@@ -379,12 +399,18 @@ def _health_push_loop(peer_orch=None) -> None:
                     metrics, fps_stats, source_starved_cameras,
                     feature_stats=feature_stats,
                 )
+                # Compute breakdown with same inputs for auditability
+                lb = _compute_lb_fn(
+                    metrics, fps_stats, source_starved_cameras,
+                    feature_stats=feature_stats,
+                )
                 offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
                 active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
                 avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
                 active_cameras = [k for k, v in fps_stats.items() if v > 0.0]
             else:
                 load_score, omega_preset = 100.0, "fps_dominant"
+                lb = _UNAVAILABLE_BREAKDOWN
                 offload_crops_received_per_s = 0.0
                 active_fps_vals = []
                 avg_fps = None
@@ -400,6 +426,7 @@ def _health_push_loop(peer_orch=None) -> None:
                 "node_id":      NODE_ID,
                 "timestamp":    _time.time(),
                 "load_score":   load_score,
+                "load_score_breakdown": lb,
                 "omega_preset": omega_preset,
                 "gpu_percent":  metrics["gpu_percent"],
                 "cpu_percent":  metrics["cpu_percent"],
@@ -416,6 +443,11 @@ def _health_push_loop(peer_orch=None) -> None:
                     "source_starved_cameras": sorted(source_starved_cameras),
                 },
             }
+
+            # Push the breakdown to the live SpeedProbe so the FPS writer
+            # includes it in the next telemetry snapshot.  No blocking, no file I/O.
+            if ACTIVE_SPEED_PROBE:
+                ACTIVE_SPEED_PROBE[0].set_load_score_breakdown(lb)
 
             # ── Proactive model ──────────────────────────────────────
             # Skip when snapshot is invalid — no features to compute on.
@@ -516,6 +548,8 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         tiler = pipeline.get_by_name("tiler")
 
         _last_probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, input_counter=input_counter)
+        ACTIVE_SPEED_PROBE.clear()
+        ACTIVE_SPEED_PROBE.append(_last_probe)
         _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler, input_counter=input_counter)
 
         ret = pipeline.set_state(Gst.State.PLAYING)
@@ -766,6 +800,9 @@ def run_python_mode(args) -> None:
     # has exited, regardless of which mode was used.
     if probe is not None:
         probe.stop_fps_writer()
+
+    # Clear the active probe reference so health loop doesn't push to stale probe
+    ACTIVE_SPEED_PROBE.clear()
 
     # Stop the overspeed event publisher and flush its queue on exit.
     if zenoh_pub is not None:
