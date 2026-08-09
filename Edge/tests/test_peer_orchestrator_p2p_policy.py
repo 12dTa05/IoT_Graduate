@@ -165,6 +165,16 @@ def _make_peer(orch, node_id, gpu_temp_c=None, load_score=10.0):
     return peer
 
 
+def _stub_vote_request_pub(o):
+    """Provide a stub 'vote_request' publisher so L1 RFO can fire in tests."""
+    class _FakePub:
+        def __init__(self):
+            self.sent = []
+        def put(self, data):
+            self.sent.append(data)
+    o._pubs["vote_request"] = _FakePub()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # L1: lightest workload
 # ─────────────────────────────────────────────────────────────────────────────
@@ -569,6 +579,284 @@ def test_config_default_transition_settle_s():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Dwell gates: L3 must remain active before L2, L2 before L1
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _setup_state_for_dwell(o, level, cam_id, since_s):
+    """Helper to set current offload level and timestamp for dwell testing."""
+    o.set_offload_level(cam_id, level, target_node="node_beta")
+    o._offload_level_changed_at[cam_id] = time.time() - since_s
+
+
+def test_l3_dwell_blocks_escalation_to_l2_before_duration():
+    """L3 must be active for l3_dwell_s (10s default) before L2 can escalate."""
+    o = _new_orch(
+        offload_level=3,
+        offload_level3_threshold=57.0,
+        offload_level2_threshold=65.0,
+        offload_level1_threshold=75.0,
+        l3_dwell_s=10.0,
+        l2_dwell_s=7.0,
+        overload_duration_s=0.0,
+    )
+    _add_peer_beta(o)
+    _setup_overloaded_self(o, load_score=66.0, cameras=["cam_a", "cam_b"])
+    # cam_b is heaviest (8.0) → L2/L3 offload target; set L3 active for 5s (<10s)
+    _setup_state_for_dwell(o, level=3, cam_id="cam_b", since_s=5.0)
+
+    o._check_self_overload()
+
+    # L3 should NOT have escalated to L2 (still at level 3)
+    assert o.get_offload_level("cam_b") == 3, (
+        f"Expected L3 still active (dwell not met), got level={o.get_offload_level('cam_b')}"
+    )
+
+
+def test_l3_dwell_permits_escalation_to_l2_after_duration():
+    """After l3_dwell_s (10s), L2 escalation is permitted."""
+    o = _new_orch(
+        offload_level=3,
+        offload_level3_threshold=57.0,
+        offload_level2_threshold=65.0,
+        offload_level1_threshold=75.0,
+        l3_dwell_s=10.0,
+        l2_dwell_s=7.0,
+        overload_duration_s=0.0,
+    )
+    _add_peer_beta(o)
+    _setup_overloaded_self(o, load_score=66.0, cameras=["cam_a", "cam_b"])
+    # cam_b is heaviest (8.0) → L2/L3 offload target; set L3 active for 11s (>10s)
+    _setup_state_for_dwell(o, level=3, cam_id="cam_b", since_s=11.0)
+
+    o._check_self_overload()
+
+    # L3 should have escalated to L2
+    assert o.get_offload_level("cam_b") == 2, (
+        f"Expected L2 after L3 dwell met, got level={o.get_offload_level('cam_b')}"
+    )
+
+
+def test_l2_dwell_blocks_escalation_to_l1_before_duration():
+    """L2 must be active for l2_dwell_s (7s default) before L1 can escalate."""
+    o = _new_orch(
+        offload_level=3,
+        offload_level3_threshold=57.0,
+        offload_level2_threshold=65.0,
+        offload_level1_threshold=75.0,
+        l3_dwell_s=10.0,
+        l2_dwell_s=7.0,
+        overload_duration_s=0.0,
+        cooldown_s=0.0,
+    )
+    _add_peer_beta(o)
+    _setup_overloaded_self(o, load_score=80.0, cameras=["cam_a", "cam_b"])
+    # cam_a is lightest (5.0) → L1 offload target; set L2 active for 4s (<7s)
+    _setup_state_for_dwell(o, level=2, cam_id="cam_a", since_s=4.0)
+
+    o._check_self_overload()
+
+    # L2 should NOT have escalated to L1 (still at level 2)
+    assert o.get_offload_level("cam_a") == 2, (
+        f"Expected L2 still active (dwell not met), got level={o.get_offload_level('cam_a')}"
+    )
+
+
+def test_l2_dwell_permits_escalation_to_l1_after_duration():
+    """After l2_dwell_s (7s), L1 escalation is permitted."""
+    o = _new_orch(
+        offload_level=3,
+        offload_level3_threshold=57.0,
+        offload_level2_threshold=65.0,
+        offload_level1_threshold=75.0,
+        l3_dwell_s=10.0,
+        l2_dwell_s=7.0,
+        overload_duration_s=0.0,
+        cooldown_s=0.0,
+    )
+    _add_peer_beta(o)
+    _setup_overloaded_self(o, load_score=80.0, cameras=["cam_a", "cam_b"])
+    # cam_a is lightest (5.0) → L1 offload target; set L2 active for 8s (>7s)
+    _setup_state_for_dwell(o, level=2, cam_id="cam_a", since_s=8.0)
+
+    _stub_vote_request_pub(o)
+    o._check_self_overload()
+    # L1 triggers: vote in progress for cam_a, fine-grained level cleared.
+    with o._lock:
+        assert "cam_a" in o._vote_in_progress, (
+            f"Expected L1 RFO for 'cam_a' after L2 dwell met, vote_in_progress={o._vote_in_progress}"
+        )
+    # L2 cleared before triggering L1
+    assert o.get_offload_level("cam_a") == 0, (
+        f"Expected L2 cleared for L1, got level={o.get_offload_level('cam_a')}"
+    )
+
+
+def test_l1_permitted_when_no_lower_level_active():
+    """Direct L1 (no L2/L3 active) remains permitted when no lower level active."""
+    o = _new_orch(
+        offload_level=3,
+        offload_level3_threshold=57.0,
+        offload_level2_threshold=65.0,
+        offload_level1_threshold=75.0,
+        l3_dwell_s=10.0,
+        l2_dwell_s=7.0,
+        overload_duration_s=0.0,
+        cooldown_s=0.0,
+    )
+    _add_peer_beta(o)
+    _setup_overloaded_self(o, load_score=80.0, cameras=["cam_a", "cam_b"])
+    # No lower level active (level 0)
+
+    _stub_vote_request_pub(o)
+    o._check_self_overload()
+
+    # L1 should proceed (RFO triggered)
+    with o._lock:
+        assert "cam_a" in o._vote_in_progress, (
+            f"Expected L1 RFO for 'cam_a' (no lower level active), "
+            f"vote_in_progress={o._vote_in_progress}"
+        )
+
+
+def test_l1_bypasses_dwell_when_hardware_fuse_active():
+    """Hardware emergency fuse (risk_index >= hard_fuse_threshold) bypasses all dwell gates."""
+    o = _new_orch(
+        offload_level=3,
+        offload_level3_threshold=57.0,
+        offload_level2_threshold=65.0,
+        offload_level1_threshold=75.0,
+        l3_dwell_s=10.0,
+        l2_dwell_s=7.0,
+        overload_duration_s=0.0,
+        cooldown_s=0.0,
+        proactive={"hard_fuse_threshold": 0.95, "enabled": True},
+    )
+    _add_peer_beta(o)
+    _setup_overloaded_self(o, load_score=80.0, cameras=["cam_a", "cam_b"])
+    # risk_index 0.96 ≥ hard_fuse=0.95 → fuse ACTIVE
+    o._self_state.risk_index = 0.96
+    # cam_a is lightest (5.0) → L1 target; L2 active for only 1s (far less than 7s dwell)
+    _setup_state_for_dwell(o, level=2, cam_id="cam_a", since_s=1.0)
+
+    _stub_vote_request_pub(o)
+    o._check_self_overload()
+
+    # L1 should proceed despite dwell not met (fuse bypasses)
+    with o._lock:
+        assert "cam_a" in o._vote_in_progress, (
+            f"Expected L1 RFO despite dwell (fuse bypass), vote_in_progress={o._vote_in_progress}"
+        )
+
+
+def test_malformed_dwell_config_uses_defaults():
+    """Malformed/missing dwell config falls back to safe defaults (10s L3, 7s L2)."""
+    o = _new_orch(
+        offload_level=3,
+        offload_level3_threshold=57.0,
+        offload_level2_threshold=65.0,
+        offload_level1_threshold=75.0,
+        # Omit l3_dwell_s and l2_dwell_s to test defaults
+        overload_duration_s=0.0,
+    )
+    _add_peer_beta(o)
+    _setup_overloaded_self(o, load_score=66.0, cameras=["cam_a", "cam_b"])
+    # cam_b heaviest (8.0) → L2/L3 target; L3 active for 5s (less than 10s default)
+    _setup_state_for_dwell(o, level=3, cam_id="cam_b", since_s=5.0)
+
+    o._check_self_overload()
+
+    # Should be blocked by default 10s dwell
+    assert o.get_offload_level("cam_b") == 3, (
+        f"Expected L3 still active (default 10s dwell not met), got level={o.get_offload_level('cam_b')}"
+    )
+
+    # Now test with 11s (past default)
+    _setup_state_for_dwell(o, level=3, cam_id="cam_b", since_s=11.0)
+    o._check_self_overload()
+    assert o.get_offload_level("cam_b") == 2, (
+        f"Expected L2 after default 10s dwell met, got level={o.get_offload_level('cam_b')}"
+    )
+
+
+def test_negative_dwell_config_uses_defaults():
+    """Negative dwell values fall back to defaults (fail-safe)."""
+    o = _new_orch(
+        offload_level=3,
+        offload_level3_threshold=57.0,
+        offload_level2_threshold=65.0,
+        offload_level1_threshold=75.0,
+        l3_dwell_s=-5.0,  # Invalid - should use default 10s
+        l2_dwell_s=-1.0,  # Invalid - should use default 7s
+        overload_duration_s=0.0,
+    )
+    _add_peer_beta(o)
+    _setup_overloaded_self(o, load_score=66.0, cameras=["cam_a", "cam_b"])
+    # L3 active for 5s (less than 10s default)
+    _setup_state_for_dwell(o, level=3, cam_id="cam_b", since_s=5.0)
+
+    o._check_self_overload()
+
+    assert o.get_offload_level("cam_b") == 3, (
+        f"Expected L3 still active (negative config → default 10s), got level={o.get_offload_level('cam_b')}"
+    )
+
+
+def test_string_dwell_config_uses_defaults():
+    """Non-numeric dwell values fall back to defaults (fail-safe)."""
+    o = _new_orch(
+        offload_level=3,
+        offload_level3_threshold=57.0,
+        offload_level2_threshold=65.0,
+        offload_level1_threshold=75.0,
+        l3_dwell_s="invalid",  # Invalid - should use default 10s
+        l2_dwell_s="also_bad",  # Invalid - should use default 7s
+        overload_duration_s=0.0,
+        cooldown_s=0.0,
+    )
+    _add_peer_beta(o)
+    _setup_overloaded_self(o, load_score=80.0, cameras=["cam_a", "cam_b"])
+    # cam_a lightest (5.0) → L1 target; L2 active for 3s (less than 7s default)
+    _setup_state_for_dwell(o, level=2, cam_id="cam_a", since_s=3.0)
+
+    o._check_self_overload()
+
+    assert o.get_offload_level("cam_a") == 2, (
+        f"Expected L2 still active (string config → default 7s), got level={o.get_offload_level('cam_a')}"
+    )
+
+
+def test_dwell_gate_only_blocks_escalation_from_active_lower_level():
+    """Dwell gates only prevent escalation FROM an active lower level, not all L1 globally."""
+    o = _new_orch(
+        offload_level=3,
+        offload_level3_threshold=57.0,
+        offload_level2_threshold=65.0,
+        offload_level1_threshold=75.0,
+        l3_dwell_s=10.0,
+        l2_dwell_s=7.0,
+        overload_duration_s=0.0,
+        cooldown_s=0.0,
+    )
+    _add_peer_beta(o)
+    _setup_overloaded_self(o, load_score=80.0, cameras=["cam_a", "cam_b"])
+    # cam_a has L2 active for only 1s (dwell not met) and is the LIGHTEST
+    # (L1 picks lightest), so the dwell gate on cam_a blocks it.
+    _setup_state_for_dwell(o, level=2, cam_id="cam_a", since_s=1.0)
+
+    o._check_self_overload()
+
+    # cam_a (lightest, L1 pick) is blocked by its own L2 dwell.
+    assert o.get_offload_level("cam_a") == 2, (
+        f"Expected cam_a L2 still active (dwell not met), got {o.get_offload_level('cam_a')}"
+    )
+    # No L1 vote should have been triggered for cam_a.
+    with o._lock:
+        assert "cam_a" not in o._vote_in_progress, (
+            f"cam_a should not be voting (L2 dwell blocks it), got {o._vote_in_progress}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -593,6 +881,16 @@ if __name__ == "__main__":
         test_post_migration_settle_blocks_overload_action,
         test_settle_window_expiry_permits_decision,
         test_config_default_transition_settle_s,
+        test_l3_dwell_blocks_escalation_to_l2_before_duration,
+        test_l3_dwell_permits_escalation_to_l2_after_duration,
+        test_l2_dwell_blocks_escalation_to_l1_before_duration,
+        test_l2_dwell_permits_escalation_to_l1_after_duration,
+        test_l1_permitted_when_no_lower_level_active,
+        test_l1_bypasses_dwell_when_hardware_fuse_active,
+        test_malformed_dwell_config_uses_defaults,
+        test_negative_dwell_config_uses_defaults,
+        test_string_dwell_config_uses_defaults,
+        test_dwell_gate_only_blocks_escalation_from_active_lower_level,
     ]
     passed = failed = 0
     for t in tests:

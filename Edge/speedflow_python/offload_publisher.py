@@ -69,8 +69,36 @@ class OffloadPublisher:
         self._thread: Optional[threading.Thread] = None
         self._running = False
 
-        self._sent  = 0
-        self._drops = 0
+        # Thread-safe lifetime E2E counters (int reads are atomic in CPython)
+        self._encoded      = 0
+        self._enqueued     = 0
+        self._sent         = 0
+        self._dropped      = 0
+        self._send_errors  = 0
+
+    # ------------------------------------------------------------------
+    # Counter accessors (thread-safe: atomic int reads in CPython)
+    # ------------------------------------------------------------------
+
+    @property
+    def offload_encoded_count(self) -> int:
+        return self._encoded
+
+    @property
+    def offload_enqueued_count(self) -> int:
+        return self._enqueued
+
+    @property
+    def offload_sent_count(self) -> int:
+        return self._sent
+
+    @property
+    def offload_dropped_count(self) -> int:
+        return self._dropped
+
+    @property
+    def offload_send_errors_count(self) -> int:
+        return self._send_errors
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -106,7 +134,8 @@ class OffloadPublisher:
                     pass
             if self._session:
                 self._session.close()
-        logger.info("[OffloadPub] Stopped. sent=%d dropped=%d", self._sent, self._drops)
+        logger.info("[OffloadPub] Stopped. encoded=%d enqueued=%d sent=%d dropped=%d send_errors=%d",
+                    self._encoded, self._enqueued, self._sent, self._dropped, self._send_errors)
 
     # ------------------------------------------------------------------
     # Public API — non-blocking enqueue
@@ -128,6 +157,7 @@ class OffloadPublisher:
         jpeg = self._encode_jpeg(crop_bgr, quality=85)
         if jpeg is None:
             return
+        self._encoded += 1
         self._enqueue({
             "type":        TYPE_PLATE,
             "src":         self._node_id,
@@ -157,6 +187,7 @@ class OffloadPublisher:
         jpeg = self._encode_jpeg(crop_bgr, quality=80)
         if jpeg is None:
             return
+        self._encoded += 1
         self._enqueue({
             "type":         TYPE_VEHICLE,
             "src":          self._node_id,
@@ -185,14 +216,16 @@ class OffloadPublisher:
     def _enqueue(self, item: dict) -> None:
         try:
             self._queue.put_nowait(item)
+            self._enqueued += 1
         except queue.Full:
             try:
                 self._queue.get_nowait()   # drop oldest
                 self._queue.put_nowait(item)
-                self._drops += 1
-                if self._drops % 50 == 1:
+                self._dropped += 1
+                self._enqueued += 1
+                if self._dropped % 50 == 1:
                     logger.warning(
-                        "[OffloadPub] Queue full — dropping oldest (total=%d)", self._drops
+                        "[OffloadPub] Queue full — dropping oldest (total=%d)", self._dropped
                     )
             except (queue.Empty, queue.Full):
                 pass
@@ -225,4 +258,5 @@ class OffloadPublisher:
                 pub.put(msgpack.packb(item, use_bin_type=True))
                 self._sent += 1
             except Exception as exc:
+                self._send_errors += 1
                 logger.warning("[OffloadPub] Send error: %s", exc)

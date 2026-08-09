@@ -108,6 +108,16 @@ def _parse_starved_cameras(raw) -> List[str]:
     return [c for c in raw if isinstance(c, str)]
 
 
+def _dwell_s(cfg: dict, key: str, default: float) -> float:
+    """Read a dwell duration from config; malformed/missing → default (fail-safe)."""
+    raw = cfg.get(key, default)
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return default
+    if not math.isfinite(float(raw)) or float(raw) < 0.0:
+        return default
+    return float(raw)
+
+
 def _thermal_admission_ok(gpu_temp_c, therm_cfg) -> bool:
     """
     Shared thermal-admission gate for BOTH roles.
@@ -1045,8 +1055,31 @@ class PeerOrchestrator:
                 return
 
         # Escalation ladder: 3 → 2 → 1
+        # Read dwell config (fail-safe defaults if missing/malformed)
+        l3_dwell = _dwell_s(cfg, "l3_dwell_s", 10.0)
+        l2_dwell = _dwell_s(cfg, "l2_dwell_s", 7.0)
+        # Hardware emergency fuse bypass: if risk_index >= hard_fuse_threshold,
+        # skip dwell gates entirely so L1 can trigger immediately.
+        hard_fuse = float(cfg.get("proactive", {}).get("hard_fuse_threshold", 0.95))
+        fuse_active = state.risk_index >= hard_fuse
+
         if load >= thr1 and global_offload >= 1:
             # Full stream migration (Level 1) — existing RFO path.
+            # Dwell gate: if this camera currently has L2 active, require L2
+            # to have been active for l2_dwell seconds before escalating to L1.
+            # Bypassed if hardware emergency fuse is active.
+            # Only blocks normal escalation FROM an active L2, not all L1 globally.
+            if not fuse_active and current_level == 2:
+                l2_since = self._offload_level_changed_at.get(cam_to_offload, 0.0)
+                if now - l2_since < l2_dwell:
+                    if self._maybe_log_block("l2_dwell", now):
+                        logger.info(
+                            "[PeerOrch] L1 escalation blocked: L2 dwell not met for '%s' "
+                            "(%.1fs elapsed, need %.1fs, fuse=%s) — retaining Level 2",
+                            cam_to_offload, now - l2_since, l2_dwell, fuse_active,
+                        )
+                    return
+
             # Guard: check vote-in-progress and per-camera migration cooldown
             # BEFORE clearing any fine-grained offload so Level 2/3 survives
             # when L1 is blocked.
@@ -1089,6 +1122,21 @@ class PeerOrchestrator:
             self._trigger_rfo(cam_to_offload, relaxation_tier=0)
 
         elif load >= thr2 and global_offload >= 2:
+            # Dwell gate: if this camera currently has L3 active, require L3
+            # to have been active for l3_dwell seconds before escalating to L2.
+            # Bypassed if hardware emergency fuse is active.
+            # Only blocks normal escalation FROM an active L3, not all L2 globally.
+            if not fuse_active and current_level == 3:
+                l3_since = self._offload_level_changed_at.get(cam_to_offload, 0.0)
+                if now - l3_since < l3_dwell:
+                    if self._maybe_log_block("l3_dwell", now):
+                        logger.info(
+                            "[PeerOrch] L2 escalation blocked: L3 dwell not met for '%s' "
+                            "(%.1fs elapsed, need %.1fs, fuse=%s) — retaining Level 3",
+                            cam_to_offload, now - l3_since, l3_dwell, fuse_active,
+                        )
+                    return
+
             best_peer = self._pick_best_peer(for_offload_level=2)
             if not best_peer:
                 if self._maybe_log_block("no_peer_l2", now):

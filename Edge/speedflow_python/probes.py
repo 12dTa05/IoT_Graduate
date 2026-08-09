@@ -238,6 +238,9 @@ class SpeedProbe:
         # Queue is thread-safe; maxsize prevents unbounded growth if results
         # arrive faster than frames.
         self._offload_result_q: queue.Queue = queue.Queue(maxsize=256)
+        # Lifetime counter of results successfully enqueued from the receiver
+        # (sender-probe side of the offload E2E loop). Thread-safe (int).
+        self._results_received: int = 0
 
         # ── Unified telemetry counters (reset on every writer flush) ───────
         # Per-camera FPS frame counters — incremented in _tick_fps, drained
@@ -330,8 +333,73 @@ class SpeedProbe:
         """
         try:
             self._offload_result_q.put_nowait(result)
+            self._results_received += 1
         except queue.Full:
             pass   # discard stale result — next frame will get a fresher one
+
+    def _snapshot_offload_crops(self, prev_count: int, prev_ts: float):
+        """
+        Build the _offload_crops telemetry dict from the live offload
+        publisher/receiver counter objects.
+
+        Counter reads are wrapped in getattr + int() so a missing or partially
+        initialized object can never raise inside the GStreamer/writer thread.
+        Returns (offload_crops, prev_count, prev_ts) so the caller can keep
+        the received_per_s window state.
+
+        Kept as a standalone method so host tests can exercise the flush
+        logic without a live GStreamer pipeline.
+        """
+        now_ts = time.time()
+
+        def _cnt(obj, name: str, default: int = 0) -> int:
+            try:
+                return int(getattr(obj, name, default))
+            except Exception:
+                return default
+
+        offload_crops = {
+            "processed_count": _cnt(self._offload_rcv, "offload_processed_count"),
+            "received_per_s":  0.0,
+            "ts":              now_ts,
+        }
+
+        # Receiver-side lifetime counters
+        for name in (
+            "offload_received_count",
+            "offload_queue_dropped_count",
+            "offload_errors_count",
+            "offload_results_sent_count",
+        ):
+            offload_crops[name] = _cnt(self._offload_rcv, name)
+
+        # Sender-side lifetime counters (crops encoded/enqueued/sent)
+        for name in (
+            "offload_encoded_count",
+            "offload_enqueued_count",
+            "offload_sent_count",
+            "offload_dropped_count",
+            "offload_send_errors_count",
+        ):
+            offload_crops[name] = _cnt(self._offload_pub, name)
+
+        # Sender-probe side: results successfully enqueued by OffloadReceiver
+        # into the OSD result queue.
+        offload_crops["results_received"] = self._results_received
+
+        # Rate (received_per_s) — backward-compat computation on the monotonic
+        # processed counter.
+        count = offload_crops["processed_count"]
+        if prev_ts > 0:
+            dt = max(0.001, now_ts - prev_ts)
+            rate = (count - prev_count) / dt
+        else:
+            rate = 0.0
+        prev_count = count
+        prev_ts = now_ts
+        offload_crops["received_per_s"] = round(max(0.0, rate), 3)
+
+        return offload_crops, prev_count, prev_ts
 
     # ------------------------------------------------------------------
     # FPS counter
@@ -464,21 +532,10 @@ class SpeedProbe:
                             input_fps[cam_id] = 0.0
 
                 # ── Offload receiver processed count ───────────────────────
-                if self._offload_rcv is not None:
-                    now_ts = time.time()
-                    count = self._offload_rcv.offload_processed_count
-                    if _prev_offload_ts > 0:
-                        dt = max(0.001, now_ts - _prev_offload_ts)
-                        rate = (count - _prev_offload_count) / dt
-                    else:
-                        rate = 0.0
-                    _prev_offload_count = count
-                    _prev_offload_ts = now_ts
-                    out["_offload_crops"] = {
-                        "processed_count": count,
-                        "received_per_s":  round(max(0.0, rate), 3),
-                        "ts":              now_ts,
-                    }
+                if self._offload_rcv is not None or self._offload_pub is not None:
+                    offload_crops, _prev_offload_count, _prev_offload_ts = \
+                        self._snapshot_offload_crops(_prev_offload_count, _prev_offload_ts)
+                    out["_offload_crops"] = offload_crops
 
                 # ── Atomic write: temp file + os.replace ───────────────────
                 tmp_path = FPS_STATS_FILE + ".tmp"

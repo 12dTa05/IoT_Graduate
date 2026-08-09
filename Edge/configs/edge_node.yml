@@ -80,6 +80,13 @@ p2p:
   # Cooldown between level changes for the same camera (seconds)
   offload_level_cooldown_s: 12.0
 
+  # Minimum dwell time (seconds) before escalation from a lower level.
+  # Prevents premature escalation while the lower-level offload takes effect.
+  # Dwell starts when set_offload_level commits L3/L2 for that camera.
+  # Bypassed if a hardware emergency fuse is explicitly active.
+  l3_dwell_s: 10.0    # L3 must remain active this long before L2
+  l2_dwell_s: 7.0     # L2 must remain active this long before L1
+
   # TensorRT engine paths used by the offload receiver (Level 2 + 3)
   lpr_engine_path: "models/lpr.engine"
   lpd_engine_path: "models/lpd.engine"

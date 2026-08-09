@@ -52,10 +52,6 @@ _lpr_labels_lock  = threading.Lock()
 # TensorRT engine loader (lazy, cached)
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# TensorRT engine loader (lazy, cached)
-# ---------------------------------------------------------------------------
-
 def _try_import_trt():
     """Return (trt, cuda) or (None, None) if not installed."""
     try:
@@ -336,8 +332,12 @@ class OffloadReceiver:
         # Result publisher cache
         self._result_pubs: Dict[str, Any] = {}
 
-        self._processed = 0
-        self._errors    = 0
+        # Thread-safe lifetime E2E counters (int reads are atomic in CPython)
+        self._received       = 0
+        self._queue_dropped  = 0
+        self._processed      = 0
+        self._errors         = 0
+        self._results_sent   = 0
 
         # Result subscription used when this node sends crops to a peer.
         self._result_handler: Optional[Any] = None
@@ -347,6 +347,26 @@ class OffloadReceiver:
     def offload_processed_count(self) -> int:
         """Monotonic count of successfully handled crop items. Thread-safe (int)."""
         return self._processed
+
+    @property
+    def offload_received_count(self) -> int:
+        """Crops successfully decoded from the wire. Thread-safe (int)."""
+        return self._received
+
+    @property
+    def offload_queue_dropped_count(self) -> int:
+        """Crops dropped because the work queue was full. Thread-safe (int)."""
+        return self._queue_dropped
+
+    @property
+    def offload_errors_count(self) -> int:
+        """Worker-loop handle errors. Thread-safe (int)."""
+        return self._errors
+
+    @property
+    def offload_results_sent_count(self) -> int:
+        """Results published back to senders. Thread-safe (int)."""
+        return self._results_sent
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -381,8 +401,9 @@ class OffloadReceiver:
         if self._thread:
             self._thread.join(timeout=5)
         logger.info(
-            "[OffloadReceiver] Stopped. processed=%d errors=%d",
-            self._processed, self._errors,
+            "[OffloadReceiver] Stopped. received=%d processed=%d queue_dropped=%d errors=%d results_sent=%d",
+            self._received, self._processed, self._queue_dropped,
+            self._errors, self._results_sent,
         )
 
     def set_result_handler(self, handler) -> None:
@@ -431,9 +452,13 @@ class OffloadReceiver:
         try:
             payload = msgpack.unpackb(sample.payload.to_bytes(), raw=False)
             payload["_crop_type"] = crop_type
+            # Received is credited as soon as the wire payload decodes — even
+            # if the work queue is full and the crop is then dropped.
+            self._received += 1
             try:
                 self._work_q.put_nowait(payload)
             except queue.Full:
+                self._queue_dropped += 1
                 logger.debug("[OffloadReceiver] Work queue full — dropping")
         except Exception as exc:
             logger.warning("[OffloadReceiver] Decode error: %s", exc)
@@ -561,3 +586,4 @@ class OffloadReceiver:
             "ts":         time.time(),
         }
         pub.put(msgpack.packb(payload, use_bin_type=True))
+        self._results_sent += 1

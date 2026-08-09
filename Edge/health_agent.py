@@ -566,6 +566,127 @@ def _compute_load_score(
     return round(score, 1), "fps_dominant"
 
 
+def _compute_load_score_breakdown(
+    metrics: dict,
+    fps_stats: dict,
+    source_starved_cameras: set = None,
+    feature_stats: Optional[dict] = None,
+) -> dict:
+    """
+    Pure helper yielding auditable breakdown of the load score computation.
+
+    Returns a dict with fields:
+        fps_score         — piecewise-linear FPS score [0, 100]
+        workload_bonus    — additive workload bonus (clamped to max_bonus)
+        thermal_bonus     — additive thermal bonus (clamped to max_bonus)
+        composite_score   — min(100, fps_score + workload_bonus + thermal_bonus)  (post-cap, pre-fuse)
+        load_score        — final score after hardware emergency floor (post-fuse)
+
+    This function mirrors _compute_load_score exactly but exposes internals.
+    Malformed values never crash and preserve score behavior.
+    """
+    _starved = source_starved_cameras or set()
+
+    # ponytail: malformed fps_stats (None / non-dict) → no active cameras
+    # → unavailable 100, preserving _compute_load_score's empty-dict behavior.
+    if not isinstance(fps_stats, dict):
+        return {
+            "fps_score": 100.0,
+            "workload_bonus": 0.0,
+            "thermal_bonus": 0.0,
+            "composite_score": 100.0,
+            "load_score": 100.0,
+        }
+
+    _maybe_reload_edge_cfg()
+    ls_cfg = _EDGE_CFG.get("load_score", {})
+    if not isinstance(ls_cfg, dict):
+        ls_cfg = {}
+    hw_fuse_threshold = float(ls_cfg.get("hw_fuse_threshold", 90.0))
+    hw_fuse_score_floor = float(ls_cfg.get("hw_fuse_score_floor", 75.0))
+
+    # ── FPS score (piecewise linear) ──────────────────────────
+    active_fps_vals = [
+        v for k, v in fps_stats.items()
+        if v > 0.0 and k not in _starved
+    ]
+    if active_fps_vals:
+        avg_fps = sum(active_fps_vals) / len(active_fps_vals)
+    else:
+        return {
+            "fps_score": 100.0,
+            "workload_bonus": 0.0,
+            "thermal_bonus": 0.0,
+            "composite_score": 100.0,
+            "load_score": 100.0,
+        }
+
+    fps_clamped = max(0.0, min(TARGET_FPS, avg_fps))
+
+    if fps_clamped >= TARGET_FPS:
+        fps_score = 0.0
+    elif fps_clamped >= 22.0:
+        fps_score = 57.0 * (TARGET_FPS - fps_clamped) / (TARGET_FPS - 22.0)
+    elif fps_clamped >= 19.0:
+        fps_score = 57.0 + (65.0 - 57.0) * (22.0 - fps_clamped) / (22.0 - 19.0)
+    elif fps_clamped >= 17.0:
+        fps_score = 65.0 + (75.0 - 65.0) * (19.0 - fps_clamped) / (19.0 - 17.0)
+    else:
+        fps_score = 75.0 + (100.0 - 75.0) * (17.0 - fps_clamped) / (17.0 - 0.0)
+
+    # ── Workload bonus ────────────────────────────────────────
+    workload_bonus = 0.0
+    wl_cfg = ls_cfg.get("workload", {})
+    if (isinstance(wl_cfg, dict) and wl_cfg.get("enabled") is True
+            and isinstance(feature_stats, dict)):
+        wl_total = sum(
+            _derive_camera_workload(feature_stats, fps_stats, _starved).values()
+        )
+        wl_cap = _finite_positive(wl_cfg.get("capacity"))
+        wl_max = _finite_positive(wl_cfg.get("max_bonus"))
+        if wl_cap is not None and wl_max is not None:
+            workload_bonus = min(wl_max, wl_max * wl_total / wl_cap)
+
+    # ── Thermal bonus ─────────────────────────────────────────
+    thermal_bonus = 0.0
+    th_cfg = ls_cfg.get("thermal", {})
+    if isinstance(th_cfg, dict) and th_cfg.get("enabled") is True:
+        temp_val = _finite_nonneg(metrics.get("gpu_temp_c"))
+        onset = _finite_nonneg(th_cfg.get("onset_c"))
+        critical = _finite_nonneg(th_cfg.get("critical_c"))
+        th_max = _finite_positive(th_cfg.get("max_bonus"))
+        if (temp_val is not None and onset is not None
+                and critical is not None and th_max is not None
+                and onset < critical):
+            if temp_val >= critical:
+                thermal_bonus = th_max
+            elif temp_val > onset:
+                thermal_bonus = th_max * (temp_val - onset) / (critical - onset)
+
+    # ── Composite (post cap, pre fuse) ────────────────────────
+    composite = min(100.0, fps_score + workload_bonus + thermal_bonus)
+
+    # ── Hardware emergency floor (fuse) ───────────────────────
+    hw_saturated = (
+        metrics.get("cpu_percent", 0.0) >= hw_fuse_threshold or
+        metrics.get("ram_percent", 0.0) >= hw_fuse_threshold
+    )
+    fps_emergency = fps_clamped < TARGET_FPS - 2.0
+
+    if hw_saturated and fps_emergency:
+        load_score = max(composite, hw_fuse_score_floor)
+    else:
+        load_score = composite
+
+    return {
+        "fps_score": round(fps_score, 1),
+        "workload_bonus": round(workload_bonus, 1),
+        "thermal_bonus": round(thermal_bonus, 1),
+        "composite_score": round(composite, 1),
+        "load_score": round(load_score, 1),
+    }
+
+
 # ── Config-safe float helpers used by _compute_load_score ──────
 def _finite_positive(v):
     """Return float(v) for finite v > 0.0 (not bool); None otherwise."""
@@ -950,6 +1071,11 @@ class HealthAgent:
                         metrics, fps_stats, source_starved_cameras=starved_cams,
                         feature_stats=feature_stats,
                     )
+                    # Compute breakdown for auditable payload
+                    load_score_breakdown = _compute_load_score_breakdown(
+                        metrics, fps_stats, source_starved_cameras=starved_cams,
+                        feature_stats=feature_stats,
+                    )
                     offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
                     # BUG-I fix: exclude 0-fps cameras from avg_fps,
                     # matching the exclusion applied in _compute_load_score()
@@ -960,6 +1086,13 @@ class HealthAgent:
                 else:
                     starved_cams = set()
                     load_score, omega_preset = 100.0, "fps_dominant"
+                    load_score_breakdown = {
+                        "fps_score": 100.0,
+                        "workload_bonus": 0.0,
+                        "thermal_bonus": 0.0,
+                        "composite_score": 100.0,
+                        "load_score": 100.0,
+                    }
                     offload_crops_received_per_s = 0.0
                     active_fps_vals = []
                     avg_fps = None
@@ -989,6 +1122,7 @@ class HealthAgent:
                     "timestamp":     time.time(),
                     "load_score":    load_score,
                     "omega_preset":  omega_preset,
+                    "load_score_breakdown": load_score_breakdown,
                     "gpu_percent":   metrics["gpu_percent"],
                     "cpu_percent":   metrics["cpu_percent"],
                     "ram_percent":   metrics["ram_percent"],

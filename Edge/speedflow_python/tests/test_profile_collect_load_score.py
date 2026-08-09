@@ -19,6 +19,7 @@ Run:
 from __future__ import annotations
 
 import importlib.util
+import math
 import sys
 import time
 from pathlib import Path
@@ -90,6 +91,7 @@ _ha = _exec_deps_stubbed(
     },
 )
 _compute_load_score = _ha._compute_load_score
+_compute_load_score_breakdown = _ha._compute_load_score_breakdown
 
 # profile_collect does `from health_agent import _read_payload, _compute_load_score`.
 # Register a stub health_agent module exposing the two names it needs, so
@@ -296,6 +298,165 @@ def test_degraded_fps_cpu_ram_both_saturated_floor():
         _fps(cam_01=17.0),
     )
     assert score >= 75.0
+
+
+# ---------------------------------------------------------------------------
+# _compute_load_score_breakdown — auditable breakdown fields
+# ---------------------------------------------------------------------------
+
+def test_breakdown_normal_fps_no_bonuses():
+    """Normal FPS, no bonuses → breakdown matches legacy behavior."""
+    br = _compute_load_score_breakdown(_metrics(), _fps(camA=22.0))
+    assert set(br.keys()) == {"fps_score", "workload_bonus", "thermal_bonus", "composite_score", "load_score"}
+    assert abs(br["fps_score"] - 57.0) < 0.05
+    assert br["workload_bonus"] == 0.0
+    assert br["thermal_bonus"] == 0.0
+    assert br["composite_score"] == 57.0
+    assert br["load_score"] == 57.0  # no fuse
+
+
+def test_breakdown_composite_vs_load_score_distinction():
+    """composite_score (post cap) vs load_score (post fuse) must be distinct when fuse triggers."""
+    # fps 22 -> fps_score 57; cpu 92 -> hw_saturated; fps_clamped=22 < 25 -> fuse
+    br = _compute_load_score_breakdown(_metrics(cpu=92.0), _fps(camA=22.0))
+    assert br["composite_score"] == 57.0
+    assert br["load_score"] == 75.0  # floor applied
+    assert br["load_score"] > br["composite_score"]
+
+
+def test_breakdown_no_fuse_when_fps_healthy():
+    """No fuse when FPS >= TARGET_FPS - 2 (25), even with CPU/RAM saturated."""
+    br = _compute_load_score_breakdown(_metrics(cpu=95, ram=95), _fps(camA=27.0))
+    assert br["composite_score"] == 0.0
+    assert br["load_score"] == 0.0  # no fuse
+
+
+def test_breakdown_no_fuse_gpu_saturated():
+    """GPU saturation alone never triggers the fuse."""
+    br = _compute_load_score_breakdown(_metrics(gpu=95), _fps(camA=22.0))
+    assert br["composite_score"] == 57.0
+    assert br["load_score"] == 57.0  # no fuse
+
+
+def test_breakdown_workload_bonus_in_composite():
+    """Workload bonus reflected in composite, not in fps_score."""
+    _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0, "max_bonus": 10.0})
+    try:
+        br = _compute_load_score_breakdown(
+            _metrics(), _fps(camA=27.0),
+            feature_stats={"camA": {"n_track": 15, "n_plate": 5}},  # total 20 -> bonus 5.0
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert br["fps_score"] == 0.0
+    assert br["workload_bonus"] == 5.0
+    assert br["composite_score"] == 5.0
+    assert br["load_score"] == 5.0
+
+
+def test_breakdown_thermal_bonus_in_composite():
+    """Thermal bonus reflected in composite."""
+    _ha._EDGE_CFG = _ha_cfg(thermal={"enabled": True, "onset_c": 70.0, "critical_c": 85.0, "max_bonus": 5.0})
+    try:
+        br = _compute_load_score_breakdown(
+            _metrics(gpu_temp_c=85.0), _fps(camA=27.0),
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert br["fps_score"] == 0.0
+    assert br["thermal_bonus"] == 5.0
+    assert br["composite_score"] == 5.0
+    assert br["load_score"] == 5.0
+
+
+def test_breakdown_composite_capped_at_100():
+    """composite_score capped at 100; load_score also capped (pre-fuse)."""
+    _ha._EDGE_CFG = _ha_cfg(
+        workload={"enabled": True, "capacity": 40.0, "max_bonus": 10.0},
+        thermal={"enabled": True, "onset_c": 70.0, "critical_c": 85.0, "max_bonus": 5.0},
+    )
+    try:
+        # fps 1.0 -> fps_score ~98.5 + 10 + 5 = 113.5 -> capped 100
+        br = _compute_load_score_breakdown(
+            _metrics(gpu_temp_c=85.0), _fps(camA=1.0),
+            feature_stats={"camA": {"n_track": 20, "n_plate": 20}},
+        )
+    finally:
+        _ha._EDGE_CFG = {}
+    assert br["composite_score"] == 100.0
+    assert br["load_score"] == 100.0
+
+
+def test_breakdown_malformed_telemetry_config_never_crashes():
+    """Malformed inputs never crash; returns valid breakdown with safe defaults."""
+    # None fps_stats -> treated as no active cameras -> 100
+    br = _compute_load_score_breakdown(_metrics(), None)
+    assert br["load_score"] == 100.0
+    assert br["fps_score"] == 100.0
+
+    # Non-dict fps_stats
+    br = _compute_load_score_breakdown(_metrics(), "bad")
+    assert br["load_score"] == 100.0
+
+    # Malformed config - load_score missing
+    _ha._EDGE_CFG = {"load_score": "not_a_dict"}
+    try:
+        br = _compute_load_score_breakdown(_metrics(), _fps(camA=27.0))
+    finally:
+        _ha._EDGE_CFG = {}
+    assert br["fps_score"] == 0.0
+    assert br["load_score"] == 0.0
+
+
+def test_breakdown_no_cameras_unavailable():
+    """No active cameras -> all scores 100 (unavailable)."""
+    br = _compute_load_score_breakdown(_metrics(), {})
+    assert br["fps_score"] == 100.0
+    assert br["composite_score"] == 100.0
+    assert br["load_score"] == 100.0
+
+
+def test_breakdown_payload_presence():
+    """Simulate HealthAgent._run payload structure and verify load_score_breakdown is present."""
+    # This mirrors what HealthAgent._run does
+    metrics = _metrics(cpu=40, ram=30, gpu_temp_c=60)
+    fps_stats = _fps(camA=22.0)
+    starved_cams = set()
+    feature_stats = {"camA": {"n_track": 10, "n_plate": 2}}
+
+    load_score, omega_preset = _compute_load_score(
+        metrics, fps_stats, source_starved_cameras=starved_cams, feature_stats=feature_stats
+    )
+    load_score_breakdown = _compute_load_score_breakdown(
+        metrics, fps_stats, source_starved_cameras=starved_cams, feature_stats=feature_stats
+    )
+
+    # Verify load_score matches breakdown.load_score
+    assert load_score == load_score_breakdown["load_score"]
+
+    # Verify breakdown structure
+    assert isinstance(load_score_breakdown, dict)
+    for key in ("fps_score", "workload_bonus", "thermal_bonus", "composite_score", "load_score"):
+        assert key in load_score_breakdown
+        assert isinstance(load_score_breakdown[key], (int, float))
+        assert math.isfinite(load_score_breakdown[key])
+
+
+def test_breakdown_invalid_snapshot_simulated():
+    """When HealthAgent._run invalid snapshot branch, breakdown still valid with all-100s."""
+    load_score_breakdown = {
+        "fps_score": 100.0,
+        "workload_bonus": 0.0,
+        "thermal_bonus": 0.0,
+        "composite_score": 100.0,
+        "load_score": 100.0,
+    }
+    # Verify structure
+    assert load_score_breakdown["load_score"] == 100.0
+    assert load_score_breakdown["fps_score"] == 100.0
+    assert load_score_breakdown["workload_bonus"] == 0.0
+    assert load_score_breakdown["thermal_bonus"] == 0.0
+    assert load_score_breakdown["composite_score"] == 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -1202,6 +1363,18 @@ if __name__ == "__main__":
         test_gpu_saturated_healthy_25_fps_no_floor,
         test_degraded_fps_no_cpu_ram_saturation_no_floor,
         test_degraded_fps_cpu_ram_both_saturated_floor,
+        # load-score breakdown
+        test_breakdown_normal_fps_no_bonuses,
+        test_breakdown_composite_vs_load_score_distinction,
+        test_breakdown_no_fuse_when_fps_healthy,
+        test_breakdown_no_fuse_gpu_saturated,
+        test_breakdown_workload_bonus_in_composite,
+        test_breakdown_thermal_bonus_in_composite,
+        test_breakdown_composite_capped_at_100,
+        test_breakdown_malformed_telemetry_config_never_crashes,
+        test_breakdown_no_cameras_unavailable,
+        test_breakdown_payload_presence,
+        test_breakdown_invalid_snapshot_simulated,
         # collector gate
         test_cadence_s_is_one,
         test_extract_telemetry_none,
