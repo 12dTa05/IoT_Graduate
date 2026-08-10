@@ -96,61 +96,194 @@ class _TRTEngine:
         self._host_outputs: list = []
         self._dev_inputs:   list = []
         self._dev_outputs:  list = []
+        self._input_shapes: list = []
         self._output_shapes: list = []
 
         if self._use_trt10_api:
-            n_io = int(self._engine.num_io_tensors)
-            for i in range(n_io):
-                name  = self._engine.get_tensor_name(i)
-                shape = tuple(self._engine.get_tensor_shape(name))
-                if any(dim < 0 for dim in shape):
-                    raise RuntimeError(
-                        f"Dynamic TensorRT shape for {name} is not supported by "
-                        "the lightweight offload receiver"
-                    )
-                dtype    = trt.nptype(self._engine.get_tensor_dtype(name))
-                host_mem = cuda.pagelocked_empty(int(np.prod(shape)), dtype)
-                dev_mem  = cuda.mem_alloc(host_mem.nbytes)
-                self._bindings.append(int(dev_mem))
-                self._tensor_names.append(name)
-                self._context.set_tensor_address(name, int(dev_mem))
-                if self._engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
-                    self._host_inputs.append(host_mem)
-                    self._dev_inputs.append(dev_mem)
-                else:
-                    self._host_outputs.append(host_mem)
-                    self._dev_outputs.append(dev_mem)
-                    self._output_shapes.append(shape)
-            binding_count = n_io
+            self._allocate_trt10(trt, cuda)
         else:
-            binding_count = int(self._engine.num_bindings)
-            for i in range(binding_count):
-                shape    = tuple(self._engine.get_binding_shape(i))
-                if any(dim < 0 for dim in shape):
-                    raise RuntimeError(
-                        f"Dynamic TensorRT binding shape at index {i} is not "
-                        "supported by the lightweight offload receiver"
-                    )
-                dtype    = trt.nptype(self._engine.get_binding_dtype(i))
-                host_mem = cuda.pagelocked_empty(int(np.prod(shape)), dtype)
-                dev_mem  = cuda.mem_alloc(host_mem.nbytes)
-                self._bindings.append(int(dev_mem))
-                if self._engine.binding_is_input(i):
-                    self._host_inputs.append(host_mem)
-                    self._dev_inputs.append(dev_mem)
-                else:
-                    self._host_outputs.append(host_mem)
-                    self._dev_outputs.append(dev_mem)
-                    self._output_shapes.append(shape)
+            self._allocate_trt8(trt, cuda)
 
         if not self._host_inputs:
             raise RuntimeError(f"TensorRT engine has no input bindings/tensors: {engine_path}")
 
         self._stream = cuda.Stream()
-        logger.info("[TRTEngine] Loaded %s — %d I/O tensor(s)", engine_path, binding_count)
+        logger.info("[TRTEngine] Loaded %s — %d I/O tensor(s)", engine_path, len(self._bindings))
+
+    def _allocate_trt10(self, trt, cuda) -> None:
+        """TensorRT 10 name-based tensor API with dynamic profile 0 support."""
+        n_io = int(self._engine.num_io_tensors)
+        # First pass: collect tensor info and resolve dynamic INPUT shapes via profile 0
+        tensor_infos: list[dict] = []
+        for i in range(n_io):
+            name = self._engine.get_tensor_name(i)
+            tensor_infos.append({
+                "name":  name,
+                "shape": tuple(self._engine.get_tensor_shape(name)),
+                "dtype": trt.nptype(self._engine.get_tensor_dtype(name)),
+                "mode":  self._engine.get_tensor_mode(name),
+            })
+
+        # Resolve dynamic input shapes using profile 0 (opt shape)
+        for info in tensor_infos:
+            if info["mode"] != trt.TensorIOMode.INPUT:
+                continue
+            shape = info["shape"]
+            # Check if this input has dynamic dimensions
+            if any(dim < 0 for dim in shape):
+                name = info["name"]
+                min_shape, opt_shape, max_shape = self._engine.get_tensor_profile_shape(name, 0)
+                logger.info("[TRTEngine] Dynamic input '%s': min=%s opt=%s max=%s",
+                            name, min_shape, opt_shape, max_shape)
+                # Use opt shape (index 1)
+                if any(dim <= 0 for dim in opt_shape):
+                    raise RuntimeError(
+                        f"TensorRT profile 0 opt shape for input '{name}' contains "
+                        f"non-positive dimension(s): {opt_shape}"
+                    )
+                info["shape"] = tuple(opt_shape)
+                # Require the context to accept the concrete input shape.
+                if not self._context.set_input_shape(name, info["shape"]):
+                    raise RuntimeError(
+                        f"TensorRT set_input_shape failed for input '{name}' "
+                        f"with shape {info['shape']} (profile 0 opt)"
+                    )
+            # else: static input, shape already concrete
+
+        # After all input shapes are set, validate that the context considers
+        # all binding shapes specified (TRT 10+ provides all_binding_shapes_specified).
+        # Explicit False -> RuntimeError. Missing attribute -> compatible (skip check).
+        all_specified = getattr(self._context, "all_binding_shapes_specified", None)
+        if all_specified is False:
+            raise RuntimeError(
+                "TensorRT context reports all_binding_shapes_specified=False. "
+                "Not all required input shapes have been set."
+            )
+
+        # Second pass: now all input shapes are set, resolve output shapes from context
+        for info in tensor_infos:
+            name  = info["name"]
+            shape = info["shape"]
+            dtype = info["dtype"]
+            host_mem = None
+            dev_mem = None
+            if info["mode"] == trt.TensorIOMode.INPUT:
+                # Input shape already resolved above
+                host_mem = cuda.pagelocked_empty(int(np.prod(shape)), dtype)
+                dev_mem = cuda.mem_alloc(host_mem.nbytes)
+                self._host_inputs.append(host_mem)
+                self._dev_inputs.append(dev_mem)
+                self._input_shapes.append(shape)
+            else:
+                # Output: get concrete shape from context after input shapes are set
+                resolved_shape = tuple(self._context.get_tensor_shape(name))
+                if any(dim <= 0 for dim in resolved_shape):
+                    raise RuntimeError(
+                        f"TensorRT context resolved non-positive dimension for output "
+                        f"'{name}': {resolved_shape}. Ensure all dynamic inputs have "
+                        f"valid shapes set before allocation."
+                    )
+                shape = resolved_shape
+                host_mem = cuda.pagelocked_empty(int(np.prod(shape)), dtype)
+                dev_mem = cuda.mem_alloc(host_mem.nbytes)
+                self._host_outputs.append(host_mem)
+                self._dev_outputs.append(dev_mem)
+                self._output_shapes.append(shape)
+
+            self._bindings.append(int(dev_mem))
+            self._tensor_names.append(name)
+            self._context.set_tensor_address(name, int(dev_mem))
+
+    def _allocate_trt8(self, trt, cuda) -> None:
+        """TensorRT 8 binding-index API with dynamic profile 0 support."""
+        binding_count = int(self._engine.num_bindings)
+
+        # First pass: collect binding info
+        binding_infos: list[dict] = []
+        for i in range(binding_count):
+            binding_infos.append({
+                "index":   i,
+                "shape":   tuple(self._engine.get_binding_shape(i)),
+                "dtype":   trt.nptype(self._engine.get_binding_dtype(i)),
+                "is_input": self._engine.binding_is_input(i),
+            })
+
+        # Resolve dynamic input shapes using profile 0 (opt shape)
+        for info in binding_infos:
+            if not info["is_input"]:
+                continue
+            shape = info["shape"]
+            if any(dim < 0 for dim in shape):
+                i = info["index"]
+                min_shape, opt_shape, max_shape = self._engine.get_profile_shape(0, i)
+                logger.info("[TRTEngine] Dynamic binding %d: min=%s opt=%s max=%s",
+                            i, min_shape, opt_shape, max_shape)
+                if any(dim <= 0 for dim in opt_shape):
+                    raise RuntimeError(
+                        f"TensorRT profile 0 opt shape for binding {i} contains "
+                        f"non-positive dimension(s): {opt_shape}"
+                    )
+                info["shape"] = tuple(opt_shape)
+                # Require the context to accept the concrete input shape.
+                if not self._context.set_binding_shape(i, info["shape"]):
+                    raise RuntimeError(
+                        f"TensorRT set_binding_shape failed for binding {i} "
+                        f"with shape {info['shape']} (profile 0 opt)"
+                    )
+            # else: static input, shape already concrete
+
+        # After all input shapes are set, validate that the context considers
+        # all binding shapes specified (TRT 10+ provides all_binding_shapes_specified).
+        # Explicit False -> RuntimeError. Missing attribute -> compatible (skip check).
+        all_specified = getattr(self._context, "all_binding_shapes_specified", None)
+        if all_specified is False:
+            raise RuntimeError(
+                "TensorRT context reports all_binding_shapes_specified=False. "
+                "Not all required input shapes have been set."
+            )
+
+        # Second pass: allocate with resolved shapes
+        for info in binding_infos:
+            i         = info["index"]
+            shape     = info["shape"]
+            dtype     = info["dtype"]
+            host_mem = None
+            dev_mem  = None
+            if info["is_input"]:
+                # Input shape already resolved above
+                host_mem = cuda.pagelocked_empty(int(np.prod(shape)), dtype)
+                dev_mem = cuda.mem_alloc(host_mem.nbytes)
+                self._host_inputs.append(host_mem)
+                self._dev_inputs.append(dev_mem)
+                self._input_shapes.append(shape)
+            else:
+                # Output: get concrete shape from context
+                resolved_shape = tuple(self._context.get_binding_shape(i))
+                if any(dim <= 0 for dim in resolved_shape):
+                    raise RuntimeError(
+                        f"TensorRT context resolved non-positive dimension for output "
+                        f"binding {i}: {resolved_shape}. Ensure all dynamic inputs have "
+                        f"valid shapes set before allocation."
+                    )
+                shape = resolved_shape
+                host_mem = cuda.pagelocked_empty(int(np.prod(shape)), dtype)
+                dev_mem = cuda.mem_alloc(host_mem.nbytes)
+                self._host_outputs.append(host_mem)
+                self._dev_outputs.append(dev_mem)
+                self._output_shapes.append(shape)
+
+            self._bindings.append(int(dev_mem))
 
     def infer(self, input_array: np.ndarray) -> list:
         """Run one inference pass. Returns list of output ndarrays."""
+        expected_size = int(self._host_inputs[0].size)
+        actual_size = int(input_array.size)
+        if actual_size != expected_size:
+            raise ValueError(
+                f"Input array size {actual_size} does not match engine input 0 "
+                f"size {expected_size} (shape {self._input_shapes[0] if self._input_shapes else '?'}); "
+                f"preprocess crop to the engine's expected shape"
+            )
         np.copyto(self._host_inputs[0], input_array.ravel())
         self._cuda.memcpy_htod_async(self._dev_inputs[0], self._host_inputs[0], self._stream)
         if self._use_trt10_api:
