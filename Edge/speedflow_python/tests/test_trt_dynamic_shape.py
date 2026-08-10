@@ -5,10 +5,10 @@ Deterministic mock tests for _TRTEngine dynamic-shape contract in
 offload_receiver.py.
 
 Covers:
-- TRT10 dynamic success (profile 0 opt shape -> setter ok -> output resolved)
-- TRT8 dynamic success (profile 0 opt shape -> setter ok -> output resolved)
+- TRT10 dynamic success (profile 0 MIN shape -> setter ok -> output resolved)
+- TRT8 dynamic success (profile 0 MIN shape -> setter ok -> output resolved)
 - Setter failure (set_input_shape / set_binding_shape returns False)
-- Unresolved output / profile invalid (non-positive dims in opt or output)
+- Unresolved output / profile invalid (non-positive dims in min or output)
 - infer() input-size mismatch validation
 
 No tensorrt/pycuda required — _try_import_trt is patched with mocks.
@@ -84,8 +84,8 @@ def _make_mock_cuda():
     return cuda
 
 
-def _mock_engine_trt10(trt, dynamic_input=True, profile_opt=(1, 3, 48, 96),
-                       profile_opt_valid=True):
+def _mock_engine_trt10(trt, dynamic_input=True, profile_min=(1, 3, 24, 48),
+                       profile_min_valid=True):
     """TRT10-style mock engine: num_io_tensors, name-based tensor API."""
     engine = MagicMock()
     engine.num_io_tensors = 2
@@ -103,13 +103,14 @@ def _mock_engine_trt10(trt, dynamic_input=True, profile_opt=(1, 3, 48, 96),
         trt.TensorIOMode.INPUT if name == "input" else trt.TensorIOMode.OUTPUT
     )
 
-    if profile_opt_valid:
+    if profile_min_valid:
         engine.get_tensor_profile_shape = lambda name, p: (
-            (1, 3, 24, 48), profile_opt, (1, 3, 96, 192)
+            profile_min, (1, 3, 48, 96), (1, 3, 96, 192)
         )
     else:
+        # Non-positive dim in the MIN shape -> allocation must reject it.
         engine.get_tensor_profile_shape = lambda name, p: (
-            (1, 3, 24, 48), (1, 3, -1, 96), (1, 3, 96, 192)
+            (1, 3, -1, 96), (1, 3, 48, 96), (1, 3, 96, 192)
         )
     return engine
 
@@ -127,8 +128,8 @@ def _mock_context_trt10(setter_succeeds=True, resolved_output=(1, 68, 1),
     return ctx
 
 
-def _mock_engine_trt8(trt, dynamic_input=True, profile_opt=(1, 3, 48, 96),
-                      profile_opt_valid=True):
+def _mock_engine_trt8(trt, dynamic_input=True, profile_min=(1, 3, 24, 48),
+                      profile_min_valid=True):
     """TRT8-style mock engine: num_bindings, binding-index API.
     Using spec= so it must NOT expose num_io_tensors (MagicMock auto-creates
     attributes, which would falsely select the TRT10 path).
@@ -147,13 +148,14 @@ def _mock_engine_trt8(trt, dynamic_input=True, profile_opt=(1, 3, 48, 96),
     engine.get_binding_dtype = lambda i: MagicMock()
     engine.binding_is_input = lambda i: i == 0
 
-    if profile_opt_valid:
+    if profile_min_valid:
         engine.get_profile_shape = lambda p, i: (
-            (1, 3, 24, 48), profile_opt, (1, 3, 96, 192)
+            profile_min, (1, 3, 48, 96), (1, 3, 96, 192)
         )
     else:
+        # Non-positive dim in the MIN shape -> allocation must reject it.
         engine.get_profile_shape = lambda p, i: (
-            (1, 3, 24, 48), (1, 3, -1, 96), (1, 3, 96, 192)
+            (1, 3, -1, 96), (1, 3, 48, 96), (1, 3, 96, 192)
         )
     return engine
 
@@ -196,7 +198,7 @@ def _build(trt, cuda, engine, context):
 # ---------------------------------------------------------------------------
 
 def test_trt10_dynamic_success():
-    """TRT10: dynamic input -> profile 0 opt -> setter ok -> output resolved."""
+    """TRT10: dynamic input -> profile 0 min -> setter ok -> output resolved."""
     trt, cuda = _make_mock_trt(), _make_mock_cuda()
     engine = _mock_engine_trt10(trt, dynamic_input=True)
     context = _mock_context_trt10(setter_succeeds=True)
@@ -204,15 +206,15 @@ def test_trt10_dynamic_success():
     with _build(trt, cuda, engine, context):
         eng = _TRTEngine("/fake/path.engine")
 
-    assert eng._input_shapes == [(1, 3, 48, 96)]          # resolved from opt
+    assert eng._input_shapes == [(1, 3, 24, 48)]          # resolved from min
     assert eng._output_shapes == [(1, 68, 1)]             # resolved from context
-    context.set_input_shape.assert_called_once_with("input", (1, 3, 48, 96))
+    context.set_input_shape.assert_called_once_with("input", (1, 3, 24, 48))
     assert eng._use_trt10_api is True
     print("  PASS  test_trt10_dynamic_success")
 
 
 def test_trt8_dynamic_success():
-    """TRT8: dynamic input -> profile 0 opt -> setter ok -> output resolved."""
+    """TRT8: dynamic input -> profile 0 min -> setter ok -> output resolved."""
     trt, cuda = _make_mock_trt(), _make_mock_cuda()
     engine = _mock_engine_trt8(trt, dynamic_input=True)
     context = _mock_context_trt8(setter_succeeds=True)
@@ -220,9 +222,9 @@ def test_trt8_dynamic_success():
     with _build(trt, cuda, engine, context):
         eng = _TRTEngine("/fake/path.engine")
 
-    assert eng._input_shapes == [(1, 3, 48, 96)]
+    assert eng._input_shapes == [(1, 3, 24, 48)]
     assert eng._output_shapes == [(1, 68, 1)]
-    context.set_binding_shape.assert_called_once_with(0, (1, 3, 48, 96))
+    context.set_binding_shape.assert_called_once_with(0, (1, 3, 24, 48))
     assert eng._use_trt10_api is False
     print("  PASS  test_trt8_dynamic_success")
 
@@ -259,10 +261,10 @@ def test_trt8_setter_failure():
     print("  PASS  test_trt8_setter_failure")
 
 
-def test_trt10_profile_opt_invalid_nonpositive():
-    """TRT10: profile 0 opt shape has a non-positive dim -> RuntimeError."""
+def test_trt10_profile_min_invalid_nonpositive():
+    """TRT10: profile 0 min shape has a non-positive dim -> RuntimeError."""
     trt, cuda = _make_mock_trt(), _make_mock_cuda()
-    engine = _mock_engine_trt10(trt, dynamic_input=True, profile_opt_valid=False)
+    engine = _mock_engine_trt10(trt, dynamic_input=True, profile_min_valid=False)
     context = _mock_context_trt10(setter_succeeds=True)
 
     with _build(trt, cuda, engine, context):
@@ -271,14 +273,14 @@ def test_trt10_profile_opt_invalid_nonpositive():
             assert False, "Expected RuntimeError"
         except RuntimeError as e:
             assert "non-positive dimension" in str(e)
-            assert "opt shape" in str(e)
-    print("  PASS  test_trt10_profile_opt_invalid_nonpositive")
+            assert "min shape" in str(e)
+    print("  PASS  test_trt10_profile_min_invalid_nonpositive")
 
 
-def test_trt8_profile_opt_invalid_nonpositive():
-    """TRT8: profile 0 opt shape has a non-positive dim -> RuntimeError."""
+def test_trt8_profile_min_invalid_nonpositive():
+    """TRT8: profile 0 min shape has a non-positive dim -> RuntimeError."""
     trt, cuda = _make_mock_trt(), _make_mock_cuda()
-    engine = _mock_engine_trt8(trt, dynamic_input=True, profile_opt_valid=False)
+    engine = _mock_engine_trt8(trt, dynamic_input=True, profile_min_valid=False)
     context = _mock_context_trt8(setter_succeeds=True)
 
     with _build(trt, cuda, engine, context):
@@ -287,8 +289,8 @@ def test_trt8_profile_opt_invalid_nonpositive():
             assert False, "Expected RuntimeError"
         except RuntimeError as e:
             assert "non-positive dimension" in str(e)
-            assert "opt shape" in str(e)
-    print("  PASS  test_trt8_profile_opt_invalid_nonpositive")
+            assert "min shape" in str(e)
+    print("  PASS  test_trt8_profile_min_invalid_nonpositive")
 
 
 def test_trt10_unresolved_output_nonpositive():
@@ -364,7 +366,7 @@ def test_trt10_all_binding_shapes_specified_missing_attr():
     with _build(trt, cuda, engine, context):
         eng = _TRTEngine("/fake/path.engine")
 
-    assert eng._input_shapes == [(1, 3, 48, 96)]
+    assert eng._input_shapes == [(1, 3, 24, 48)]
     assert eng._output_shapes == [(1, 68, 1)]
     print("  PASS  test_trt10_all_binding_shapes_specified_missing_attr")
 
@@ -380,7 +382,7 @@ def test_trt8_all_binding_shapes_specified_missing_attr():
     with _build(trt, cuda, engine, context):
         eng = _TRTEngine("/fake/path.engine")
 
-    assert eng._input_shapes == [(1, 3, 48, 96)]
+    assert eng._input_shapes == [(1, 3, 24, 48)]
     assert eng._output_shapes == [(1, 68, 1)]
     print("  PASS  test_trt8_all_binding_shapes_specified_missing_attr")
 
@@ -394,14 +396,14 @@ def test_infer_input_size_mismatch():
     with _build(trt, cuda, engine, context):
         eng = _TRTEngine("/fake/path.engine")
 
-    # Engine expects 1*3*48*96 = 13824 elements; give it 1*3*64*64 = 12288.
+    # Engine expects 1*3*24*48 = 3456 elements; give it 1*3*64*64 = 12288.
     wrong = np.zeros((1, 3, 64, 64), dtype=np.float32)
     try:
         eng.infer(wrong)
         assert False, "Expected ValueError"
     except ValueError as e:
         assert "does not match engine input 0 size" in str(e)
-        assert "13824" in str(e)
+        assert "3456" in str(e)
     print("  PASS  test_infer_input_size_mismatch")
 
 
@@ -414,7 +416,7 @@ def test_infer_input_size_match():
     with _build(trt, cuda, engine, context):
         eng = _TRTEngine("/fake/path.engine")
 
-    right = np.zeros((1, 3, 48, 96), dtype=np.float32)  # exactly 13824
+    right = np.zeros((1, 3, 24, 48), dtype=np.float32)  # exactly 3456
     outputs = eng.infer(right)
     assert len(outputs) == 1
     assert outputs[0].shape == (1, 68, 1)
@@ -446,8 +448,8 @@ if __name__ == "__main__":
         test_trt8_dynamic_success,
         test_trt10_setter_failure,
         test_trt8_setter_failure,
-        test_trt10_profile_opt_invalid_nonpositive,
-        test_trt8_profile_opt_invalid_nonpositive,
+        test_trt10_profile_min_invalid_nonpositive,
+        test_trt8_profile_min_invalid_nonpositive,
         test_trt10_unresolved_output_nonpositive,
         test_trt8_unresolved_output_nonpositive,
         test_trt10_all_binding_shapes_specified_false,

@@ -241,6 +241,11 @@ class SpeedProbe:
         # Lifetime counter of results successfully enqueued from the receiver
         # (sender-probe side of the offload E2E loop). Thread-safe (int).
         self._results_received: int = 0
+        # Lifetime counter of results rejected at inject time because the
+        # receiver explicitly flagged an inference failure (inference_ok=False).
+        # Thread-safe (int). Surfaced in _snapshot_offload_crops as
+        # "results_rejected".
+        self._results_rejected: int = 0
 
         # ── Producer-gate counters for L2/L3 crop offload ──────────────────
         # Lifetime, cumulative, lock-protected. Incremented on the
@@ -379,13 +384,47 @@ class SpeedProbe:
         """
         Thread-safe entry point for OffloadReceiver to push decoded plate text
         back into this probe.  Called from the offload receiver worker thread.
-        result: {stid, camera_id, frame_no, plate_text, confidence, ts}
+        result: {stid, camera_id, frame_no, plate_text, confidence, ts,
+                 inference_ok?}
+
+        Result contract (receiver → sender):
+          • inference_ok present and False → inference failure; the result is
+            rejected (not queued, not injected into the OSD overlay) and the
+            rejection counter is incremented.
+          • inference_ok missing (legacy payloads) or True → valid observation,
+            accepted even when plate_text is empty / confidence is 0.  An empty
+            plate_text is a legitimate "plate not readable" outcome and still
+            locks the track so it is not re-offloaded.
         """
+        # Strict identity check: only explicit boolean False is rejected.
+        # Legacy payloads lacking the key get default True → accepted.
+        if result.get("inference_ok", True) is False:
+            self._results_rejected += 1
+            return
         try:
             self._offload_result_q.put_nowait(result)
             self._results_received += 1
         except queue.Full:
             pass   # discard stale result — next frame will get a fresher one
+
+    def _drain_offload_results(self) -> None:
+        """
+        Drain receiver results queued by inject_offload_result into the OSD
+        plate-lock table.  Only valid observations (not flagged as inference
+        failures) reach this queue — rejection happens at inject time.
+
+        An empty plate_text is a valid observation (plate not readable) and
+        still locks the track via plate_locked so it is not re-offloaded.
+        Results with no stid are silently dropped (no track to associate).
+        """
+        while True:
+            try:
+                res    = self._offload_result_q.get_nowait()
+                stid_r = tuple(res.get("stid", []))
+                if stid_r:
+                    self.plate_locked[stid_r] = res.get("plate_text", "")
+            except queue.Empty:
+                break
 
     def _gate_inc(self, name: str, n: int = 1) -> None:
         """
@@ -502,6 +541,7 @@ class SpeedProbe:
             "offload_queue_dropped_count",
             "offload_errors_count",
             "offload_results_sent_count",
+            "offload_inference_errors_count",
         ):
             offload_crops[name] = _cnt(self._offload_rcv, name)
 
@@ -518,6 +558,9 @@ class SpeedProbe:
         # Sender-probe side: results successfully enqueued by OffloadReceiver
         # into the OSD result queue.
         offload_crops["results_received"] = self._results_received
+        # Results rejected at inject time because the receiver flagged an
+        # inference failure (inference_ok=False).
+        offload_crops["results_rejected"] = self._results_rejected
 
         # Producer-gate counters (L2/L3 crop offload) — cumulative lifetime
         # counters incremented on the GStreamer thread. Read via a lock-held
@@ -970,15 +1013,8 @@ class SpeedProbe:
 
         # ── Drain offload results from peer receiver ───────────────────────
         # Must happen before the frame loop so results land in OSD this frame.
-        while True:
-            try:
-                res    = self._offload_result_q.get_nowait()
-                stid_r = tuple(res.get("stid", []))
-                text_r = res.get("plate_text", "")
-                if stid_r and text_r:
-                    self.plate_locked[stid_r] = text_r
-            except queue.Empty:
-                break
+        # Rejection of inference-failure results happened at inject time.
+        self._drain_offload_results()
 
         while l_frame:
             frame_meta   = pyds.NvDsFrameMeta.cast(l_frame.data)

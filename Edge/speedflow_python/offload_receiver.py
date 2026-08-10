@@ -12,7 +12,16 @@ Subscribes to:
 
 Results are published back to the sender:
   offload/results/{my_node_id}/{sender_node_id}
-    payload: {stid, camera_id, frame_no, plate_text, confidence, ts}
+    payload: {stid, camera_id, frame_no, plate_text, confidence,
+              inference_ok, ts}
+
+inference_ok is True for every published payload: only successful inference
+runs publish.  An inference failure — engine unavailable (not loaded) or an
+inference exception (LPR or LPD) — suppresses the result entirely and
+increments the offload_inference_errors counter, with a concise reason carried
+to the rate-limited WARNING log.  A valid empty observation (LPD found no
+plate bbox, or LPR decoded no text) is *not* an error — it still publishes
+with inference_ok=True and an empty plate_text.
 
 The inference engines are loaded lazily on the first request (avoids startup
 cost when offload is not active).  Both engines are loaded in a dedicated
@@ -47,6 +56,34 @@ logger = logging.getLogger(__name__)
 # _decode_lpr_output._labels, leaving a corrupt list.
 _lpr_labels_cache: dict = {}          # labels_path → List[str]
 _lpr_labels_lock  = threading.Lock()
+
+# Rate limit for inference-exception warning logs: at most one warning per
+# this many seconds.  A crashed TRT engine can fail on every crop, so without
+# a limit the log would drown in repetitive stack traces.
+_inference_error_log_interval = 5.0
+
+
+class _InferenceFailure:
+    """Internal outcome distinguishing inference *failure* from a valid empty
+    observation.  Returned by _run_lpr/_run_lpd when the engine is unavailable
+    (not loaded) or raises.  Carries a concise, safe reason for the
+    rate-limited WARNING log.  A None (LPD) or ("", 0.0) (LPR) return remains a
+    *valid* empty result that still publishes."""
+
+    __slots__ = ("reason",)
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+
+def _safe_infer_reason(exc: BaseException, limit: int = 120) -> str:
+    """One-line exception summary for logs: type + message, truncated.
+    Never includes a traceback — no stack spam when a crashed engine fails
+    on every crop."""
+    text = f"{type(exc).__name__}: {exc}".strip()
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
+    return text
 
 # ---------------------------------------------------------------------------
 # TensorRT engine loader (lazy, cached)
@@ -124,7 +161,7 @@ class _TRTEngine:
                 "mode":  self._engine.get_tensor_mode(name),
             })
 
-        # Resolve dynamic input shapes using profile 0 (opt shape)
+        # Resolve dynamic input shapes using profile 0 (MIN shape for batch-1 crops)
         for info in tensor_infos:
             if info["mode"] != trt.TensorIOMode.INPUT:
                 continue
@@ -135,18 +172,18 @@ class _TRTEngine:
                 min_shape, opt_shape, max_shape = self._engine.get_tensor_profile_shape(name, 0)
                 logger.info("[TRTEngine] Dynamic input '%s': min=%s opt=%s max=%s",
                             name, min_shape, opt_shape, max_shape)
-                # Use opt shape (index 1)
-                if any(dim <= 0 for dim in opt_shape):
+                # Use MIN shape (index 0) for batch=1 crop preprocessing
+                if any(dim <= 0 for dim in min_shape):
                     raise RuntimeError(
-                        f"TensorRT profile 0 opt shape for input '{name}' contains "
-                        f"non-positive dimension(s): {opt_shape}"
+                        f"TensorRT profile 0 min shape for input '{name}' contains "
+                        f"non-positive dimension(s): {min_shape}"
                     )
-                info["shape"] = tuple(opt_shape)
+                info["shape"] = tuple(min_shape)
                 # Require the context to accept the concrete input shape.
                 if not self._context.set_input_shape(name, info["shape"]):
                     raise RuntimeError(
                         f"TensorRT set_input_shape failed for input '{name}' "
-                        f"with shape {info['shape']} (profile 0 opt)"
+                        f"with shape {info['shape']} (profile 0 min)"
                     )
             # else: static input, shape already concrete
 
@@ -208,7 +245,7 @@ class _TRTEngine:
                 "is_input": self._engine.binding_is_input(i),
             })
 
-        # Resolve dynamic input shapes using profile 0 (opt shape)
+        # Resolve dynamic input shapes using profile 0 (MIN shape for batch=1 crops)
         for info in binding_infos:
             if not info["is_input"]:
                 continue
@@ -218,17 +255,18 @@ class _TRTEngine:
                 min_shape, opt_shape, max_shape = self._engine.get_profile_shape(0, i)
                 logger.info("[TRTEngine] Dynamic binding %d: min=%s opt=%s max=%s",
                             i, min_shape, opt_shape, max_shape)
-                if any(dim <= 0 for dim in opt_shape):
+                # Use MIN shape (index 0) for batch=1 crop preprocessing
+                if any(dim <= 0 for dim in min_shape):
                     raise RuntimeError(
-                        f"TensorRT profile 0 opt shape for binding {i} contains "
-                        f"non-positive dimension(s): {opt_shape}"
+                        f"TensorRT profile 0 min shape for binding {i} contains "
+                        f"non-positive dimension(s): {min_shape}"
                     )
-                info["shape"] = tuple(opt_shape)
+                info["shape"] = tuple(min_shape)
                 # Require the context to accept the concrete input shape.
                 if not self._context.set_binding_shape(i, info["shape"]):
                     raise RuntimeError(
                         f"TensorRT set_binding_shape failed for binding {i} "
-                        f"with shape {info['shape']} (profile 0 opt)"
+                        f"with shape {info['shape']} (profile 0 min)"
                     )
             # else: static input, shape already concrete
 
@@ -472,6 +510,13 @@ class OffloadReceiver:
         self._errors         = 0
         self._results_sent   = 0
 
+        # Cumulative inference-execution errors (distinct from worker-loop
+        # errors above).  Incremented only when an inference run itself raises
+        # inside _run_lpr/_run_lpd — NOT for valid empty results such as
+        # "no plate decoded".  Rate-limited warning logging.
+        self._inference_errors = 0
+        self._last_inference_error_log = float("-inf")
+
         # Result subscription used when this node sends crops to a peer.
         self._result_handler: Optional[Any] = None
         self._result_sub_declared = False
@@ -500,6 +545,13 @@ class OffloadReceiver:
     def offload_results_sent_count(self) -> int:
         """Results published back to senders. Thread-safe (int)."""
         return self._results_sent
+
+    @property
+    def offload_inference_errors_count(self) -> int:
+        """Cumulative inference-execution errors (distinct from worker-loop
+        errors).  Incremented only when inference itself raises, not for
+        valid empty results. Thread-safe (int)."""
+        return self._inference_errors
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -652,20 +704,33 @@ class OffloadReceiver:
 
         plate_text = ""
         confidence = 0.0
+        inference_ok = True
 
         if crop_type == "plate":
-            plate_text, confidence = self._run_lpr(crop_bgr)
+            result = self._run_lpr(crop_bgr)
+            if isinstance(result, _InferenceFailure):
+                self._record_inference_error("LPR", result.reason)
+                return
+            plate_text, confidence = result
 
         elif crop_type == "vehicle":
             # Level 2: LPD first, then LPR on the plate sub-crop
             plate_bbox = self._run_lpd(crop_bgr)
+            if isinstance(plate_bbox, _InferenceFailure):
+                self._record_inference_error("LPD", plate_bbox.reason)
+                return
             if plate_bbox is not None:
                 px, py, pw, ph = plate_bbox
                 plate_crop = crop_bgr[py:py+ph, px:px+pw]
                 if plate_crop.size > 0:
-                    plate_text, confidence = self._run_lpr(plate_crop)
+                    lpr_result = self._run_lpr(plate_crop)
+                    if isinstance(lpr_result, _InferenceFailure):
+                        self._record_inference_error("LPR", lpr_result.reason)
+                        return
+                    plate_text, confidence = lpr_result
+            # else: no plate bbox — valid empty observation, still publish.
 
-        # Publish result back to sender
+        # Publish result back to sender (only reached on successful inference)
         self._publish_result(
             dst_node  = src_node,
             camera_id = camera_id,
@@ -673,34 +738,52 @@ class OffloadReceiver:
             frame_no  = frame_no,
             plate_text= plate_text,
             confidence= confidence,
+            inference_ok = inference_ok,
         )
 
-    def _run_lpr(self, plate_bgr: np.ndarray) -> Tuple[str, float]:
+    def _record_inference_error(self, stage: str, reason: str) -> None:
+        """
+        Count an inference failure (engine unavailable or exception) and log it
+        at WARNING rate-limited to one message per
+        _inference_error_log_interval seconds.  Never debug-only, never silent.
+        The reason is a concise one-liner already produced by
+        _safe_infer_reason or a static "engine not loaded" string — never a
+        traceback.
+        """
+        self._inference_errors += 1
+        now = time.monotonic()
+        if now - self._last_inference_error_log >= _inference_error_log_interval:
+            self._last_inference_error_log = now
+            logger.warning(
+                "[OffloadReceiver] %s inference error #%d: %s; result suppressed",
+                stage, self._inference_errors, reason,
+            )
+
+    def _run_lpr(self, plate_bgr: np.ndarray) -> Any:
         if self._lpr_engine is None:
-            return "", 0.0
+            return _InferenceFailure("LPR engine not loaded")
         inp = _preprocess_lpr(plate_bgr)
         try:
             outputs = self._lpr_engine.infer(inp)
             return _decode_lpr_output(outputs, self._labels_path)
         except Exception as exc:
-            logger.debug("[OffloadReceiver] LPR infer error: %s", exc)
-            return "", 0.0
+            return _InferenceFailure(_safe_infer_reason(exc))
 
-    def _run_lpd(self, vehicle_bgr: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    def _run_lpd(self, vehicle_bgr: np.ndarray) -> Any:
         if self._lpd_engine is None:
-            return None
+            return _InferenceFailure("LPD engine not loaded")
         h, w = vehicle_bgr.shape[:2]
         inp  = _preprocess_lpd(vehicle_bgr)
         try:
             outputs = self._lpd_engine.infer(inp)
             return _decode_lpd_output(outputs, w, h)
         except Exception as exc:
-            logger.debug("[OffloadReceiver] LPD infer error: %s", exc)
-            return None
+            return _InferenceFailure(_safe_infer_reason(exc))
 
     def _publish_result(
         self, dst_node: str, camera_id: str, stid: tuple,
         frame_no: int, plate_text: str, confidence: float,
+        inference_ok: bool = True,
     ) -> None:
         key = f"offload/results/{self._node_id}/{dst_node}"
         pub = self._result_pubs.get(key)
@@ -709,14 +792,15 @@ class OffloadReceiver:
             self._result_pubs[key] = pub
 
         payload = {
-            "src":        self._node_id,
-            "dst":        dst_node,
-            "camera_id":  camera_id,
-            "stid":       list(stid),
-            "frame_no":   frame_no,
-            "plate_text": plate_text,
-            "confidence": float(confidence),
-            "ts":         time.time(),
+            "src":         self._node_id,
+            "dst":         dst_node,
+            "camera_id":   camera_id,
+            "stid":        list(stid),
+            "frame_no":    frame_no,
+            "plate_text":  plate_text,
+            "confidence":  float(confidence),
+            "inference_ok": bool(inference_ok),
+            "ts":          time.time(),
         }
         pub.put(msgpack.packb(payload, use_bin_type=True))
         self._results_sent += 1

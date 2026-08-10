@@ -488,12 +488,541 @@ def test_receiver_all_counter_accessors_exist():
     assert hasattr(rcv, "offload_queue_dropped_count")
     assert hasattr(rcv, "offload_errors_count")
     assert hasattr(rcv, "offload_results_sent_count")
+    assert hasattr(rcv, "offload_inference_errors_count")
 
     # backward compat
     assert hasattr(rcv, "offload_processed_count")
 
     rcv.stop()
     print("  PASS  test_receiver_all_counter_accessors_exist")
+
+
+# ======================================================================
+# Inference outcome tests (contract: inference exception ≠ valid empty)
+# ======================================================================
+
+def _make_failing_lpr_engine():
+    """Mock LPR engine that always raises on infer()."""
+    class _FailEngine:
+        def infer(self, inp):
+            raise RuntimeError("simulated LPR engine crash")
+    return _FailEngine()
+
+
+def _enable_jpeg_decode():
+    """Patch cv2.imdecode stub to return a real crop so inference runs."""
+    import cv2
+    cv2.imdecode = lambda arr, flag: np.zeros((120, 160, 3), dtype=np.uint8)
+
+
+def _make_failing_lpd_engine():
+    """Mock LPD engine that always raises on infer()."""
+    class _FailEngine:
+        def infer(self, inp):
+            raise RuntimeError("simulated LPD engine crash")
+    return _FailEngine()
+
+
+def _make_successful_lpr_engine(plate_text="ABC123", confidence=0.95):
+    """Mock LPR engine that returns a successful decode."""
+    class _OkEngine:
+        def infer(self, inp):
+            # outputs format expected by _decode_lpr_output
+            return [
+                np.array([1, 2, 3], dtype=np.int32),  # argmax seq
+                np.array([0.9, 0.9, 0.9], dtype=np.float32),  # max probs
+            ]
+    return _OkEngine()
+
+
+def _make_successful_lpd_engine(has_plate=True):
+    """Mock LPD engine that returns a plate bbox or None."""
+    class _OkEngine:
+        def infer(self, inp):
+            if has_plate:
+                # [x1, y1, x2, y2, conf, class]
+                return [np.array([[0.1, 0.1, 0.5, 0.5, 0.9, 0]], dtype=np.float32)]
+            else:
+                return [np.array([[0.1, 0.1, 0.5, 0.5, 0.1, 0]], dtype=np.float32)]  # below thresh
+    return _OkEngine()
+
+
+def test_receiver_lpr_inference_failure_suppresses_publish():
+    """LPR infer exception → no publish, inference_errors counter increments."""
+    rcv_mod = _load("offload_receiver", "speedflow_python/offload_receiver.py")
+    _enable_jpeg_decode()
+    session = _FakeSession()
+
+    rcv = rcv_mod.OffloadReceiver(
+        node_id="edge-02",
+        session=session,
+        lpr_engine_path="/nonexistent/lpr.engine",
+        lpd_engine_path="/nonexistent/lpd.engine",
+        labels_path="/nonexistent/labels.txt",
+    )
+    rcv.start()
+
+    # Prevent _load_engines_once from overwriting our mock
+    rcv._engines_loaded = True
+
+    # Replace LPR engine with a failing one
+    rcv._lpr_engine = _make_failing_lpr_engine()
+
+    # Send a plate sample
+    payload = {
+        "type": "plate", "src": "edge-01", "dst": "edge-02",
+        "camera_id": "cam_01", "stid": [0, 42], "frame_no": 1,
+        "jpeg": b"fake", "confidence": 0.9, "ts": 1234567890.0
+    }
+    rcv._on_plate_sample(_FakeSample(payload))
+
+    # Wait for worker to process
+    import time
+    for _ in range(50):
+        time.sleep(0.02)
+        if rcv.offload_processed_count >= 1:
+            break
+
+    # Assert: received=1, processed=1, results_sent=0, inference_errors=1
+    assert rcv.offload_received_count == 1
+    assert rcv.offload_processed_count == 1
+    assert rcv.offload_results_sent_count == 0
+    assert rcv.offload_inference_errors_count == 1
+
+    rcv.stop()
+    print("  PASS  test_receiver_lpr_inference_failure_suppresses_publish")
+
+
+def test_receiver_lpd_inference_failure_suppresses_publish():
+    """LPD infer exception → no publish, inference_errors counter increments."""
+    rcv_mod = _load("offload_receiver", "speedflow_python/offload_receiver.py")
+    _enable_jpeg_decode()
+    session = _FakeSession()
+
+    rcv = rcv_mod.OffloadReceiver(
+        node_id="edge-02",
+        session=session,
+        lpr_engine_path="/nonexistent/lpr.engine",
+        lpd_engine_path="/nonexistent/lpd.engine",
+        labels_path="/nonexistent/labels.txt",
+    )
+    rcv.start()
+
+    # Prevent _load_engines_once from overwriting our mock
+    rcv._engines_loaded = True
+
+    # Replace LPD engine with a failing one
+    rcv._lpd_engine = _make_failing_lpd_engine()
+
+    # Send a vehicle sample
+    payload = {
+        "type": "vehicle", "src": "edge-01", "dst": "edge-02",
+        "camera_id": "cam_01", "stid": [0, 43], "frame_no": 2,
+        "jpeg": b"fake", "confidence": 0.9, "ts": 1234567891.0
+    }
+    rcv._on_vehicle_sample(_FakeSample(payload))
+
+    # Wait for worker to process
+    import time
+    for _ in range(50):
+        time.sleep(0.02)
+        if rcv.offload_processed_count >= 1:
+            break
+
+    # Assert: received=1, processed=1, results_sent=0, inference_errors=1
+    assert rcv.offload_received_count == 1
+    assert rcv.offload_processed_count == 1
+    assert rcv.offload_results_sent_count == 0
+    assert rcv.offload_inference_errors_count == 1
+
+    rcv.stop()
+    print("  PASS  test_receiver_lpd_inference_failure_suppresses_publish")
+
+
+def test_receiver_lpd_no_bbox_valid_empty_publishes():
+    """LPD succeeds but finds no plate bbox → valid empty publish, inference_ok=True."""
+    rcv_mod = _load("offload_receiver", "speedflow_python/offload_receiver.py")
+    _enable_jpeg_decode()
+    session = _FakeSession()
+
+    rcv = rcv_mod.OffloadReceiver(
+        node_id="edge-02",
+        session=session,
+        lpr_engine_path="/nonexistent/lpr.engine",
+        lpd_engine_path="/nonexistent/lpd.engine",
+        labels_path="/nonexistent/labels.txt",
+    )
+    rcv.start()
+
+    # Prevent _load_engines_once from overwriting our mock
+    rcv._engines_loaded = True
+
+    # Replace LPD engine with one that returns no plate (low confidence)
+    rcv._lpd_engine = _make_successful_lpd_engine(has_plate=False)
+
+    # Send a vehicle sample
+    payload = {
+        "type": "vehicle", "src": "edge-01", "dst": "edge-02",
+        "camera_id": "cam_01", "stid": [0, 44], "frame_no": 3,
+        "jpeg": b"fake", "confidence": 0.9, "ts": 1234567892.0
+    }
+    rcv._on_vehicle_sample(_FakeSample(payload))
+
+    # Wait for worker to process
+    import time
+    for _ in range(50):
+        time.sleep(0.02)
+        if rcv.offload_processed_count >= 1:
+            break
+
+    # Assert: published with empty plate_text, inference_ok=True
+    assert rcv.offload_received_count == 1
+    assert rcv.offload_processed_count == 1
+    assert rcv.offload_results_sent_count == 1
+    assert rcv.offload_inference_errors_count == 0
+
+    # Check published payload
+    pub = session.pubs["offload/results/edge-02/edge-01"]
+    assert len(pub.put_calls) == 1
+    import msgpack
+    result = msgpack.unpackb(pub.put_calls[0], raw=False)
+    assert result["plate_text"] == ""
+    assert result["confidence"] == 0.0
+    assert result["inference_ok"] is True
+
+    rcv.stop()
+    print("  PASS  test_receiver_lpd_no_bbox_valid_empty_publishes")
+
+
+def test_receiver_lpr_empty_plate_text_valid_publishes():
+    """LPR succeeds but decodes empty string → valid empty publish, inference_ok=True."""
+    rcv_mod = _load("offload_receiver", "speedflow_python/offload_receiver.py")
+    _enable_jpeg_decode()
+    session = _FakeSession()
+
+    rcv = rcv_mod.OffloadReceiver(
+        node_id="edge-02",
+        session=session,
+        lpr_engine_path="/nonexistent/lpr.engine",
+        lpd_engine_path="/nonexistent/lpd.engine",
+        labels_path="/nonexistent/labels.txt",
+    )
+    rcv.start()
+
+    # Prevent _load_engines_once from overwriting our mock
+    rcv._engines_loaded = True
+
+    # Replace LPR engine with one that returns empty decode
+    class _EmptyLprEngine:
+        def infer(self, inp):
+            # Returns empty CTC decode
+            return [
+                np.array([], dtype=np.int32),
+                np.array([], dtype=np.float32),
+            ]
+    rcv._lpr_engine = _EmptyLprEngine()
+
+    # Send a plate sample
+    payload = {
+        "type": "plate", "src": "edge-01", "dst": "edge-02",
+        "camera_id": "cam_01", "stid": [0, 45], "frame_no": 4,
+        "jpeg": b"fake", "confidence": 0.9, "ts": 1234567893.0
+    }
+    rcv._on_plate_sample(_FakeSample(payload))
+
+    # Wait for worker to process
+    import time
+    for _ in range(50):
+        time.sleep(0.02)
+        if rcv.offload_processed_count >= 1:
+            break
+
+    # Assert: published with empty plate_text, inference_ok=True
+    assert rcv.offload_received_count == 1
+    assert rcv.offload_processed_count == 1
+    assert rcv.offload_results_sent_count == 1
+    assert rcv.offload_inference_errors_count == 0
+
+    pub = session.pubs["offload/results/edge-02/edge-01"]
+    assert len(pub.put_calls) == 1
+    import msgpack
+    result = msgpack.unpackb(pub.put_calls[0], raw=False)
+    assert result["plate_text"] == ""
+    assert result["confidence"] == 0.0
+    assert result["inference_ok"] is True
+
+    rcv.stop()
+    print("  PASS  test_receiver_lpr_empty_plate_text_valid_publishes")
+
+
+def test_receiver_inference_error_counter_accuracy():
+    """inference_errors increments exactly on infer exceptions (not valid empty)."""
+    rcv_mod = _load("offload_receiver", "speedflow_python/offload_receiver.py")
+    _enable_jpeg_decode()
+    session = _FakeSession()
+
+    rcv = rcv_mod.OffloadReceiver(
+        node_id="edge-02",
+        session=session,
+        lpr_engine_path="/nonexistent/lpr.engine",
+        lpd_engine_path="/nonexistent/lpd.engine",
+        labels_path="/nonexistent/labels.txt",
+    )
+    rcv.start()
+
+    # Prevent _load_engines_once from overwriting our mock
+    rcv._engines_loaded = True
+
+    # 1. LPR inference failure
+    rcv._lpr_engine = _make_failing_lpr_engine()
+    payload = {"type": "plate", "src": "edge-01", "dst": "edge-02",
+               "camera_id": "cam_01", "stid": [0, 1], "frame_no": 1,
+               "jpeg": b"fake", "confidence": 0.9, "ts": 1.0}
+    rcv._on_plate_sample(_FakeSample(payload))
+    import time
+    for _ in range(50):
+        time.sleep(0.02)
+        if rcv.offload_processed_count >= 1:
+            break
+    assert rcv.offload_inference_errors_count == 1
+    assert rcv.offload_results_sent_count == 0
+
+    # 2. LPD inference failure
+    rcv._lpd_engine = _make_failing_lpd_engine()
+    payload = {"type": "vehicle", "src": "edge-01", "dst": "edge-02",
+               "camera_id": "cam_01", "stid": [0, 2], "frame_no": 2,
+               "jpeg": b"fake", "confidence": 0.9, "ts": 2.0}
+    rcv._on_vehicle_sample(_FakeSample(payload))
+    for _ in range(50):
+        time.sleep(0.02)
+        if rcv.offload_processed_count >= 2:
+            break
+    assert rcv.offload_inference_errors_count == 2
+    assert rcv.offload_results_sent_count == 0
+
+    # 3. LPD no bbox (valid empty) - should NOT increment
+    rcv._lpd_engine = _make_successful_lpd_engine(has_plate=False)
+    payload = {"type": "vehicle", "src": "edge-01", "dst": "edge-02",
+               "camera_id": "cam_01", "stid": [0, 3], "frame_no": 3,
+               "jpeg": b"fake", "confidence": 0.9, "ts": 3.0}
+    rcv._on_vehicle_sample(_FakeSample(payload))
+    for _ in range(50):
+        time.sleep(0.02)
+        if rcv.offload_processed_count >= 3:
+            break
+    assert rcv.offload_inference_errors_count == 2  # unchanged
+    assert rcv.offload_results_sent_count == 1
+
+    # 4. LPR empty plate text (valid empty) - should NOT increment
+    rcv._lpr_engine = _make_successful_lpr_engine(plate_text="", confidence=0.0)
+    payload = {"type": "plate", "src": "edge-01", "dst": "edge-02",
+               "camera_id": "cam_01", "stid": [0, 4], "frame_no": 4,
+               "jpeg": b"fake", "confidence": 0.9, "ts": 4.0}
+    rcv._on_plate_sample(_FakeSample(payload))
+    for _ in range(50):
+        time.sleep(0.02)
+        if rcv.offload_processed_count >= 4:
+            break
+    assert rcv.offload_inference_errors_count == 2  # unchanged
+    assert rcv.offload_results_sent_count == 2
+
+    rcv.stop()
+    print("  PASS  test_receiver_inference_error_counter_accuracy")
+
+
+# ======================================================================
+# Engine unavailable tests (LPR/LPD None with engines marked loaded)
+# ======================================================================
+
+def test_receiver_lpr_engine_unavailable_suppresses_publish():
+    """LPR engine is None (not loaded) → no publish, inference_errors increments,
+    warning contains concise reason."""
+    rcv_mod = _load("offload_receiver", "speedflow_python/offload_receiver.py")
+    _enable_jpeg_decode()
+    session = _FakeSession()
+
+    rcv = rcv_mod.OffloadReceiver(
+        node_id="edge-02",
+        session=session,
+        lpr_engine_path="/nonexistent/lpr.engine",
+        lpd_engine_path="/nonexistent/lpd.engine",
+        labels_path="/nonexistent/labels.txt",
+    )
+    rcv.start()
+
+    # Mark engines as loaded, but keep LPR engine as None (unavailable)
+    rcv._engines_loaded = True
+    rcv._lpr_engine = None
+
+    # Send a plate sample
+    payload = {
+        "type": "plate", "src": "edge-01", "dst": "edge-02",
+        "camera_id": "cam_01", "stid": [0, 42], "frame_no": 1,
+        "jpeg": b"fake", "confidence": 0.9, "ts": 1234567890.0
+    }
+    rcv._on_plate_sample(_FakeSample(payload))
+
+    # Wait for worker to process
+    import time
+    for _ in range(50):
+        time.sleep(0.02)
+        if rcv.offload_processed_count >= 1:
+            break
+
+    # Assert: received=1, processed=1, results_sent=0, inference_errors=1
+    assert rcv.offload_received_count == 1
+    assert rcv.offload_processed_count == 1
+    assert rcv.offload_results_sent_count == 0
+    assert rcv.offload_inference_errors_count == 1
+
+    rcv.stop()
+    print("  PASS  test_receiver_lpr_engine_unavailable_suppresses_publish")
+
+
+def test_receiver_lpd_engine_unavailable_suppresses_publish():
+    """LPD engine is None (not loaded) → no publish, inference_errors increments,
+    warning contains concise reason."""
+    rcv_mod = _load("offload_receiver", "speedflow_python/offload_receiver.py")
+    _enable_jpeg_decode()
+    session = _FakeSession()
+
+    rcv = rcv_mod.OffloadReceiver(
+        node_id="edge-02",
+        session=session,
+        lpr_engine_path="/nonexistent/lpr.engine",
+        lpd_engine_path="/nonexistent/lpd.engine",
+        labels_path="/nonexistent/labels.txt",
+    )
+    rcv.start()
+
+    # Mark engines as loaded, but keep LPD engine as None (unavailable)
+    rcv._engines_loaded = True
+    rcv._lpd_engine = None
+
+    # Send a vehicle sample
+    payload = {
+        "type": "vehicle", "src": "edge-01", "dst": "edge-02",
+        "camera_id": "cam_01", "stid": [0, 43], "frame_no": 2,
+        "jpeg": b"fake", "confidence": 0.9, "ts": 1234567891.0
+    }
+    rcv._on_vehicle_sample(_FakeSample(payload))
+
+    # Wait for worker to process
+    import time
+    for _ in range(50):
+        time.sleep(0.02)
+        if rcv.offload_processed_count >= 1:
+            break
+
+    # Assert: received=1, processed=1, results_sent=0, inference_errors=1
+    assert rcv.offload_received_count == 1
+    assert rcv.offload_processed_count == 1
+    assert rcv.offload_results_sent_count == 0
+    assert rcv.offload_inference_errors_count == 1
+
+    rcv.stop()
+    print("  PASS  test_receiver_lpd_engine_unavailable_suppresses_publish")
+
+
+def test_receiver_inference_error_warning_rate_limited():
+    """WARNING log for inference errors is rate-limited (one per 5s).
+    Uses mocked time.monotonic and captured logger."""
+    rcv_mod = _load("offload_receiver", "speedflow_python/offload_receiver.py")
+    _enable_jpeg_decode()
+    session = _FakeSession()
+
+    rcv = rcv_mod.OffloadReceiver(
+        node_id="edge-02",
+        session=session,
+        lpr_engine_path="/nonexistent/lpr.engine",
+        lpd_engine_path="/nonexistent/lpd.engine",
+        labels_path="/nonexistent/labels.txt",
+    )
+    rcv.start()
+
+    # Prevent _load_engines_once from overwriting our mock
+    rcv._engines_loaded = True
+
+    # Mock time.monotonic to control rate limiting
+    import time
+    mock_time = [0.0]
+    orig_monotonic = time.monotonic
+    time.monotonic = lambda: mock_time[0]
+
+    # Capture warning logs
+    import logging
+    warn_msgs = []
+    recv_logger = logging.getLogger("speedflow_python.offload_receiver")
+    orig_warning = recv_logger.warning
+    try:
+        recv_logger.warning = lambda msg, *a, **kw: warn_msgs.append(
+            msg % a if a else msg
+        )
+
+        # 1. First failure at t=0 → should warn
+        rcv._lpr_engine = None
+        payload = {"type": "plate", "src": "edge-01", "dst": "edge-02",
+                   "camera_id": "cam_01", "stid": [0, 1], "frame_no": 1,
+                   "jpeg": b"fake", "confidence": 0.9, "ts": 1.0}
+        rcv._on_plate_sample(_FakeSample(payload))
+        for _ in range(50):
+            time.sleep(0.001)
+            if rcv.offload_processed_count >= 1:
+                break
+        assert rcv.offload_inference_errors_count == 1
+        assert len(warn_msgs) == 1
+        assert "LPR inference error #1" in warn_msgs[0]
+        assert "engine not loaded" in warn_msgs[0].lower()
+
+        # 2. Second failure at t=1 (within 5s interval) → NO warning
+        mock_time[0] = 1.0
+        payload = {"type": "plate", "src": "edge-01", "dst": "edge-02",
+                   "camera_id": "cam_01", "stid": [0, 2], "frame_no": 2,
+                   "jpeg": b"fake", "confidence": 0.9, "ts": 2.0}
+        rcv._on_plate_sample(_FakeSample(payload))
+        for _ in range(50):
+            time.sleep(0.001)
+            if rcv.offload_processed_count >= 2:
+                break
+        assert rcv.offload_inference_errors_count == 2
+        assert len(warn_msgs) == 1  # still only 1 warning
+
+        # 3. Third failure at t=6 (beyond 5s interval) → warning again
+        mock_time[0] = 6.0
+        payload = {"type": "plate", "src": "edge-01", "dst": "edge-02",
+                   "camera_id": "cam_01", "stid": [0, 3], "frame_no": 3,
+                   "jpeg": b"fake", "confidence": 0.9, "ts": 3.0}
+        rcv._on_plate_sample(_FakeSample(payload))
+        for _ in range(50):
+            time.sleep(0.001)
+            if rcv.offload_processed_count >= 3:
+                break
+        assert rcv.offload_inference_errors_count == 3
+        assert len(warn_msgs) == 2
+        assert "LPR inference error #3" in warn_msgs[1]
+
+        # 4. LPD engine unavailable with exception reason also produces concise warning
+        mock_time[0] = 12.0  # beyond interval again
+        rcv._lpd_engine = _make_failing_lpd_engine()
+        payload = {"type": "vehicle", "src": "edge-01", "dst": "edge-02",
+                   "camera_id": "cam_01", "stid": [0, 4], "frame_no": 4,
+                   "jpeg": b"fake", "confidence": 0.9, "ts": 4.0}
+        rcv._on_vehicle_sample(_FakeSample(payload))
+        for _ in range(50):
+            time.sleep(0.001)
+            if rcv.offload_processed_count >= 4:
+                break
+        assert rcv.offload_inference_errors_count == 4
+        assert len(warn_msgs) == 3
+        assert "LPD inference error #4" in warn_msgs[2]
+        assert "simulated lpd engine crash" in warn_msgs[2].lower()
+
+    finally:
+        time.monotonic = orig_monotonic
+        recv_logger.warning = orig_warning
+
+    rcv.stop()
+    print("  PASS  test_receiver_inference_error_warning_rate_limited")
 
 
 # ======================================================================
@@ -1085,6 +1614,14 @@ if __name__ == "__main__":
         test_receiver_queue_dropped_counter,
         test_receiver_results_sent_counter,
         test_receiver_all_counter_accessors_exist,
+        test_receiver_lpr_inference_failure_suppresses_publish,
+        test_receiver_lpd_inference_failure_suppresses_publish,
+        test_receiver_lpd_no_bbox_valid_empty_publishes,
+        test_receiver_lpr_empty_plate_text_valid_publishes,
+        test_receiver_inference_error_counter_accuracy,
+        test_receiver_lpr_engine_unavailable_suppresses_publish,
+        test_receiver_lpd_engine_unavailable_suppresses_publish,
+        test_receiver_inference_error_warning_rate_limited,
         test_probe_results_received_counter,
         test_writer_surfaces_all_counters,
         test_gate_counters_l2_active_no_objects,
