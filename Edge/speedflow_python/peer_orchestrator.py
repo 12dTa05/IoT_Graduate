@@ -672,7 +672,7 @@ class PeerOrchestrator:
         If peer has active cameras → trigger leaderless failover.
         """
         now = time.time()
-        timeout = self._cfg.get("heartbeat_timeout_s", 15.0)
+        timeout = self._cfg.get("heartbeat_timeout_s", 5.0)
 
         with self._lock:
             to_check = list(self._peers.items())
@@ -741,7 +741,7 @@ class PeerOrchestrator:
             return
 
         now = time.time()
-        timeout = self._cfg.get("heartbeat_timeout_s", 15.0)
+        timeout = self._cfg.get("heartbeat_timeout_s", 5.0)
         to_return: List[str] = []
 
         with self._lock:
@@ -1216,7 +1216,7 @@ class PeerOrchestrator:
         Returns None if no suitable peer is found.
         """
         now = time.time()
-        timeout = self._cfg.get("heartbeat_timeout_s", 15.0)
+        timeout = self._cfg.get("heartbeat_timeout_s", 5.0)
 
         # Thermal admission gate: reject peers with unsafe or ambiguous
         # temperatures before evaluating load score. Configurable via
@@ -1730,7 +1730,7 @@ class PeerOrchestrator:
         """
         cfg = self._cfg
         now = time.time()
-        timeout = cfg.get("heartbeat_timeout_s", 15.0)
+        timeout = cfg.get("heartbeat_timeout_s", 5.0)
 
         # Read dead peer's camera configs AND build alive_peers in a single lock
         # acquisition to prevent torn reads between the two operations.

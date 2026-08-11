@@ -7,7 +7,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger("edge_registry")
 
-HEARTBEAT_TIMEOUT = 15.0
+# Must match Edge/configs/edge_node.yml peer.heartbeat_timeout_s.
+HEARTBEAT_TIMEOUT = 5.0
 WATCHDOG_INTERVAL = 5.0
 
 

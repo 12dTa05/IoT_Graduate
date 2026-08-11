@@ -1,0 +1,120 @@
+# segment 1/60 (dense)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/dense/video_out_S.mp4'
+# segment 2/60 (surge_spike)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/surge_spike/video_out_S.mp4'
+# segment 3/60 (signal_cycle)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/signal_cycle/video_out_S.mp4'
+# segment 4/60 (empty)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/empty/video_out_S.mp4'
+# segment 5/60 (sparse)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/sparse/video_out_S.mp4'
+# segment 6/60 (moderate)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/moderate/video_out_S.mp4'
+# segment 7/60 (empty)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/empty/video_out_S.mp4'
+# segment 8/60 (signal_cycle)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/signal_cycle/video_out_S.mp4'
+# segment 9/60 (dense)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/dense/video_out_S.mp4'
+# segment 10/60 (sparse)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/sparse/video_out_S.mp4'
+# segment 11/60 (empty)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/empty/video_out_S.mp4'
+# segment 12/60 (surge_spike)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/surge_spike/video_out_S.mp4'
+# segment 13/60 (sparse)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/sparse/video_out_S.mp4'
+# segment 14/60 (signal_cycle)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/signal_cycle/video_out_S.mp4'
+# segment 15/60 (empty)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/empty/video_out_S.mp4'
+# segment 16/60 (surge_spike)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/surge_spike/video_out_S.mp4'
+# segment 17/60 (dense)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/dense/video_out_S.mp4'
+# segment 18/60 (moderate)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/moderate/video_out_S.mp4'
+# segment 19/60 (surge_spike)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/surge_spike/video_out_S.mp4'
+# segment 20/60 (signal_cycle)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/signal_cycle/video_out_S.mp4'
+# segment 21/60 (empty)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/empty/video_out_S.mp4'
+# segment 22/60 (surge_spike)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/surge_spike/video_out_S.mp4'
+# segment 23/60 (signal_cycle)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/signal_cycle/video_out_S.mp4'
+# segment 24/60 (dense)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/dense/video_out_S.mp4'
+# segment 25/60 (empty)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/empty/video_out_S.mp4'
+# segment 26/60 (signal_cycle)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/signal_cycle/video_out_S.mp4'
+# segment 27/60 (sparse)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/sparse/video_out_S.mp4'
+# segment 28/60 (empty)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/empty/video_out_S.mp4'
+# segment 29/60 (signal_cycle)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/signal_cycle/video_out_S.mp4'
+# segment 30/60 (surge_spike)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/surge_spike/video_out_S.mp4'
+# segment 31/60 (dense)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/dense/video_out_S.mp4'
+# segment 32/60 (moderate)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/moderate/video_out_S.mp4'
+# segment 33/60 (empty)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/empty/video_out_S.mp4'
+# segment 34/60 (signal_cycle)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/signal_cycle/video_out_S.mp4'
+# segment 35/60 (sparse)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/sparse/video_out_S.mp4'
+# segment 36/60 (moderate)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/moderate/video_out_S.mp4'
+# segment 37/60 (dense)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/dense/video_out_S.mp4'
+# segment 38/60 (empty)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/empty/video_out_S.mp4'
+# segment 39/60 (moderate)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/moderate/video_out_S.mp4'
+# segment 40/60 (signal_cycle)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/signal_cycle/video_out_S.mp4'
+# segment 41/60 (surge_spike)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/surge_spike/video_out_S.mp4'
+# segment 42/60 (sparse)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/sparse/video_out_S.mp4'
+# segment 43/60 (dense)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/dense/video_out_S.mp4'
+# segment 44/60 (moderate)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/moderate/video_out_S.mp4'
+# segment 45/60 (surge_spike)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/surge_spike/video_out_S.mp4'
+# segment 46/60 (signal_cycle)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/signal_cycle/video_out_S.mp4'
+# segment 47/60 (empty)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/empty/video_out_S.mp4'
+# segment 48/60 (dense)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/dense/video_out_S.mp4'
+# segment 49/60 (sparse)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/sparse/video_out_S.mp4'
+# segment 50/60 (moderate)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/moderate/video_out_S.mp4'
+# segment 51/60 (empty)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/empty/video_out_S.mp4'
+# segment 52/60 (sparse)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/sparse/video_out_S.mp4'
+# segment 53/60 (moderate)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/moderate/video_out_S.mp4'
+# segment 54/60 (dense)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/dense/video_out_S.mp4'
+# segment 55/60 (sparse)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/sparse/video_out_S.mp4'
+# segment 56/60 (surge_spike)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/surge_spike/video_out_S.mp4'
+# segment 57/60 (signal_cycle)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/signal_cycle/video_out_S.mp4'
+# segment 58/60 (sparse)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/sparse/video_out_S.mp4'
+# segment 59/60 (surge_spike)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/surge_spike/video_out_S.mp4'
+# segment 60/60 (dense)
+file '/home/death/Documents/IoT_Graduate/Camera/videos/dense/video_out_S.mp4'

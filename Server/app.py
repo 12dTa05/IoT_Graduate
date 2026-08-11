@@ -29,7 +29,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("server_app")
 
-from Server.edge_registry import EdgeRegistry
+from Server.edge_registry import EdgeRegistry, HEARTBEAT_TIMEOUT
 from Server.violation_store import ViolationStore
 
 
@@ -199,7 +199,7 @@ async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
     if not node_id:
         return web.Response(text="node_id query param required", status=400)
 
-    ws = web.WebSocketResponse(heartbeat=15.0)
+    ws = web.WebSocketResponse(heartbeat=HEARTBEAT_TIMEOUT)
     await ws.prepare(request)
 
     # BUG-C/D fix: close the old WebSocket BEFORE registering the new one.

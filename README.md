@@ -1,1016 +1,278 @@
 # IoT Graduate — Distributed Edge Traffic Monitoring
 
-IoT Graduate is an experimental distributed traffic-monitoring system built for Jetson-class edge devices. It combines NVIDIA DeepStream video analytics, TensorRT inference, RTSP camera simulation, Zenoh peer-to-peer coordination, and an aiohttp dashboard server.
+Experimental distributed traffic-monitoring system for NVIDIA Jetson edge devices.
+Detects vehicles, tracks them, estimates speed via homography, reads license plates,
+records violations, and redistributes camera workloads between Jetson nodes under load.
 
-The project detects vehicles, tracks them across calibrated road regions, estimates speed, recognizes license plates, records violations, and can redistribute camera workloads between edge nodes when one node becomes overloaded.
-
-> Status: research / experimental prototype. The repository intentionally keeps several lab conveniences such as local `.env` files, generated engines, and simple open network endpoints. Treat it as a trusted-LAN system unless hardening is added.
-
----
-
-## Table of Contents
-
-- [System Overview](#system-overview)
-- [Repository Layout](#repository-layout)
-- [Main Runtime Flow](#main-runtime-flow)
-- [Edge Node](#edge-node)
-  - [Entry Points](#edge-entry-points)
-  - [DeepStream Pipeline](#deepstream-pipeline)
-  - [Camera Configuration](#camera-configuration)
-  - [Speed Estimation](#speed-estimation)
-  - [License Plate Detection and Recognition](#license-plate-detection-and-recognition)
-  - [Dynamic Camera Add / Remove](#dynamic-camera-add--remove)
-  - [Output Modes](#output-modes)
-  - [Native C++ Extension Layer](#native-c-extension-layer)
-  - [Load Model](#load-model)
-  - [P2P Orchestration](#p2p-orchestration)
-  - [Crop Offload](#crop-offload)
-  - [Monitoring and Health](#monitoring-and-health)
-- [Server](#server)
-- [Camera Simulator](#camera-simulator)
-- [Configuration Reference](#configuration-reference)
-- [Models and TensorRT Engines](#models-and-tensorrt-engines)
-- [Tools and Tests](#tools-and-tests)
-- [Runbook](#runbook)
-- [Data Formats](#data-formats)
-- [Known Limitations and Risks](#known-limitations-and-risks)
-- [Recommended Next Steps](#recommended-next-steps)
+> **Status:** research prototype. Designed for a trusted LAN; not hardened for open networks.
 
 ---
 
-## System Overview
+## Architecture — Three Parts
 
-At a high level, the system has three deployable parts:
+```
+Camera/          Edge/ (Jetson A / B)       Server/
+MediaMTX RTSP  →  DeepStream pipeline    →  MediaMTX relay (RTSP push)
+Docker sim       + health_agent          →  aiohttp dashboard :9090
+                 + PeerOrchestrator         WebSocket to browsers
+                   (Zenoh peer-mode)
+```
 
-1. **Camera simulator (`Camera/`)**
-   - Runs MediaMTX and FFmpeg-based camera containers.
-   - Converts local video files into RTSP streams such as `rtsp://host:8554/cam1`.
+**Camera** — Docker Compose runs MediaMTX (`:8554`) + FFmpeg containers that loop MP4
+files as RTSP streams simulating live cameras.
 
-2. **Edge node (`Edge/`)**
-   - Runs the DeepStream inference pipeline on Jetson hardware.
-   - Consumes RTSP cameras or video files.
-   - Detects vehicles, license plates, recognized plate text, speed, and violations.
-   - Publishes events to the central server.
-   - Exchanges peer status, votes, migration commands, and offload payloads over Zenoh.
+**Edge** — Each Jetson runs:
+1. `health_agent.py` — collects Jetson metrics (jtop), computes `load_score`, publishes
+   Zenoh heartbeats, forwards overspeed events to Server via WebSocket.
+2. `main.py` (DeepStream pipeline) — multi-stream YOLO11 detection → NvDCF tracker →
+   LPD secondary model → LPR secondary model → nvdsanalytics → speed calculation →
+   violation snapshot. Outputs RTSP push to Server's MediaMTX relay.
 
-3. **Server (`Server/`)**
-   - Runs an aiohttp web application and WebSocket endpoints.
-   - Receives edge events and snapshots.
-   - Stores violations on disk.
-   - Serves the browser dashboard from `Server/static/index.html`.
-   - Can run its own MediaMTX relay for centralized RTSP viewing.
+**Server** — aiohttp app (`:9090`): WebSocket hub receiving health + overspeed payloads
+from all Jetson nodes; serves a browser dashboard; stores violation records.
 
-### Logical Architecture
+---
 
-```mermaid
-flowchart LR
-    subgraph Camera[Camera Simulator / Real Cameras]
-        C1[RTSP cam1]
-        C2[RTSP cam2]
-        Cn[RTSP camN]
-    end
+## Jetson DeepStream Pipeline
 
-    subgraph EdgeA[Edge Node A]
-        DS[DeepStream Pipeline]
-        Probe[Pad Probes: speed, LPR, events]
-        Pub[Zenoh / WebSocket Publishers]
-        Orch[P2P Orchestrator]
-    end
+```
+N × uridecodebin
+      │
+  nvstreammux  (1920×1080 mux, up to max_streams=8)
+      │
+   PGIE  (YOLO11 — vehicle detection)
+      │
+  NvDCF tracker
+      │
+  SGIE1 (LPD — license plate detection)
+      │
+  SGIE2 (LPR — license plate recognition)
+      │
+ nvdsanalytics  (ROI polygon, line crossing)
+      │
+  SpeedProbe (GLib buffer probe)
+      │
+  rtsp_push sink → MediaMTX relay on Server
+```
 
-    subgraph EdgeB[Edge Node B]
-        DSB[DeepStream Pipeline]
-        OrchB[P2P Orchestrator]
-        Recv[Offload Receiver]
-    end
+Per-camera homography maps pixel displacement to world coordinates (meters);
+median-filtered speed estimate triggers an overspeed event when `speed_kmh > SPEED_LIMIT_KMH`.
 
-    subgraph Server[Central Server]
-        API[aiohttp API + WebSockets]
-        Store[Violation Store]
-        UI[Dashboard]
-        MTX[MediaMTX Relay]
-    end
+Pipeline writes a unified JSON snapshot to `/dev/shm/speedflow_fps.json` every 1 s.
+`health_agent` reads this file atomically (sequence + session_id + `_updated_at`
+staleness guard) and rejects stale or non-advancing payloads.
 
-    C1 --> DS
-    C2 --> DS
-    Cn --> DS
-    DS --> Probe
-    Probe --> Pub
-    Pub --> API
-    API --> Store
-    API --> UI
-    Orch <-- Zenoh peer protocol --> OrchB
-    Probe -- crop offload --> Recv
-    EdgeA -- optional RTSP push --> MTX
+---
+
+## Load Score — FPS-Primary Composite
+
+`load_score` is the single number driving all offload decisions.
+
+**FPS piecewise-linear curve** (input clamped to `[0, TARGET_FPS=27]`):
+
+| avg FPS | score | level anchor |
+|---------|-------|--------------|
+| ≥ 27    |   0   | healthy      |
+| 22      |  57   | L3 threshold |
+| 19      |  65   | L2 threshold |
+| 17      |  75   | L1 threshold |
+| 0       | 100   | unavailable  |
+
+Linear interpolation between anchors; source-starved cameras excluded from the average.
+
+**Optional additive bonuses** (configured in `configs/edge_node.yml → load_score:`):
+- `workload`: linear ramp on `n_track + n_plate` across active non-starved cameras,
+  up to `max_bonus` (default 10.0) at `capacity` (default 40.0 objects).
+- `thermal`: linear ramp on `gpu_temp_c` from `onset_c=70` to `critical_c=85`,
+  up to `max_bonus=5.0`.
+- `composite = min(100, fps_score + workload_bonus + thermal_bonus)`
+
+**Hardware emergency floor** (post-composite):
+If CPU ≥ `hw_fuse_threshold=90` OR RAM ≥ 90 **and** FPS is already degraded
+(`avg_fps < TARGET_FPS − 2`), then `score = max(composite, hw_fuse_score_floor=75.0)`.
+GPU utilisation is excluded from the fuse (burst-aliased by DeepStream).
+
+Every health cycle publishes `load_score_breakdown` with fields:
+`fps_score`, `workload_bonus`, `thermal_bonus`, `composite_score`, `load_score`.
+
+---
+
+## Multi-Level Offload Policy (A-side orchestrator)
+
+Each Jetson runs an independent `PeerOrchestrator`; no master node.
+
+### Load thresholds → escalation ladder
+
+| Threshold | Score | Action |
+|-----------|-------|--------|
+| L3 = 57   | ≥ 57  | Offload **plate crops** (JPEG ~1–3 KB) to peer B via Zenoh |
+| L2 = 65   | ≥ 65  | Offload **vehicle crops** (~15–40 KB) to peer B for LPD+LPR |
+| L1 = 75   | ≥ 75  | Full-stream RTSP **camera migration** to peer B |
+| Reclaim   | < 50  | Reclaim migrated cameras when load stable for `reclaim_stable_s=15` |
+
+Escalation requires `overload_duration_s=7` of sustained overload before acting.
+Dwell timers (`l3_dwell_s=10`, `l2_dwell_s=7`) prevent premature escalation.
+`offload_level` in `edge_node.yml` controls which levels are active (default: 3).
+
+### Make-before-break migration (L1)
+
+1. A-side broadcasts RFO (Request For Offload) on `peers/vote/request`.
+2. Capable peers respond on `peers/vote/proposal` within `vote_window_s=2`.
+3. A-side selects winner by ε-constraint (FPS model, load, network RTT).
+4. Winner receives decision on `peers/vote/decision`, ADDs camera, waits for PLAYING.
+5. Winner ACKs on `peers/vote/ack/{cam}`.
+6. A-side receives ACK → REMOVEs camera. Stream continuity preserved.
+7. Rollback: if no ACK within `migration_timeout_s=15`, A-side aborts migration.
+
+**Failover rescue:** Edge peers and the Server registry declare a node OFFLINE
+after the shared `heartbeat_timeout_s=5` silence.
+Surviving nodes wait a random jitter (`failover_jitter_max_s=3`) then ADD the
+orphaned cameras from the deceased peer's last known `camera_configs`.
+
+### A-side result filtering
+
+When A-side offloads crops (L2/L3), `offload/results/{receiver}/{sender}` Zenoh
+messages carry `{stid, camera_id, frame_no, plate_text, confidence, inference_ok}`.
+A-side filters results by matching `stid + camera_id` against live tracks before
+inserting plate text into the speed-violation record.
+
+---
+
+## B-side Offload Receiver
+
+`offload_receiver.py` subscribes to:
+- `offload/plates/*/{my_node_id}` — L3: run LPR engine on plate crop
+- `offload/vehicles/*/{my_node_id}` — L2: run LPD then LPR engine on vehicle crop
+
+TensorRT engines (`models/lpd.engine`, `models/lpr.engine`) are loaded lazily on the
+first request. Dynamic shapes: profile 0 **MIN shape** is used for single-crop
+batch-1 inference (supports both TensorRT 8 / JetPack 5 and TRT 10 / JetPack 6 APIs).
+
+**Failed inference is not published.** Only successful runs (including a valid empty
+observation — no plate detected) publish a result. Engine unavailable or inference
+exception → result suppressed, `offload_inference_errors` counter incremented,
+rate-limited warning logged.
+
+---
+
+## Zenoh Communication
+
+All inter-node messaging uses Zenoh **peer mode** with UDP multicast scouting
+(no broker required on the LAN).
+
+| Key expression pattern | Direction | Purpose |
+|------------------------|-----------|---------|
+| `peers/status/{node_id}` | broadcast | Health heartbeat (msgpack) |
+| `peers/vote/request` | broadcast | RFO — overloaded node requests offload |
+| `peers/vote/proposal` | broadcast | Bid from capable peer |
+| `peers/vote/decision` | broadcast | Winner selection |
+| `peers/vote/ack/{cam_id}` | broadcast | Winner confirms stream PLAYING |
+| `traffic/events/{node_id}/**` | local | Pipeline → health_agent → Server (overspeed) |
+| `offload/plates/{src}/{dst}` | directed | L3 plate crop (A→B) |
+| `offload/vehicles/{src}/{dst}` | directed | L2 vehicle crop (A→B) |
+| `offload/results/{recv}/{sender}` | directed | Inference result (B→A) |
+
+---
+
+## Running the Edge Node
+
+All Edge commands run from `Edge/` with the `DoAn` conda environment.
+
+```bash
+# Default: start health_agent + pipeline, RTSP push mode
+./run_edge.sh
+
+# Display to screen
+./run_edge.sh --mode display
+
+# Custom RTSP push destination
+./run_edge.sh --mode rtsp_push --rtsp-push-url rtsp://192.168.212.21:8554/jetson_A
+
+# With workload/thermal bonus policy
+./run_edge.sh --load-policy actual --load-model formula
+
+# Collect calibration data for load predictor (600 s alongside live pipeline)
+./run_edge.sh --collect
+./run_edge.sh --collect --collect-output logs/calibration.csv \
+              --collect-duration 600 --collect-wbase-ref 12.5
+
+# Full 6-step automated calibration (W_base → collect → fit → plot)
+./run_edge.sh --calibrate
+
+# Train DL load predictor from pre-collected CSVs (no pipeline needed)
+./run_edge.sh --train-dataset csv_collected --load-model dl
+
+# Stop: Ctrl+C (graceful 3 s shutdown, then SIGKILL)
+```
+
+`TELEMETRY_INTERVAL` is locked at `1.0 s` — the only supported cadence.
+
+**Test commands** (DoAn conda env, from `Edge/`):
+```bash
+conda run -n DoAn python3 -m pytest tests/ -v
+conda run -n DoAn python3 -m py_compile health_agent.py
+conda run -n DoAn python3 -m py_compile speedflow_python/peer_orchestrator.py
 ```
 
 ---
 
-## Repository Layout
-
-```text
-IoT_Graduate/
-├── Camera/
-│   ├── Dockerfile
-│   ├── docker-compose.yml
-│   ├── generate-compose.sh
-│   ├── ground_truth.csv
-│   ├── mediamtx.yml
-│   ├── sim_cameras.yml
-│   ├── start.sh
-│   └── videos/
-├── Edge/
-│   ├── main.py
-│   ├── health_agent.py
-│   ├── run_edge.sh
-│   ├── setup_system.sh
-│   ├── speed_gui.py
-│   ├── requirements.txt
-│   ├── configs/
-│   ├── models/
-│   ├── speedflow_cpp/
-│   ├── speedflow_python/
-│   ├── tests/
-│   └── tools/
-├── Server/
-│   ├── app.py
-│   ├── edge_registry.py
-│   ├── violation_store.py
-│   ├── docker-compose.media.yml
-│   ├── mediamtx.yml
-│   ├── requirements.txt
-│   ├── static/
-│   └── violations/
-├── .gitignore
-└── README.md
-```
-
-### Directory Responsibilities
-
-| Path | Purpose |
-| --- | --- |
-| `Camera/` | Local RTSP camera simulation using Docker, MediaMTX, FFmpeg, and local videos. |
-| `Edge/` | Jetson-side runtime: DeepStream inference, tracking, speed estimation, event publishing, and peer orchestration. |
-| `Edge/configs/` | DeepStream inference configs, tracker configs, analytics configs, camera definitions, labels, and P2P tuning. |
-| `Edge/models/` | TensorRT engine artifacts and build script. |
-| `Edge/speedflow_cpp/` | C++ speed/geometry/image-enhancement implementation exposed to Python as `speedflow_cpp.so`. |
-| `Edge/speedflow_python/` | Main Python backend package. |
-| `Edge/tools/` | Profiling, calibration, plotting, and coefficient fitting utilities. |
-| `Edge/tests/` | Unit tests for the load model. |
-| `Server/` | Dashboard backend, violation storage, edge registry, and central MediaMTX compose file. |
-
----
-
-## Main Runtime Flow
-
-The normal end-to-end flow is:
-
-1. Camera sources are defined in `Edge/configs/cameras.yml` or passed with `--source`.
-2. `Edge/main.py` starts the selected output mode.
-3. `speedflow_python/run_python.py` loads settings and builds the DeepStream graph.
-4. `core_pipeline.py` creates the GStreamer pipeline:
-   - source bins
-   - `nvstreammux`
-   - primary detector
-   - tracker
-   - secondary license-plate detector
-   - secondary license-plate recognizer
-   - analytics / OSD / output sink
-5. `probes.py` receives metadata from pad probes.
-6. Tracking, speed estimation, LPR text extraction, snapshots, and violation decisions are computed.
-7. Events are published to the server and/or peers.
-8. Server stores violations and pushes updates to the dashboard.
-9. Peer orchestrators monitor load and can offload crop-level inference or migrate whole camera streams.
-
-```mermaid
-sequenceDiagram
-    participant Cam as RTSP Camera
-    participant Edge as Edge DeepStream
-    participant Probe as Pad Probe Logic
-    participant Peer as Zenoh Peers
-    participant Server as Dashboard Server
-    participant Browser as Browser Dashboard
-
-    Cam->>Edge: RTSP frames
-    Edge->>Edge: YOLO vehicle detection
-    Edge->>Edge: Tracking + LPD + LPR
-    Edge->>Probe: Object metadata
-    Probe->>Probe: Speed + violation decision
-    Probe->>Server: traffic event / violation snapshot
-    Probe->>Peer: optional crop offload
-    Peer->>Edge: optional migration / result messages
-    Server->>Browser: WebSocket dashboard update
-```
-
----
-
-## Edge Node
-
-The Edge node is the main computation unit. It is designed for Jetson Orin-class hardware with NVIDIA DeepStream, TensorRT, GStreamer, CUDA, and Python bindings.
-
-### Edge Entry Points
-
-| File | Role |
-| --- | --- |
-| `Edge/main.py` | CLI entry point. Selects `display`, `file`, or `rtsp_push` mode. |
-| `Edge/run_edge.sh` | Convenience launcher script. |
-| `Edge/setup_system.sh` | Experimental provisioning script that rewrites local configuration. Review before use. |
-| `Edge/health_agent.py` | Publishes Jetson hardware health metrics. |
-| `Edge/speed_gui.py` | GUI-oriented entry point / helper for speed monitoring. |
-
-Run from the `Edge/` directory:
+## Camera (Simulation)
 
 ```bash
-python3 main.py --mode display
-python3 main.py --mode file --output output/result.mp4
-python3 main.py --mode rtsp_push
-python3 main.py --mode rtsp_push --rtsp-push-url rtsp://server:8554/jetson_A
+cd Camera
+docker compose up -d        # starts MediaMTX :8554 + FFmpeg cam1/cam2 containers
+docker compose down
 ```
 
-Or use the convenience launcher with load-policy selection:
-
-```bash
-./run_edge.sh --mode rtsp_push --load-policy actual
-./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model formula
-./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model dl
-```
-
-### DeepStream Pipeline
-
-Main file: `Edge/speedflow_python/core_pipeline.py`
-
-The pipeline is built around NVIDIA DeepStream and GStreamer. Its core stages are:
-
-1. **Input source bins**
-   - Created from RTSP URLs or file paths.
-   - Each camera maps to a DeepStream source ID.
-
-2. **`nvstreammux`**
-   - Batches multiple camera streams into one inference batch.
-   - Uses configured mux width and height.
-
-3. **Primary detector (PGIE)**
-   - Config: `Edge/configs/config_infer_primary_yolo11.txt`
-   - Labels: `Edge/configs/labels_YOLO.txt`
-   - Detects traffic objects, mainly vehicles.
-
-4. **Tracker**
-   - Configs include:
-     - `config_tracker_lpd.yml`
-     - `config_tracker_NvDCF_perf.yml`
-   - Maintains object identity across frames so speed can be estimated over time.
-
-5. **Secondary license plate detector (LPD)**
-   - Config: `config_infer_secondary_lpd.txt`
-   - Labels: `labels_lpd.txt`
-   - Locates plate regions inside vehicle crops.
-
-6. **Secondary license plate recognizer (LPR)**
-   - Config: `config_infer_secondary_lpr.txt`
-   - Labels: `labels_lpr.txt`
-   - Uses a custom parser in `configs/nvinfer_custom_lpr_parser/`.
-
-7. **Analytics / OSD / sink**
-   - Analytics config: `config_nvdsanalytics.txt`
-   - Output sink depends on selected mode:
-     - display window
-     - MP4 file output
-     - RTSP push
-
-### Camera Configuration
-
-Main file: `Edge/configs/cameras.yml`
-
-Each camera entry contains:
-
-| Field | Meaning |
-| --- | --- |
-| `camera_id` | Stable logical camera name, e.g. `cam_01`. |
-| `source_id` | Numeric DeepStream source ID. Must be unique per active pipeline. |
-| `uri` | RTSP URL or local file path. |
-| `enabled` | Whether the stream should be active. |
-| `name` | Human-readable display name. |
-| `fps` | Expected frame rate. |
-| `speed_limit_kmh` | Violation threshold. |
-| `homography.source_points` | Four source image points used to map image coordinates to road-plane coordinates. |
-| `homography.target_width` / `target_height` | Real-world calibration dimensions. |
-| `roi_polygon` | Region of interest in mux-resolution pixel coordinates. |
-| `output.record` | Whether this camera should be recorded in file mode. |
-| `output.record_path` | Per-camera recording destination. |
-
-The comments in `cameras.yml` indicate coordinates are currently defined at mux resolution `1280x720`. If mux dimensions change, homography and ROI points must be scaled.
-
-### Speed Estimation
-
-Speed logic combines object tracking and camera calibration:
-
-- Each vehicle receives a persistent tracker ID.
-- Its image position is projected through the camera homography.
-- Movement over time gives estimated real-world speed.
-- ROI filtering avoids estimating outside the configured road region.
-- Median filtering and native helpers smooth noisy estimates.
-
-Relevant files:
-
-| File | Purpose |
-| --- | --- |
-| `speedflow_python/probes.py` | Reads DeepStream metadata and updates per-object speed state. |
-| `speedflow_python/analytics.py` | Analytics helpers and violation-related calculations. |
-| `speedflow_python/speedflow_c.py` | Python wrapper around native C++ helpers with Python fallback behavior. |
-| `speedflow_cpp/speedflow.cpp` | Native speed / geometry implementation. |
-| `speedflow_cpp/speedflow.h` | Native declarations. |
-
-### License Plate Detection and Recognition
-
-The license plate path has two levels:
-
-1. **LPD** — locate the plate region.
-2. **LPR** — classify character sequence from the plate crop.
-
-Relevant files:
-
-| File | Purpose |
-| --- | --- |
-| `configs/config_infer_secondary_lpd.txt` | Secondary detector config for license plate detection. |
-| `configs/config_infer_secondary_lpr.txt` | Secondary classifier config for plate recognition. |
-| `configs/labels_lpd.txt` | LPD labels. |
-| `configs/labels_lpr.txt` | LPR character labels. |
-| `configs/nvinfer_custom_lpr_parser/nvdsinfer_custom_impl_lpr.cpp` | Custom DeepStream parser for LPR classifier output. |
-| `configs/nvinfer_custom_lpr_parser/nvinfer_custom_lpr_parser.cpp` | Parser integration source. |
-| `speedflow_python/plate_preprocessor.py` | Plate crop preprocessing utilities. |
-
-The LPR custom parser now uses relative label lookup candidates and validates tensor dimensionality before indexing output shapes.
-
-### Dynamic Camera Add / Remove
-
-The project supports runtime camera changes:
-
-- Local edits to `configs/cameras.yml` can enable or disable cameras.
-- Zenoh control messages can request `ADD`, `REMOVE`, and `STATUS` actions.
-- P2P migration uses dynamic add/remove as the mechanism for full stream movement.
-
-Relevant files:
-
-| File | Purpose |
-| --- | --- |
-| `speedflow_python/camera_config.py` | Parses and watches camera YAML configuration. |
-| `speedflow_python/core_pipeline.py` | Implements dynamic source-bin creation, streammux linking, and cleanup. |
-| `speedflow_python/zenoh_subscriber.py` | Receives remote camera-control messages. |
-| `speedflow_python/peer_orchestrator.py` | Uses dynamic add/remove for peer migration and reclaim. |
-
-Dynamic ADD now also creates the per-camera recording branch in file mode when `record: true` is set and the pipeline has a demux branch available. Dynamic REMOVE tears down that recording branch too.
-
-### Output Modes
-
-The Edge runtime supports three modes through `main.py`:
-
-| Mode | Command | Purpose |
-| --- | --- | --- |
-| `display` | `python3 main.py --mode display` | Show tiled live output on screen. |
-| `file` | `python3 main.py --mode file --output output/result.mp4` | Write pipeline output to MP4; camera-level recording can also be enabled in `cameras.yml`. |
-| `rtsp_push` | `python3 main.py --mode rtsp_push` | Push processed stream to a central RTSP endpoint. |
-
-### Native C++ Extension Layer
-
-Native implementation lives in `Edge/speedflow_cpp/`.
-
-| File | Purpose |
-| --- | --- |
-| `speedflow.cpp` | Core native implementation for geometry, speed estimation helpers, ROI, and smoothing. |
-| `speedflow.h` | Header for native functions. |
-| `plate_enhance.cpp` | Native image-enhancement support for plate crops. |
-
-Python uses this through `speedflow_python/speedflow_c.py`. The wrapper is designed to fall back to Python implementations if the compiled `.so` is unavailable, which keeps development and tests possible on non-Jetson systems.
-
-### Load Model
-
-The load model estimates when an edge node is under pressure and should offload work.
-
-Relevant files:
-
-| File | Purpose |
-| --- | --- |
-| `speedflow_python/load_model.py` | Hardware load scoring, proactive model, thermal fuse, risk index, and DL predictor. |
-| `configs/edge_node.yml` | P2P, load-score, proactive model, and DL model configuration. |
-| `tools/train_dl_model.py` | Trains a 3-feature ONNX load predictor and exports it for runtime use. |
-| `tests/test_load_model.py` | Unit tests for load-model behavior. |
-
-#### Load Policy and Load Model Selection
-
-The system supports three load-balancing policies and two predictor types, selectable at runtime via environment variables or `run_edge.sh` CLI flags:
-
-| `LOAD_POLICY` | Meaning |
-| --- | --- |
-| `actual` | Passive baseline — decisions use measured hardware load only; no traffic-flow prediction. |
-| `predict_no_base` | Proactive traffic-flow prediction without `W_base` (ablation study). |
-| `predict_with_base` | Proactive traffic-flow prediction with `W_base` (proposed full model). |
-
-| `LOAD_MODEL` | Meaning |
-| --- | --- |
-| `formula` | Closed-form coefficient model (linear/quadratic in vehicle/plate counts). |
-| `dl` | Deep-learning time-series predictor (ONNX Runtime, 3-feature sliding window). |
-
-Defaults: `LOAD_POLICY=actual`, `LOAD_MODEL=formula` — identical to previous behavior.
-
-Usage with `run_edge.sh`:
-
-```bash
-./run_edge.sh --mode rtsp_push --load-policy actual
-./run_edge.sh --mode rtsp_push --load-policy predict_no_base --load-model formula
-./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model formula
-./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model dl
-```
-
-Or via environment variables:
-
-```bash
-LOAD_POLICY=predict_with_base LOAD_MODEL=formula ./run_edge.sh --mode rtsp_push
-```
-
-When `LOAD_POLICY=actual`, the proactive model is disabled and the peer orchestrator falls back to the legacy `load_score > overload_threshold` path. When `predict_no_base`, `W_base` is forced to zero. When `predict_with_base`, the configured `W_base` from `edge_node.yml` is used.
-
-For the DL predictor, the base/no-base distinction is defined by the training target, not by post-hoc addition: train on `load_score`/`gpu_percent` for `predict_with_base`, or on a delta-load target (excluding idle cost) for `predict_no_base`.
-
-#### Proactive Model Formula
-
-The proactive model combines:
-
-- **CV-plane workload estimate (`L_proactive`)**
-  - Base workload `W_base`.
-  - Number of tracked vehicles.
-  - Quadratic vehicle term if needed.
-  - Number of plates.
-  - Stationary fraction.
-
-- **Hardware safety fuse (`H_reactive`)**
-  - GPU, CPU, RAM, thermal pressure.
-
-- **Noisy-OR fusion**
-  - Combines proactive and reactive signals into a unified risk index.
-
-Simplified formula from `edge_node.yml` comments:
-
-```text
-L = (W_base + Σ_cam[α₁·N_track + α₂·N_track² + β·N_plate + γ·S]) / 100
-H = max(R_GPU, R_CPU, R_RAM) × Θ_thermal
-U = 1 - (1 - L̂_avg)(1 - Ĥ_avg)
-```
-
-Where `U` is the smoothed risk index used to trigger offload escalation when proactive mode is enabled.
-
-#### DL Predictor
-
-The DL predictor (`DLPredictor` in `load_model.py`) uses ONNX Runtime with a 3-feature sliding window:
-
-- Input features per window: `[n_track_mean, n_plate_mean, stationary_fraction_mean]`
-- Input shape: `(1, window_k, 3)` — `window_k` past windows
-- Output: predicted load on a 0–100 scale, normalized to `[0, 1]`
-- Degrades safely to `0.0` if the model is missing, not enough history, or inference fails
-
-Train the model with:
-
-```bash
-cd Edge
-python3 tools/train_dl_model.py \
-  --csv logs/calibration.csv \
-  --output models/load_predictor.onnx \
-  --window-k 5 \
-  --horizon-rows 1
-```
-
-The trained model is loaded at runtime from the path configured in `edge_node.yml`:
-
-```yaml
-proactive:
-  dl_model:
-    model_path: "models/load_predictor.onnx"
-    window_k: 5
-    horizon_s: 10
-```
-
-### P2P Orchestration
-
-Main file: `Edge/speedflow_python/peer_orchestrator.py`
-
-The system has a decentralized load-balancing protocol over Zenoh. There is no single leader for normal migration decisions.
-
-Key concepts:
-
-| Concept | Meaning |
-| --- | --- |
-| Peer status | Each node publishes health/load/camera ownership. |
-| RFO / RFQ-style vote | An overloaded node asks peers who can accept a camera. |
-| ε-constraint bidding | A peer only bids if it passes capacity, FPS, network, cooldown, and penalty checks. |
-| F(x) score | Bid ranking based on current load and available capacity. |
-| Make-before-Break | Receiver starts the stream first; requester removes its local stream only after ACK. |
-| Penalty cooldown | A peer that times out during migration is temporarily penalized. |
-| Reclaim | A node can take back migrated cameras after sustained recovery. |
-| Leaderless failover | Surviving peers use consistent hashing to decide who rescues cameras from an offline node. |
-
-#### Migration Flow
-
-```mermaid
-sequenceDiagram
-    participant A as Overloaded Edge A
-    participant B as Candidate Edge B
-    participant Z as Zenoh
-
-    A->>Z: publish vote request for camera
-    Z->>B: deliver request
-    B->>B: check ε constraints
-    B->>Z: publish proposal if eligible
-    Z->>A: deliver proposal
-    A->>A: select winner
-    A->>Z: publish decision
-    Z->>B: tell winner to ADD camera
-    B->>B: dynamic ADD and wait until PLAYING
-    B->>Z: publish ACK
-    Z->>A: deliver ACK
-    A->>A: dynamic REMOVE local camera
-```
-
-#### ε-Constraint Checks
-
-Before a peer can accept a camera it evaluates:
-
-1. **Capacity** — future active stream count must not exceed `eps_streams_max`.
-2. **FPS prediction** — configured `fps_model` must remain above the threshold for the tier.
-3. **Network reachability** — camera RTSP source must be reachable within the tier network budget.
-4. **Camera cooldown** — recently migrated cameras are not immediately moved again.
-5. **Penalty state** — peers that recently failed a migration can be temporarily avoided.
-
-### Crop Offload
-
-Main files:
-
-| File | Purpose |
-| --- | --- |
-| `speedflow_python/offload_publisher.py` | Sends plate or vehicle crops to peers. |
-| `speedflow_python/offload_receiver.py` | Receives crop requests and runs remote inference. |
-| `speedflow_python/peer_orchestrator.py` | Decides when to use crop offload vs full migration. |
-
-The offload ladder has three levels:
-
-| Level | Meaning | Cost | When used |
-| --- | --- | --- | --- |
-| Level 3 | Plate-crop offload | Lowest | Send plate crops for remote LPR. |
-| Level 2 | Vehicle-crop offload | Medium | Send vehicle crops for remote LPD + LPR. |
-| Level 1 | Full stream migration | Highest / most disruptive | Move the full camera stream to another edge node. |
-
-The orchestrator escalates from lower-cost to higher-cost actions as load increases:
-
-```text
-normal processing → Level 3 → Level 2 → Level 1
-```
-
-### Monitoring and Health
-
-Monitoring appears in two layers:
-
-1. **Edge to server monitoring**
-   - `speedflow_python/monitor_client.py`
-   - Sends edge events and health information to the dashboard server.
-
-2. **Hardware health agent**
-   - `Edge/health_agent.py`
-   - Uses Jetson hardware metrics through dependencies such as `jetson-stats` / `jtop`.
-
-Metrics influence dashboard visibility and peer load-balancing decisions.
+Video files go in `Camera/videos/`. Edit `docker-compose.yml` or `.env` to add more cameras.
 
 ---
 
 ## Server
 
-The server is an aiohttp application that receives edge events, tracks online edge nodes, stores violations, and serves the browser dashboard.
-
-### Server Files
-
-| File | Purpose |
-| --- | --- |
-| `Server/app.py` | Main aiohttp app, HTTP routes, WebSocket endpoints, event ingest, dashboard push. |
-| `Server/edge_registry.py` | Tracks edge node presence, health, heartbeat state, and active cameras. |
-| `Server/violation_store.py` | Stores and queries violation records and snapshots. |
-| `Server/static/index.html` | Browser dashboard UI. |
-| `Server/docker-compose.media.yml` | Central MediaMTX relay compose file plus health sidecar. |
-| `Server/mediamtx.yml` | MediaMTX server configuration. |
-| `Server/requirements.txt` | Python server dependencies. |
-| `Server/violations/` | Runtime violation output directory. |
-
-### Server Responsibilities
-
-- Accept WebSocket connections from edge nodes.
-- Accept WebSocket connections from dashboard browser clients.
-- Process traffic events and violation events.
-- Write violation metadata and snapshots to local storage.
-- Broadcast live updates to the dashboard.
-- Expose API routes for querying stored violations and edge status.
-- Optionally relay processed RTSP streams through MediaMTX.
-
-### Dashboard
-
-The dashboard is currently a single static HTML file:
-
-```text
-Server/static/index.html
-```
-
-It displays live system state pushed by the server over WebSocket, including edge status, traffic events, and violations.
-
-This keeps deployment simple but means UI, styling, and client-side logic live together in one large file.
-
----
-
-## Camera Simulator
-
-The `Camera/` directory provides local test cameras using Docker containers.
-
-### Camera Files
-
-| File | Purpose |
-| --- | --- |
-| `Camera/Dockerfile` | Builds the FFmpeg camera publisher container. |
-| `Camera/docker-compose.yml` | Runs MediaMTX and multiple simulated camera containers. |
-| `Camera/mediamtx.yml` | Local RTSP server configuration. |
-| `Camera/sim_cameras.yml` | Simulator camera definitions. |
-| `Camera/generate-compose.sh` | Generates compose content from simulator definitions. |
-| `Camera/start.sh` | Starts camera publishing inside the container. |
-| `Camera/videos/` | Source videos mounted into camera containers. |
-| `Camera/ground_truth.csv` | Ground-truth data for experiments / validation. |
-
-### Current Compose Setup
-
-`Camera/docker-compose.yml` defines:
-
-- `rtsp_server` using `bluenviron/mediamtx:latest`
-- `cam1` publishing `/videos/crowd_peace.mp4` to `rtsp://rtsp_server:8554/cam1`
-- `cam2` publishing `/videos/peace_crowd.mp4` to `rtsp://rtsp_server:8554/cam2`
-- `cam3` publishing `/videos/crowd_peace.mp4` to `rtsp://rtsp_server:8554/cam3`
-- `cam4` publishing `/videos/peace_crowd.mp4` to `rtsp://rtsp_server:8554/cam4`
-
-Start it from `Camera/`:
-
-```bash
-docker compose up --build
-```
-
----
-
-## Configuration Reference
-
-### Root-Level Git Files
-
-| File | Purpose |
-| --- | --- |
-| `.gitignore` | Ignore rules. Currently does not ignore all runtime artifacts or `.env` files. |
-| `.gitattributes` | Git attributes. |
-
-### `.env` Files
-
-The project has `.env` files in:
-
-```text
-Camera/.env
-Edge/.env
-Server/.env
-```
-
-They are currently tracked in git. They are useful for lab reproducibility, but production deployments should move secrets and deployment-specific IPs out of version control.
-
-### `Edge/configs/cameras.yml`
-
-Defines camera sources, speed limits, calibration, ROI polygons, and recording preferences.
-
-Important operational notes:
-
-- `source_id` must be unique for active cameras.
-- `camera_id` should be stable across nodes because migration and violation records depend on it.
-- Homography and ROI coordinates must match mux resolution.
-- `enabled: false` is safer than deleting a camera block when testing dynamic removal.
-
-### `Edge/configs/edge_node.yml`
-
-Holds structured P2P and load-model settings:
-
-- `p2p.overload_threshold`
-- `p2p.overload_duration_s`
-- `p2p.cooldown_s`
-- `p2p.migration_timeout_s`
-- `p2p.vote_window_s`
-- `p2p.eps_*` constraints
-- `p2p.fps_model`
-- `p2p.offload_level*` thresholds
-- `load_score` weights
-- `proactive` coefficients and risk thresholds
-- `proactive.dl_model` ONNX model path, window size, and horizon
-
-Flat scalar runtime settings live in `Edge/.env` according to the comments in the file.
-
-### DeepStream Configs
-
-| File | Purpose |
-| --- | --- |
-| `config_infer_primary_yolo11.txt` | Primary YOLO detector. |
-| `config_infer_secondary_lpd.txt` | Secondary plate detector. |
-| `config_infer_secondary_lpr.txt` | Secondary plate recognizer. |
-| `config_nvdsanalytics.txt` | DeepStream analytics config. |
-| `config_tracker_lpd.yml` | Tracker config used with plate/vehicle flow. |
-| `config_tracker_NvDCF_perf.yml` | NvDCF performance-oriented tracker config. |
-
-### Labels
-
-| File | Purpose |
-| --- | --- |
-| `labels_YOLO.txt` | Primary detector labels. |
-| `labels_lpd.txt` | License plate detector labels. |
-| `labels_lpr.txt` | License plate recognizer character labels. |
-
----
-
-## Models and TensorRT Engines
-
-Models and engines live in `Edge/models/`.
-
-Current artifacts include:
-
-| File | Meaning |
-| --- | --- |
-| `yolo11n.engine` | YOLO11 TensorRT engine. |
-| `YOLO_n.engine` | YOLO TensorRT engine artifact used by existing configs/scripts. |
-| `lpd.engine` | License plate detector TensorRT engine. |
-| `lpr.engine` | License plate recognition TensorRT engine. |
-| `RVRT.engine` | Super-resolution / enhancement related TensorRT engine. |
-| `build_engines.sh` | Script for building TensorRT engines. |
-
-Because TensorRT engines are hardware-, TensorRT-, CUDA-, and DeepStream-version sensitive, they may need to be rebuilt on a different Jetson or software stack.
-
----
-
-## Tools and Tests
-
-### Tools
-
-| File | Purpose |
-| --- | --- |
-| `Edge/tools/profile_collect.py` | Collects workload/profile data on target Jetson. |
-| `Edge/tools/fit_coefficients.py` | Fits proactive load-model coefficients and writes config. |
-| `Edge/tools/train_dl_model.py` | Trains a 3-feature ONNX load predictor for `LOAD_MODEL=dl`. |
-| `Edge/tools/plot_rmse.py` | Visualizes model fitting error. |
-| `Edge/tools/plot_burst.py` | Visualizes burst / workload behavior. |
-
-Suggested calibration workflow from `edge_node.yml`:
-
-```bash
-cd Edge
-python3 tools/profile_collect.py --wbase --wbase-output logs/wbase.txt
-python3 tools/profile_collect.py --output logs/calibration.csv --wbase-ref <W_base>
-python3 tools/fit_coefficients.py --csv logs/calibration.csv --wbase <W_base> --output configs/edge_node.yml
-```
-
-### Tests
-
-Current test suite:
-
-```bash
-cd Edge
-python3 -m pytest tests/test_load_model.py -q
-```
-
-The existing load-model tests have been verified to pass locally.
-
----
-
-## Runbook
-
-### 1. Start Simulated Cameras
-
-```bash
-cd Camera
-docker compose up --build
-```
-
-This starts MediaMTX and the configured simulated cameras.
-
-### 2. Start Server
-
-Install dependencies:
-
 ```bash
 cd Server
-python3 -m pip install -r requirements.txt
+python3 app.py              # dashboard at http://0.0.0.0:9090
 ```
 
-Run the aiohttp server according to the app's configured entry point/environment. If using the central RTSP relay:
-
-```bash
-docker compose -f docker-compose.media.yml up
-```
-
-### 3. Start Edge Node
-
-Install dependencies on the Jetson:
-
-```bash
-cd Edge
-python3 -m pip install -r requirements.txt
-```
-
-Run one of:
-
-```bash
-python3 main.py --mode display
-python3 main.py --mode file --output output/result.mp4
-python3 main.py --mode rtsp_push
-```
-
-Or use the convenience launcher with load-policy selection:
-
-```bash
-./run_edge.sh --mode rtsp_push --load-policy actual
-./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model formula
-./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model dl
-```
-
-### 4. Multi-Node Experiment
-
-For a peer-to-peer experiment:
-
-1. Give each Jetson a unique node ID in its local `.env`.
-2. Configure each node's local `configs/cameras.yml` with only the cameras it owns initially.
-3. Ensure all Jetsons can reach each other's Zenoh discovery network.
-4. Ensure every node can reach camera RTSP URLs it may need to adopt.
-5. Tune `configs/edge_node.yml` capacity, FPS, cooldown, and threshold values.
-6. Start all edge nodes.
-7. Watch peer status, migration decisions, and server dashboard updates.
+Requires `Server/.env` with `SERVER_PORT`, `MEDIAMTX_API`, etc.
+Violations stored as JSON in `Server/violations/`.
 
 ---
 
-## Data Formats
+## Key Configuration Files
 
-### Camera Definition
-
-Representative camera block:
-
-```yaml
-cam_01:
-  camera_id: "cam_01"
-  source_id: 0
-  uri: "rtsp://192.168.212.20:8554/cam1"
-  enabled: true
-  name: "Camera 01"
-  fps: 25.0
-  speed_limit_kmh: 80.0
-  homography:
-    source_points:
-      - [1264, 542]
-      - [192, 545]
-      - [421, 145]
-      - [827, 149]
-    target_width: 15
-    target_height: 35
-  roi_polygon: [1264, 542, 192, 545, 421, 145, 827, 149]
-  output:
-    record: true
-    record_path: "output/cam_01.mp4"
-```
-
-### Zenoh Key Expressions
-
-Common key expressions used by the peer system:
-
-| Key | Purpose |
-| --- | --- |
-| `peers/status/{node_id}` | Peer heartbeat/status. |
-| `peers/vote/request` | Migration vote request. |
-| `peers/vote/proposal` | Candidate proposal. |
-| `peers/vote/decision` | Winner decision. |
-| `peers/vote/ack/{camera_id}` | Make-before-Break ACK. |
-| `peers/control/{node_id}` | Camera control commands for one node. |
-| `offload/plates/{src}/{dst}` | Plate-crop offload request. |
-| `offload/vehicles/{src}/{dst}` | Vehicle-crop offload request. |
-| `offload/results/{receiver}/{sender}` | Offload inference result returned to sender. |
-| `traffic/events/{node_id}/{camera_id}` | Traffic event publication. |
-
-### Violation Storage
-
-Violations are managed by `Server/violation_store.py` and written under `Server/violations/`. The store keeps metadata and snapshot files so the dashboard can query and display historical violations.
+| File | Purpose |
+|------|---------|
+| `Edge/.env` | All flat settings: `NODE_ID`, `TARGET_FPS=27`, `HEALTH_INTERVAL=1.0`, RTSP URLs, model paths |
+| `Edge/configs/cameras.yml` | Per-camera RTSP URIs, homography, ROI, speed limit. Hot-reloaded (~100 ms via inotify). |
+| `Edge/configs/edge_node.yml` | P2P thresholds, offload levels, load_score bonuses, proactive model coefficients |
+| `Server/.env` | `SERVER_PORT=9090`, `MEDIAMTX_API` |
+| `Camera/.env` | RTSP port, video file paths for Docker sim |
 
 ---
 
-## Known Limitations and Risks
+## Proactive Load Model (Optional)
 
-These are acceptable in the current experimental phase but important for future deployment.
+`edge_node.yml → proactive:` holds a formula-based predictor
+(`W_base + Σ[α₁·N_track + α₂·N_track² + β·N_plate + γ·S]`) or a DL ONNX predictor.
+Both are **disabled by default** (`enabled: false`). Shadow mode emits `risk_index`
+telemetry without affecting decisions. To activate:
 
-### Network Trust
-
-- Server APIs and WebSocket endpoints are open by default.
-- Zenoh peer messages are trusted by node ID and payload.
-- A production deployment should add authentication, authorization, and message integrity.
-
-### Version-Sensitive Native Stack
-
-- DeepStream, TensorRT, CUDA, GStreamer, Python bindings, and JetPack versions must match the target environment.
-- TensorRT engines may fail when moved between devices or software versions.
-
-### Runtime Artifacts in Git
-
-- `.env` files are currently tracked.
-- Engine files, compiled objects, native libraries, video files, outputs, and caches may appear in the worktree.
-- This is convenient for experiments but should be cleaned before public or production use.
-
-### Dynamic DeepStream Mutation
-
-- Dynamic source add/remove is complex because GStreamer elements must be linked, synchronized, and cleaned up at runtime.
-- Make-before-Break protects migrations, but slow RTSP sources can still cause timeouts.
-
-### Calibration Sensitivity
-
-- Speed estimation depends on correct homography and ROI points.
-- Bad calibration creates bad speed estimates even when detection/tracking is correct.
-
-### Dashboard Structure
-
-- The dashboard is a single large HTML file.
-- This is simple to deploy but harder to maintain as features grow.
-
-### Experimental Provisioning
-
-- `setup_system.sh` rewrites local deployment files.
-- Review it before running on a new machine.
+1. Run `./run_edge.sh --calibrate` to measure W_base, collect data, fit coefficients.
+2. Edit `configs/edge_node.yml`: set `proactive.enabled: true`.
+3. Restart with the chosen `--load-policy` and `--load-model`.
 
 ---
 
-## Recommended Next Steps
+## Limitations / Unproven
 
-For research continuation:
-
-1. Calibrate `edge_node.yml` proactive coefficients on the target Jetson.
-2. Collect time-series traffic/load data with `tools/profile_collect.py`.
-3. Train a DL load predictor with `tools/train_dl_model.py` and evaluate prediction accuracy.
-4. Compare active vs passive load balancing: run the same traffic scenario with `LOAD_POLICY=actual` (passive baseline) vs `LOAD_POLICY=predict_with_base` (proactive), then compare FPS, dropped frames, overload duration, and migration timing.
-5. Produce predicted-vs-actual load time-series graphs showing the proactive model crossing the overload threshold earlier than the reactive baseline.
-6. Validate migration behavior under controlled overload.
-7. Compare Level 3 / Level 2 / Level 1 offload cost and accuracy.
-8. Add tests for dynamic camera config parsing and migration decisions.
-
-For deployment hardening:
-
-1. Add auth to server WebSockets and REST APIs.
-2. Configure Zenoh with a trusted deployment mode and credentials.
-3. Stop tracking deployment-specific `.env` files.
-4. Move generated engines, native build outputs, videos, snapshots, and caches out of git.
-5. Split dashboard UI into maintainable modules if it continues growing.
-6. Add health checks for all long-running containers and services.
-
-For maintainability:
-
-1. Keep camera config, DeepStream config, and model filenames synchronized.
-2. Document the exact JetPack / DeepStream / TensorRT versions used for engine generation.
-3. Add one smoke test for server startup and one parser/config test for camera YAML.
-4. Keep the dynamic pipeline path and startup pipeline path using shared helpers to avoid drift.
-
----
-
-## Quick Command Summary
-
-```bash
-# Simulated RTSP cameras
-cd Camera && docker compose up --build
-
-# Edge display mode
-cd Edge && python3 main.py --mode display
-
-# Edge file mode
-cd Edge && python3 main.py --mode file --output output/result.mp4
-
-# Edge RTSP push mode
-cd Edge && python3 main.py --mode rtsp_push
-
-# Edge with load-policy selection (active vs passive load balancing)
-cd Edge && ./run_edge.sh --mode rtsp_push --load-policy actual
-cd Edge && ./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model formula
-cd Edge && ./run_edge.sh --mode rtsp_push --load-policy predict_with_base --load-model dl
-
-# Train DL load predictor
-cd Edge && python3 tools/train_dl_model.py --csv logs/calibration.csv --output models/load_predictor.onnx
-
-# Load model tests
-cd Edge && python3 -m pytest tests/test_load_model.py -q
-
-# Central MediaMTX relay
-cd Server && docker compose -f docker-compose.media.yml up
-```
-
----
-
-## Project Summary
-
-IoT Graduate is not just a single-camera traffic detector. It is a full distributed edge experiment:
-
-- DeepStream handles high-throughput multi-camera perception.
-- Calibration and tracking turn detections into speed estimates.
-- LPD/LPR models extract plate information for violations.
-- The server centralizes visibility and historical violation data.
-- Zenoh lets multiple edge nodes coordinate without a central load-balancing controller.
-- The offload ladder provides a research path from cheap crop-level remote inference to full stream migration.
-- The load policy selection (`LOAD_POLICY` + `LOAD_MODEL`) enables direct comparison of passive vs active (proactive) load balancing, the main research contribution.
-
-The strongest part of the design is the integration of perception, hardware load modeling, traffic-flow prediction, and peer orchestration. The main engineering challenge is keeping the runtime pipeline, deployment configuration, model artifacts, and distributed control plane synchronized as the experiment evolves.
+- **L3/L2 offload** (crop Zenoh path): implemented and unit-tested; end-to-end
+  field throughput under real Jetson thermal load is not benchmarked.
+- **Proactive model** is disabled by default; coefficients are placeholders until
+  calibration runs on the target hardware.
+- **Full-cycle migration** (L1 make-before-break) is implemented; simultaneous
+  multi-node failure recovery is not tested beyond two-node setups.
+- **Thermal/workload bonus** sections are config-gated; set `enabled: false` to
+  revert to pure FPS-dominant scoring.
+- No TLS/auth on Zenoh, WebSocket, or RTSP endpoints — trusted LAN only.
