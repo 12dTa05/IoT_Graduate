@@ -320,9 +320,8 @@ ok "cameras.yml generated"
 # 7. Generate Camera/docker-compose.yml for this node
 #
 # rtsp_server + exactly the two local camera services for this node.
-# VIDEO_FILE is /videos/sample.mp4 (user replaces as needed).
-# Camera/.env variables are NOT interpolated by compose at runtime,
-# so all values are written literally here.
+# VIDEO_FILE and RTSP_URL are resolved from Camera/.env at compose runtime.
+# Each node keeps its global camera numbering (cam1/cam2 or cam3/cam4).
 #
 # Mapping:
 #   jetson_A: services cam1, cam2  (RTSP paths /cam1, /cam2)
@@ -344,8 +343,8 @@ cat > "$COMPOSE_FILE" <<EOF
 #   jetson_A  →  cam1, cam2
 #   jetson_B  →  cam3, cam4
 #
-# To swap the video source, replace /videos/sample.mp4 with your file
-# and restart: docker compose restart cam${CAM_LOCAL_NUMS[0]} cam${CAM_LOCAL_NUMS[1]}
+# To swap a video source, set CAM${CAM_LOCAL_NUMS[0]}_VIDEO_FILE or
+# CAM${CAM_LOCAL_NUMS[1]}_VIDEO_FILE in Camera/.env, then restart the services.
 # =============================================================
 services:
   rtsp_server:
@@ -363,8 +362,8 @@ services:
     depends_on:
       - rtsp_server
     environment:
-      - VIDEO_FILE=/videos/sample.mp4
-      - RTSP_URL=rtsp://rtsp_server:8554/cam${CAM_LOCAL_NUMS[0]}
+      - VIDEO_FILE=\${CAM${CAM_LOCAL_NUMS[0]}_VIDEO_FILE:-/videos/sample.mp4}
+      - RTSP_URL=\${CAM${CAM_LOCAL_NUMS[0]}_RTSP_URL:-rtsp://rtsp_server:8554/cam${CAM_LOCAL_NUMS[0]}}
     volumes:
       - ./videos:/videos
     restart: unless-stopped
@@ -375,8 +374,8 @@ services:
     depends_on:
       - rtsp_server
     environment:
-      - VIDEO_FILE=/videos/sample.mp4
-      - RTSP_URL=rtsp://rtsp_server:8554/cam${CAM_LOCAL_NUMS[1]}
+      - VIDEO_FILE=\${CAM${CAM_LOCAL_NUMS[1]}_VIDEO_FILE:-/videos/sample.mp4}
+      - RTSP_URL=\${CAM${CAM_LOCAL_NUMS[1]}_RTSP_URL:-rtsp://rtsp_server:8554/cam${CAM_LOCAL_NUMS[1]}}
     volumes:
       - ./videos:/videos
     restart: unless-stopped

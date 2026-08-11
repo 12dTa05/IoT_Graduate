@@ -15,14 +15,6 @@ EOF
 
 for ((i=1;i<=CAMERA_COUNT;i++))
 do
-    VIDEO_FILE="./videos/cam${i}.mp4"
-
-    if [ -f "$VIDEO_FILE" ]; then
-        VIDEO_PATH="/videos/cam${i}.mp4"
-    else
-        VIDEO_PATH="/videos/sample.mp4"
-    fi
-
 cat >> docker-compose.yml <<EOF
   cam$i:
     build: .
@@ -30,8 +22,8 @@ cat >> docker-compose.yml <<EOF
     depends_on:
       - rtsp_server
     environment:
-      - VIDEO_FILE=${VIDEO_PATH}
-      - RTSP_URL=rtsp://rtsp_server:8554/cam$i
+      - VIDEO_FILE=\${CAM${i}_VIDEO_FILE:-/videos/cam${i}.mp4}
+      - RTSP_URL=\${CAM${i}_RTSP_URL:-rtsp://rtsp_server:8554/cam$i}
     volumes:
       - ./videos:/videos
     restart: unless-stopped

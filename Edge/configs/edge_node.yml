@@ -207,8 +207,8 @@ proactive:
   # Deep-learning predictor (used when LOAD_MODEL=dl)
   # Training contract (tools/train_fps_forecaster.py):
   #   source_interval_s=0.5  → raw pipeline writes 2 rows/s
-  #   sample_interval_s=2.0  → model trained at 2.0s cadence (matches HEALTH_INTERVAL)
-  #   history=5               → 5 rows × 2.0s = 10 s lookback
+  #   sample_interval_s=1.0  → model trained at 1.0s cadence (matches HEALTH_INTERVAL)
+  #   history=5               → 5 rows × 1.0s = 5 s lookback
   #   horizons=[6.0, 10.0]   → ONNX outputs [FPS@t+6s, FPS@t+10s]
   #   horizon_index=0        → use first output (t+6s)
   #
@@ -217,6 +217,6 @@ proactive:
   dl_model:
     model_path:        ""        # e.g. "models/future_fps_predictor.onnx" — train artifact not yet produced
     window_k:           5        # deployment-side history length (must match trainer's --history)
-    sample_interval_s:  2.0      # cadence in seconds (must match HEALTH_INTERVAL + trainer's --sample-interval)
+    sample_interval_s:  1.0      # cadence in seconds (must match HEALTH_INTERVAL + trainer's --sample-interval)
     horizons_s:         [6, 10]  # forecast horizons (must match trainer's --horizons)
     horizon_index:      0        # which horizon to use: 0 = t+6s, 1 = t+10s

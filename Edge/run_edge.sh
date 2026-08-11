@@ -55,7 +55,7 @@ TELEMETRY_INTERVAL="1.0"
 COLLECT=0
 COLLECT_OUTPUT="logs/calibration.csv"
 COLLECT_DURATION=600
-COLLECT_INTERVAL=2.0
+COLLECT_INTERVAL=1.0
 COLLECT_WBASE_REF=0.0
 
 # --calibrate defaults (superset of --collect)
