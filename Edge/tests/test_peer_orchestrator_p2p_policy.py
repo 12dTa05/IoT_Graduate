@@ -185,6 +185,9 @@ def test_l1_selects_lightest_camera():
         active_cameras=["cam_fast", "cam_med", "cam_slow"],
         camera_workload={"cam_fast": 2.0, "cam_med": 5.0, "cam_slow": 11.0},
     )
+    # Treat all active cameras as locally-owned so the L1 ownership guard
+    # does not bypass this legacy selector test.
+    o._get_owned_camera_ids = lambda: set(sim_state.active_cameras)
     # L1 migrates the lowest-workload camera.
     chosen = o._pick_camera_to_offload(sim_state, level=1)
     assert chosen == "cam_fast", f"Expected cam_fast (lightest), got {chosen}"
@@ -252,6 +255,9 @@ def test_reclaimed_camera_ineligible_during_observation_window():
         active_cameras=["cam_a", "cam_b"],
         camera_workload={"cam_a": 2.0, "cam_b": 12.0},
     )
+    # Treat both cameras as locally-owned so the ownership guard does not
+    # bypass the reclaim-window check this test is verifying.
+    o._get_owned_camera_ids = lambda: set(sim_state.active_cameras)
     # Simulate: cam_a was just reclaimed (no wall-clock wait)
     o._reclaim_completed_at["cam_a"] = time.time()
 
@@ -276,6 +282,8 @@ def test_reclaimed_camera_eligible_after_observation_window():
         active_cameras=["cam_a", "cam_b"],
         camera_workload={"cam_a": 5.0, "cam_b": 20.0},
     )
+    # All active cameras owned (legacy behaviour for this selector test).
+    o._get_owned_camera_ids = lambda: set(sim_state.active_cameras)
     o._reclaim_completed_at["cam_a"] = time.time() - 1.0  # 1s ago → window elapsed
     chosen = o._pick_camera_to_offload(sim_state, level=1)
     assert chosen == "cam_a", f"Expected cam_a after window expired, got {chosen}"
@@ -675,6 +683,9 @@ def test_l2_dwell_permits_escalation_to_l1_after_duration():
     )
     _add_peer_beta(o)
     _setup_overloaded_self(o, load_score=80.0, cameras=["cam_a", "cam_b"])
+    # Treat all active cameras as locally-owned so the L1 ownership guard
+    # does not bypass this legacy dwell-gate test.
+    o._get_owned_camera_ids = lambda: {"cam_a", "cam_b"}
     # cam_a is lightest (5.0) → L1 offload target; set L2 active for 8s (>7s)
     _setup_state_for_dwell(o, level=2, cam_id="cam_a", since_s=8.0)
 
@@ -705,6 +716,8 @@ def test_l1_permitted_when_no_lower_level_active():
     )
     _add_peer_beta(o)
     _setup_overloaded_self(o, load_score=80.0, cameras=["cam_a", "cam_b"])
+    # All active cameras owned (legacy test does not exercise the guard).
+    o._get_owned_camera_ids = lambda: {"cam_a", "cam_b"}
     # No lower level active (level 0)
 
     _stub_vote_request_pub(o)
@@ -733,6 +746,8 @@ def test_l1_bypasses_dwell_when_hardware_fuse_active():
     )
     _add_peer_beta(o)
     _setup_overloaded_self(o, load_score=80.0, cameras=["cam_a", "cam_b"])
+    # All active cameras owned (legacy test does not exercise the guard).
+    o._get_owned_camera_ids = lambda: {"cam_a", "cam_b"}
     # risk_index 0.96 ≥ hard_fuse=0.95 → fuse ACTIVE
     o._self_state.risk_index = 0.96
     # cam_a is lightest (5.0) → L1 target; L2 active for only 1s (far less than 7s dwell)
@@ -857,6 +872,246 @@ def test_dwell_gate_only_blocks_escalation_from_active_lower_level():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# L1 ownership invariant: each Edge must retain at least one locally-owned
+# camera configured in Edge/configs/cameras.yml during all full-stream
+# offload decisions. Rescued/migrated-in (foreign) cameras do NOT count.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_l1_excludes_last_owned_when_foreign_active():
+    """1 owned + 1 foreign active → L1 must NOT migrate the only owned camera."""
+    o = _new_orch()
+    # Only cam_a is locally-owned; cam_b is foreign (rescued/migrated-in).
+    o._get_owned_camera_ids = lambda: {"cam_a"}
+    sim_state = _make_state(
+        active_cameras=["cam_a", "cam_b"],
+        # cam_a is the LIGHTEST (would normally win L1), cam_b is heavier.
+        camera_workload={"cam_a": 2.0, "cam_b": 12.0},
+    )
+    chosen = o._pick_camera_to_offload(sim_state, level=1)
+    assert chosen == "cam_b", (
+        f"Expected cam_b (foreign) so cam_a (last owned) remains active; "
+        f"got {chosen}"
+    )
+    # Invariant: at least one owned camera remains active.
+    assert "cam_a" in sim_state.active_cameras, "cam_a must remain active"
+
+
+def test_l1_with_two_owned_can_migrate_at_most_one_owned():
+    """2 owned + 1 foreign active → L1 may migrate at most one owned camera.
+
+    Whichever camera is picked (lightest of all eligible), at least one
+    owned camera must remain active afterwards.
+    """
+    o = _new_orch()
+    # cam_a, cam_b are owned; cam_c is foreign.
+    o._get_owned_camera_ids = lambda: {"cam_a", "cam_b"}
+    sim_state = _make_state(
+        active_cameras=["cam_a", "cam_b", "cam_c"],
+        # cam_a is lightest of owned; cam_c (foreign) is lightest overall.
+        camera_workload={"cam_a": 4.0, "cam_b": 12.0, "cam_c": 2.0},
+    )
+    chosen = o._pick_camera_to_offload(sim_state, level=1)
+    # Both cam_a (owned, leaves cam_b) and cam_c (foreign, leaves both owned)
+    # are valid picks; the picker walks lightest-first and chooses cam_c.
+    assert chosen == "cam_c", (
+        f"Expected cam_c (lightest foreign), got {chosen}"
+    )
+    # Invariant: at least one owned camera remains active.
+    owned_remaining = {"cam_a", "cam_b"} & (set(sim_state.active_cameras) - {chosen})
+    assert owned_remaining, (
+        f"After migration of {chosen}, no owned cameras remain active"
+    )
+
+    # Also verify: if the foreign camera is ineligible, the lightest owned
+    # is picked (one of two owned migrates, one remains).
+    sim_state2 = _make_state(
+        active_cameras=["cam_a", "cam_b", "cam_c"],
+        # cam_c has no workload evidence (ineligible); picker falls back to
+        # cam_a (lightest of the eligible owned cameras).
+        camera_workload={"cam_a": 4.0, "cam_b": 12.0},
+    )
+    chosen2 = o._pick_camera_to_offload(sim_state2, level=1)
+    assert chosen2 == "cam_a", (
+        f"Expected cam_a (lightest owned, cam_c ineligible), got {chosen2}"
+    )
+    owned_remaining2 = {"cam_a", "cam_b"} & (set(sim_state2.active_cameras) - {chosen2})
+    assert owned_remaining2 == {"cam_b"}, (
+        f"Expected cam_b to remain as the last owned camera; got {owned_remaining2}"
+    )
+
+
+def test_l1_fails_safe_when_no_owned_camera_active():
+    """Only foreign cameras active → L1 returns None (fail safe)."""
+    o = _new_orch()
+    # Nothing owned is active (all active cameras are foreign/rescued).
+    o._get_owned_camera_ids = lambda: {"cam_owned_offline"}
+    sim_state = _make_state(
+        active_cameras=["cam_rescued_1", "cam_rescued_2"],
+        camera_workload={"cam_rescued_1": 2.0, "cam_rescued_2": 8.0},
+    )
+    chosen = o._pick_camera_to_offload(sim_state, level=1)
+    assert chosen is None, (
+        f"Expected None (no owned active → fail safe), got {chosen}"
+    )
+
+
+def test_l1_fails_safe_when_only_owned_is_ineligible_and_only_owned_remains():
+    """Only one owned camera is active AND no foreign cameras exist → return None.
+
+    The L1 ownership guard is satisfied (the owned camera remains active).
+    The "no eligible candidate" branch fires because cam_owned is starved
+    (ineligible) and there is no other camera to migrate. This is the
+    fail-safe path: nothing useful can be offloaded.
+    """
+    o = _new_orch()
+    o._get_owned_camera_ids = lambda: {"cam_owned"}
+    # Build state manually: only cam_owned is active and it's source-starved,
+    # so it's ineligible; no other camera exists to migrate.
+    sim_state = types.SimpleNamespace(
+        active_cameras=["cam_owned"],
+        camera_workload={"cam_owned": 2.0},
+        source_starved_cameras=["cam_owned"],
+        fps_per_camera={},
+        avg_fps=None,
+        load_score=80.0,
+        risk_index=0.0,
+        overload_since=time.time() - 20.0,
+        penalty_until=0.0,
+    )
+    chosen = o._pick_camera_to_offload(sim_state, level=1)
+    # Note: this also returns None via the "active_cameras <= 1" early-return,
+    # not via the ownership guard. Either way, the behaviour is correct:
+    # never migrate the last camera on the node.
+    assert chosen is None, (
+        f"Expected None (only camera is ineligible), got {chosen}"
+    )
+
+
+def test_l2_can_select_last_owned_camera():
+    """L2 crop offload is allowed to pick the last owned camera — it does
+    NOT remove the stream (crop work is sent to a peer, stream stays local).
+    """
+    o = _new_orch()
+    # Only cam_a is owned; cam_b is foreign.
+    o._get_owned_camera_ids = lambda: {"cam_a"}
+    sim_state = _make_state(
+        active_cameras=["cam_a", "cam_b"],
+        # cam_a (owned) is heaviest → L2 normally picks it.
+        camera_workload={"cam_a": 12.0, "cam_b": 4.0},
+    )
+    chosen = o._pick_camera_to_offload(sim_state, level=2)
+    assert chosen == "cam_a", (
+        f"L2 must be allowed to pick the last owned camera (heaviest); got {chosen}"
+    )
+
+
+def test_l3_can_select_last_owned_camera():
+    """L3 plate-crop offload is allowed to pick the last owned camera."""
+    o = _new_orch()
+    o._get_owned_camera_ids = lambda: {"cam_a"}
+    sim_state = _make_state(
+        active_cameras=["cam_a", "cam_b"],
+        camera_workload={"cam_a": 12.0, "cam_b": 4.0},
+    )
+    chosen = o._pick_camera_to_offload(sim_state, level=3)
+    assert chosen == "cam_a", (
+        f"L3 must be allowed to pick the last owned camera (heaviest); got {chosen}"
+    )
+
+
+def test_get_owned_camera_ids_prefers_live_camera_manager():
+    """Helper uses live CameraManager when available (hot-reloaded source)."""
+    import threading
+    o = _new_orch()
+
+    class _Cfg:
+        def __init__(self, cid, enabled):
+            self.camera_id = cid
+            self.enabled = enabled
+
+    class _FakeCM:
+        """Mimic the parts of CameraManager the helper reaches into."""
+        def __init__(self):
+            self._lock = threading.RLock()
+            self._configs = {
+                "cam_x": _Cfg("cam_x", True),
+                "cam_y": _Cfg("cam_y", True),
+                "cam_z": _Cfg("cam_z", False),   # disabled → excluded
+            }
+
+    o._camera_manager = _FakeCM()
+    owned = o._get_owned_camera_ids()
+    assert owned == {"cam_x", "cam_y"}, (
+        f"Expected only enabled cameras from CameraManager; got {owned}"
+    )
+
+
+def test_get_owned_camera_ids_falls_back_to_cameras_yml():
+    """Helper reads enabled cameras from cameras.yml when CameraManager is None."""
+    import tempfile
+    import yaml
+    tmp = tempfile.mkdtemp(prefix="po_owns_")
+    try:
+        yml_path = Path(tmp) / "cameras.yml"
+        yml_path.write_text(
+            textwrap.dedent("""\
+                cameras:
+                  cam_owned_1:
+                    camera_id: "cam_owned_1"
+                    enabled: true
+                  cam_owned_2:
+                    camera_id: "cam_owned_2"
+                    enabled: true
+                  cam_disabled:
+                    camera_id: "cam_disabled"
+                    enabled: false
+                  cam_default_enabled:
+                    camera_id: "cam_default_enabled"
+                    # enabled key missing → defaults to True
+                """),
+            encoding="utf-8",
+        )
+        o = _new_orch()
+        # _new_orch sets camera_manager=None → fallback path is exercised.
+        o._camera_configs_dir = Path(tmp)
+        # Force cache reset so this file is read on the next call.
+        o._cameras_cache = None
+        o._cameras_cache_mtime = None
+
+        owned = o._get_owned_camera_ids()
+        assert "cam_owned_1" in owned, f"Expected cam_owned_1 in {owned}"
+        assert "cam_owned_2" in owned, f"Expected cam_owned_2 in {owned}"
+        assert "cam_disabled" not in owned, (
+            f"Disabled camera must be excluded; got {owned}"
+        )
+        assert "cam_default_enabled" in owned, (
+            f"Cameras with no 'enabled' key default to True; got {owned}"
+        )
+    finally:
+        # Clean up temp dir
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_get_owned_camera_ids_returns_empty_on_missing_yml():
+    """Helper returns empty set (fail safe) when cameras.yml is absent."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="po_owns_empty_")
+    try:
+        o = _new_orch()
+        # Point at a directory with no cameras.yml.
+        o._camera_configs_dir = Path(tmp)
+        o._cameras_cache = None
+        o._cameras_cache_mtime = None
+
+        owned = o._get_owned_camera_ids()
+        assert owned == set(), f"Expected empty set on missing YAML; got {owned}"
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -891,6 +1146,15 @@ if __name__ == "__main__":
         test_negative_dwell_config_uses_defaults,
         test_string_dwell_config_uses_defaults,
         test_dwell_gate_only_blocks_escalation_from_active_lower_level,
+        test_l1_excludes_last_owned_when_foreign_active,
+        test_l1_with_two_owned_can_migrate_at_most_one_owned,
+        test_l1_fails_safe_when_no_owned_camera_active,
+        test_l1_fails_safe_when_only_owned_is_ineligible_and_only_owned_remains,
+        test_l2_can_select_last_owned_camera,
+        test_l3_can_select_last_owned_camera,
+        test_get_owned_camera_ids_prefers_live_camera_manager,
+        test_get_owned_camera_ids_falls_back_to_cameras_yml,
+        test_get_owned_camera_ids_returns_empty_on_missing_yml,
     ]
     passed = failed = 0
     for t in tests:

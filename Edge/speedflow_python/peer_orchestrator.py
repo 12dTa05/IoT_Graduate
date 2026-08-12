@@ -1964,6 +1964,67 @@ class PeerOrchestrator:
             return cfg.get("uri")
         return None
 
+    def _get_owned_camera_ids(self) -> set:
+        """
+        Return the set of camera IDs this node is configured to own.
+
+        Ownership = cameras enabled in this node's local cameras.yml. Rescued
+        and migrated-in cameras are NOT owned by this node — they live on a
+        peer's cameras.yml. The helper is consumed by _pick_camera_to_offload
+        to enforce the invariant "at least one locally-owned camera remains
+        active during full-stream L1 offload".
+
+        Hot reload:
+          * Preferred path: live CameraManager (inotify-watched inotify
+            handler reloads _configs on every cameras.yml change).
+          * Fallback path: cameras.yml on disk, cached by mtime so a change
+            is picked up on the next call after the file is rewritten.
+
+        Returns an empty set on any error — fail safe (the L1 caller
+        treats empty ownership as "fail safe, don't migrate").
+        """
+        # Fast path: live CameraManager (hot-reloaded via inotify)
+        cm = self._camera_manager
+        if cm is not None:
+            try:
+                with cm._lock:
+                    return {
+                        c.camera_id for c in cm._configs.values()
+                        if getattr(c, "enabled", False)
+                    }
+            except Exception as exc:
+                logger.debug(
+                    "[PeerOrch] CameraManager ownership lookup failed: %s", exc
+                )
+
+        # Fallback: cameras.yml with mtime-based cache invalidation.
+        # Mirrors the same pattern used in _get_camera_config so reloads
+        # are visible without restarting the orchestrator.
+        try:
+            import yaml
+            yml_path = self._camera_configs_dir / "cameras.yml"
+            try:
+                current_mtime = yml_path.stat().st_mtime
+            except OSError:
+                current_mtime = 0.0
+
+            if (self._cameras_cache is None
+                    or getattr(self, "_cameras_cache_mtime", None) != current_mtime):
+                with open(yml_path, "r", encoding="utf-8") as f:
+                    raw = yaml.safe_load(f)
+                self._cameras_cache = (raw or {}).get("cameras", {}) or {}
+                self._cameras_cache_mtime = current_mtime
+
+            return {
+                cam_id for cam_id, cfg in (self._cameras_cache or {}).items()
+                if isinstance(cfg, dict) and bool(cfg.get("enabled", True))
+            }
+        except Exception as exc:
+            logger.debug(
+                "[PeerOrch] cameras.yml ownership lookup failed: %s", exc
+            )
+            return set()
+
     def _pick_camera_to_offload(self, state: PeerState, level: int) -> Optional[str]:
         """
         Select camera to offload based on intended offload level.
@@ -1986,6 +2047,23 @@ class PeerOrchestrator:
         Never offload the last camera — node must keep at least 1 camera
         to continue operation. If only 1 camera remains and still overloaded,
         that's a hardware limit that cannot be solved by migration.
+
+        L1 ownership invariant
+        ──────────────────────
+        Full-stream migration removes a stream from this node. We must keep
+        at least one locally-owned camera (enabled in this node's cameras.yml)
+        active at all times. Rescued/migrated-in cameras are NOT owned by
+        this node — the previous selector kept one arbitrary active camera,
+        so a foreign camera could "stand in" while every owned camera got
+        migrated away.
+
+          * If no owned camera is active → fail safe (return None).
+          * Otherwise, among eligible candidates, pick the lightest whose
+            migration still leaves ≥1 owned camera active.
+
+        L2/L3 crop offload does NOT remove the stream, so the ownership
+        guard does not apply — it is allowed to pick the last owned camera
+        as a crop source.
         """
         if len(state.active_cameras) <= 1:
             if state.active_cameras:
@@ -2019,8 +2097,32 @@ class PeerOrchestrator:
             return None
 
         if level == 1:
-            # L1 migration: lightest camera = min workload
-            return min(eligible, key=lambda c: eligible[c])
-        else:
-            # L2/L3 crop offload: heaviest camera = max workload
-            return max(eligible, key=lambda c: eligible[c])
+            # L1 ownership guard: never migrate away the last owned camera.
+            owned_active = self._get_owned_camera_ids() & set(state.active_cameras)
+            if not owned_active:
+                # Fail safe: nothing locally-owned is active. Even if a foreign
+                # (rescued/migrated-in) camera is available, do not migrate —
+                # the node would end up owning zero local streams.
+                logger.warning(
+                    "[PeerOrch] L1 fail-safe: no locally-owned camera is active "
+                    "(active=%d). Skipping migration to preserve ownership.",
+                    len(state.active_cameras),
+                )
+                return None
+            # Walk candidates lightest-first; skip any whose migration would
+            # leave zero owned cameras active. The first one that preserves
+            # ≥1 owned camera wins.
+            for c in sorted(eligible, key=lambda cam: eligible[cam]):
+                if c not in owned_active or (owned_active - {c}):
+                    return c
+            # Every eligible candidate would zero out owned cameras — fail safe.
+            logger.warning(
+                "[PeerOrch] L1 fail-safe: every eligible candidate would leave "
+                "zero owned cameras active (eligible=%d, owned_active=%d).",
+                len(eligible), len(owned_active),
+            )
+            return None
+
+        # L2/L3 crop offload: heaviest camera = max workload. The crop
+        # offload keeps the stream local; ownership guard does not apply.
+        return max(eligible, key=lambda c: eligible[c])
