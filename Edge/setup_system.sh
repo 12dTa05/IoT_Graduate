@@ -13,6 +13,7 @@
 # Node → IP → local camera streams → global Edge camera IDs:
 #   jetson_A  192.168.212.20  Docker cam1,cam2  →  cam_01, cam_02
 #   jetson_B  192.168.212.21  Docker cam3,cam4  →  cam_03, cam_04
+#   jetson_C  192.168.212.22  Docker cam5,cam6  →  cam_05, cam_06
 #
 # What it does:
 #   1. Install system packages (GStreamer, build tools, Python, Docker)
@@ -48,6 +49,7 @@ else
     echo "  Available node identities:"
     echo "    jetson_A  →  192.168.212.20  (cam1, cam2  →  cam_01, cam_02)"
     echo "    jetson_B  →  192.168.212.21  (cam3, cam4  →  cam_03, cam_04)"
+    echo "    jetson_C  →  192.168.212.22  (cam5, cam6  →  cam_05, cam_06)"
     echo ""
     read -rp "  Enter NODE_ID for this device [jetson_A]: " NODE_ID
     NODE_ID="${NODE_ID:-jetson_A}"
@@ -66,8 +68,13 @@ case "$NODE_ID" in
         CAM_LOCAL_NUMS=(3 4)
         CAM_EDGE_IDS=(cam_03 cam_04)
         ;;
+    jetson_C)
+        ADVERTISE_IP="192.168.212.22"
+        CAM_LOCAL_NUMS=(5 6)
+        CAM_EDGE_IDS=(cam_05 cam_06)
+        ;;
     *)
-        die "Unknown NODE_ID '$NODE_ID'. Expected jetson_A or jetson_B."
+        die "Unknown NODE_ID '$NODE_ID'. Expected jetson_A, jetson_B, or jetson_C."
         ;;
 esac
 
@@ -278,7 +285,7 @@ cameras:
     uri: "rtsp://$ADVERTISE_IP:8554/cam${CAM_LOCAL_NUMS[0]}"
     enabled: true
     name: "Camera ${CAM_LOCAL_NUMS[0]}"
-    fps: 25.0
+    fps: 30.0
     speed_limit_kmh: 80.0
     homography:
       source_points:
@@ -299,7 +306,7 @@ cameras:
     uri: "rtsp://$ADVERTISE_IP:8554/cam${CAM_LOCAL_NUMS[1]}"
     enabled: true
     name: "Camera ${CAM_LOCAL_NUMS[1]}"
-    fps: 25.0
+    fps: 30.0
     speed_limit_kmh: 80.0
     homography:
       source_points:
@@ -342,6 +349,7 @@ cat > "$COMPOSE_FILE" <<EOF
 # Node → local camera services:
 #   jetson_A  →  cam1, cam2
 #   jetson_B  →  cam3, cam4
+#   jetson_C  →  cam5, cam6
 #
 # To swap a video source, set CAM${CAM_LOCAL_NUMS[0]}_VIDEO_FILE or
 # CAM${CAM_LOCAL_NUMS[1]}_VIDEO_FILE in Camera/.env, then restart the services.
@@ -401,6 +409,7 @@ if ! grep -q "$PEER_HINT" /etc/hosts 2>/dev/null; then
 # IoT_Graduate peer nodes
 192.168.212.20 jetson_A
 192.168.212.21 jetson_B
+192.168.212.22 jetson_C
 HOSTS
     ok "/etc/hosts updated"
 fi
