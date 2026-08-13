@@ -6,8 +6,8 @@ file './Camera/videos/sparse/video_in_N.mp4'
 file './Camera/videos/moderate/video_in_N.mp4'
 # segment 4/288 (empty)
 file './Camera/videos/empty/video_in_N.mp4'
-# segment 5/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 5/288 (sparse)
+file './Camera/videos/sparse/video_in_N.mp4'
 # segment 6/288 (signal_cycle)
 file './Camera/videos/signal_cycle/video_in_N.mp4'
 # segment 7/288 (empty)
@@ -18,8 +18,8 @@ file './Camera/videos/dense/video_in_N.mp4'
 file './Camera/videos/sparse/video_in_N.mp4'
 # segment 10/288 (empty)
 file './Camera/videos/empty/video_in_N.mp4'
-# segment 11/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 11/288 (moderate)
+file './Camera/videos/moderate/video_in_N.mp4'
 # segment 12/288 (sparse)
 file './Camera/videos/sparse/video_in_N.mp4'
 # segment 13/288 (surge_spike)
@@ -44,8 +44,8 @@ file './Camera/videos/surge_spike/video_in_N.mp4'
 file './Camera/videos/signal_cycle/video_in_N.mp4'
 # segment 23/288 (empty)
 file './Camera/videos/empty/video_in_N.mp4'
-# segment 24/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 24/288 (sparse)
+file './Camera/videos/sparse/video_in_N.mp4'
 # segment 25/288 (moderate)
 file './Camera/videos/moderate/video_in_N.mp4'
 # segment 26/288 (sparse)
@@ -70,8 +70,8 @@ file './Camera/videos/signal_cycle/video_in_N.mp4'
 file './Camera/videos/empty/video_in_N.mp4'
 # segment 36/288 (moderate)
 file './Camera/videos/moderate/video_in_N.mp4'
-# segment 37/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 37/288 (moderate)
+file './Camera/videos/moderate/video_in_N.mp4'
 # segment 38/288 (surge_spike)
 file './Camera/videos/surge_spike/video_in_N.mp4'
 # segment 39/288 (empty)
@@ -84,8 +84,8 @@ file './Camera/videos/signal_cycle/video_in_N.mp4'
 file './Camera/videos/sparse/video_in_N.mp4'
 # segment 43/288 (moderate)
 file './Camera/videos/moderate/video_in_N.mp4'
-# segment 44/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 44/288 (surge_spike)
+file './Camera/videos/surge_spike/video_in_N.mp4'
 # segment 45/288 (sparse)
 file './Camera/videos/sparse/video_in_N.mp4'
 # segment 46/288 (signal_cycle)
@@ -152,8 +152,8 @@ file './Camera/videos/empty/video_in_N.mp4'
 file './Camera/videos/moderate/video_in_N.mp4'
 # segment 77/288 (signal_cycle)
 file './Camera/videos/signal_cycle/video_in_N.mp4'
-# segment 78/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 78/288 (surge_spike)
+file './Camera/videos/surge_spike/video_in_N.mp4'
 # segment 79/288 (sparse)
 file './Camera/videos/sparse/video_in_N.mp4'
 # segment 80/288 (moderate)
@@ -202,8 +202,8 @@ file './Camera/videos/moderate/video_in_N.mp4'
 file './Camera/videos/signal_cycle/video_in_N.mp4'
 # segment 102/288 (surge_spike)
 file './Camera/videos/surge_spike/video_in_N.mp4'
-# segment 103/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 103/288 (sparse)
+file './Camera/videos/sparse/video_in_N.mp4'
 # segment 104/288 (moderate)
 file './Camera/videos/moderate/video_in_N.mp4'
 # segment 105/288 (signal_cycle)
@@ -236,8 +236,8 @@ file './Camera/videos/sparse/video_in_N.mp4'
 file './Camera/videos/empty/video_in_N.mp4'
 # segment 119/288 (surge_spike)
 file './Camera/videos/surge_spike/video_in_N.mp4'
-# segment 120/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 120/288 (surge_spike)
+file './Camera/videos/surge_spike/video_in_N.mp4'
 # segment 121/288 (moderate)
 file './Camera/videos/moderate/video_in_N.mp4'
 # segment 122/288 (empty)
@@ -256,8 +256,8 @@ file './Camera/videos/moderate/video_in_N.mp4'
 file './Camera/videos/signal_cycle/video_in_N.mp4'
 # segment 129/288 (surge_spike)
 file './Camera/videos/surge_spike/video_in_N.mp4'
-# segment 130/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 130/288 (sparse)
+file './Camera/videos/sparse/video_in_N.mp4'
 # segment 131/288 (sparse)
 file './Camera/videos/sparse/video_in_N.mp4'
 # segment 132/288 (surge_spike)
@@ -342,8 +342,8 @@ file './Camera/videos/dense/video_in_N.mp4'
 file './Camera/videos/moderate/video_in_N.mp4'
 # segment 172/288 (surge_spike)
 file './Camera/videos/surge_spike/video_in_N.mp4'
-# segment 173/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 173/288 (sparse)
+file './Camera/videos/sparse/video_in_N.mp4'
 # segment 174/288 (moderate)
 file './Camera/videos/moderate/video_in_N.mp4'
 # segment 175/288 (signal_cycle)
@@ -356,8 +356,8 @@ file './Camera/videos/dense/video_in_N.mp4'
 file './Camera/videos/empty/video_in_N.mp4'
 # segment 179/288 (sparse)
 file './Camera/videos/sparse/video_in_N.mp4'
-# segment 180/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 180/288 (moderate)
+file './Camera/videos/moderate/video_in_N.mp4'
 # segment 181/288 (empty)
 file './Camera/videos/empty/video_in_N.mp4'
 # segment 182/288 (surge_spike)
@@ -370,8 +370,8 @@ file './Camera/videos/sparse/video_in_N.mp4'
 file './Camera/videos/empty/video_in_N.mp4'
 # segment 186/288 (signal_cycle)
 file './Camera/videos/signal_cycle/video_in_N.mp4'
-# segment 187/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 187/288 (moderate)
+file './Camera/videos/moderate/video_in_N.mp4'
 # segment 188/288 (empty)
 file './Camera/videos/empty/video_in_N.mp4'
 # segment 189/288 (surge_spike)
@@ -398,8 +398,8 @@ file './Camera/videos/dense/video_in_N.mp4'
 file './Camera/videos/sparse/video_in_N.mp4'
 # segment 200/288 (empty)
 file './Camera/videos/empty/video_in_N.mp4'
-# segment 201/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 201/288 (surge_spike)
+file './Camera/videos/surge_spike/video_in_N.mp4'
 # segment 202/288 (signal_cycle)
 file './Camera/videos/signal_cycle/video_in_N.mp4'
 # segment 203/288 (sparse)
@@ -534,8 +534,8 @@ file './Camera/videos/dense/video_in_N.mp4'
 file './Camera/videos/empty/video_in_N.mp4'
 # segment 268/288 (signal_cycle)
 file './Camera/videos/signal_cycle/video_in_N.mp4'
-# segment 269/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 269/288 (sparse)
+file './Camera/videos/sparse/video_in_N.mp4'
 # segment 270/288 (sparse)
 file './Camera/videos/sparse/video_in_N.mp4'
 # segment 271/288 (moderate)
@@ -562,8 +562,8 @@ file './Camera/videos/dense/video_in_N.mp4'
 file './Camera/videos/moderate/video_in_N.mp4'
 # segment 282/288 (surge_spike)
 file './Camera/videos/surge_spike/video_in_N.mp4'
-# segment 283/288 (dense)
-file './Camera/videos/dense/video_in_N.mp4'
+# segment 283/288 (sparse)
+file './Camera/videos/sparse/video_in_N.mp4'
 # segment 284/288 (moderate)
 file './Camera/videos/moderate/video_in_N.mp4'
 # segment 285/288 (signal_cycle)
