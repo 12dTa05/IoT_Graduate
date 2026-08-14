@@ -19,7 +19,6 @@ sleep 5
 
 exec ffmpeg -re -stream_loop -1 \
     -i "$VIDEO_FILE" \
-    -vf "fps=${TARGET_FPS}" \
     -c:v copy \
     -preset ultrafast \
     -tune zerolatency \
