@@ -165,6 +165,7 @@ def _detect_source_starved(
     fps_stats: dict,
     input_fps: dict,
     edge_cfg: dict,
+    source_type_map: Optional[dict] = None,
 ) -> set:
     """
     Detect cameras whose source (upstream feed) is starved.
@@ -172,6 +173,18 @@ def _detect_source_starved(
     A camera is source-starved ONLY when BOTH conditions hold:
       1. Input rate is absent/zero or materially below the expected source rate.
       2. Output rate is also absent/low (not a pure output transient).
+
+    Source-type gate (Phase 1 validity contract):
+      ``source_type_map`` maps camera_id → ``"live"`` | ``"file"`` (derived
+      from the camera URI in cameras.yml).  File-playback cameras are NEVER
+      classified as source-starved: their input FPS is decoder throughput
+      (bounded by the GPU, not by any upstream feed), so comparing it against
+      ``expected_source_rate`` would silently treat hardware-limited playback
+      as a starved live feed.  This is a DEVICE GATE — realtime enforcement
+      for file playback is not implemented in the current pipeline (see
+      core_pipeline.streammux ``live-source``); do not fake it with FPS math.
+      When source_type_map is None/missing the gate is inert — every camera
+      is evaluated exactly as before (backward compatible).
 
     When _input_fps is unavailable (empty/missing/malformed), returns an empty
     set — preserving current FPS-score behaviour exactly.
@@ -196,6 +209,8 @@ def _detect_source_starved(
         fps_stats = {}
     if not isinstance(edge_cfg, dict):
         edge_cfg = {}
+    if not isinstance(source_type_map, dict):
+        source_type_map = {}
 
     sc_cfg = edge_cfg.get("source_starved", {})
     if not isinstance(sc_cfg, dict):
@@ -251,6 +266,11 @@ def _detect_source_starved(
 
     starved: set = set()
     for cam_id in set(fps_stats) | set(input_fps):
+        # File-playback cameras are excluded from starvation classification:
+        # their input FPS is decoder throughput, not an upstream feed rate.
+        # See the source_type_map docstring above (device gate).
+        if source_type_map.get(cam_id) == "file":
+            continue
         in_fps  = _safe_fps(input_fps.get(cam_id))
         out_fps = _safe_fps(fps_stats.get(cam_id))
         if in_fps < threshold and out_fps < threshold:
@@ -300,7 +320,13 @@ def _read_pipeline_snapshot() -> tuple:
     """
     Read the pipeline JSON once, validate freshness/integrity, return all parts.
 
-    Returns (valid: bool, fps_stats, feature_stats, offload_crops, input_fps).
+    Returns (valid: bool, fps_stats, feature_stats, offload_crops,
+             input_fps, source_modes).
+
+    ``source_modes`` is ``_telemetry.source_modes`` from the probe payload
+    (camera_id → "live" | "file").  Missing or malformed → {} so callers
+    that don't yet pass it to _detect_source_starved remain backward
+    compatible.
 
     When valid=False:
       fps_stats is {} and the caller must not use telemetry-derived
@@ -309,11 +335,17 @@ def _read_pipeline_snapshot() -> tuple:
     """
     payload = _read_payload()
     if not _validate_payload(payload):
-        return False, {}, {}, {}, {}
+        return False, {}, {}, {}, {}, {}
     input_fps = payload.get("_input_fps", {})
     if not isinstance(input_fps, dict):
         input_fps = {}
-    return True, *_payload_parts(payload), input_fps
+    source_modes = {}
+    telemetry = payload.get("_telemetry")
+    if isinstance(telemetry, dict):
+        m = telemetry.get("source_modes")
+        if isinstance(m, dict):
+            source_modes = {str(k): str(v) for k, v in m.items()}
+    return True, *_payload_parts(payload), input_fps, source_modes
 
 
 # ---------------------------------------------------------------------------
@@ -1055,7 +1087,7 @@ class HealthAgent:
 
                 metrics = self._collect_metrics()
 
-                snapshot_valid, fps_stats, feature_stats, offload_crops, input_fps = \
+                snapshot_valid, fps_stats, feature_stats, offload_crops, input_fps, source_modes = \
                     _read_pipeline_snapshot()
 
                 # ── Pipeline unavailable guard ─────────────────────────
@@ -1065,7 +1097,8 @@ class HealthAgent:
                 # (load_score 100 = worst) + empty pipeline section.
                 if snapshot_valid:
                     starved_cams = _detect_source_starved(
-                        fps_stats, input_fps, get_edge_cfg()
+                        fps_stats, input_fps, get_edge_cfg(),
+                        source_type_map=source_modes,
                     )
                     load_score, omega_preset = _compute_load_score(
                         metrics, fps_stats, source_starved_cameras=starved_cams,
@@ -1130,7 +1163,18 @@ class HealthAgent:
                     "power_mw":      metrics["power_mw"],
                     "source":        metrics.get("source", "jtop"),
                     "pipeline": {
-                        "fps_per_camera": fps_stats,
+                        # pipeline_available distinguishes "pipeline not yet
+                        # started / stale snapshot" (False, load_score=100)
+                        # from real overload (True, load_score=100).
+                        "pipeline_available": snapshot_valid,
+                        # output_fps_per_camera = frames the probe actually
+                        # processed this window (pipeline throughput).
+                        # fps_per_camera is kept for backward compatibility.
+                        "fps_per_camera":        fps_stats,
+                        "output_fps_per_camera": fps_stats,
+                        # input_fps_per_camera = raw frames arriving from the
+                        # source (decoder/demux probe), before any drop.
+                        "input_fps_per_camera":  input_fps if snapshot_valid else {},
                         "avg_fps":        avg_fps,
                         "active_cameras": active_cameras,
                         "source_starved_cameras": sorted(starved_cams),

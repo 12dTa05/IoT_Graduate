@@ -108,6 +108,23 @@ def _parse_starved_cameras(raw) -> List[str]:
     return [c for c in raw if isinstance(c, str)]
 
 
+def _pick_fps_dict(pipeline: dict) -> dict:
+    """Return the canonical per-camera FPS dict from a pipeline section.
+
+    Phase 1 added ``output_fps_per_camera`` as the unambiguous name for
+    pipeline throughput FPS.  ``fps_per_camera`` is kept for backward
+    compatibility.  Prefer the new name; fall back to the legacy key so
+    peers on older firmware still work.
+    """
+    if not isinstance(pipeline, dict):
+        return {}
+    out = pipeline.get("output_fps_per_camera")
+    if isinstance(out, dict):
+        return out
+    fallback = pipeline.get("fps_per_camera", {})
+    return fallback if isinstance(fallback, dict) else {}
+
+
 def _has_valid_positive_fps(fps_per_camera) -> bool:
     """Return True if fps_per_camera has at least one finite, positive (>0) value.
 
@@ -302,6 +319,34 @@ class PeerOrchestrator:
         # Used to reclaim cameras when this node's load drops below threshold.
         self._migrated_out: Dict[str, str] = {}
 
+        # Phase 3 — bounded in-flight reservation accounting.
+        #
+        # Sender side: _peer_inflight[peer_node_id] counts how many L1 stream
+        # migrations have been decided (decision published) toward that peer but
+        # whose ADD ack has not yet arrived.  _pick_best_peer adds this to
+        # len(peer.active_cameras) before applying the capacity gate so two
+        # simultaneous RFOs cannot both pick the same already-full peer.
+        # Decremented on ACK (stream PLAYING) or on migration timeout (rollback).
+        # ponytail: per-peer int rather than per-camera set — O(1), no camera-id
+        # coupling, naturally collapses when the reservation resolves.
+        self._peer_inflight: Dict[str, int] = {}
+
+        # Phase 3 — sender-side camera→winner mapping used to decrement
+        # _peer_inflight on ACK or timeout.  Populated in _close_vote_window;
+        # cleared in _on_vote_ack (ACK path) and _wait_and_remove (timeout path).
+        self._pending_winner: Dict[str, str] = {}
+
+        # Receiver side: count of bids sent but whose ADD command has not yet
+        # arrived.  ε1 in _evaluate_and_bid gates on
+        # current_streams + _self_inflight >= eps_streams_max so a node with 3
+        # streams that has already bid on one RFO won't bid on a second and
+        # overflow capacity.  Decayed by a timer (vote_window_s +
+        # migration_timeout_s) since the ADD command goes to ZenohCommandSubscriber
+        # rather than back through this orchestrator — timeout-only decay is the
+        # conservative safe path.
+        self._self_inflight: int = 0
+        self._self_inflight_lock = threading.Lock()  # separate from _lock to avoid nesting
+
         # Reclaim post-return observation window: camera_id → timestamp of reclaim
         # completion.  Prevents the reclaimed camera from being immediately
         # migrated away again during its transient FPS warm-up window on this node.
@@ -441,7 +486,9 @@ class PeerOrchestrator:
 
             pipeline = payload.get("pipeline", {}) or {}
             self._self_state.avg_fps = pipeline.get("avg_fps")
-            self._self_state.fps_per_camera = pipeline.get("fps_per_camera", {})
+            # Prefer output_fps_per_camera (Phase 1 unambiguous key); fall back
+            # to fps_per_camera for backward compatibility with older firmware.
+            self._self_state.fps_per_camera = _pick_fps_dict(pipeline)
             self._self_state.active_cameras = list(pipeline.get("active_cameras", []))
             self._self_state.camera_configs = pipeline.get("camera_configs", {})
             # Backwards-compatible: missing or malformed mapping → empty dict.
@@ -592,7 +639,9 @@ class PeerOrchestrator:
                 self._self_state.risk_index  = payload.get("risk_index",  0.0)
                 pipeline = payload.get("pipeline", {}) or {}
                 self._self_state.avg_fps = pipeline.get("avg_fps")
-                self._self_state.fps_per_camera = pipeline.get("fps_per_camera", {})
+                # Prefer output_fps_per_camera (Phase 1 unambiguous key); fall back
+                # to fps_per_camera for backward compatibility with older firmware.
+                self._self_state.fps_per_camera = _pick_fps_dict(pipeline)
                 self._self_state.active_cameras = list(pipeline.get("active_cameras", []))
                 # Backwards-compatible: missing or malformed mapping → empty.
                 self._self_state.camera_workload = _parse_camera_workload(
@@ -657,7 +706,9 @@ class PeerOrchestrator:
 
             pipeline = payload.get("pipeline", {}) or {}
             peer.avg_fps        = pipeline.get("avg_fps")
-            peer.fps_per_camera = pipeline.get("fps_per_camera", {})
+            # Prefer output_fps_per_camera (Phase 1 unambiguous key); fall back
+            # to fps_per_camera for backward compatibility with older firmware.
+            peer.fps_per_camera = _pick_fps_dict(pipeline)
             peer.active_cameras = list(pipeline.get("active_cameras", []))
             peer.camera_configs = pipeline.get("camera_configs", peer.camera_configs)
             # Backwards-compatible: missing or malformed mapping → empty.
@@ -674,8 +725,16 @@ class PeerOrchestrator:
             except (TypeError, ValueError):
                 peer.max_streams = 8
 
-            # Track overload onset using same proactive-aware helper
-            overloaded = self._is_overloaded(peer.load_score, peer.risk_index)
+            # Track overload onset using same proactive-aware helper.
+            # Gate on valid positive FPS: load_score=100 with fps={} means the
+            # peer pipeline is unavailable (pipeline_available=False), NOT
+            # genuinely overloaded.  Without this gate a newly-started peer
+            # would appear overloaded to election logic before its pipeline runs.
+            peer_fps_valid = _has_valid_positive_fps(peer.fps_per_camera)
+            overloaded = (
+                self._is_overloaded(peer.load_score, peer.risk_index)
+                and peer_fps_valid
+            )
             if overloaded:
                 if peer.overload_since is None:
                     peer.overload_since = time.time()
@@ -1450,7 +1509,13 @@ class PeerOrchestrator:
                     continue
                 if now - peer.last_seen > timeout:
                     continue
-                if for_offload_level <= 1 and len(peer.active_cameras) >= peer.max_streams:
+                if for_offload_level <= 1 and (
+                    len(peer.active_cameras) + self._peer_inflight.get(nid, 0)
+                    >= peer.max_streams
+                ):
+                    # ponytail: count in-flight reservations so simultaneous
+                    # RFOs from this node don't both pick the same peer and
+                    # overflow its stream capacity before ACKs arrive.
                     continue
                 if not _thermal_admission_ok(peer.gpu_temp_c, therm_cfg):
                     logger.info(
@@ -1584,12 +1649,28 @@ class PeerOrchestrator:
             "cam_config": cam_config,
             "ts":         time.time(),
         }
+        winner_id = winner["bidder"]
+
+        # Phase 3 review fix 1+3: atomically (a) reserve a stream slot on the
+        # winner and (b) register the pending-ACK event BEFORE the decision is
+        # published.  A fast valid ACK from the winner can therefore never
+        # arrive before its event exists, so it cannot be dropped into a false
+        # timeout/penalty.  All three lifecycle actors — _close_vote_window
+        # (reserve), _on_vote_ack (ACK release), _wait_and_remove (timeout
+        # release) — mutate _peer_inflight/_pending_winner under _lock so a
+        # single canonical owner always wins the pop.
+        ack_event = threading.Event()
+        with self._lock:
+            self._peer_inflight[winner_id] = self._peer_inflight.get(winner_id, 0) + 1
+            self._pending_winner[camera_id] = winner_id
+            self._pending_acks[camera_id] = ack_event
 
         self._pubs["vote_decision"].put(msgpack.packb(decision, use_bin_type=True))
         self._cam_cooldown[camera_id] = time.time()
         logger.info(
-            "[PeerOrch] Election won by '%s' for '%s' (score=%.1f, fps_pred=%.1f)",
-            winner["bidder"], camera_id, winner["score"], winner.get("fps_predicted", 0),
+            "[PeerOrch] Election won by '%s' for '%s' (score=%.1f, fps_pred=%.1f, inflight=%d)",
+            winner_id, camera_id, winner["score"], winner.get("fps_predicted", 0),
+            self._peer_inflight[winner_id],
         )
 
     # ------------------------------------------------------------------
@@ -1629,6 +1710,27 @@ class PeerOrchestrator:
             self_load = self._self_state.load_score
             self_temp = self._self_state.gpu_temp_c
 
+        # Phase 3 review fix 2 and Fix 5: explicit L1 capacity semantics.
+        #
+        # ``max_streams`` is the hard hardware/pipeline limit (e.g. GStreamer
+        # streammux max-sources / decoder max slots) — enforced for direct
+        # sender-side peer selection in ``_pick_best_peer`` and for failover
+        # self-eligibility.  It is NEVER relaxed by L2/L3 offload.
+        #
+        # ``eps_streams_max`` is the ε admission policy limit — it is the
+        # ceiling used by the receiver's ε1 gate (_evaluate_and_bid) which
+        # additionally accounts ``_self_inflight`` reservations (bids accepted
+        # but not yet ADDed).  Both the capacity check and the reservation
+        # increment are held under ``_self_inflight_lock`` as a single atomic
+        # read–modify–write, with explicit rollback on every downstream reject
+        # path so concurrent evaluators cannot overbook eps_streams_max.
+        #
+        # Canonical expression of L1 slot availability (used consistently in
+        # _pick_best_peer, _evaluate_and_bid, and failover self-eligibility):
+        #   sender gate (receiver hardware):           peer.active_cameras + peer_inflight < peer.max_streams
+        #   receiver admission (receiver ε policy):    current_active + self_inflight < eps_streams_max
+        #   failover self-eligibility (self hardware): current_active + self_accepted < eps_streams_max  (= eps_streams_max)
+
         # ε0 — Thermal admission gate for THIS node (receiver).
         # Same rule as _pick_best_peer's sender-side gate: do not bid when
         # this node is too hot or has an unknown reading under a conservative
@@ -1643,94 +1745,133 @@ class PeerOrchestrator:
             )
             return
 
-        # ε1 — Capacity constraint
+        # ε1 — Capacity constraint (Phase 3 review fix 2).
+        #
+        # The capacity check AND the _self_inflight reservation increment are
+        # one atomic critical section: concurrent evaluators cannot both read
+        # the same "free slot" and overbook past eps_streams_max.  The
+        # reservation is made BEFORE any later ε-check (ε2..ε5) or the RTT
+        # measurement, and rolled back via the finally block below on every
+        # downstream rejection/exception — so a bid that never ships does not
+        # hold capacity, and one that ships is counted exactly once.
         eps_streams_max = self._cfg.get("eps_streams_max", 4)
-        if current_streams >= eps_streams_max:
+        with self._self_inflight_lock:
+            accounted_streams = current_streams + self._self_inflight
+            if accounted_streams >= eps_streams_max:
+                logger.info(
+                    "[PeerOrch] RFO rejected for '%s': ε1 (capacity) — "
+                    "current=%d inflight=%d max=%d",
+                    camera_id, current_streams,
+                    accounted_streams - current_streams, eps_streams_max,
+                )
+                return
+            self._self_inflight += 1  # reserve now, atomically with the check
+
+        # Flag flipped to False once the bid is fully shipped (no rollback).
+        reservation_committed = False
+        try:
+            # ε2 — FPS prediction
+            # YAML parses bare integer keys as int; look up both int and str forms
+            fps_model = self._cfg.get("fps_model", {})
+            streams_after = current_streams + 1
+            predicted_fps = fps_model.get(streams_after,
+                            fps_model.get(str(streams_after), None))
+            if predicted_fps is None:
+                logger.info(
+                    "[PeerOrch] RFO rejected for '%s': ε2 (FPS) — "
+                    "no fps_model entry for streams_after=%d (current=%d, max modeled=%d)",
+                    camera_id, streams_after, current_streams, max(fps_model.keys(), default=0),
+                )
+                return
+            if predicted_fps < eps_fps:
+                logger.info(
+                    "[PeerOrch] RFO rejected for '%s': ε2 (FPS) — "
+                    "predicted=%.1f, required=%.1f (streams_after=%d)",
+                    camera_id, predicted_fps, eps_fps, streams_after,
+                )
+                return
+
+            # ε3 — Network RTT to camera RTSP origin (blocking — safe here in thread pool)
+            # Prefer URI from the RFO payload (sent by requester who owns the camera).
+            # Fall back to local lookup for backward compatibility.
+            cam_uri = payload.get("cam_uri") or self._get_camera_uri(camera_id)
+            if not cam_uri:
+                logger.info("[PeerOrch] RFO rejected for '%s': ε3 (network) — camera URI not found", camera_id)
+                return
+            rtt_ms = self._measure_rtt(cam_uri)
+            if rtt_ms is None or rtt_ms > eps_net_ms:
+                logger.info(
+                    "[PeerOrch] RFO rejected for '%s': ε3 (network) — "
+                    "RTT=%.1fms, threshold=%.1fms",
+                    camera_id, rtt_ms if rtt_ms else -1.0, eps_net_ms,
+                )
+                return
+
+            # ε4 — Per-camera cooldown
+            last_mig = self._cam_cooldown.get(camera_id, 0.0)
+            cooldown_s = self._cfg.get("cooldown_s", 45.0)
+            time_since_last = time.time() - last_mig
+            if time_since_last < cooldown_s:
+                logger.info(
+                    "[PeerOrch] RFO rejected for '%s': ε4 (cooldown) — "
+                    "%.1fs since last migration, need %.1fs",
+                    camera_id, time_since_last, cooldown_s,
+                )
+                return
+
+            # ε5 — Penalty check (applied when this node previously caused a migration timeout)
+            now = time.time()
+            if now < self._self_penalty_until:
+                logger.info(
+                    "[PeerOrch] RFO rejected for '%s': ε5 (penalty) — "
+                    "penalized until %.1f",
+                    camera_id, self._self_penalty_until,
+                )
+                return
+
+            # All constraints pass — compute F(x)
+            # F(x) = estimated load score after accepting this stream
+            f_x = self_load + (100.0 - self_load) * 0.25
+
+            proposal = {
+                "bidder":        self._node_id,
+                "camera_id":     camera_id,
+                "score":         round(f_x, 2),
+                "fps_predicted": predicted_fps,
+                "rtt_ms":        round(rtt_ms, 1),
+                "ts":            time.time(),
+            }
+
+            self._pubs["vote_proposal"].put(msgpack.packb(proposal, use_bin_type=True))
             logger.info(
-                "[PeerOrch] RFO rejected for '%s': ε1 (capacity) — "
-                "current=%d, max=%d",
-                camera_id, current_streams, eps_streams_max,
+                "[PeerOrch] RFO accepted for '%s' (ALL ε-constraints pass) — "
+                "Bid: score=%.1f, fps_pred=%.1f, rtt=%.0fms",
+                camera_id, f_x, predicted_fps, rtt_ms,
             )
-            return
+            reservation_committed = True
 
-        # ε2 — FPS prediction
-        # YAML parses bare integer keys as int; look up both int and str forms
-        fps_model = self._cfg.get("fps_model", {})
-        streams_after = current_streams + 1
-        predicted_fps = fps_model.get(streams_after,
-                        fps_model.get(str(streams_after), None))
-        if predicted_fps is None:
-            logger.info(
-                "[PeerOrch] RFO rejected for '%s': ε2 (FPS) — "
-                "no fps_model entry for streams_after=%d (current=%d, max modeled=%d)",
-                camera_id, streams_after, current_streams, max(fps_model.keys(), default=0),
+            # Phase 3: hold the receiver-side reservation for the worst-case
+            # resolution window (vote_window_s + migration_timeout_s), then
+            # decay it.  Conservative timeout-only decay: the ADD command goes
+            # to ZenohCommandSubscriber, not back through this orchestrator,
+            # so we cannot hook the ADD arrival to release earlier.
+            decay_s = (
+                self._cfg.get("vote_window_s", 2.0)
+                + self._cfg.get("migration_timeout_s", 15.0)
             )
-            return
-        if predicted_fps < eps_fps:
-            logger.info(
-                "[PeerOrch] RFO rejected for '%s': ε2 (FPS) — "
-                "predicted=%.1f, required=%.1f (streams_after=%d)",
-                camera_id, predicted_fps, eps_fps, streams_after,
-            )
-            return
 
-        # ε3 — Network RTT to camera RTSP origin (blocking — safe here in thread pool)
-        # Prefer URI from the RFO payload (sent by requester who owns the camera).
-        # Fall back to local lookup for backward compatibility.
-        cam_uri = payload.get("cam_uri") or self._get_camera_uri(camera_id)
-        if not cam_uri:
-            logger.info("[PeerOrch] RFO rejected for '%s': ε3 (network) — camera URI not found", camera_id)
-            return
-        rtt_ms = self._measure_rtt(cam_uri)
-        if rtt_ms is None or rtt_ms > eps_net_ms:
-            logger.info(
-                "[PeerOrch] RFO rejected for '%s': ε3 (network) — "
-                "RTT=%.1fms, threshold=%.1fms",
-                camera_id, rtt_ms if rtt_ms else -1.0, eps_net_ms,
-            )
-            return
+            def _decay_self_inflight():
+                with self._self_inflight_lock:
+                    self._self_inflight = max(0, self._self_inflight - 1)
+                logger.debug("[PeerOrch] Self inflight reservation decayed (camera='%s')", camera_id)
 
-        # ε4 — Per-camera cooldown
-        last_mig = self._cam_cooldown.get(camera_id, 0.0)
-        cooldown_s = self._cfg.get("cooldown_s", 45.0)
-        time_since_last = time.time() - last_mig
-        if time_since_last < cooldown_s:
-            logger.info(
-                "[PeerOrch] RFO rejected for '%s': ε4 (cooldown) — "
-                "%.1fs since last migration, need %.1fs",
-                camera_id, time_since_last, cooldown_s,
-            )
-            return
-
-        # ε5 — Penalty check (applied when this node previously caused a migration timeout)
-        now = time.time()
-        if now < self._self_penalty_until:
-            logger.info(
-                "[PeerOrch] RFO rejected for '%s': ε5 (penalty) — "
-                "penalized until %.1f",
-                camera_id, self._self_penalty_until,
-            )
-            return
-
-        # All constraints pass — compute F(x)
-        # F(x) = estimated load score after accepting this stream
-        f_x = self_load + (100.0 - self_load) * 0.25
-
-        proposal = {
-            "bidder":        self._node_id,
-            "camera_id":     camera_id,
-            "score":         round(f_x, 2),
-            "fps_predicted": predicted_fps,
-            "rtt_ms":        round(rtt_ms, 1),
-            "ts":            time.time(),
-        }
-
-        self._pubs["vote_proposal"].put(msgpack.packb(proposal, use_bin_type=True))
-        logger.info(
-            "[PeerOrch] RFO accepted for '%s' (ALL ε-constraints pass) — "
-            "Bid: score=%.1f, fps_pred=%.1f, rtt=%.0fms",
-            camera_id, f_x, predicted_fps, rtt_ms,
-        )
+            threading.Timer(decay_s, _decay_self_inflight).start()
+        finally:
+            # Roll back the reservation if we never shipped a bid (any ε-check
+            # rejection above, RTT failure, or an unexpected exception).
+            if not reservation_committed:
+                with self._self_inflight_lock:
+                    self._self_inflight = max(0, self._self_inflight - 1)
 
     def _on_vote_proposal(self, payload: dict) -> None:
         """Collect proposals — only requester processes."""
@@ -1789,10 +1930,21 @@ class PeerOrchestrator:
         Make-before-Break: wait for winner to confirm PLAYING → REMOVE from self.
 
         If timeout → rollback (penalize winner node).
+
+        Phase 3 review fix 1: the pending-ACK event was already registered in
+        _close_vote_window BEFORE the decision was published, so a fast valid
+        ACK can never arrive before its event exists (no dropped ACK → no false
+        timeout/penalty).  We reuse that pre-registered event here instead of
+        creating a fresh one.
         """
-        event = threading.Event()
         with self._lock:
-            self._pending_acks[camera_id] = event
+            event = self._pending_acks.get(camera_id)
+        if event is None:
+            # Defensive fallback (e.g. caller other than the requester path)
+            # — create it now, even though it should already exist.
+            event = threading.Event()
+            with self._lock:
+                self._pending_acks[camera_id] = event
 
         start_ms = time.time() * 1000
         timeout = self._cfg.get("migration_timeout_s", 15.0)
@@ -1813,6 +1965,22 @@ class PeerOrchestrator:
                 "[PeerOrch] TIMEOUT (%ds) waiting for ack from '%s' for '%s'. Rolling back.",
                 int(timeout), winner_node, camera_id,
             )
+            # Phase 3 review fix 3: release the in-flight reservation ONLY if
+            # this camera still owns one, and ONLY once.  _on_vote_ack and the
+            # timeout path both race to pop _pending_winner under _lock — the
+            # single winner of the pop is the single owner of the decrement, so
+            # an ACK/timeout race can never double-release or decrement a
+            # reservation belonging to a different camera/winner.
+            with self._lock:
+                owned = self._pending_winner.pop(camera_id, None)
+            if owned == winner_node:
+                self._peer_inflight[winner_node] = max(
+                    0, self._peer_inflight.get(winner_node, 0) - 1
+                )
+                logger.debug(
+                    "[PeerOrch] Timeout released reservation for '%s' (winner='%s', inflight=%d)",
+                    camera_id, winner_node, self._peer_inflight[winner_node],
+                )
             penalty_until = time.time() + self._cfg.get("cooldown_s", 45.0) * 2
             if winner_node == self._node_id:
                 # The winner is ourselves — set our own penalty field
@@ -1918,14 +2086,69 @@ class PeerOrchestrator:
     # ------------------------------------------------------------------
 
     def _on_vote_ack(self, payload: dict) -> None:
-        """Receive ack that stream is PLAYING on winner node."""
+        """Receive ack that stream is PLAYING on winner node.
+
+        Phase 3 review fix 4 — the ACK is authenticated against the expected
+        winner/migration identity before it can release the reservation or
+        trigger the REMOVE: the payload ``node_id`` (the winner, as published
+        by ZenohCommandSubscriber) must equal the stored ``_pending_winner``
+        for that camera.  A stale, wrong, or duplicate ACK therefore cannot
+        release a reservation it does not own, and cannot set the pending-ack
+        event (which is what drives the requester's REMOVE in _wait_and_remove).
+        Fail-closed for ambiguous ACKs; safe legacy compatibility: a legacy ACK
+        without ``node_id`` is only honoured when no migration is pending for
+        that camera (i.e. there is nothing to authenticate against).
+        """
         camera_id = payload.get("camera_id", "")
         if not camera_id:
             return
+        ack_node = payload.get("node_id", "")
+        event_type = payload.get("event")
+
+        # Fail closed on clearly-invalid ACK semantics.
+        if event_type is not None and event_type != "PLAYING":
+            logger.warning(
+                "[PeerOrch] Ignoring ACK for '%s': event='%s' != 'PLAYING'.",
+                camera_id, event_type,
+            )
+            return
+
         with self._lock:
+            expected_winner = self._pending_winner.get(camera_id)
             event = self._pending_acks.get(camera_id)
-        if event:
-            event.set()
+
+            if expected_winner is not None and ack_node not in ("", expected_winner):
+                # Wrong/forged/stale sender for an in-flight migration — fail closed.
+                logger.warning(
+                    "[PeerOrch] Ignoring ACK for '%s': sender='%s' != expected winner='%s'.",
+                    camera_id, ack_node, expected_winner,
+                )
+                return
+            if expected_winner is None and ack_node not in ("", self._node_id):
+                # No pending migration but a foreign sender claims this camera —
+                # ambiguous, fail closed (do not set event, do not release).
+                logger.warning(
+                    "[PeerOrch] Ignoring ACK for '%s': no pending migration but "
+                    "sender='%s' != self.", camera_id, ack_node,
+                )
+                return
+
+            # Authenticated — now atomically claim the reservation if we own it.
+            winner_id = self._pending_winner.pop(camera_id, None)
+            if winner_id is not None:
+                self._peer_inflight[winner_id] = max(
+                    0, self._peer_inflight.get(winner_id, 0) - 1
+                )
+            if event is not None:
+                event.set()
+
+        if winner_id is not None:
+            logger.info(
+                "[PeerOrch] Ack received for '%s' from '%s' — stream is PLAYING. "
+                "Reservation released (inflight=%d).",
+                camera_id, ack_node, self._peer_inflight.get(winner_id, 0),
+            )
+        elif event is not None:
             logger.info("[PeerOrch] Ack received for '%s' — stream is PLAYING.", camera_id)
 
     # ------------------------------------------------------------------

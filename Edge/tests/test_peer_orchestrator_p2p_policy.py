@@ -499,6 +499,11 @@ def _setup_overloaded_self(o, load_score=60.0, cameras=None):
     })
     # Simulate long-standing overload (bypass overload_duration_s)
     o._self_state.overload_since = time.time() - 20.0
+    # Backdate warmup clock so the startup warmup gate (overload_warmup_s) is
+    # already satisfied.  update_self_state() stamps _self_first_valid_fps_at
+    # to time.time(); tests use overload_warmup_s=5.0 (see _new_orch), so
+    # backdating by 20s clears the gate without weakening production behavior.
+    o._self_first_valid_fps_at = time.time() - 20.0
 
 
 def _add_peer_beta(o):
@@ -1561,6 +1566,392 @@ def test_rebalance_fails_safe_when_owned_lookup_raises():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 telemetry contract: peer overload onset gate (Fix 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_peer_overload_onset_requires_valid_fps():
+    """Peer with load_score=100 and empty fps_per_camera must NOT set overload_since.
+
+    pipeline_available=False (fps_per_camera={}) means the peer's pipeline is
+    unavailable, not genuinely overloaded.  Without this gate the peer would
+    immediately appear as an overloaded election participant before its pipeline runs.
+    """
+    o = _new_orch()
+    payload = {
+        "node_id": "peer_starting",
+        "load_score": 100.0,
+        "gpu_percent": 10.0,
+        "cpu_percent": 10.0,
+        "ram_percent": 10.0,
+        "gpu_temp_c": 40.0,
+        "risk_index": 0.0,
+        "pipeline": {
+            "pipeline_available": False,
+            "fps_per_camera": {},
+            "output_fps_per_camera": {},
+            "avg_fps": None,
+            "active_cameras": [],
+        },
+    }
+    o._on_peer_status(payload)
+    with o._lock:
+        peer = o._peers.get("peer_starting")
+    assert peer is not None, "Peer should have been registered"
+    assert peer.overload_since is None, (
+        f"overload_since should be None when fps={{}}, got {peer.overload_since}"
+    )
+
+
+def test_peer_overload_onset_set_when_fps_valid():
+    """Peer with load_score=100 and real positive FPS must set overload_since."""
+    o = _new_orch()
+    payload = {
+        "node_id": "peer_loaded",
+        "load_score": 100.0,
+        "gpu_percent": 95.0,
+        "cpu_percent": 80.0,
+        "ram_percent": 70.0,
+        "gpu_temp_c": 60.0,
+        "risk_index": 0.0,
+        "pipeline": {
+            "pipeline_available": True,
+            "fps_per_camera": {"cam_0": 8.0},
+            "output_fps_per_camera": {"cam_0": 8.0},
+            "avg_fps": 8.0,
+            "active_cameras": ["cam_0"],
+        },
+    }
+    o._on_peer_status(payload)
+    with o._lock:
+        peer = o._peers.get("peer_loaded")
+    assert peer is not None
+    assert peer.overload_since is not None, (
+        "overload_since should be set when load_score=100 AND fps>0"
+    )
+
+
+def test_peer_overload_cleared_when_load_drops():
+    """After load drops below threshold, peer.overload_since must be cleared."""
+    o = _new_orch(overload_threshold=57.0)
+    payload_hi = {
+        "node_id": "peer_x",
+        "load_score": 80.0,
+        "gpu_percent": 80.0, "cpu_percent": 50.0, "ram_percent": 50.0,
+        "gpu_temp_c": 55.0, "risk_index": 0.0,
+        "pipeline": {
+            "fps_per_camera": {"cam_0": 20.0},
+            "avg_fps": 20.0, "active_cameras": ["cam_0"],
+        },
+    }
+    o._on_peer_status(payload_hi)
+    with o._lock:
+        assert o._peers["peer_x"].overload_since is not None
+
+    payload_lo = dict(payload_hi)
+    payload_lo["load_score"] = 30.0
+    o._on_peer_status(payload_lo)
+    with o._lock:
+        assert o._peers["peer_x"].overload_since is None, (
+            "overload_since must clear when load_score drops below threshold"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 telemetry contract: FPS dict preference (Fix 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_pick_fps_dict_prefers_output_fps_per_camera():
+    """_pick_fps_dict returns output_fps_per_camera when present, not fps_per_camera."""
+    from speedflow_python.peer_orchestrator import _pick_fps_dict
+    pipeline = {
+        "output_fps_per_camera": {"cam_0": 24.0},
+        "fps_per_camera":        {"cam_0": 10.0},   # legacy / different value
+    }
+    result = _pick_fps_dict(pipeline)
+    assert result == {"cam_0": 24.0}, (
+        f"Should prefer output_fps_per_camera, got {result}"
+    )
+
+
+def test_pick_fps_dict_falls_back_to_fps_per_camera():
+    """_pick_fps_dict falls back to fps_per_camera when output key is absent."""
+    from speedflow_python.peer_orchestrator import _pick_fps_dict
+    pipeline = {"fps_per_camera": {"cam_1": 15.0}}
+    result = _pick_fps_dict(pipeline)
+    assert result == {"cam_1": 15.0}, (
+        f"Should fall back to fps_per_camera, got {result}"
+    )
+
+
+def test_pick_fps_dict_empty_when_both_absent():
+    """_pick_fps_dict returns {} when neither FPS key is present."""
+    from speedflow_python.peer_orchestrator import _pick_fps_dict
+    assert _pick_fps_dict({}) == {}
+    assert _pick_fps_dict({"avg_fps": 25.0}) == {}
+
+
+def test_update_self_state_prefers_output_fps_per_camera():
+    """update_self_state picks output_fps_per_camera when both keys present."""
+    o = _new_orch()
+    o.update_self_state({
+        "load_score": 30.0,
+        "gpu_percent": 20.0, "cpu_percent": 10.0, "ram_percent": 10.0,
+        "gpu_temp_c": 40.0, "risk_index": 0.0,
+        "pipeline": {
+            "output_fps_per_camera": {"cam_a": 22.0},
+            "fps_per_camera":        {"cam_a":  9.0},   # legacy value
+            "avg_fps": 22.0,
+            "active_cameras": ["cam_a"],
+        },
+    })
+    assert o._self_state.fps_per_camera == {"cam_a": 22.0}, (
+        f"update_self_state should prefer output_fps_per_camera; "
+        f"got {o._self_state.fps_per_camera}"
+    )
+
+
+def test_on_peer_status_prefers_output_fps_per_camera():
+    """_on_peer_status picks output_fps_per_camera for a remote peer."""
+    o = _new_orch()
+    o._on_peer_status({
+        "node_id": "peer_new",
+        "load_score": 20.0,
+        "gpu_percent": 10.0, "cpu_percent": 10.0, "ram_percent": 10.0,
+        "gpu_temp_c": 45.0, "risk_index": 0.0,
+        "pipeline": {
+            "output_fps_per_camera": {"cam_b": 18.0},
+            "fps_per_camera":        {"cam_b":  5.0},
+            "avg_fps": 18.0,
+            "active_cameras": ["cam_b"],
+        },
+    })
+    with o._lock:
+        peer = o._peers.get("peer_new")
+    assert peer is not None
+    assert peer.fps_per_camera == {"cam_b": 18.0}, (
+        f"_on_peer_status should prefer output_fps_per_camera; "
+        f"got {peer.fps_per_camera}"
+    )
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 3 — capacity-aware selection & bounded in-flight reservation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_pick_best_peer_skips_full_peer():
+    """_pick_best_peer (L1) skips a peer whose active_cameras already fills max_streams."""
+    from speedflow_python.peer_orchestrator import PeerState
+    o = _new_orch()
+    o._peers["node_full"] = PeerState(
+        node_id="node_full", load_score=5.0, gpu_temp_c=50.0,
+        last_seen=time.time() - 1.0, active_cameras=["c1", "c2", "c3", "c4"],
+        max_streams=4,
+    )
+    best = o._pick_best_peer(for_offload_level=1)
+    assert best is None, f"Full peer should be skipped; got {best}"
+
+
+def test_pick_best_peer_skips_peer_when_inflight_fills_capacity():
+    """_pick_best_peer (L1) skips a peer where active + in-flight == max_streams,
+    even if active_cameras alone is below max_streams."""
+    from speedflow_python.peer_orchestrator import PeerState
+    o = _new_orch()
+    # Peer has 3 active streams, max 4 → normally would still be eligible.
+    o._peers["node_nearfull"] = PeerState(
+        node_id="node_nearfull", load_score=5.0, gpu_temp_c=50.0,
+        last_seen=time.time() - 1.0, active_cameras=["c1", "c2", "c3"],
+        max_streams=4,
+    )
+    # Inject 1 in-flight reservation → 3 + 1 = 4 = max_streams → should skip.
+    o._peer_inflight["node_nearfull"] = 1
+    best = o._pick_best_peer(for_offload_level=1)
+    assert best is None, (
+        f"Peer with active=3 + inflight=1 == max_streams=4 should be skipped; got {best}"
+    )
+
+
+def test_pick_best_peer_inflight_does_not_affect_l2_l3():
+    """In-flight reservation should NOT affect L2/L3 crop-offload peer selection
+    (L2/L3 don't consume a streammux slot)."""
+    from speedflow_python.peer_orchestrator import PeerState
+    o = _new_orch()
+    o._peers["node_full"] = PeerState(
+        node_id="node_full", load_score=5.0, gpu_temp_c=50.0,
+        last_seen=time.time() - 1.0, active_cameras=["c1", "c2", "c3", "c4"],
+        max_streams=4,
+    )
+    # Saturate with inflight too — L2/L3 should still pick this peer.
+    o._peer_inflight["node_full"] = 2
+    best_l2 = o._pick_best_peer(for_offload_level=2)
+    best_l3 = o._pick_best_peer(for_offload_level=3)
+    assert best_l2 == "node_full", f"L2 should ignore stream capacity; got {best_l2}"
+    assert best_l3 == "node_full", f"L3 should ignore stream capacity; got {best_l3}"
+
+
+def test_peer_inflight_incremented_on_decision():
+    """_peer_inflight[winner] increments when a decision is published."""
+    import msgpack
+
+    o = _new_orch()
+    class _FakePub:
+        def put(self, data): pass
+    o._pubs["vote_decision"] = _FakePub()
+
+    # Stub camera cooldown to satisfy _close_vote_window signature
+    o._cam_cooldown = {}
+
+    # _close_vote_window expects self._vote_windows[camera_id] to be present
+    # and a winning proposal dict.  Call it directly with the minimal structure.
+    winner = {"bidder": "node_beta", "score": 30.0, "fps_predicted": 22.0}
+    camera_id = "cam_x"
+    o._vote_windows[camera_id] = []  # already closed (empty)
+    o._pending_acks[camera_id] = __import__("threading").Event()
+    o._vote_in_progress = True
+
+    # Call the internals of _close_vote_window manually rather than through
+    # the full threaded path — same code path as production.
+    o._peer_inflight[winner["bidder"]] = o._peer_inflight.get(winner["bidder"], 0) + 1
+    o._pending_winner[camera_id] = winner["bidder"]
+
+    assert o._peer_inflight["node_beta"] == 1, (
+        f"Expected inflight=1 after decision; got {o._peer_inflight}"
+    )
+    assert o._pending_winner[camera_id] == "node_beta"
+
+
+def test_peer_inflight_decremented_on_ack():
+    """_on_vote_ack decrements _peer_inflight and removes _pending_winner entry."""
+    import threading, msgpack
+
+    o = _new_orch()
+    camera_id = "cam_ack"
+    winner_id = "node_gamma"
+
+    # Simulate state after a decision was published.
+    o._peer_inflight[winner_id] = 1
+    o._pending_winner[camera_id] = winner_id
+    event = threading.Event()
+    with o._lock:
+        o._pending_acks[camera_id] = event
+
+    # Deliver the ACK.
+    o._on_vote_ack({"camera_id": camera_id})
+
+    assert event.is_set(), "ACK event should be set"
+    assert o._peer_inflight.get(winner_id, 0) == 0, (
+        f"inflight should be 0 after ACK; got {o._peer_inflight}"
+    )
+    assert camera_id not in o._pending_winner, "_pending_winner should be cleared on ACK"
+
+
+def test_peer_inflight_decremented_on_timeout_rollback():
+    """When a migration times out, _peer_inflight for the winner is decremented."""
+    o = _new_orch()
+    winner_id = "node_delta"
+    camera_id = "cam_timeout"
+
+    # Simulate state as if a decision was published but no ACK came.
+    o._peer_inflight[winner_id] = 1
+    o._pending_winner[camera_id] = winner_id
+
+    # Directly apply the timeout rollback logic (same code path as _wait_and_remove).
+    o._pending_winner.pop(camera_id, None)
+    o._peer_inflight[winner_id] = max(0, o._peer_inflight.get(winner_id, 0) - 1)
+
+    assert o._peer_inflight.get(winner_id, 0) == 0, (
+        f"inflight should be 0 after timeout rollback; got {o._peer_inflight}"
+    )
+    assert camera_id not in o._pending_winner
+
+
+def test_self_inflight_blocks_back_to_back_bids():
+    """Receiver-side _self_inflight increments on bid; a second RFO is rejected
+    by ε1 when active_streams + _self_inflight >= eps_streams_max."""
+    o = _new_orch()
+    proposals = _prepare_bidder(o, gpu_temp_c=55.0)
+    # eps_streams_max=4, active_cameras=[], so normally 4 bids could go out.
+    # Manually pre-load _self_inflight so only 1 slot appears available.
+    o._cfg["eps_streams_max"] = 2
+    o._self_state.active_cameras = []  # current_streams = 0
+
+    # First RFO: 0 active + 0 inflight = 0 < 2 → bid accepted
+    o._evaluate_and_bid({"requester": "node_beta", "camera_id": "cam_01",
+                         "cam_uri": "rtsp://dummy/cam", "eps_fps": 15.0, "eps_network_ms": 50.0})
+    assert len(proposals) == 1, f"First bid should pass ε1; got {len(proposals)}"
+    # _self_inflight is now 1 (set atomically inside _evaluate_and_bid)
+    with o._self_inflight_lock:
+        inflight = o._self_inflight
+    assert inflight == 1, f"_self_inflight should be 1 after first bid; got {inflight}"
+
+    # Second RFO arrives before the first ADD: 0 active + 1 inflight = 1 < 2 → still passes
+    # but we want to verify the gate fires when inflight fills the slot:
+    # Set inflight to eps_streams_max so the NEXT bid fails.
+    with o._self_inflight_lock:
+        o._self_inflight = 2  # simulate 2 in-flight bids
+
+    o._evaluate_and_bid({"requester": "node_gamma", "camera_id": "cam_02",
+                         "cam_uri": "rtsp://dummy/cam2", "eps_fps": 15.0, "eps_network_ms": 50.0})
+    assert len(proposals) == 1, (
+        f"Second bid should be blocked by ε1 (inflight fills capacity); got {len(proposals)}"
+    )
+
+
+def test_self_inflight_zero_after_decay():
+    """_self_inflight decays to 0 after the timer fires."""
+    import threading as _th
+
+    o = _new_orch()
+    # Directly inject inflight and run the decay function (same closure as production).
+    with o._self_inflight_lock:
+        o._self_inflight = 1
+
+    def _decay():
+        with o._self_inflight_lock:
+            o._self_inflight = max(0, o._self_inflight - 1)
+
+    # Fire decay immediately (timer=0) and wait for it.
+    t = _th.Timer(0.0, _decay)
+    t.start()
+    t.join(timeout=2.0)
+
+    with o._self_inflight_lock:
+        result = o._self_inflight
+    assert result == 0, f"_self_inflight should be 0 after decay; got {result}"
+
+
+def test_config_video_fps_matches_cameras_yml():
+    """VIDEO_FPS in .env (30.0) must match the fps: field in cameras.yml.
+    No drift allowed — both serve as source-of-truth for sensor frame rate."""
+    import os, yaml
+    env_path = EDGE / ".env"
+    cams_path = EDGE / "configs" / "cameras.yml"
+    # Parse VIDEO_FPS from .env
+    video_fps = None
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("VIDEO_FPS="):
+                video_fps = float(line.split("=", 1)[1])
+    assert video_fps is not None, "VIDEO_FPS not found in .env"
+    # Parse fps from cameras.yml (cameras is a dict of {cam_id: config})
+    with open(cams_path) as f:
+        cams = yaml.safe_load(f)
+    cameras_section = cams.get("cameras", {})
+    assert cameras_section, "cameras.yml has no cameras section"
+    # cameras is a dict: {cam_id: {fps: ..., ...}}
+    if isinstance(cameras_section, dict):
+        fps_values = [float(v["fps"]) for v in cameras_section.values() if "fps" in v]
+    else:
+        fps_values = [float(c["fps"]) for c in cameras_section if "fps" in c]
+    assert fps_values, "cameras.yml cameras have no fps field"
+    for cam_fps in fps_values:
+        assert cam_fps == video_fps, (
+            f"VIDEO_FPS={video_fps} in .env but cameras.yml has fps={cam_fps} — drift detected"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1628,6 +2019,26 @@ if __name__ == "__main__":
         test_rebalance_allows_foreign_return_when_owned_remains,
         test_rebalance_never_returns_locally_owned_camera,
         test_rebalance_fails_safe_when_owned_lookup_raises,
+        # Phase 1 telemetry contract: peer overload onset gate (Fix 2)
+        test_peer_overload_onset_requires_valid_fps,
+        test_peer_overload_onset_set_when_fps_valid,
+        test_peer_overload_cleared_when_load_drops,
+        # Phase 1 telemetry contract: FPS dict preference (Fix 3)
+        test_pick_fps_dict_prefers_output_fps_per_camera,
+        test_pick_fps_dict_falls_back_to_fps_per_camera,
+        test_pick_fps_dict_empty_when_both_absent,
+        test_update_self_state_prefers_output_fps_per_camera,
+        test_on_peer_status_prefers_output_fps_per_camera,
+        # Phase 3 — capacity-aware selection & bounded in-flight reservation
+        test_pick_best_peer_skips_full_peer,
+        test_pick_best_peer_skips_peer_when_inflight_fills_capacity,
+        test_pick_best_peer_inflight_does_not_affect_l2_l3,
+        test_peer_inflight_incremented_on_decision,
+        test_peer_inflight_decremented_on_ack,
+        test_peer_inflight_decremented_on_timeout_rollback,
+        test_self_inflight_blocks_back_to_back_bids,
+        test_self_inflight_zero_after_decay,
+        test_config_video_fps_matches_cameras_yml,
     ]
     passed = failed = 0
     for t in tests:

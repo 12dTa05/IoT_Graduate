@@ -230,6 +230,12 @@ class SpeedProbe:
         # BUFFER probes; each probe calls increment() per frame.  The writer
         # loop drains counts here into _input_fps in the atomic payload.
         self._input_counter: object = None
+        # Per-camera source type ("live" | "file"), derived from the camera URI.
+        # Written by run_python.py once at startup; read by the FPS writer to
+        # populate _source_modes in the telemetry window metadata (see _telemetry).
+        # It is also consumed by run_python's source-starved detection gate on
+        # the health loop (camera_id → "file" cameras are never starved).
+        self._source_type_by_camera: dict = {}
 
         # ── Offload result injector ────────────────────────────────────────
         # offload_receiver.py feeds decoded plate results into this queue.
@@ -368,9 +374,17 @@ class SpeedProbe:
         """
         Wire a shared _InputCounter so the FPS writer drains per-camera
         input-frame counts into _input_fps in each telemetry window.
-        Called by run_python.py after creating the counter and pipeline.
         """
         self._input_counter = counter
+
+    def set_source_types(self, source_type_by_camera: dict) -> None:
+        """
+        Wire per-camera source type ("live" | "file") derived from camera URIs.
+        Consumed by the FPS writer (_telemetry._source_modes) and by run_python's
+        source-starved gate.  Called once at startup before the pipeline runs.
+        """
+        if isinstance(source_type_by_camera, dict):
+            self._source_type_by_camera = dict(source_type_by_camera)
 
     def set_load_score_breakdown(self, breakdown: Dict) -> None:
         """
@@ -705,6 +719,12 @@ class SpeedProbe:
                         "pipeline_window_started_monotonic": window_started,
                         "pipeline_window_ended_monotonic":   window_ended,
                         "pipeline_window_duration_s":        round(window_dur, 3),
+                        # Phase 1 source-mode map: camera_id → "live" | "file"
+                        # so downstream consumers can distinguish real-time live
+                        # feeds from file-playback cameras before using input
+                        # FPS for any overload/QoS logic (never treat file
+                        # throughput as source starvation).
+                        "source_modes": dict(self._source_type_by_camera),
                     },
                     "_features":       feats,
                 }
@@ -774,9 +794,15 @@ class SpeedProbe:
                 else:
                     n_track = n_plate = stat_frac = 0.0
                 snapshot[cam_id] = {
-                    "n_track":             round(n_track,  2),
-                    "n_plate":             round(n_plate,  2),
-                    "stationary_fraction": round(stat_frac, 3),
+                    # per-frame averages over the telemetry window
+                    "n_track":                   round(n_track,  2),
+                    "n_plate":                   round(n_plate,  2),
+                    "stationary_fraction":       round(stat_frac, 3),
+                    # unambiguous aliases — same values, clearer names for
+                    # dashboard / downstream consumers (ponytail: aliases only,
+                    # remove n_track/n_plate when all callers migrate)
+                    "avg_vehicles_per_frame":    round(n_track,  2),
+                    "avg_plates_per_frame":      round(n_plate,  2),
                 }
                 # Reset accumulator for next window
                 acc["n_track_sum"] = acc["n_plate_sum"] = \

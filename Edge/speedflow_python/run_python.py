@@ -94,6 +94,19 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
 
     # 3. Speed + LPR probe (pass peer_orch so it can query offload levels)
     probe = SpeedProbe(camera_manager, peer_orch=peer_orch)
+    # Wire camera -> source_type ("live" | "file") so probes.py can
+    # publish source_modes in _telemetry and downstream consumers can
+    # distinguish decoder-throughput file playback from live source FPS.
+    # ponytail: local helper, cheap ini
+    def _is_file(s: str) -> bool:
+        if not s:
+            return False
+        s = s.strip().lower()
+        return s.startswith("file://") or s.startswith("/")
+    _source_types = {}
+    for _c in camera_manager.get_enabled_configs():
+        _source_types[_c.camera_id] = "file" if _is_file(_c.uri or "") else "live"
+    probe.set_source_types(_source_types)
     if input_counter is not None:
         probe.set_input_counter(input_counter)
     if offload_pub is not None:
@@ -383,14 +396,15 @@ def _health_push_loop(peer_orch=None) -> None:
 
             # Use health_agent's metric collection via standalone function
             metrics       = collect_metrics(_jtop_session)
-            snapshot_valid, fps_stats, feature_stats, offload_crops, _input_fps = _read_pipeline()
+            snapshot_valid, fps_stats, feature_stats, offload_crops, _input_fps, _source_modes = _read_pipeline()
 
             # ── Pipeline unavailable guard ──────────────────────────────
             # Match health_agent's contract: invalid snapshot →
             # load_score 100 (unavailable), skip proactive computation.
             if snapshot_valid:
                 source_starved_cameras = _detect_source_starved(
-                    fps_stats, _input_fps, _get_edge_cfg()
+                    fps_stats, _input_fps, _get_edge_cfg(),
+                    source_type_map=_source_modes,
                 )
                 camera_workload = _derive_camera_workload(
                     feature_stats, fps_stats, source_starved_cameras
@@ -435,7 +449,15 @@ def _health_push_loop(peer_orch=None) -> None:
                 "power_mw":     metrics.get("power_mw", 0.0),
                 "source":       metrics.get("source", "jtop"),
                 "pipeline": {
-                    "fps_per_camera":  fps_stats,
+                    # pipeline_available: False = snapshot not yet valid (pipeline
+                    # starting/stale); load_score=100 is "unavailable", not overload.
+                    "pipeline_available":    snapshot_valid,
+                    # output_fps_per_camera = pipeline throughput (frames processed).
+                    # fps_per_camera kept for backward compatibility.
+                    "fps_per_camera":        fps_stats,
+                    "output_fps_per_camera": fps_stats,
+                    # input_fps_per_camera = raw source frames arriving at decoder.
+                    "input_fps_per_camera":  _input_fps if snapshot_valid else {},
                     "avg_fps":         avg_fps,
                     "active_cameras":  active_cameras,
                     "camera_configs":  _cam_configs,

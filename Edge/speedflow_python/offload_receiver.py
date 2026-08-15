@@ -68,12 +68,18 @@ class _InferenceFailure:
     observation.  Returned by _run_lpr/_run_lpd when the engine is unavailable
     (not loaded) or raises.  Carries a concise, safe reason for the
     rate-limited WARNING log.  A None (LPD) or ("", 0.0) (LPR) return remains a
-    *valid* empty result that still publishes."""
+    *valid* empty result that still publishes.
 
-    __slots__ = ("reason",)
+    fatal=True marks a permanent, unrecoverable condition (e.g. TRT not
+    installed) so callers can distinguish it from a transient engine failure
+    and suppress per-crop repeats after the one-time ERROR has been logged.
+    """
 
-    def __init__(self, reason: str) -> None:
+    __slots__ = ("reason", "fatal")
+
+    def __init__(self, reason: str, *, fatal: bool = False) -> None:
         self.reason = reason
+        self.fatal  = fatal
 
 
 def _safe_infer_reason(exc: BaseException, limit: int = 120) -> str:
@@ -499,6 +505,11 @@ class OffloadReceiver:
         self._lpr_engine: Optional[_TRTEngine] = None
         self._lpd_engine: Optional[_TRTEngine] = None
         self._engines_loaded = False
+        # Three-valued: None = not yet checked; True = TRT available;
+        # False = tensorrt/pycuda absent (permanent — logged once at ERROR).
+        # ponytail: None sentinel avoids importing TRT at construction time,
+        # keeping the receiver cheap to instantiate on host/CI.
+        self._trt_available: Optional[bool] = None
 
         # Result publisher cache
         self._result_pubs: Dict[str, Any] = {}
@@ -552,6 +563,20 @@ class OffloadReceiver:
         errors).  Incremented only when inference itself raises, not for
         valid empty results. Thread-safe (int)."""
         return self._inference_errors
+
+    @property
+    def trt_available(self) -> Optional[bool]:
+        """Three-valued TRT dependency state.
+
+        None  — not yet probed (engine load hasn't been triggered yet).
+        True  — tensorrt/pycuda imported successfully on first use.
+        False — tensorrt/pycuda absent; a one-time ERROR was logged at
+                _load_engines_once time; all crops are suppressed.
+
+        Downstream (health_agent, dashboard) can surface this to distinguish
+        "receiver running but TRT missing" from "receiver idle".
+        """
+        return self._trt_available
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -670,21 +695,60 @@ class OffloadReceiver:
     def _load_engines_once(self) -> None:
         if self._engines_loaded:
             return
-        self._engines_loaded = True  # set before load to avoid double-load on error
+
+        # --- TRT dependency check (once, actionable ERROR if absent) ----------
+        trt, cuda = _try_import_trt()
+        if trt is None:
+            self._trt_available = False
+            self._engines_loaded = True  # don't retry — dependency is permanent
+            logger.error(
+                "[OffloadReceiver] tensorrt / pycuda are NOT installed on this node. "
+                "All offloaded crops will be silently suppressed until TRT is available. "
+                "Install JetPack TensorRT bindings (pip install tensorrt pycuda) and "
+                "restart the service to enable crop-offload inference."
+            )
+            return
+        self._trt_available = True
+
+        # --- Engine file loading ----------------------------------------------
+        # Mark loaded BEFORE the attempts so a repeated first-crop race in the
+        # worker thread doesn't trigger a second load.  Partial failure (one
+        # engine missing / corrupt) is logged once at ERROR here; per-crop
+        # _run_lpr/_run_lpd will still produce _InferenceFailure with a clear
+        # reason distinguishing "engine not loaded" from "inference exception".
+        self._engines_loaded = True
         try:
             if Path(self._lpr_engine_path).exists():
                 self._lpr_engine = _TRTEngine(self._lpr_engine_path)
+                logger.info("[OffloadReceiver] LPR engine ready: %s", self._lpr_engine_path)
             else:
-                logger.warning("[OffloadReceiver] LPR engine not found: %s", self._lpr_engine_path)
+                logger.error(
+                    "[OffloadReceiver] LPR engine file not found: %s — "
+                    "rebuild with trtexec and set lpr_engine_path in config.",
+                    self._lpr_engine_path,
+                )
         except Exception as exc:
-            logger.error("[OffloadReceiver] LPR engine load failed: %s", exc)
+            logger.error(
+                "[OffloadReceiver] LPR engine load failed (%s) — "
+                "LPR inference will be suppressed until engine is rebuilt.",
+                exc,
+            )
         try:
             if Path(self._lpd_engine_path).exists():
                 self._lpd_engine = _TRTEngine(self._lpd_engine_path)
+                logger.info("[OffloadReceiver] LPD engine ready: %s", self._lpd_engine_path)
             else:
-                logger.warning("[OffloadReceiver] LPD engine not found: %s", self._lpd_engine_path)
+                logger.error(
+                    "[OffloadReceiver] LPD engine file not found: %s — "
+                    "rebuild with trtexec and set lpd_engine_path in config.",
+                    self._lpd_engine_path,
+                )
         except Exception as exc:
-            logger.error("[OffloadReceiver] LPD engine load failed: %s", exc)
+            logger.error(
+                "[OffloadReceiver] LPD engine load failed (%s) — "
+                "vehicle-level (L2) offload inference will be suppressed until engine is rebuilt.",
+                exc,
+            )
 
     def _handle_item(self, item: dict) -> None:
         self._load_engines_once()
@@ -709,7 +773,7 @@ class OffloadReceiver:
         if crop_type == "plate":
             result = self._run_lpr(crop_bgr)
             if isinstance(result, _InferenceFailure):
-                self._record_inference_error("LPR", result.reason)
+                self._record_inference_error("LPR", result.reason, fatal=result.fatal)
                 return
             plate_text, confidence = result
 
@@ -717,7 +781,7 @@ class OffloadReceiver:
             # Level 2: LPD first, then LPR on the plate sub-crop
             plate_bbox = self._run_lpd(crop_bgr)
             if isinstance(plate_bbox, _InferenceFailure):
-                self._record_inference_error("LPD", plate_bbox.reason)
+                self._record_inference_error("LPD", plate_bbox.reason, fatal=plate_bbox.fatal)
                 return
             if plate_bbox is not None:
                 px, py, pw, ph = plate_bbox
@@ -725,7 +789,7 @@ class OffloadReceiver:
                 if plate_crop.size > 0:
                     lpr_result = self._run_lpr(plate_crop)
                     if isinstance(lpr_result, _InferenceFailure):
-                        self._record_inference_error("LPR", lpr_result.reason)
+                        self._record_inference_error("LPR", lpr_result.reason, fatal=lpr_result.fatal)
                         return
                     plate_text, confidence = lpr_result
             # else: no plate bbox — valid empty observation, still publish.
@@ -741,7 +805,8 @@ class OffloadReceiver:
             inference_ok = inference_ok,
         )
 
-    def _record_inference_error(self, stage: str, reason: str) -> None:
+    def _record_inference_error(self, stage: str, reason: str, *,
+                                fatal: bool = False) -> None:
         """
         Count an inference failure (engine unavailable or exception) and log it
         at WARNING rate-limited to one message per
@@ -749,8 +814,17 @@ class OffloadReceiver:
         The reason is a concise one-liner already produced by
         _safe_infer_reason or a static "engine not loaded" string — never a
         traceback.
+
+        fatal=True (TRT not installed): skips the per-crop rate-limited
+        WARNING because the actionable one-time ERROR was already emitted in
+        _load_engines_once.  Still increments the counter so the health
+        snapshot surfaces the suppressed crop count.
         """
         self._inference_errors += 1
+        if fatal:
+            # One-time ERROR already logged at engine-load time; per-crop
+            # WARNING would be misleading noise.  Counter is still incremented.
+            return
         now = time.monotonic()
         if now - self._last_inference_error_log >= _inference_error_log_interval:
             self._last_inference_error_log = now
@@ -760,8 +834,13 @@ class OffloadReceiver:
             )
 
     def _run_lpr(self, plate_bgr: np.ndarray) -> Any:
+        if self._trt_available is False:
+            # Fatal permanent condition — TRT not installed.  Don't spam the
+            # rate-limited warning on every crop; the one-time ERROR in
+            # _load_engines_once is the actionable signal.
+            return _InferenceFailure("tensorrt/pycuda not installed", fatal=True)
         if self._lpr_engine is None:
-            return _InferenceFailure("LPR engine not loaded")
+            return _InferenceFailure("LPR engine not loaded (file missing or failed to parse)")
         inp = _preprocess_lpr(plate_bgr)
         try:
             outputs = self._lpr_engine.infer(inp)
@@ -770,8 +849,10 @@ class OffloadReceiver:
             return _InferenceFailure(_safe_infer_reason(exc))
 
     def _run_lpd(self, vehicle_bgr: np.ndarray) -> Any:
+        if self._trt_available is False:
+            return _InferenceFailure("tensorrt/pycuda not installed", fatal=True)
         if self._lpd_engine is None:
-            return _InferenceFailure("LPD engine not loaded")
+            return _InferenceFailure("LPD engine not loaded (file missing or failed to parse)")
         h, w = vehicle_bgr.shape[:2]
         inp  = _preprocess_lpd(vehicle_bgr)
         try:

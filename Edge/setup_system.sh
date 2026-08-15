@@ -209,7 +209,7 @@ TARGET_FPS=27.0
 FPS_STATS_FILE=/dev/shm/speedflow_fps.json
 
 # --- Pipeline / Video ---
-VIDEO_FPS=25.0
+VIDEO_FPS=30.0
 GPU_ID=0
 MAX_STREAMS=8
 # 1280x720: each tile is 640x360 at 4-cam tiling — saves ~44% GPU memory
