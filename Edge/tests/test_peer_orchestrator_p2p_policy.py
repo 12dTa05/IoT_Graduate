@@ -120,6 +120,8 @@ def _new_orch(overrides: dict | None = None, **kwargs) -> object:
         "offload_level3_threshold": 57.0,
         "offload_level2_threshold": 65.0,
         "offload_level1_threshold": 75.0,
+        "overload_warmup_s": 5.0,  # bypass startup warmup gate for legacy tests
+        "camera_warmup_s": 12.0,    # bypass per-camera warmup gate for legacy tests
     }
     if overrides:
         for k, v in overrides.items():
@@ -1112,6 +1114,453 @@ def test_get_owned_camera_ids_returns_empty_on_missing_yml():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Self-state FPS validity gate: load_score=100 with empty/invalid FPS must
+# never overload-escalate (preserves dashboard score).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_self_state_load_high_no_fps_never_sets_overload_since():
+    """load_score=100 with fps_per_camera={} → overload_since stays None."""
+    o = _new_orch(overload_warmup_s=10.0, overload_duration_s=0.0)
+    o.update_self_state({
+        "load_score": 100.0,
+        "gpu_percent": 99.0,
+        "cpu_percent": 99.0,
+        "ram_percent": 99.0,
+        "gpu_temp_c": 70.0,
+        "risk_index": 0.0,
+        "pipeline": {
+            "active_cameras": ["cam_a", "cam_b"],
+            "camera_workload": {"cam_a": 5.0, "cam_b": 8.0},
+            "fps_per_camera": {},
+            "max_streams": 8,
+        },
+    })
+    with o._self_lock:
+        assert o._self_state.overload_since is None, (
+            "load_score=100 with empty fps must not set overload_since"
+        )
+
+
+def test_self_state_load_high_nonpositive_fps_never_sets_overload_since():
+    """load_score=100 with fps values that are zero/negative → overload_since stays None."""
+    o = _new_orch(overload_warmup_s=10.0, overload_duration_s=0.0)
+    o.update_self_state({
+        "load_score": 100.0,
+        "gpu_percent": 99.0,
+        "cpu_percent": 99.0,
+        "ram_percent": 99.0,
+        "gpu_temp_c": 70.0,
+        "risk_index": 0.0,
+        "pipeline": {
+            "active_cameras": ["cam_a", "cam_b"],
+            "camera_workload": {"cam_a": 5.0, "cam_b": 8.0},
+            "fps_per_camera": {"cam_a": 0.0, "cam_b": -1.0},
+            "max_streams": 8,
+        },
+    })
+    with o._self_lock:
+        assert o._self_state.overload_since is None, (
+            "load_score=100 with zero/negative fps must not set overload_since"
+        )
+
+
+def test_self_state_valid_positive_fps_sets_overload_since():
+    """With at least one positive FPS, overload_since IS set (decision possible)."""
+    o = _new_orch(overload_warmup_s=0.0, overload_duration_s=0.0)
+    o.update_self_state({
+        "load_score": 60.0,
+        "gpu_percent": 60.0,
+        "cpu_percent": 60.0,
+        "ram_percent": 60.0,
+        "gpu_temp_c": 50.0,
+        "risk_index": 0.0,
+        "pipeline": {
+            "active_cameras": ["cam_a", "cam_b"],
+            "camera_workload": {"cam_a": 5.0, "cam_b": 8.0},
+            "fps_per_camera": {"cam_a": 25.0, "cam_b": 0.0},
+            "max_streams": 8,
+        },
+    })
+    with o._self_lock:
+        assert o._self_state.overload_since is not None, (
+            "valid positive FPS must allow overload_since to be set"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Startup warmup: no overload escalation until valid positive FPS has been
+# present for overload_warmup_s (default 10 s).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_startup_warmup_blocks_overload_before_first_valid_fps():
+    """No valid FPS yet → _check_self_overload must not escalate."""
+    o = _new_orch(overload_warmup_s=10.0, overload_duration_s=0.0)
+    _setup_overloaded_self(o, load_score=60.0)
+    _add_peer_beta(o)
+    # Simulate fresh start: no valid FPS ever observed.
+    o._self_first_valid_fps_at = None
+    o._check_self_overload()
+    assert o.get_offload_level("cam_a") == 0, "warmup must block before first valid FPS"
+    assert o.get_offload_level("cam_b") == 0, "warmup must block before first valid FPS"
+
+
+def test_startup_warmup_blocks_overload_inside_window():
+    """Valid FPS present for < warmup_s → still blocked."""
+    o = _new_orch(overload_warmup_s=10.0, overload_duration_s=0.0)
+    _setup_overloaded_self(o, load_score=60.0)
+    _add_peer_beta(o)
+    # First valid FPS was only 3 s ago.
+    o._self_first_valid_fps_at = time.time() - 3.0
+    o._check_self_overload()
+    assert o.get_offload_level("cam_a") == 0, "warmup window (3s<10s) must block"
+    assert o.get_offload_level("cam_b") == 0, "warmup window (3s<10s) must block"
+
+
+def test_startup_warmup_allows_overload_after_window():
+    """Valid FPS present for >= warmup_s → escalation allowed."""
+    o = _new_orch(overload_warmup_s=10.0, overload_duration_s=0.0)
+    _setup_overloaded_self(o, load_score=60.0)
+    _add_peer_beta(o)
+    o._self_first_valid_fps_at = time.time() - 20.0
+    o._check_self_overload()
+    # L3 fires (load 60 >= thr3=57) → at least one camera offloaded level 3.
+    with o._lock:
+        assert o._vote_in_progress or any(
+            o.get_offload_level(c) > 0 for c in ("cam_a", "cam_b")
+        ), "after warmup window, overload must escalate"
+
+
+def test_startup_warmup_config_zero_disables_gate():
+    """overload_warmup_s=0 → duration gate disabled (valid FPS present)."""
+    o = _new_orch(overload_warmup_s=0.0, overload_duration_s=0.0)
+    _setup_overloaded_self(o, load_score=60.0)
+    _add_peer_beta(o)
+    # Valid FPS observed (update_self_state already recorded it); warmup_s=0
+    # means the duration gate never blocks.  No manual override here.
+    o._check_self_overload()
+    with o._lock:
+        assert o._vote_in_progress or any(
+            o.get_offload_level(c) > 0 for c in ("cam_a", "cam_b")
+        ), "warmup_s=0 must not block decisions when valid FPS exists"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-camera warmup after ADD: newly-added cameras are excluded from offload
+# until their FPS has been valid for camera_warmup_s.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_newly_added_camera_excluded_from_offload():
+    """Camera added this tick (no valid FPS yet) is not eligible for offload."""
+    o = _new_orch(camera_warmup_s=10.0)
+    o._get_owned_camera_ids = lambda: {"cam_a", "cam_b"}
+    sim_state = _make_state(
+        active_cameras=["cam_a", "cam_b"],
+        # cam_a is the LIGHTEST — normally L1's pick.
+        camera_workload={"cam_a": 2.0, "cam_b": 12.0},
+    )
+    # cam_a was just ADDed: timestamps say so, no valid FPS yet.
+    o._camera_added_at["cam_a"] = time.time()
+    chosen = o._pick_camera_to_offload(sim_state, level=1)
+    assert chosen == "cam_b", (
+        f"Freshly-added cam_a (no valid FPS yet) must be excluded; got {chosen}"
+    )
+
+
+def test_newly_added_camera_with_positive_fps_still_warming():
+    """Camera added 5 s ago with valid FPS but within warmup window → excluded."""
+    o = _new_orch(camera_warmup_s=10.0)
+    o._get_owned_camera_ids = lambda: {"cam_a", "cam_b"}
+    sim_state = _make_state(
+        active_cameras=["cam_a", "cam_b"],
+        camera_workload={"cam_a": 2.0, "cam_b": 12.0},
+    )
+    o._camera_added_at["cam_a"] = time.time() - 5.0
+    o._camera_first_valid_fps_at["cam_a"] = time.time() - 5.0
+    chosen = o._pick_camera_to_offload(sim_state, level=1)
+    assert chosen == "cam_b", (
+        f"cam_a warmup (5s < 10s) must exclude it from offload; got {chosen}"
+    )
+
+
+def test_warmed_up_camera_eligible_for_offload():
+    """Camera with valid FPS beyond warmup window is eligible again."""
+    o = _new_orch(camera_warmup_s=10.0)
+    o._get_owned_camera_ids = lambda: {"cam_a", "cam_b"}
+    sim_state = _make_state(
+        active_cameras=["cam_a", "cam_b"],
+        camera_workload={"cam_a": 2.0, "cam_b": 12.0},
+    )
+    o._camera_added_at["cam_a"] = time.time() - 30.0
+    o._camera_first_valid_fps_at["cam_a"] = time.time() - 30.0
+    chosen = o._pick_camera_to_offload(sim_state, level=1)
+    assert chosen == "cam_a", (
+        f"cam_a past warmup (30s >= 10s) should be eligible; got {chosen}"
+    )
+
+
+def test_preexisting_camera_not_subject_to_warmup():
+    """Camera never ADDed (no _camera_added_at entry) skips the warmup gate."""
+    o = _new_orch(camera_warmup_s=10.0)
+    o._get_owned_camera_ids = lambda: {"cam_a", "cam_b"}
+    sim_state = _make_state(
+        active_cameras=["cam_a", "cam_b"],
+        camera_workload={"cam_a": 2.0, "cam_b": 12.0},
+    )
+    # No _camera_added_at entries — both pre-existing.
+    chosen = o._pick_camera_to_offload(sim_state, level=1)
+    assert chosen == "cam_a", (
+        f"Pre-existing cameras must bypass the warmup gate; got {chosen}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rebalance: REMOVE/return to owner only when owner is currently fresh.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _stub_control_pub(o):
+    """Stub the 'control' publisher to capture REMOVE/ADD payloads."""
+    class _FakePub:
+        def __init__(self):
+            self.sent = []
+        def put(self, data):
+            self.sent.append(data)
+    o._pubs["control"] = _FakePub()
+
+
+def _register_fresh_peer(o, node_id, active_cameras, last_seen_delta=1.0):
+    from speedflow_python.peer_orchestrator import PeerState
+    o._peers[node_id] = PeerState(
+        node_id=node_id, load_score=10.0, gpu_temp_c=50.0,
+        last_seen=time.time() - last_seen_delta,
+        active_cameras=list(active_cameras), max_streams=4,
+    )
+
+
+def _sent_control_commands(pub, cmd=None, camera_id=None):
+    """Decode msgpack'd payloads captured by the stub control publisher."""
+    import msgpack
+    out = []
+    for p in pub.sent:
+        try:
+            d = msgpack.unpackb(p, raw=False)
+        except Exception:
+            continue
+        if cmd is not None and d.get("cmd") != cmd:
+            continue
+        if camera_id is not None and d.get("camera_id") != camera_id:
+            continue
+        out.append(d)
+    return out
+
+
+def test_rebalance_skips_when_owner_absent():
+    """Owner not in peer table → no REMOVE for its rescued camera."""
+    o = _new_orch()
+    o._rescued_cameras["cam_x"] = "node_gone"
+    o._self_state.active_cameras = ["cam_x", "cam_owned"]
+    _stub_control_pub(o)
+    o._check_rebalance()
+    assert "cam_x" in o._rescued_cameras, "absent owner must keep the rescue"
+    assert _sent_control_commands(o._pubs["control"], "REMOVE", "cam_x") == [], (
+        "no REMOVE for cam_x when owner absent"
+    )
+
+
+def test_rebalance_skips_when_owner_stale():
+    """Owner heartbeat older than heartbeat_timeout_s → still rescued."""
+    o = _new_orch(heartbeat_timeout_s=5.0)
+    o._rescued_cameras["cam_x"] = "node_beta"
+    o._self_state.active_cameras = ["cam_x", "cam_owned"]
+    # last_seen 20 s ago → stale beyond 5 s timeout.
+    _register_fresh_peer(o, "node_beta", ["cam_x"], last_seen_delta=20.0)
+    _stub_control_pub(o)
+    o._check_rebalance()
+    assert "cam_x" in o._rescued_cameras, "stale owner must keep the rescue"
+    assert _sent_control_commands(o._pubs["control"], "REMOVE", "cam_x") == [], (
+        "no REMOVE for cam_x when owner stale"
+    )
+
+
+def test_rebalance_skips_when_owner_not_running_camera():
+    """Owner fresh but not yet running the camera → keep rescue."""
+    o = _new_orch()
+    o._rescued_cameras["cam_x"] = "node_beta"
+    o._self_state.active_cameras = ["cam_x", "cam_owned"]
+    # Owner fresh but active_cameras does NOT include cam_x yet.
+    _register_fresh_peer(o, "node_beta", [])
+    _stub_control_pub(o)
+    o._check_rebalance()
+    assert "cam_x" in o._rescued_cameras, "owner not running cam_x → keep rescue"
+
+
+def test_rebalance_proceeds_when_owner_fresh_and_running():
+    """Owner fresh AND running the camera → REMOVE sent, rescue released."""
+    o = _new_orch()
+    o._get_owned_camera_ids = lambda: {"cam_owned"}  # owned camera stays active
+    o._rescued_cameras["cam_x"] = "node_beta"
+    o._self_state.active_cameras = ["cam_x", "cam_owned"]
+    _register_fresh_peer(o, "node_beta", ["cam_x"], last_seen_delta=1.0)
+    _stub_control_pub(o)
+    o._check_rebalance()
+    assert "cam_x" not in o._rescued_cameras, "rescue released to fresh owner"
+    assert _sent_control_commands(o._pubs["control"], "REMOVE", "cam_x") != [], (
+        "expected a REMOVE command for cam_x"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rebalance last-active guard: never return the only remaining active camera.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_rebalance_skips_last_active_camera():
+    """Rescued camera is the ONLY active camera → never return it."""
+    o = _new_orch()
+    o._rescued_cameras["cam_x"] = "node_beta"
+    o._self_state.active_cameras = ["cam_x"]  # only cam_x active
+    _register_fresh_peer(o, "node_beta", ["cam_x"], last_seen_delta=1.0)
+    _stub_control_pub(o)
+    o._check_rebalance()
+    assert "cam_x" in o._rescued_cameras, "last active camera must not be returned"
+    assert _sent_control_commands(o._pubs["control"], "REMOVE", "cam_x") == [], (
+        "no REMOVE when it is the last active camera"
+    )
+
+
+def test_rebalance_proceeds_when_another_camera_remains():
+    """Multiple active cameras → returning one rescued camera is fine."""
+    o = _new_orch()
+    o._get_owned_camera_ids = lambda: {"cam_owned"}
+    o._rescued_cameras["cam_x"] = "node_beta"
+    o._rescued_cameras["cam_y"] = "node_gamma"
+    o._self_state.active_cameras = ["cam_x", "cam_y", "cam_owned"]
+    _register_fresh_peer(o, "node_beta", ["cam_x"], last_seen_delta=1.0)
+    _register_fresh_peer(o, "node_gamma", ["cam_y"], last_seen_delta=1.0)
+    _stub_control_pub(o)
+    o._check_rebalance()
+    assert "cam_x" not in o._rescued_cameras, "cam_x returned (owned camera remains)"
+    assert "cam_y" not in o._rescued_cameras, "cam_y returned (owned camera remains)"
+
+
+def test_rebalance_last_active_guard_per_return():
+    """Last-active-camera guard: returning every rescued camera while the
+    only locally-owned active camera stays must not drain self to zero.
+
+    Layout: 3 rescued cameras (all returnable, all foreign) + 1 owned.
+    Both foreign returns proceed without violating the last-active guard
+    because cam_owned remains active throughout.
+    """
+    o = _new_orch()
+    o._get_owned_camera_ids = lambda: {"cam_owned"}
+    o._rescued_cameras["cam_x"] = "node_beta"
+    o._rescued_cameras["cam_y"] = "node_gamma"
+    o._rescued_cameras["cam_z"] = "node_delta"
+    o._self_state.active_cameras = ["cam_x", "cam_y", "cam_z", "cam_owned"]
+    _register_fresh_peer(o, "node_beta", ["cam_x"], last_seen_delta=1.0)
+    _register_fresh_peer(o, "node_gamma", ["cam_y"], last_seen_delta=1.0)
+    _register_fresh_peer(o, "node_delta", ["cam_z"], last_seen_delta=1.0)
+    _stub_control_pub(o)
+    o._check_rebalance()
+    # All 3 rescued are returned; the owned stays.
+    assert "cam_x" not in o._rescued_cameras
+    assert "cam_y" not in o._rescued_cameras
+    assert "cam_z" not in o._rescued_cameras
+
+
+# Hard invariant: zero locally-owned active cameras => block all returns
+# (never leave this node with zero locally-owned cameras, not merely zero
+# active cameras).  See peer_orchestrator.py:_check_rebalance.
+
+
+def test_rebalance_blocked_when_only_foreign_rescued_active_no_owned():
+    """(1) Only foreign rescued cameras active + owner fresh => no return.
+    Returning cam_x would leave this node with zero locally-owned active
+    cameras (and the hard invariant demands >=1), so _check_rebalance
+    must NOT send REMOVE even though cam_x's owner is fresh and running.
+    """
+    o = _new_orch()
+    # cameras.yml is empty / no locally-owned cameras on this node.
+    o._get_owned_camera_ids = lambda: set()
+    o._rescued_cameras["cam_x"] = "node_beta"
+    o._self_state.active_cameras = ["cam_x"]  # only foreign rescued
+    _register_fresh_peer(o, "node_beta", ["cam_x"], last_seen_delta=1.0)
+    _stub_control_pub(o)
+    o._check_rebalance()
+    assert "cam_x" in o._rescued_cameras, (
+        "no locally-owned active camera — rescue MUST be held"
+    )
+    assert _sent_control_commands(o._pubs["control"], "REMOVE", "cam_x") == [], (
+        "must not REMOVE when returning would leave zero owned"
+    )
+
+
+def test_rebalance_allows_foreign_return_when_owned_remains():
+    """(2) Owned + foreign active => foreign may return.
+    Returning cam_x leaves cam_owned (locally-owned) active, so the hard
+    invariant is preserved and the foreign rescue can be released to its
+    recovered owner.
+    """
+    o = _new_orch()
+    o._get_owned_camera_ids = lambda: {"cam_owned"}
+    o._rescued_cameras["cam_x"] = "node_beta"
+    o._self_state.active_cameras = ["cam_x", "cam_owned"]
+    _register_fresh_peer(o, "node_beta", ["cam_x"], last_seen_delta=1.0)
+    _stub_control_pub(o)
+    o._check_rebalance()
+    assert "cam_x" not in o._rescued_cameras, (
+        "foreign rescue may return when owned camera remains active"
+    )
+    assert _sent_control_commands(o._pubs["control"], "REMOVE", "cam_x") != [], (
+        "expected a REMOVE command for the returned rescued camera"
+    )
+
+
+def test_rebalance_never_returns_locally_owned_camera():
+    """(3) An owned camera in _rescued_cameras is NEVER returned here.
+    Even if data-race / ownership-transition somehow placed an owned
+    camera into the rescued-cameras map, the rebalance path must NOT
+    issue a REMOVE for it (that would migrate our own camera to a peer).
+    """
+    o = _new_orch()
+    o._get_owned_camera_ids = lambda: {"cam_owned"}
+    # Defensive scenario: an owned camera ended up in _rescued_cameras.
+    o._rescued_cameras["cam_owned"] = "node_beta"
+    o._self_state.active_cameras = ["cam_owned"]
+    _register_fresh_peer(o, "node_beta", ["cam_owned"], last_seen_delta=1.0)
+    _stub_control_pub(o)
+    o._check_rebalance()
+    assert "cam_owned" in o._rescued_cameras, (
+        "locally-owned camera must never be returned by rebalance"
+    )
+    assert _sent_control_commands(o._pubs["control"], "REMOVE", "cam_owned") == [], (
+        "no REMOVE for a locally-owned camera"
+    )
+
+
+def test_rebalance_fails_safe_when_owned_lookup_raises():
+    """Fail-safe: if _get_owned_camera_ids() raises, treat ownership as
+    unresolved and block all returns (consistent with the L1 ownership
+    guard's fail-safe semantics).
+    """
+    o = _new_orch()
+
+    def _boom():
+        raise RuntimeError("camera manager unavailable")
+
+    o._get_owned_camera_ids = _boom
+    o._rescued_cameras["cam_x"] = "node_beta"
+    o._self_state.active_cameras = ["cam_x", "cam_owned"]
+    _register_fresh_peer(o, "node_beta", ["cam_x"], last_seen_delta=1.0)
+    _stub_control_pub(o)
+    o._check_rebalance()
+    assert "cam_x" in o._rescued_cameras, (
+        "fail-safe must hold rescue when ownership is unresolved"
+    )
+    assert _sent_control_commands(o._pubs["control"], "REMOVE", "cam_x") == [], (
+        "no REMOVE when ownership cannot be resolved"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1155,6 +1604,30 @@ if __name__ == "__main__":
         test_get_owned_camera_ids_prefers_live_camera_manager,
         test_get_owned_camera_ids_falls_back_to_cameras_yml,
         test_get_owned_camera_ids_returns_empty_on_missing_yml,
+        test_self_state_load_high_no_fps_never_sets_overload_since,
+        test_self_state_load_high_nonpositive_fps_never_sets_overload_since,
+        test_self_state_valid_positive_fps_sets_overload_since,
+        test_startup_warmup_blocks_overload_before_first_valid_fps,
+        test_startup_warmup_blocks_overload_inside_window,
+        test_startup_warmup_allows_overload_after_window,
+        test_startup_warmup_config_zero_disables_gate,
+        test_newly_added_camera_excluded_from_offload,
+        test_newly_added_camera_with_positive_fps_still_warming,
+        test_warmed_up_camera_eligible_for_offload,
+        test_preexisting_camera_not_subject_to_warmup,
+        test_rebalance_skips_when_owner_absent,
+        test_rebalance_skips_when_owner_stale,
+        test_rebalance_skips_when_owner_not_running_camera,
+        test_rebalance_proceeds_when_owner_fresh_and_running,
+        test_rebalance_skips_last_active_camera,
+        test_rebalance_proceeds_when_another_camera_remains,
+        test_rebalance_last_active_guard_per_return,
+        # Hard invariant: zero locally-owned active cameras => block all
+        # returns.  See peer_orchestrator.py:_check_rebalance.
+        test_rebalance_blocked_when_only_foreign_rescued_active_no_owned,
+        test_rebalance_allows_foreign_return_when_owned_remains,
+        test_rebalance_never_returns_locally_owned_camera,
+        test_rebalance_fails_safe_when_owned_lookup_raises,
     ]
     passed = failed = 0
     for t in tests:

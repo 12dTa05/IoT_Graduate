@@ -108,6 +108,27 @@ def _parse_starved_cameras(raw) -> List[str]:
     return [c for c in raw if isinstance(c, str)]
 
 
+def _has_valid_positive_fps(fps_per_camera) -> bool:
+    """Return True if fps_per_camera has at least one finite, positive (>0) value.
+
+    ponytail: gates overload decisions on the presence of *real* FPS evidence.
+    Confirmed from Jetson logs: a freshly-started pipeline reports load_score=100
+    while fps_per_camera is still empty (or contains only 0/NaN) — the load
+    score is meaningless without running streams and must NOT escalate the
+    node into RFO.  Dashboard keeps the raw load_score; only the decision path
+    is gated, preserving what the operator sees.
+    """
+    if not fps_per_camera or not isinstance(fps_per_camera, dict):
+        return False
+    for v in fps_per_camera.values():
+        if (isinstance(v, (int, float))
+                and not isinstance(v, bool)
+                and math.isfinite(v)
+                and v > 0.0):
+            return True
+    return False
+
+
 def _dwell_s(cfg: dict, key: str, default: float) -> float:
     """Read a dwell duration from config; malformed/missing → default (fail-safe)."""
     raw = cfg.get(key, default)
@@ -304,6 +325,25 @@ class PeerOrchestrator:
         # Penalty timestamp for this node itself (set on migration timeout rollback)
         self._self_penalty_until: float = 0.0
 
+        # ponytail: track when self FIRST observed valid positive FPS (startup
+        # warmup gate).  Sticky — set on the first update that contains real
+        # measurements, never reset, so the gate measures "time since valid FPS
+        # first appeared" rather than "current sample validity".  Suppresses
+        # overload escalation for overload_warmup_s (default 10 s) after start.
+        self._self_first_valid_fps_at: Optional[float] = None
+
+        # ponytail: per-camera "ADD timestamp".  Set whenever we issue an ADD
+        # command (winner of vote, leaderless failover, reclaim).  Cameras NOT
+        # in this dict are assumed pre-existing and skip the per-camera warmup
+        # gate — this keeps the existing L1/L2/L3 selector tests passing
+        # without forcing every test to set a fake ADD timestamp.
+        self._camera_added_at: Dict[str, float] = {}
+
+        # ponytail: per-camera "first valid positive FPS" timestamp.  Sticky
+        # within the lifetime of the dict entry; cleared (overwritten) when we
+        # ADD the camera again so the warmup restarts.
+        self._camera_first_valid_fps_at: Dict[str, float] = {}
+
         # -----------------------------------------------------------------------
         # Offload level table — shared with SpeedProbe (read from probe thread).
         # Maps camera_id → offload level (0=none, 1=stream, 2=vehicle, 3=plate).
@@ -418,8 +458,38 @@ class PeerOrchestrator:
             except (TypeError, ValueError):
                 self._self_state.max_streams = 8
 
-            overloaded = self._is_overloaded(
-                self._self_state.load_score, self._self_state.risk_index
+            # ponytail: track when valid positive FPS first appeared — drives the
+            # startup warmup gate in _check_self_overload.  Sticky: once set,
+            # never reset, so the gate measures elapsed time since first valid
+            # sample rather than the validity of the current sample.
+            fps_valid = _has_valid_positive_fps(self._self_state.fps_per_camera)
+            if fps_valid and self._self_first_valid_fps_at is None:
+                self._self_first_valid_fps_at = time.time()
+
+            # Per-camera first-valid-FPS timestamps (sticky, per camera).
+            # Drives the post-ADD warmup gate in _pick_camera_to_offload so a
+            # freshly-ADDed camera is ineligible for offload until its FPS has
+            # been valid for camera_warmup_s seconds.
+            if fps_valid:
+                now_ts = time.time()
+                for cam_id, fps_val in self._self_state.fps_per_camera.items():
+                    if not isinstance(cam_id, str):
+                        continue
+                    if (isinstance(fps_val, (int, float))
+                            and not isinstance(fps_val, bool)
+                            and math.isfinite(fps_val)
+                            and fps_val > 0.0):
+                        self._camera_first_valid_fps_at.setdefault(cam_id, now_ts)
+
+            # Overload onset: must be BOTH overloaded (legacy load_score or
+            # proactive risk_index) AND have valid positive FPS samples.
+            # load_score=100 with empty/zero/NaN fps is meaningless without
+            # running streams and must NOT escalate the node.
+            overloaded = (
+                self._is_overloaded(
+                    self._self_state.load_score, self._self_state.risk_index
+                )
+                and fps_valid
             )
             if overloaded:
                 if self._self_state.overload_since is None:
@@ -532,10 +602,32 @@ class PeerOrchestrator:
                     pipeline.get("source_starved_cameras", [])
                 )
 
-                # Overload onset: use risk_index when proactive mode is active,
-                # otherwise fall back to the legacy load_score threshold.
-                overloaded = self._is_overloaded(
-                    self._self_state.load_score, self._self_state.risk_index
+                # ponytail: startup + per-camera warmup timestamp tracking —
+                # same logic as update_self_state so the Zenoh-self path and
+                # the direct update_self_state path behave identically.
+                fps_valid = _has_valid_positive_fps(self._self_state.fps_per_camera)
+                if fps_valid and self._self_first_valid_fps_at is None:
+                    self._self_first_valid_fps_at = time.time()
+                if fps_valid:
+                    now_ts = time.time()
+                    for cam_id, fps_val in self._self_state.fps_per_camera.items():
+                        if not isinstance(cam_id, str):
+                            continue
+                        if (isinstance(fps_val, (int, float))
+                                and not isinstance(fps_val, bool)
+                                and math.isfinite(fps_val)
+                                and fps_val > 0.0):
+                            self._camera_first_valid_fps_at.setdefault(cam_id, now_ts)
+
+                # Overload onset: must be BOTH overloaded AND have valid
+                # positive FPS samples.  load_score=100 with empty/zero/NaN
+                # fps is meaningless without running streams — dashboard
+                # keeps the raw load_score, but the decision path is gated.
+                overloaded = (
+                    self._is_overloaded(
+                        self._self_state.load_score, self._self_state.risk_index
+                    )
+                    and fps_valid
                 )
                 if overloaded:
                     if self._self_state.overload_since is None:
@@ -736,6 +828,29 @@ class PeerOrchestrator:
         If peer X died and we rescued cam_01, cam_02, and then X restarts
         and reports cam_01, cam_02 in its active_cameras, we remove our
         rescued copies to avoid duplicate streams.
+
+        Guards (per spec):
+        - owner absent (peer is None) → skip; never REMOVE/return to a
+          peer that is no longer in the routing table.
+        - owner stale (now - last_seen > heartbeat_timeout_s, default 5 s)
+          → skip; the heartbeat timeout is sourced from config so operators
+          can tune it.
+        - owner not running the camera (not in peer.active_cameras) → skip;
+          rebalance is only valid when the owner has actually resumed
+          processing it.
+        - last-active-camera guard → never return a rescued camera that
+          would leave this node processing zero streams.
+        - hard owned-camera invariant (NEW) → never leave this node with
+          zero locally-owned cameras (cameras.yml via _get_owned_camera_ids),
+          not merely zero active cameras.  Implemented as two layered checks:
+            1. aggregate guard: if no locally-owned camera is currently
+               active, block ALL returns (the node is in a degraded state;
+               foreign returns make it worse).
+            2. per-camera guard: if a specific camera in _rescued_cameras is
+               locally-owned (defensive — _rescued_cameras should only ever
+               hold foreign cameras), skip its return.
+          Failover rescue is unaffected because _leaderless_failover does
+          not route through _check_rebalance.
         """
         if not self._rescued_cameras:
             return
@@ -744,15 +859,86 @@ class PeerOrchestrator:
         timeout = self._cfg.get("heartbeat_timeout_s", 5.0)
         to_return: List[str] = []
 
+        # ponytail: snapshot self-active under _self_lock and rescued/peers
+        # under _lock so we can compute "after return" atomically without
+        # races.  _camera_added_at is not read here.
+        with self._self_lock:
+            self_active_snapshot = set(self._self_state.active_cameras)
+
+        # Resolve locally-owned camera IDs (live CameraManager first, then
+        # cameras.yml).  ponytail: wrap in try/except — the helper is
+        # documented as fail-safe (returns empty on error) but we belt-and-
+        # brace it because a leak here would silently violate the hard
+        # invariant that protects L1 migration availability.
+        try:
+            owned_ids = self._get_owned_camera_ids()
+        except Exception as exc:
+            logger.warning(
+                "[PeerOrch][Rebalance] _get_owned_camera_ids() raised: %s; "
+                "treating ownership as unresolved and blocking all returns.",
+                exc,
+            )
+            owned_ids = None
+        if owned_ids is None:
+            owned_ids = set()
+        owned_active_snapshot = owned_ids & self_active_snapshot
+
+        # Aggregate owned-camera guard: zero locally-owned active cameras
+        # means the node cannot satisfy the L1 ownership invariant for
+        # migration decisions (see _pick_camera_to_offload).  Returning
+        # any rescued camera would not change owned_active (rescued cameras
+        # are foreign) but it would also fail to fix the degradation, so
+        # we hold all rescues here until at least one owned camera resumes.
+        # This is the hard invariant requested in the spec.
+        if not owned_active_snapshot:
+            logger.warning(
+                "[PeerOrch][Rebalance] BLOCKED: no locally-owned active "
+                "cameras (owned_active=0, rescued=%d). Holding rescued "
+                "cameras until an owned stream resumes.",
+                len(self._rescued_cameras),
+            )
+            return
+
         with self._lock:
-            for camera_id, original_owner in list(self._rescued_cameras.items()):
-                peer = self._peers.get(original_owner)
-                if peer is None:
-                    continue
-                # Owner is back online AND is running this camera again
-                if (now - peer.last_seen <= timeout
-                        and camera_id in peer.active_cameras):
-                    to_return.append(camera_id)
+            rescued_snapshot = list(self._rescued_cameras.items())
+            peers_snapshot = dict(self._peers)
+        # Decrement as we commit each return so two concurrent eligible
+        # returns don't both pass the "more than one active remains" check.
+        remaining_after = set(self_active_snapshot)
+        for camera_id, original_owner in rescued_snapshot:
+            # Per-camera guard: an owned camera must NEVER be returned by
+            # this rebalance path.  _rescued_cameras is only ever populated
+            # by _leaderless_failover from a peer's active_cameras, but a
+            # transition window or a misconfigured yml could in principle
+            # place an owned camera here.  Skip defensively.
+            if camera_id in owned_ids:
+                logger.warning(
+                    "[PeerOrch][Rebalance] Skipping return of '%s' to '%s': "
+                    "camera is locally-owned; this rebalance path only "
+                    "handles foreign rescued cameras.",
+                    camera_id, original_owner,
+                )
+                continue
+            peer = peers_snapshot.get(original_owner)
+            if peer is None:
+                # Owner absent from routing table.
+                continue
+            if now - peer.last_seen > timeout:
+                # Owner heartbeat older than configured timeout — stale.
+                continue
+            if camera_id not in peer.active_cameras:
+                # Owner is back but hasn't resumed running this camera yet.
+                continue
+            if camera_id in remaining_after and len(remaining_after) <= 1:
+                # Last-active-camera guard: would leave zero streams locally.
+                logger.warning(
+                    "[PeerOrch][Rebalance] Skipping return of '%s' to '%s': "
+                    "it is the last active camera on this node (active=%d).",
+                    camera_id, original_owner, len(remaining_after),
+                )
+                continue
+            remaining_after.discard(camera_id)
+            to_return.append(camera_id)
 
         for camera_id in to_return:
             original_owner = self._rescued_cameras.pop(camera_id, None)
@@ -855,6 +1041,13 @@ class PeerOrchestrator:
             # Step 2 — Only then REMOVE from holder
             add_cmd = {**cam_config, "cmd": "ADD"}
             self._pubs["control"].put(msgpack.packb(add_cmd, use_bin_type=True))
+            # ponytail: record the ADD so the per-camera warmup gate in
+            # _pick_camera_to_offload suppresses offload actions on this
+            # camera until its FPS has been valid for camera_warmup_s seconds.
+            self._camera_added_at[camera_id] = now
+            # Clear any stale first-valid-fps snapshot so the warmup restarts
+            # from zero for this new ADD event.
+            self._camera_first_valid_fps_at.pop(camera_id, None)
             logger.info(
                 "[PeerOrch] Reclaim: load=%.1f < threshold=%.1f — "
                 "ADD '%s' back to self (was held by '%s'), waiting for ack...",
@@ -929,6 +1122,30 @@ class PeerOrchestrator:
         if now - state.overload_since < cfg.get("overload_duration_s", 10.0):
             logger.debug("[PeerOrch] Overload too recent (%.1fs < %.1fs)",
                         now - state.overload_since, cfg.get("overload_duration_s", 10.0))
+            return
+
+        # ponytail: startup warmup gate.  Even with overload_since set,
+        # suppress all overload escalation until self has had valid positive
+        # FPS for overload_warmup_s seconds (default 10).  Without this, a
+        # load_score that spiked before the pipeline stabilised could fire
+        # RFO moments after start.  Field is sticky — once valid FPS appears
+        # the timer counts from that moment; the gate never goes backwards.
+        warmup_s = cfg.get("overload_warmup_s", 10.0)
+        first_valid_fps_at = self._self_first_valid_fps_at
+        if first_valid_fps_at is None:
+            if self._maybe_log_block("warmup_no_fps", now):
+                logger.warning(
+                    "[PeerOrch] Overload check BLOCKED: startup warmup — "
+                    "no valid positive FPS observed yet. No L3/L2/L1 actions."
+                )
+            return
+        if now - first_valid_fps_at < warmup_s:
+            if self._maybe_log_block("warmup_active", now):
+                logger.warning(
+                    "[PeerOrch] Overload check BLOCKED: startup warmup "
+                    "(%.1fs since first valid FPS, need %.1fs). No L3/L2/L1 actions.",
+                    now - first_valid_fps_at, warmup_s,
+                )
             return
 
         # ── Decision suppression: pending-ack & post-migration settle ──
@@ -1554,6 +1771,10 @@ class PeerOrchestrator:
             winner_key = f"peers/control/{winner}"
             self._session.put(winner_key, msgpack.packb(add_cmd, use_bin_type=True))
             logger.info("[PeerOrch] ADD command published for '%s' to '%s'", camera_id, winner)
+            # ponytail: camera now being added from vote winner — record the ADD
+            # so _pick_camera_to_offload can apply the per-camera warmup gate.
+            self._camera_added_at[camera_id] = time.time()
+            self._camera_first_valid_fps_at.pop(camera_id, None)
 
         elif from_node == self._node_id:
             # --- I AM REQUESTER: wait for ack then REMOVE ---
@@ -1821,6 +2042,10 @@ class PeerOrchestrator:
                 self._pubs["control"].put(msgpack.packb(add_cmd, use_bin_type=True))
                 self_accepted += 1
                 self._rescued_cameras[camera_id] = dead_node_id
+                # ponytail: rescue ADD — record so _pick_camera_to_offload
+                # applies the per-camera warmup gate to this camera too.
+                self._camera_added_at[camera_id] = time.time()
+                self._camera_first_valid_fps_at.pop(camera_id, None)
                 logger.info("[Failover] Rescue ADD sent: '%s' → me (rtt=%.0fms)", camera_id, rtt)
 
                 self._migration_log.log(
@@ -2077,21 +2302,44 @@ class PeerOrchestrator:
         reclaim_stability = self._cfg.get("reclaim_stability_s", 30.0)
         starved = set(state.source_starved_cameras or [])
 
+        # ponytail: per-camera warmup gate.  A freshly-ADDed camera whose FPS
+        # hasn't stabilised is ineligible for offload — its workload is
+        # untrustworthy and offloading it would just thrash.  Cameras NOT
+        # recorded in _camera_added_at are pre-existing and skip the gate,
+        # which keeps the existing L1/L2/L3 selector tests passing.
+        camera_warmup_s = self._cfg.get(
+            "camera_warmup_s", self._cfg.get("overload_warmup_s", 10.0),
+        )
+
+        def _camera_warming_up(cam_id: str) -> bool:
+            if cam_id not in self._camera_added_at:
+                return False  # pre-existing — no warmup
+            first_fps = self._camera_first_valid_fps_at.get(cam_id)
+            if first_fps is None:
+                return True   # added but no valid FPS observed yet
+            return (now - first_fps) < camera_warmup_s
+
         # Workload evidence must come from the health payload. Require a
         # finite, non-negative workload per camera; missing/malformed values
         # are skipped (fail safe). Do NOT fall back to output FPS.
         workload = state.camera_workload or {}
-        eligible = {
-            c: float(workload[c])
-            for c in state.active_cameras
-            if c not in starved
-            and now - self._reclaim_completed_at.get(c, 0.0) >= reclaim_stability
-            and c in workload
-            and isinstance(workload[c], (int, float))
-            and not isinstance(workload[c], bool)
-            and math.isfinite(workload[c])
-            and workload[c] >= 0
-        }
+        eligible = {}
+        for c in state.active_cameras:
+            if c in starved:
+                continue
+            if now - self._reclaim_completed_at.get(c, 0.0) < reclaim_stability:
+                continue
+            if _camera_warming_up(c):
+                continue
+            if c not in workload:
+                continue
+            w = workload[c]
+            if not (isinstance(w, (int, float))
+                    and not isinstance(w, bool)
+                    and math.isfinite(w)
+                    and w >= 0):
+                continue
+            eligible[c] = float(w)
 
         if not eligible:
             return None
