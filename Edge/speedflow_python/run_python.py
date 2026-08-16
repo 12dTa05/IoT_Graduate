@@ -298,11 +298,13 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
 
 
 # ---------------------------------------------------------------------------
-# Health push — periodic metrics to local PeerOrchestrator self-state.
-# In the normal run_edge.sh deployment, standalone health_agent.py owns Zenoh
-# peers/status publishing and WebSocket forwarding to the Monitor Server. In
-# explicit PIPELINE_OWN_WS=1 standalone/dev mode this loop also owns those
-# external publishes so main.py can run without health_agent.py.
+# Health push — periodic metrics to local PeerOrchestrator self-state, and a
+# heartbeat on peers/status/<NODE_ID> via PeerOrchestrator's shared Zenoh
+# session at the same 1 s cadence.  In the default run_edge.sh deployment a
+# standalone health_agent.py process also publishes on the same key from its
+# own session; in explicit PIPELINE_OWN_WS=1 standalone/dev mode this loop
+# additionally owns WebSocket forwarding to the Monitor Server so main.py can
+# run without health_agent.py.
 # ---------------------------------------------------------------------------
 
 def _health_push_loop(peer_orch=None) -> None:
@@ -483,22 +485,24 @@ def _health_push_loop(peer_orch=None) -> None:
                 )
                 payload.update(proactive_result)
 
-            # Keep local PeerOrchestrator state fresh without publishing a
-            # duplicate peers/status/<NODE_ID> heartbeat in the default
-            # run_edge.sh deployment.
+            # Keep local PeerOrchestrator state fresh and publish a fresh
+            # heartbeat on peers/status/<NODE_ID> via the shared session.
+            # health_agent.py may also publish from its own session in the
+            # default run_edge.sh deployment; that second source publishes
+            # under the SAME node_id so the Zenoh pub/sub contract is
+            # satisfied regardless of which process is running.
+            # send_to_monitor is deliberately inside the PIPELINE_OWN_WS=1
+            # block below (MonitorClient ownership = standalone / dev mode).
             if peer_orch is not None:
                 peer_orch.update_self_state(payload)
+                import msgpack as _msgpack
+                peer_orch.publish_status(
+                    _msgpack.packb(payload, use_bin_type=True)
+                )
 
-            # Standalone/dev mode: when main.py is intentionally run without
-            # health_agent.py, this process becomes the external telemetry owner.
             if os.environ.get("PIPELINE_OWN_WS") == "1":
                 from speedflow_python.monitor_client import send_to_monitor
                 send_to_monitor(payload)
-                if peer_orch is not None:
-                    import msgpack as _msgpack
-                    peer_orch.publish_status(
-                        _msgpack.packb(payload, use_bin_type=True)
-                    )
 
         except Exception as _exc:
             import logging as _logging
@@ -804,9 +808,9 @@ def run_python_mode(args) -> None:
     )
     _health_thread.start()
     if os.environ.get("PIPELINE_OWN_WS") == "1":
-        print("[HealthPush] Started (PIPELINE_OWN_WS: self-state + Zenoh/WebSocket)")
+        print("[HealthPush] Started (PIPELINE_OWN_WS: Zenoh heartbeat + WebSocket)")
     else:
-        print("[HealthPush] Started (self-state only; Zenoh/WebSocket via health_agent)")
+        print("[HealthPush] Started (Zenoh heartbeat; WebSocket via health_agent)")
 
     # Run pipeline — offload_pub + zenoh_pub references passed so SpeedProbe can use them
     if args.mode == "display":

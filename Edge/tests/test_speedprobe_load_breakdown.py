@@ -518,8 +518,128 @@ def test_active_probe_lifecycle():
 
 
 # ====================================================================
-# Runner
+# Regression tests: _health_push_loop heartbeat publication contract
 # ====================================================================
+# Root cause: previously publish_status lived inside the PIPELINE_OWN_WS=1
+# block, so in default run_edge.sh mode no Zenoh heartbeat ever left the
+# pipeline process.  Peers only saw NODE_ONLINE (from zenoh_subscriber)
+# → 10 s mutual false-offline / leaderless failover.
+#
+# Fix: publish_status is called unconditionally each cycle (when
+# peer_orch is not None).  send_to_monitor stays inside PIPELINE_OWN_WS=1
+# so MonitorClient ownership preserved.
+# ====================================================================
+
+
+def _find_health_push_loop(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name == "_health_push_loop":
+            return node
+    raise AssertionError("_health_push_loop not found in AST")
+
+
+def _find_pipeline_owns_ws_block(func_tree):
+    """Find the if-block where PIPELINE_OWN_WS==1 is tested (Compare node), restricted to subtree."""
+    for node in ast.walk(func_tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if isinstance(test, ast.Compare):
+            ops = test.ops
+            if len(ops) != 1:
+                continue
+            left_caller = None
+            right_check = None
+            if isinstance(test.left, ast.Call):
+                left_caller = test.left
+                right_check = test.comparators
+            elif len(test.comparators) == 1 and isinstance(test.comparators[0], ast.Call):
+                left_caller = test.comparators[0]
+                right_check = [test.left]
+            else:
+                continue
+            if not (isinstance(left_caller.func, ast.Attribute)
+                    and left_caller.func.attr == "get"
+                    and isinstance(left_caller.func.value, ast.Attribute)
+                    and left_caller.func.value.attr == "environ"
+                    and isinstance(left_caller.func.value.value, ast.Name)
+                    and left_caller.func.value.value.id == "os"):
+                continue
+            if not (len(left_caller.args) == 1
+                    and isinstance(left_caller.args[0], ast.Constant)
+                    and left_caller.args[0].value == "PIPELINE_OWN_WS"):
+                continue
+            if not (len(right_check) == 1
+                    and isinstance(right_check[0], ast.Constant)
+                    and right_check[0].value == "1"):
+                continue
+            return node
+    return None
+
+
+def _count_calls_in(node, name):
+    """Count Expr(Call(<name>(...) or <x>.<name>(...))) nodes in ast subtree."""
+    count = 0
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Expr) and isinstance(sub.value, ast.Call):
+            call = sub.value
+            func = call.func
+            if isinstance(func, ast.Attribute) and func.attr == name:
+                count += 1
+            elif isinstance(func, ast.Name) and func.id == name:
+                count += 1
+    return count
+
+
+def test_health_loop_publish_status_outside_own_ws_block():
+    """publish_status is called at the loop top level, not inside PIPELINE_OWN_WS=1.
+
+    Regression: publish_status used to live inside the PIPELINE_OWN_WS=1
+    block, so the default run_edge.sh mode never broadcast a heartbeat.
+    """
+    func = _find_health_push_loop(_RUN_PY_TREE)
+    own_ws_block = _find_pipeline_owns_ws_block(func)
+
+    pub_total = _count_calls_in(func, "publish_status")
+    pub_in_own_ws = _count_calls_in(own_ws_block, "publish_status") \
+        if own_ws_block else 0
+
+    assert pub_total >= 1, (
+        "publish_status must appear in _health_push_loop body "
+        f"(got {pub_total} call(s))"
+    )
+    assert pub_in_own_ws == 0, (
+        "publish_status must NOT be inside PIPELINE_OWN_WS=1 block — "
+        "otherwise default mode (PIPELINE_OWN_WS unset) never broadcasts "
+        "a heartbeat and peers falsely declare this node offline after 10 s."
+    )
+
+
+def test_health_loop_send_to_monitor_only_in_own_ws_block():
+    """send_to_monitor stays inside PIPELINE_OWN_WS=1 (MonitorClient owned there).
+
+    Duplicate-heartbeat guard: publish_status must not be called from inside
+    the PIPELINE_OWN_WS=1 block (would double-publish in standalone mode).
+    """
+    func = _find_health_push_loop(_RUN_PY_TREE)
+    own_ws_block = _find_pipeline_owns_ws_block(func)
+
+    assert own_ws_block is not None, (
+        "PIPELINE_OWN_WS=1 branch must exist in _health_push_loop"
+    )
+    send_in_block = _count_calls_in(own_ws_block, "send_to_monitor")
+    pub_in_block = _count_calls_in(own_ws_block, "publish_status")
+
+    assert send_in_block >= 1, (
+        "send_to_monitor must be inside PIPELINE_OWN_WS=1 block "
+        f"(MonitorClient ownership = standalone/dev mode; got {send_in_block})"
+    )
+    assert pub_in_block == 0, (
+        "publish_status must NOT be inside PIPELINE_OWN_WS=1 block — "
+        "otherwise the loop would publish twice in standalone mode "
+        f"(got {pub_in_block} call(s))"
+    )
 
 if __name__ == "__main__":
     tests = [
@@ -529,6 +649,8 @@ if __name__ == "__main__":
         test_health_loop_uses_breakdown_function,
         test_health_loop_flat_invalid_breakdown_present,
         test_active_probe_lifecycle,
+        test_health_loop_publish_status_outside_own_ws_block,
+        test_health_loop_send_to_monitor_only_in_own_ws_block,
     ]
     passed = failed = 0
     for t in tests:
