@@ -308,3 +308,25 @@ def test_file_chain_caps_before_osd():
     assert caps_idx + 1 == osd_idx, (
         f"capsfilter({caps_idx}) should be immediately before nvdsosd({osd_idx})"
     )
+
+
+def test_live_source_all_files_paces_realtime():
+    """Pure file playback → streammux live-source=0 (PTS-paced realtime,
+    output FPS cannot exceed source FPS)."""
+    cams = [_DummyCamera(), _DummyCamera()]
+    for c in cams:
+        c.uri = "file:///tmp/dummy.mp4"
+    build_pipeline(cams, sink_type="file")
+    streammux = next(e for e in _ELEMENTS if e.factory == "nvstreammux")
+    assert streammux.get_property("live-source") == 0, (
+        f"live-source for file playback: {streammux.get_property('live-source')}"
+    )
+
+
+def test_live_source_any_live_keeps_push_mode():
+    """Any live (RTSP) source → streammux live-source=1 unchanged (arrival-rate
+    push; file cameras in a mixed pipeline are documented via source_modes +
+    muxer_live_source telemetry instead of changing global pacing)."""
+    build_pipeline(_DUMMY_CAMS, sink_type="file")  # _DummyCamera URIs are rtsp
+    streammux = next(e for e in _ELEMENTS if e.factory == "nvstreammux")
+    assert streammux.get_property("live-source") == 1

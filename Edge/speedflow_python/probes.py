@@ -47,6 +47,25 @@ from .camera_config import CameraManager, CameraConfig
 logger = logging.getLogger(__name__)
 
 
+def muxer_live_source(source_type_by_camera: Dict[str, str]) -> int:
+    """Mirror core_pipeline's streammux live-source decision for telemetry.
+
+    0 → every camera is a file source (PTS-paced realtime playback, so
+    output FPS cannot exceed the source file's own FPS).
+    1 → at least one live source present (arrival-rate push; a "file"
+    camera in such a pipeline runs at decoder throughput and its output
+    FPS may exceed the source FPS).
+
+    Kept as a pure function so the writer loop and host tests agree on the
+    contract without racing the 1 s telemetry writer thread.
+    """
+    if source_type_by_camera and all(
+        v == "file" for v in source_type_by_camera.values()
+    ):
+        return 0
+    return 1
+
+
 class CSVLogger:
     """Lightweight CSV appender — optional, non-critical path.
 
@@ -725,6 +744,15 @@ class SpeedProbe:
                         # FPS for any overload/QoS logic (never treat file
                         # throughput as source starvation).
                         "source_modes": dict(self._source_type_by_camera),
+                        # Mirror of core_pipeline's streammux live-source
+                        # decision (0 = all files → PTS-paced realtime playback,
+                        # output FPS ≤ source FPS; 1 = any live source →
+                        # arrival-rate push).  Diagnostic contract: when
+                        # muxer_live_source=1, a "file" camera's output FPS is
+                        # decoder throughput and may exceed its source FPS.
+                        "muxer_live_source": (
+                            muxer_live_source(self._source_type_by_camera)
+                        ),
                     },
                     "_features":       feats,
                 }
@@ -759,8 +787,16 @@ class SpeedProbe:
                         out["load_score_breakdown"] = dict(self._load_score_breakdown)
 
                 # ── Atomic write: temp file + os.replace ───────────────────
+                # Filesystem hardening: os.replace raises ENOENT when the
+                # destination's parent directory does not exist (e.g. a
+                # nested /dev/shm/<subdir>/ path whose subdir was never
+                # created, or a tmpfs that was cleared/recreated under us).
+                # Recreate the parent first so the atomic swap can land.
                 tmp_path = FPS_STATS_FILE + ".tmp"
                 try:
+                    _parent = os.path.dirname(os.path.abspath(FPS_STATS_FILE))
+                    if _parent and not os.path.isdir(_parent):
+                        os.makedirs(_parent, exist_ok=True)
                     with open(tmp_path, "w") as f:
                         json.dump(out, f)
                     os.replace(tmp_path, FPS_STATS_FILE)

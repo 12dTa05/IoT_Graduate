@@ -368,6 +368,70 @@ def test_aliases_consistent_with_base_keys():
     print("  PASS  test_aliases_consistent_with_base_keys")
 
 
+def test_muxer_live_source_contract():
+    """muxer_live_source mirrors core_pipeline's streammux live-source decision:
+    all files → 0 (PTS-paced realtime), any live → 1 (arrival-rate push)."""
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        fps_file = f.name
+
+    probe_mod = _load("probes", "speedflow_python/probes.py", fps_file)
+    mls = probe_mod.muxer_live_source
+
+    # All files → PTS-paced realtime (output FPS can never exceed source FPS)
+    assert mls({"cam_01": "file", "cam_02": "file"}) == 0
+    # Any live source → arrival-rate push (unchanged behavior)
+    assert mls({"cam_01": "live", "cam_02": "file"}) == 1
+    assert mls({"cam_01": "live"}) == 1
+    # Empty map (no cameras yet) → conservative live default
+    assert mls({}) == 1
+
+    os.unlink(fps_file)
+    print("  PASS  test_muxer_live_source_contract")
+
+
+def test_writer_payload_includes_source_output_contract():
+    """The writer's _telemetry payload must expose source_modes AND
+    muxer_live_source so downstream can interpret output FPS vs source FPS."""
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        fps_file = f.name
+
+    probe_mod = _load("probes", "speedflow_python/probes.py", fps_file)
+    # Shorten the real writer cycle for a deterministic, fast read of the
+    # atomically-written payload (module-global is re-read each loop).
+    probe_mod.TELEMETRY_INTERVAL = 0.05
+
+    class _StubCameraManager:
+        def get_config(self, source_id):
+            return None
+
+    probe = probe_mod.SpeedProbe(camera_manager=_StubCameraManager(), cooldown_s=0.1)
+    # Inject a source-mode map the way run_python would (file-playback setup)
+    probe.set_source_types({"cam_01": "file", "cam_02": "file"})
+
+    import json as _json
+    payload = {}
+    for _ in range(50):
+        time.sleep(0.05)
+        try:
+            payload = _json.loads(open(fps_file).read())
+            if "_telemetry" in payload:
+                break
+        except (OSError, ValueError):
+            continue
+
+    telemetry = payload.get("_telemetry", {})
+    assert telemetry.get("source_modes") == {"cam_01": "file", "cam_02": "file"}, (
+        f"source_modes: {telemetry.get('source_modes')}"
+    )
+    assert telemetry.get("muxer_live_source") == 0, (
+        f"expected realtime pacing for all-file pipeline, got {telemetry.get('muxer_live_source')}"
+    )
+
+    probe.stop_fps_writer()
+    os.unlink(fps_file)
+    print("  PASS  test_writer_payload_includes_source_output_contract")
+
+
 # ---------------------------------------------------------------------------
 # Run all
 # ---------------------------------------------------------------------------
@@ -382,6 +446,8 @@ if __name__ == "__main__":
         test_health_payload_output_fps_equals_fps_per_camera,
         test_health_payload_input_fps_preserved_raw,
         test_aliases_consistent_with_base_keys,
+        test_muxer_live_source_contract,
+        test_writer_payload_includes_source_output_contract,
     ]
     failed = []
     for t in tests:

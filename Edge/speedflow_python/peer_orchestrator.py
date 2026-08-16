@@ -821,9 +821,20 @@ class PeerOrchestrator:
         """
         Detect offline peers (heartbeat timeout).
         If peer has active cameras → trigger leaderless failover.
+
+        Grace/convergence guard: a peer is only declared OFFLINE after
+        ``heartbeat_timeout_s + failover_grace_s`` of silence.  The extra
+        grace window prevents transient Zenoh / network blips from
+        triggering an expensive leaderless failover for a peer that is
+        still alive but briefly unreachable.  Default grace equals
+        ``heartbeat_timeout_s`` so the total wait is 2× the heartbeat
+        timeout — configurable via ``p2p.failover_grace_s`` in
+        ``Edge/configs/edge_node.yml``.
         """
         now = time.time()
         timeout = self._cfg.get("heartbeat_timeout_s", 5.0)
+        grace_s = self._cfg.get("failover_grace_s", timeout)
+        offline_threshold = timeout + grace_s
 
         with self._lock:
             to_check = list(self._peers.items())
@@ -832,7 +843,7 @@ class PeerOrchestrator:
             if node_id == self._node_id:
                 continue
             silent_s = now - peer.last_seen
-            if silent_s > timeout:
+            if silent_s > offline_threshold:
                 self._clear_offload_target(node_id)
                 if peer.active_cameras:
                     # BUG-6 fix: use _failover_triggered set to prevent
@@ -844,8 +855,9 @@ class PeerOrchestrator:
                         orphans = list(peer.active_cameras)
                         self._failover_triggered.add(node_id)
                         logger.critical(
-                            "[PeerOrch] Peer '%s' OFFLINE with %d cameras! Triggering failover...",
-                            node_id, len(orphans),
+                            "[PeerOrch] Peer '%s' OFFLINE (silent %.1fs ≥ %.1fs) with %d cameras! "
+                            "Triggering failover...",
+                            node_id, silent_s, offline_threshold, len(orphans),
                         )
                         self._notified_offline.discard(node_id)
                         threading.Thread(
@@ -911,8 +923,9 @@ class PeerOrchestrator:
           Failover rescue is unaffected because _leaderless_failover does
           not route through _check_rebalance.
         """
-        if not self._rescued_cameras:
-            return
+        with self._lock:
+            if not self._rescued_cameras:
+                return
 
         now = time.time()
         timeout = self._cfg.get("heartbeat_timeout_s", 5.0)
@@ -949,13 +962,17 @@ class PeerOrchestrator:
         # are foreign) but it would also fail to fix the degradation, so
         # we hold all rescues here until at least one owned camera resumes.
         # This is the hard invariant requested in the spec.
+        # ponytail: rate-limit the diagnostic — this branch fires every 1s
+        # tick while the node is in the degraded state; one log per
+        # BLOCKED_LOG_COOLDOWN (15 s) is enough to alert without spam.
         if not owned_active_snapshot:
-            logger.warning(
-                "[PeerOrch][Rebalance] BLOCKED: no locally-owned active "
-                "cameras (owned_active=0, rescued=%d). Holding rescued "
-                "cameras until an owned stream resumes.",
-                len(self._rescued_cameras),
-            )
+            if self._maybe_log_block("rebalance_no_owned", now):
+                logger.warning(
+                    "[PeerOrch][Rebalance] BLOCKED: no locally-owned active "
+                    "cameras (owned_active=0, rescued=%d). Holding rescued "
+                    "cameras until an owned stream resumes.",
+                    len(self._rescued_cameras),
+                )
             return
 
         with self._lock:
@@ -1000,7 +1017,8 @@ class PeerOrchestrator:
             to_return.append(camera_id)
 
         for camera_id in to_return:
-            original_owner = self._rescued_cameras.pop(camera_id, None)
+            with self._lock:
+                original_owner = self._rescued_cameras.pop(camera_id, None)
             if original_owner is None:
                 continue
             remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
@@ -2171,6 +2189,30 @@ class PeerOrchestrator:
         Each surviving peer runs independently → same hash result.
         Winner executes ADD after jitter (0-2s) to avoid race.
         After jitter, check peers/status/+ to see if camera already rescued.
+
+        Dead-owner filtering
+        ────────────────────
+        The dead peer's ``active_cameras`` can contain stale entries:
+          * cameras that were being migrated TO the dead peer (in flight when it died)
+          * cameras that the dead peer had previously rescued from another peer
+          * cameras that were offloaded (L2/L3) to the dead peer
+
+        Rescuing any of those creates duplicate streams — the original owner
+        (or another alive peer) is already running them.  The dead peer's
+        ``camera_configs`` (populated from its last heartbeat's
+        ``pipeline.camera_configs``) is the authoritative "owned by the dead
+        node" set: cameras it was configured to manage.  We intersect the
+        orphan list with those keys before rescue.  If the dead peer never
+        populated ``camera_configs`` (older firmware / missing field), we fall
+        back to the full orphan list — never silently drop a mandatory rescue.
+
+        Duplicate prevention (local)
+        ────────────────────────────
+        The consistent hash ensures only one node wins each camera across the
+        cluster.  Within this node, we additionally guard against double-rescue:
+          * camera already in ``_rescued_cameras`` (rescued in a prior run)
+          * camera already in ``_self_state.active_cameras`` (we're running it)
+        Both are checked under their respective locks.
         """
         cfg = self._cfg
         now = time.time()
@@ -2180,7 +2222,7 @@ class PeerOrchestrator:
         # acquisition to prevent torn reads between the two operations.
         with self._lock:
             dead_peer = self._peers.get(dead_node_id)
-            peer_cam_configs = dead_peer.camera_configs if dead_peer else {}
+            peer_cam_configs = dict(dead_peer.camera_configs) if dead_peer else {}
 
             # Build alive candidate list — includes self so this node can rescue too
             # BUG-1 fix: read active_cameras from _self_state under _self_lock.
@@ -2197,6 +2239,28 @@ class PeerOrchestrator:
                 and now - peer.last_seen <= timeout
                 and len(peer.active_cameras) < peer.max_streams
             ] + ([self._node_id] if self_eligible else []))
+
+        # Dead-owner filtering: intersect orphans with the dead peer's
+        # authoritative camera_configs.  Anything in active_cameras but not in
+        # camera_configs is stale / offload / migrated-in — must NOT be rescued.
+        # Falls back to the full list when camera_configs was never populated.
+        if peer_cam_configs:
+            owned_set = set(peer_cam_configs.keys())
+            before_n = len(orphaned_cameras)
+            orphaned_cameras = [c for c in orphaned_cameras if c in owned_set]
+            filtered_out = before_n - len(orphaned_cameras)
+            if filtered_out:
+                logger.info(
+                    "[Failover] Filtered %d stale/non-owned entries from '%s' orphan list "
+                    "(active_cameras included offload/migrated-in cameras).",
+                    filtered_out, dead_node_id,
+                )
+            if not orphaned_cameras:
+                logger.warning(
+                    "[Failover] No owned orphans from '%s' after dead-owner filtering. "
+                    "Skipping rescue.", dead_node_id,
+                )
+                return
 
         # BUG-11: Track how many cameras this node has accepted during this
         # failover loop so we don't exceed eps_streams_max across iterations.
@@ -2215,6 +2279,24 @@ class PeerOrchestrator:
             winner = self._consistent_hash(camera_id, alive_peers)
 
             if winner == self._node_id:
+                # Local-side duplicate guard: skip if WE already rescued this
+                # camera in a prior failover run, or if we're already running it.
+                with self._lock:
+                    if camera_id in self._rescued_cameras:
+                        logger.info(
+                            "[Failover] Camera '%s' already in _rescued_cameras (owner='%s'). "
+                            "Skipping duplicate rescue.",
+                            camera_id, self._rescued_cameras[camera_id],
+                        )
+                        continue
+                with self._self_lock:
+                    if camera_id in self._self_state.active_cameras:
+                        logger.info(
+                            "[Failover] Camera '%s' already active on self. Skipping duplicate rescue.",
+                            camera_id,
+                        )
+                        continue
+
                 # Re-check capacity including cameras accepted earlier in this loop
                 # BUG-1 fix: read active_cameras under _self_lock
                 with self._self_lock:
@@ -2264,7 +2346,8 @@ class PeerOrchestrator:
                 add_cmd = {**cam_config, "cmd": "ADD"}
                 self._pubs["control"].put(msgpack.packb(add_cmd, use_bin_type=True))
                 self_accepted += 1
-                self._rescued_cameras[camera_id] = dead_node_id
+                with self._lock:
+                    self._rescued_cameras[camera_id] = dead_node_id
                 # ponytail: rescue ADD — record so _pick_camera_to_offload
                 # applies the per-camera warmup gate to this camera too.
                 self._camera_added_at[camera_id] = time.time()

@@ -261,7 +261,18 @@ def build_pipeline(
     streammux.set_property("width", mux_width)
     streammux.set_property("height", mux_height)
     streammux.set_property("batched-push-timeout", 33_000)
-    streammux.set_property("live-source", 1)   # mostly RTSP live sources
+    # live-source=1 (arrival-rate push) is correct for live RTSP sources,
+    # but for pure file playback it lets the muxer run at decode speed, so
+    # output FPS can exceed the source file's native FPS.  live-source=0
+    # paces the muxer to the sources' PTS → realtime playback (output FPS
+    # ≤ source FPS).  Mixed live+file pipelines must stay 1 (a live source
+    # would stall under PTS pacing); probes.py telemetry exposes the
+    # decision as muxer_live_source so downstream can interpret FPS.
+    live_source = (
+        0 if all(is_file_uri(normalize_uri(c.uri)) for c in camera_configs)
+        else 1
+    )
+    streammux.set_property("live-source", live_source)
     streammux.set_property("attach-sys-ts", True)
 
     # ── Core AI processing ───────────────────────────────────────────────────
