@@ -1943,6 +1943,50 @@ class PeerOrchestrator:
                 daemon=True,
             ).start()
 
+    def _l1_remove_ownership_guard(self, camera_id: str) -> bool:
+        """
+        Final atomic ownership guard, called immediately before an L1 REMOVE
+        that would remove ``camera_id`` from this node's pipeline.
+
+        The decision-time guard in ``_pick_camera_to_offload`` ran against a
+        snapshot that is now stale: while we waited for the winner's ACK, a
+        concurrent migration / reclaim / rebalance may have removed every
+        other locally-owned camera, leaving this one as the last owned stream.
+        Re-check ownership against the CURRENT active set so a stale decision
+        can never REMOVE the final owned camera and leave only foreign streams.
+
+        Logically atomic: reads ownership (``_get_owned_camera_ids``) and the
+        active set (``_self_state.active_cameras`` under ``_self_lock``) with
+        no intervening wait/await before the caller acts on the result.
+
+        Returns True if the REMOVE may proceed; False if it must be aborted
+        (this camera is the last locally-owned active camera, or ownership is
+        unresolved).
+        """
+        try:
+            owned = self._get_owned_camera_ids()
+        except Exception as exc:
+            logger.warning(
+                "[PeerOrch] L1 ownership guard: ownership lookup failed: %s", exc
+            )
+            owned = set()
+
+        with self._self_lock:
+            active = set(self._self_state.active_cameras)
+
+        if not owned:
+            # Fail closed: cannot prove another owned camera would remain.
+            return False
+
+        # Removing a foreign (rescued/migrated-in) camera never reduces the
+        # locally-owned-active count, so it may always proceed.
+        if camera_id not in owned:
+            return True
+
+        # Owned camera: proceed only if some OTHER owned camera stays active.
+        owned_active = owned & active
+        return bool(owned_active - {camera_id})
+
     def _wait_and_remove(self, camera_id: str, winner_node: str) -> None:
         """
         Make-before-Break: wait for winner to confirm PLAYING → REMOVE from self.
@@ -2015,6 +2059,44 @@ class PeerOrchestrator:
             return
 
         # Success — REMOVE from self
+        # Final atomic ownership guard: the decision-time check in
+        # _pick_camera_to_offload ran against a snapshot that may now be
+        # stale.  A concurrent migration / reclaim / rebalance can have
+        # removed every other owned camera while we were waiting for this
+        # ACK, turning `camera_id` into the last owned stream.  Block the
+        # REMOVE rather than strip the node down to foreign-only streams.
+        if not self._l1_remove_ownership_guard(camera_id):
+            logger.error(
+                "[PeerOrch] L1 REMOVE ABORTED for '%s' (winner='%s'): it is now "
+                "the last locally-owned active camera. Keeping it local; not "
+                "sending REMOVE to self.",
+                camera_id, winner_node,
+            )
+            # Clean pending reservation/state: the ACK handler normally pops
+            # _pending_winner, but on a blocked path we defensively release it
+            # here so a stale winner mapping can never leak into a later vote
+            # or double-release a slot belonging to another camera.
+            with self._lock:
+                stale_winner = self._pending_winner.pop(camera_id, None)
+            if stale_winner == winner_node:
+                self._peer_inflight[winner_node] = max(
+                    0, self._peer_inflight.get(winner_node, 0) - 1
+                )
+                logger.debug(
+                    "[PeerOrch] L1 REMOVE abort released reservation for '%s' "
+                    "(winner='%s', inflight=%d)",
+                    camera_id, winner_node, self._peer_inflight[winner_node],
+                )
+            self._migration_log.log(
+                self._node_id, winner_node, camera_id,
+                "overload", trigger_load, trigger_fps,
+                time.time() * 1000 - start_ms, "OWNERSHIP_GUARD_BLOCK",
+            )
+            # Suppress immediate re-escalation for this camera so the same
+            # stale decision is not retried in the next tick.
+            self._cam_cooldown[camera_id] = time.time()
+            return
+
         remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
         self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
         logger.info(

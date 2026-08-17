@@ -24,6 +24,7 @@ import textwrap
 import time
 import types
 import traceback
+import inspect
 from pathlib import Path
 from importlib.util import spec_from_file_location, module_from_spec
 
@@ -1562,6 +1563,218 @@ def test_rebalance_fails_safe_when_owned_lookup_raises():
     )
     assert _sent_control_commands(o._pubs["control"], "REMOVE", "cam_x") == [], (
         "no REMOVE when ownership cannot be resolved"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# L1 REMOVE ownership guard (root-cause fix for final-camera removal bug)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Stub to simulate a single in-flight ACK event (make _wait_and_remove return
+# immediately without any real Zenoh I/O or threading).
+def _stub_wait_and_remove_ack(o, camera_id, winner_node):
+    """Patch _wait_and_remove so it completes synchronously with a successful ACK."""
+    import time as _time
+
+    def _waiter(cid, wn, timeout=2.0):
+        # Simulate the ACK being already fired and _pending_acks set.
+        with o._lock:
+            evt = o._pending_acks.get(cid)
+        if evt is not None:
+            evt.set()
+        return True, _time.time() * 1000
+
+    o._wait_and_remove = _waiter
+
+
+def _call_l1_guard(o, camera_id, owned_ids=None, active_cameras=None):
+    """Invoke the private L1 guard with injected state."""
+    if owned_ids is not None:
+        o._get_owned_camera_ids = lambda: set(owned_ids)
+    if active_cameras is not None:
+        o._self_state.active_cameras = list(active_cameras)
+    return o._l1_remove_ownership_guard(camera_id)
+
+
+# ── Tests 1-4: L1 ownership guard ──────────────────────────────────────────
+
+
+def test_guard_blocks_stale_decision_when_last_owned_becomes_single_active():
+    """Stale decision: snapshot had 2 owned cameras, but by REMOVE-time only 1
+    remains active.  Guard must block — node must retain at least one owned camera.
+
+    This is the exact root-cause violation from live logs.
+    """
+    o = _new_orch()
+    # Initial snapshot: both cam_a and cam_b owned and active.
+    assert _call_l1_guard(o, "cam_a", owned_ids={"cam_a", "cam_b"},
+                          active_cameras=["cam_a", "cam_b"]) is True
+    # Concurrent migration strips cam_b from active before REMOVE fires for cam_a.
+    # cam_a is now the ONLY owned active camera → stale REMOVE must be blocked.
+    assert _call_l1_guard(o, "cam_a", owned_ids={"cam_a", "cam_b"},
+                          active_cameras=["cam_a"]) is False
+    # Removing cam_b instead is still safe: cam_a (owned) remains active.
+    assert _call_l1_guard(o, "cam_b", owned_ids={"cam_a", "cam_b"},
+                          active_cameras=["cam_a"]) is True
+    # A camera that is not locally-owned (foreign rescued stream) may always be
+    # removed, even while an owned camera is the only locally-active one.
+    assert _call_l1_guard(o, "cam_foreign", owned_ids={"cam_a", "cam_b"},
+                          active_cameras=["cam_a", "cam_foreign"]) is True
+
+
+def test_guard_allows_foreign_camera_remove_when_only_foreign_active():
+    """Foreign-only active state: removing a foreign camera must never be blocked
+    because it does not reduce the locally-owned-active count.
+    """
+    o = _new_orch()
+    o._get_owned_camera_ids = lambda: {"cam_owned"}
+    o._self_state.active_cameras = ["cam_foreign"]
+    # Foreign camera removal should always proceed (not owned).
+    assert o._l1_remove_ownership_guard("cam_foreign") is True
+
+
+def test_guard_allows_owned_remove_when_second_owned_camera_remains():
+    """Normal migration: two owned cameras active → removing either is fine."""
+    o = _new_orch()
+    # cam_a removal with cam_b still owned+active → OK.
+    assert _call_l1_guard(o, "cam_a",
+                          owned_ids={"cam_a", "cam_b"},
+                          active_cameras=["cam_a", "cam_b"]) is True
+    # cam_b removal with cam_a still owned+active → OK.
+    assert _call_l1_guard(o, "cam_b",
+                          owned_ids={"cam_a", "cam_b"},
+                          active_cameras=["cam_a", "cam_b"]) is True
+
+
+def test_guard_blocks_owned_remove_when_it_would_be_last_active_owned():
+    """Exact boundary: removing cam_last would leave this node with zero locally-
+    owned active cameras, even though foreign cameras are also active.  Guard blocks.
+    """
+    o = _new_orch()
+    # cam_foreign is foreign; cam_owned is the last locally-owned active camera.
+    assert _call_l1_guard(o, "cam_owned",
+                          owned_ids={"cam_owned"},
+                          active_cameras=["cam_owned", "cam_foreign"]) is False
+    # Same: removing the foreign camera is fine (not owned).
+    assert _call_l1_guard(o, "cam_foreign",
+                          owned_ids={"cam_owned"},
+                          active_cameras=["cam_owned", "cam_foreign"]) is True
+
+
+def test_guard_fail_closed_when_ownership_lookup_raises():
+    """Root-cause guard is fail-closed: if ownership is unresolvable, block."""
+    o = _new_orch()
+    o._get_owned_camera_ids = lambda: (_ for _ in ()).throw(
+        RuntimeError("camera manager unavailable")
+    )
+    o._self_state.active_cameras = ["cam_a", "cam_b"]
+    assert o._l1_remove_ownership_guard("cam_a") is False
+    assert o._l1_remove_ownership_guard("cam_b") is False
+
+
+def test_wait_and_remove_blocks_l1_remove_on_guard_failure():
+    """End-to-end: pre-fire ACK so _wait_and_remove reaches the guard, verify
+    that a stale snapshot (last owned camera) causes it to abort with no REMOVE.
+    """
+    o = _new_orch()
+    _stub_control_pub(o)
+
+    o._get_owned_camera_ids = lambda: {"cam_a"}
+    o._self_state.active_cameras = ["cam_a"]  # only one owned active → guard blocks
+    o._peer_inflight["peer_winner"] = 1  # reservation in-flight
+
+    # Pre-populate ACK plumbing so _wait_and_remove unblocks immediately.
+    with o._lock:
+        import threading
+        o._pending_winner["cam_a"] = "peer_winner"
+        o._pending_acks["cam_a"] = threading.Event()
+        o._pending_acks["cam_a"].set()  # ACK already arrived
+
+    # Run the real method (sync, since event is already set).
+    o._wait_and_remove("cam_a", "peer_winner")
+
+    # No REMOVE must have been published.
+    assert _sent_control_commands(o._pubs["control"], "REMOVE", "cam_a") == [], (
+        "no REMOVE must be sent when L1 guard blocks"
+    )
+    # Reservation must have been released by the abort cleanup.
+    assert o._peer_inflight.get("peer_winner", 0) == 0
+    # Cooldown must suppress immediate re-escalation.
+    assert "cam_a" in o._cam_cooldown
+    assert time.time() - o._cam_cooldown["cam_a"] < 2.0
+
+
+def test_wait_and_remove_proceeds_when_owned_camera_remains():
+    """Normal happy path: guard passes → REMOVE command is sent."""
+    o = _new_orch()
+    _stub_control_pub(o)
+
+    o._get_owned_camera_ids = lambda: {"cam_a", "cam_b"}
+    o._self_state.active_cameras = ["cam_a", "cam_b"]
+    o._peer_inflight["peer_winner"] = 0
+
+    with o._lock:
+        import threading
+        o._pending_winner["cam_a"] = "peer_winner"
+        o._pending_acks["cam_a"] = threading.Event()
+        o._pending_acks["cam_a"].set()
+
+    o._wait_and_remove("cam_a", "peer_winner")
+
+    assert _sent_control_commands(o._pubs["control"], "REMOVE", "cam_a") != [], (
+        "REMOVE must be sent when another owned camera remains"
+    )
+    # cam_a now migrated out, recorded.
+    assert o._migrated_out.get("cam_a") == "peer_winner"
+
+
+def test_no_l1_remove_bypass_guard_placement():
+    """All three L1 REMOVE publication paths in the orchestrator have appropriate
+    ownership protection — none can bypass the guard to remove a locally-owned
+    camera from this node.
+
+    Path 1: _wait_and_remove — guard installed at the only self-REMOVE site.
+    Path 2: _check_rebalance — per-camera skip for owned cameras + hard invariant.
+    Path 3: _wait_and_remove_reclaim — sends REMOVE to holder_node (different
+             node), never to self; this node is the reclaimer, not the remover.
+    """
+    o = _new_orch()
+    _stub_control_pub(o)
+
+    # ── Path 1: _wait_and_remove self-REMOVE is now guarded ──────────────
+    o._get_owned_camera_ids = lambda: {"cam_a"}
+    o._self_state.active_cameras = ["cam_a"]
+    o._peer_inflight["peer_winner"] = 1
+    with o._lock:
+        import threading
+        o._pending_winner["cam_a"] = "peer_winner"
+        o._pending_acks["cam_a"] = threading.Event()
+        o._pending_acks["cam_a"].set()
+    o._wait_and_remove("cam_a", "peer_winner")
+    assert _sent_control_commands(o._pubs["control"], "REMOVE", "cam_a") == [], (
+        "_wait_and_remove must not publish REMOVE when guard blocks"
+    )
+
+    # ── Path 2: _check_rebalance only handles rescued (foreign) cameras ───
+    o._get_owned_camera_ids = lambda: {"cam_owned"}
+    o._rescued_cameras["cam_owned"] = "node_beta"   # defensive: owned in rescued
+    o._self_state.active_cameras = ["cam_owned"]
+    _register_fresh_peer(o, "node_beta", ["cam_owned"], last_seen_delta=1.0)
+    _stub_control_pub(o)
+    o._check_rebalance()
+    assert _sent_control_commands(o._pubs["control"], "REMOVE", "cam_owned") == [], (
+        "_check_rebalance must not REMOVE a locally-owned camera"
+    )
+
+    # ── Path 3: reclaim sends REMOVE to holder, not to self ───────────────
+    # The reclaim REMOVE targets peers/control/{holder_node}; it can never
+    # remove a locally-owned camera from this node's pipeline.
+    src = inspect.getsource(o._wait_and_remove_reclaim)
+    assert "holder_control_key = f\"peers/control/{holder_node}\"" in src, (
+        "reclaim REMOVE must be addressed to holder_node's control key"
+    )
+    assert "o._pubs[\"control\"]" not in src, (
+        "reclaim must not publish REMOVE to its own control queue"
     )
 
 
