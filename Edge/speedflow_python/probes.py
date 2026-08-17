@@ -316,26 +316,11 @@ class SpeedProbe:
         self._fps_frame_count: Dict[str, int] = defaultdict(int)
         self._fps_frame_lock = threading.Lock()
 
-        # ── PTS source-rate evidence (per-camera ring, drained each window) ──
-        # Raw OSD callbacks can burst (live muxer catch-up, file throughput
-        # spikes) and inflate callback-count FPS above the native source
-        # rate.  buf_pts (ns) recorded per frame lets the writer measure the
-        # actual source rate via PTS deltas and bound the published FPS to
-        # it, while keeping the raw callback rate in _fps_frame_count for
-        # diagnostics.  The ring is drained (cleared) at the start of each
-        # writer window so measurements are per-window and removed cameras
-        # leave no stale PTS accumulation.
-        self._pts_ring_lock = threading.Lock()
-        self._pts_ring: Dict[str, deque] = defaultdict(
-            lambda: deque(maxlen=256)
-        )
-
         # ── Configured native FPS cache (per camera) ───────────────────────
-        # Authoritative fallback when buf_pts is unavailable (live CSI/USB
-        # sources on Jetson often expose buf_pts=0/None).  Updated from
+        # Authoritative native rate bound against burst delivery. Updated from
         # cam_cfg.fps on every frame inside _tick_fps, read by the writer
-        # to bound published FPS when the PTS ring stays empty.  Protected
-        # by _pts_ring_lock (same lock, same per-camera lifetime).
+        # to bound published FPS = min(raw callback FPS, configured camera FPS).
+        self._configured_fps_lock = threading.Lock()
         self._configured_fps: Dict[str, float] = {}
 
         # ── Proactive feature cache (per camera, updated every frame) ──────
@@ -646,26 +631,19 @@ class SpeedProbe:
                  configured_fps: Optional[float] = None) -> None:
         """Increment per-camera frame counter for the current writer window.
 
-        ``pts_ns`` is the frame PTS (namespace from frame_meta.buf_pts, i.e.
-        nanoseconds since some stream epoch).  When present it is pushed onto
-        the per-camera PTS ring so the writer can measure the true source rate
-        from PTS deltas; the callback counter remains the raw arrival rate
-        (diagnostics).  ``None``/``0`` means "PTS unavailable" and keeps the
-        legacy callback-only behaviour.
+        ``pts_ns`` is accepted for signature compatibility but no longer used
+        to bound published FPS (frame_meta.buf_pts is batch-level and duplicates
+        halve FPS on Jetson).
 
         ``configured_fps`` is the camera's authored native FPS
-        (CameraConfig.fps).  Stored per-camera so the writer can bound
-        published FPS by it when PTS evidence is absent — e.g. live CSI/USB
-        sources on Jetson where buf_pts is never populated.  ``None`` or
+        (CameraConfig.fps). Stored per-camera so the writer bounds published
+        FPS = min(raw callback FPS, configured camera FPS). ``None`` or
         non-positive values are ignored (fallback to raw callback rate).
         """
         with self._fps_frame_lock:
             self._fps_frame_count[camera_id] += 1
-        if pts_ns:
-            with self._pts_ring_lock:
-                self._pts_ring[camera_id].append(pts_ns)
         if configured_fps is not None and configured_fps > 0:
-            with self._pts_ring_lock:
+            with self._configured_fps_lock:
                 self._configured_fps[camera_id] = configured_fps
 
     def get_fps_stats(self) -> Dict[str, float]:
@@ -745,89 +723,26 @@ class SpeedProbe:
 
                 # Compute fps = frames / window_duration for each camera
                 # from raw OSD callback counts (the "arrival rate" the writer
-                # always saw).  PTS evidence in the ring is then used to bound
-                # the *published* value: when the ring has at least two valid
-                # timestamps the source rate measured from PTS deltas replaces
-                # the callback rate, guaranteeing that burst delivery cannot
-                # report an output FPS above the native source FPS.
+                # always saw).
                 fps: Dict[str, float] = {}
                 for cam_id, n_frames in frame_counts.items():
                     fps[cam_id] = round(n_frames / window_dur, 1)
 
-                # ── PTS-based source-rate bound ────────────────────────────
-                # Build a per-camera raw-callback telemetry snapshot, then
-                # walk each ring and compute PTS deltas for this writer window.
-                # Any camera whose ring has fewer than 2 entries keeps the
-                # unmodified callback rate (PTS was unavailable or source
-                # reported it after the window end — not an error).
                 raw_cb_fps: Dict[str, float] = dict(fps)
-                src_pts_fps: Dict[str, float] = {}
-                reordered_pts: Dict[str, int] = {}
                 burst_cams: Dict[str, float] = {}
                 fps_bound_by: Dict[str, str] = {}
-                with self._pts_ring_lock:
-                    for cam_id, ring in list(self._pts_ring.items()):
-                        # Snapshot and drain — source rate is per writer
-                        # window so stale/removed-camera PTS cannot persist.
-                        pts_snapshot = list(ring)
-                        ring.clear()
-                        if len(pts_snapshot) < 2:
-                            continue
-                        # Count out-of-order PTS delivery (e.g. multi-threaded
-                        # decoding, ring jitter, or encoder resets).
-                        reordered = sum(
-                            1 for i in range(1, len(pts_snapshot))
-                            if pts_snapshot[i] < pts_snapshot[i - 1]
-                        )
-                        if reordered:
-                            reordered_pts[cam_id] = reordered_pts.get(
-                                cam_id, 0
-                            ) + reordered
-                        # Sort valid PTS values so out-of-order arrival does not
-                        # truncate the window span or halve FPS, and deduplicate
-                        # identical timestamps.
-                        valid_pts = sorted(set(pts_snapshot))
-                        if len(valid_pts) < 2:
-                            continue
-                        dt_ns = valid_pts[-1] - valid_pts[0]
-                        n_frames = len(valid_pts) - 1
-                        # A real source spans at least ~1 ms between frames.
-                        # Sub-ms spans come from garbage PTS (duplicate or
-                        # near-zero window) and would produce absurd rates — treat as invalid.
-                        if dt_ns < 1_000_000 or dt_ns <= 0:
-                            continue
-                        measured_src_fps = round(
-                            (n_frames * 1e9) / dt_ns, 1
-                        )
-                        src_pts_fps[cam_id] = measured_src_fps
-                        # Publish the lower of callback rate and measured
-                        # source rate so burst delivery cannot exceed the
-                        # native source FPS.
-                        cb_fps = raw_cb_fps.get(cam_id, 0.0)
-                        if cb_fps > measured_src_fps:
-                            fps[cam_id] = measured_src_fps
-                            burst_cams[cam_id] = round(
-                                cb_fps - measured_src_fps, 1
-                            )
-                            fps_bound_by[cam_id] = "pts"
 
-                # ── Configured-fps bound (PTS-unavailable fallback) ────────
-                # Live CSI/USB sources on Jetson often expose buf_pts=0/None,
-                # so the PTS ring stays empty for a camera and the only rate
-                # available is the raw OSD callback count (which can burst
-                # above the native rate).  Use the camera's authored native
-                # FPS (CameraConfig.fps, pushed per frame by _tick_fps) as
-                # an authoritative upper bound — it cannot exceed what the
-                # user configured the camera to deliver.  Cameras with PTS
-                # evidence skip this pass: the more precise PTS-derived
-                # source rate already won above.
-                with self._pts_ring_lock:
+                # ── Configured camera FPS bound ────────────────────────────
+                # Published FPS = min(raw callback FPS, configured camera FPS).
+                # Live CSI/USB or file sources can deliver callbacks in bursts;
+                # the camera's authored native rate (CameraConfig.fps, pushed
+                # per frame by _tick_fps) is the authoritative upper bound.
+                # If no configured FPS is available, fallback to raw callback FPS.
+                with self._configured_fps_lock:
                     cfg_snapshot = dict(self._configured_fps)
                 for cam_id, cfg_fps in cfg_snapshot.items():
-                    if cam_id in src_pts_fps:
-                        continue   # PTS evidence is more precise
                     cb_fps = raw_cb_fps.get(cam_id, 0.0)
-                    if cb_fps > cfg_fps:
+                    if cfg_fps > 0 and cb_fps > cfg_fps:
                         fps[cam_id] = cfg_fps
                         burst_cams[cam_id] = round(cb_fps - cfg_fps, 1)
                         fps_bound_by[cam_id] = "configured"
@@ -870,25 +785,17 @@ class SpeedProbe:
                         "muxer_live_source": (
                             muxer_live_source(self._source_type_by_camera)
                         ),
-                        # FPS root-cause fix diagnostics under _telemetry:
+                        # FPS diagnostics under _telemetry:
                         #   raw_callback_fps_per_camera — OSD callback rate
                         #     this window (legacy arrival-rate semantics),
-                        #   source_pts_fps_per_camera — true source rate from
-                        #     PTS deltas (only cameras with ≥2 valid PTS),
                         #   fps_burst_per_camera — camera_id: (callback FPS −
-                        #     source FPS) for windows where delivery exceeded
-                        #     the native source rate,
-                        #   pts_reordered_per_camera (and legacy pts_dropped_per_camera)
-                        #     — out-of-order PTS count this window.
-                        #   fps_bound_by_per_camera — camera_id → "pts" |
-                        #     "configured" indicating which upper bound
-                        #     actually clamped published FPS (absent when
-                        #     no clamping occurred).
+                        #     configured FPS) for windows where delivery exceeded
+                        #     the configured rate,
+                        #   fps_bound_by_per_camera — camera_id → "configured"
+                        #     indicating upper bound clamped published FPS
+                        #     (absent when no clamping occurred).
                         "raw_callback_fps_per_camera": raw_cb_fps,
-                        "source_pts_fps_per_camera":   src_pts_fps,
                         "fps_burst_per_camera":        burst_cams,
-                        "pts_reordered_per_camera":    reordered_pts,
-                        "pts_dropped_per_camera":      reordered_pts,
                         "fps_bound_by_per_camera":     fps_bound_by,
                     },
                     "_features":       feats,
@@ -897,21 +804,11 @@ class SpeedProbe:
                 for cam_id, f in fps.items():
                     out[cam_id] = f
 
-                # ── Input FPS (PTS source-rate evidence) ──────────────────
-                # _input_fps is the best available estimate of the camera's
-                # NATIVE frame rate, for downstream source-starvation and
-                # QoS logic:
-                #   • when PTS deltas are valid (≥2 frames in the window
-                #     with monotonic, ≥1 ms spacing), _input_fps = the
-                #     PTS-derived source rate — this is the true camera
-                #     output rate, independent of pipeline burst/catch-up;
-                #   • when PTS evidence is absent (live source with no PTS,
-                #     sparse window, or garbage timestamps), _input_fps falls
-                #     back to the bounded output FPS (conservative but safe).
-                # The raw OSD callback rate is retained separately under
-                # _telemetry.raw_callback_fps_per_camera for diagnostics.
+                # ── Input FPS ─────────────────────────────────────────────
+                # _input_fps reflects the configured/native frame rate or
+                # bounded output FPS.
                 input_fps: Dict[str, float] = {
-                    cam_id: src_pts_fps.get(cam_id, fps[cam_id])
+                    cam_id: fps[cam_id]
                     for cam_id in fps
                 }
                 out["_input_fps"] = input_fps
