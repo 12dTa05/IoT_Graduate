@@ -541,7 +541,16 @@ class PeerOrchestrator:
             if overloaded:
                 if self._self_state.overload_since is None:
                     self._self_state.overload_since = time.time()
-                self._reclaim_eligible_since = None
+                # Only reset reclaim eligibility if we are NOT in a
+                # post-reclaim transition settle window.  Transient load
+                # spikes during stream warm-up after a reclaim ADD are
+                # expected and must not restart the reclaim_stable_s timer
+                # for the next pending reclaim — otherwise chained reclaims
+                # are impossible within tight run windows.
+                if time.time() <= self._transition_settle_until:
+                    pass  # preserve _reclaim_eligible_since
+                else:
+                    self._reclaim_eligible_since = None
             else:
                 self._self_state.overload_since = None
 
@@ -681,8 +690,12 @@ class PeerOrchestrator:
                 if overloaded:
                     if self._self_state.overload_since is None:
                         self._self_state.overload_since = time.time()
-                    # Node is overloaded again — reset reclaim eligibility
-                    self._reclaim_eligible_since = None
+                    # Only reset reclaim eligibility outside the post-reclaim
+                    # transition settle window — same guard as update_self_state.
+                    if time.time() <= self._transition_settle_until:
+                        pass  # preserve _reclaim_eligible_since
+                    else:
+                        self._reclaim_eligible_since = None
                 else:
                     self._self_state.overload_since = None
             return
