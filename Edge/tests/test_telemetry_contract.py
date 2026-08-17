@@ -303,7 +303,7 @@ def test_health_payload_distinguishes_unavailable_from_overload():
     overloaded = _build_health_agent_payload(
         snapshot_valid=True,
         fps_stats={"cam_01": 0.5},
-        input_fps={"cam_01": 30.0},
+        input_fps={"cam_01": 0.5},
     )
 
     assert unavailable["pipeline_available"] is False
@@ -321,17 +321,42 @@ def test_health_payload_output_fps_equals_fps_per_camera():
     print("  PASS  test_health_payload_output_fps_equals_fps_per_camera")
 
 
-def test_health_payload_input_fps_preserved_raw():
-    """input_fps_per_camera reflects the raw source FPS, separate from output FPS."""
-    fps = {"cam_01": 15.0}   # output: dropped frames
-    inp = {"cam_01": 30.0}   # input: full 30 fps arriving
+def test_health_payload_input_fps_matches_output_fps_shared_window():
+    """Fallback contract: when PTS is unavailable, _input_fps falls back to
+    the bounded output FPS, so input_fps_per_camera == output_fps_per_camera
+    for that window.  (When PTS is available they differ — see
+    test_health_payload_input_fps_from_pts_source_rate.)"""
+    fps = {"cam_01": 15.0}
+    inp = {"cam_01": 15.0}   # PTS unavailable → fallback equals output
     pl = _build_health_agent_payload(snapshot_valid=True, fps_stats=fps, input_fps=inp)
 
+    assert pl["output_fps_per_camera"]["cam_01"] == pl["input_fps_per_camera"]["cam_01"]
     assert pl["output_fps_per_camera"]["cam_01"] == 15.0
-    assert pl["input_fps_per_camera"]["cam_01"] == 30.0
-    # They differ — proving they are separate measurements
+    print("  PASS  test_health_payload_input_fps_matches_output_fps_shared_window")
+
+
+def test_health_payload_input_fps_from_pts_source_rate():
+    """PTS-available contract: _input_fps is the PTS-derived source rate,
+    which may differ from the bounded output fps.
+
+    Example: a 30fps source with burst delivery —
+      output_fps_per_camera = 30.0   (callback rate bounded by PTS to ~30)
+      input_fps_per_camera  = 29.9   (PTS-measured native source rate)
+    The two values are close but come from different evidence; the health
+    agent must pass through whatever SpeedProbe provides without forcing
+    equality."""
+    fps_stats = {"cam_01": 30.0}   # bounded output FPS (from SpeedProbe.fps)
+    input_fps = {"cam_01": 29.9}   # PTS-derived source rate (from src_pts_fps)
+    pl = _build_health_agent_payload(
+        snapshot_valid=True, fps_stats=fps_stats, input_fps=input_fps
+    )
+
+    # Both are present and correct — the builder must not conflate them.
+    assert pl["output_fps_per_camera"]["cam_01"] == 30.0
+    assert pl["input_fps_per_camera"]["cam_01"] == 29.9
+    # In the PTS-available case they need not be equal.
     assert pl["output_fps_per_camera"]["cam_01"] != pl["input_fps_per_camera"]["cam_01"]
-    print("  PASS  test_health_payload_input_fps_preserved_raw")
+    print("  PASS  test_health_payload_input_fps_from_pts_source_rate")
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +469,8 @@ if __name__ == "__main__":
         test_health_payload_pipeline_available_false,
         test_health_payload_distinguishes_unavailable_from_overload,
         test_health_payload_output_fps_equals_fps_per_camera,
-        test_health_payload_input_fps_preserved_raw,
+        test_health_payload_input_fps_matches_output_fps_shared_window,
+        test_health_payload_input_fps_from_pts_source_rate,
         test_aliases_consistent_with_base_keys,
         test_muxer_live_source_contract,
         test_writer_payload_includes_source_output_contract,

@@ -15,7 +15,7 @@ import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
 
-from .core_pipeline import build_pipeline, dynamic_add_stream, dynamic_remove_stream, _InputCounter
+from .core_pipeline import build_pipeline, dynamic_add_stream, dynamic_remove_stream
 from .camera_config import CameraManager
 from .probes import SpeedProbe, ROIFilterProbe
 from .plate_preprocessor import PlatePreprocessorProbe
@@ -50,8 +50,7 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
                   peer_orch=None,
                   offload_pub=None,
                   offload_rcv=None,
-                  zenoh_pub=None,
-                  input_counter: _InputCounter = None) -> SpeedProbe:
+                  zenoh_pub=None) -> SpeedProbe:
     """
     Attach ROI filter, plate preprocessor, and speed probe to *pipeline*.
     Returns the SpeedProbe instance.
@@ -107,8 +106,6 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
     for _c in camera_manager.get_enabled_configs():
         _source_types[_c.camera_id] = "file" if _is_file(_c.uri or "") else "live"
     probe.set_source_types(_source_types)
-    if input_counter is not None:
-        probe.set_input_counter(input_counter)
     if offload_pub is not None:
         probe.set_offload_publisher(offload_pub)
     if offload_rcv is not None:
@@ -143,7 +140,6 @@ def _attach_camera_manager(
     streammux: Gst.Element,
     source_bins: dict,
     tiler: Gst.Element = None,
-    input_counter: _InputCounter = None,
 ):
     """
     Hooks up the CameraManager to safely add/remove streams dynamically.
@@ -163,7 +159,7 @@ def _attach_camera_manager(
 
     def on_add(cam_cfg):
         print(f"[Dynamic] Adding camera '{cam_cfg.camera_id}' (source_id={cam_cfg.source_id})")
-        dynamic_add_stream(pipeline, streammux, cam_cfg, tiler, source_bins, input_counter)
+        dynamic_add_stream(pipeline, streammux, cam_cfg, tiler, source_bins)
         # Register mapping immediately after successful add.
         # This function runs in GLib Main Loop → safe, no lock needed.
         source_id_to_cam_id[cam_cfg.source_id] = cam_cfg.camera_id
@@ -237,22 +233,19 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
-    input_counter = _InputCounter()
-
     ret_build = build_pipeline(
         camera_configs=configs,
         sink_type="display",
         mux_width=args.width,
         mux_height=args.height,
-        input_counter=input_counter,
     )
     pipeline, nvdsosd, streammux, source_bins = ret_build
     tiler = pipeline.get_by_name("tiler")
 
-    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, input_counter=input_counter)
+    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
     ACTIVE_SPEED_PROBE.clear()
     ACTIVE_SPEED_PROBE.append(probe)
-    _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler, input_counter=input_counter)
+    _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
     t0_playing = time.monotonic()
     ret = pipeline.set_state(Gst.State.PLAYING)
@@ -271,21 +264,18 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
-    input_counter = _InputCounter()
-
     ret_build = build_pipeline(
         camera_configs=configs,
         sink_type="file",
         mux_width=args.width,
         mux_height=args.height,
-        input_counter=input_counter,
     )
     pipeline, nvdsosd, streammux, source_bins = ret_build
 
-    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, input_counter=input_counter)
+    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
     ACTIVE_SPEED_PROBE.clear()
     ACTIVE_SPEED_PROBE.append(probe)
-    _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, None, input_counter=input_counter)
+    _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, None)
 
     print(f"[Python File Mode] Processing multi-streams to output files...")
     ret = pipeline.set_state(Gst.State.PLAYING)
@@ -458,7 +448,9 @@ def _health_push_loop(peer_orch=None) -> None:
                     # fps_per_camera kept for backward compatibility.
                     "fps_per_camera":        fps_stats,
                     "output_fps_per_camera": fps_stats,
-                    # input_fps_per_camera = raw source frames arriving at decoder.
+                    # input_fps_per_camera = PTS-derived native source rate
+                    # (SpeedProbe.buf_pts deltas), falling back to bounded
+                    # OSD output rate when PTS is unavailable.
                     "input_fps_per_camera":  _input_fps if snapshot_valid else {},
                     "avg_fps":         avg_fps,
                     "active_cameras":  active_cameras,
@@ -560,7 +552,6 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
     _last_probe = None
 
     while True:
-        input_counter = _InputCounter()
         ret_build = build_pipeline(
             camera_configs=camera_manager.get_enabled_configs(),
             sink_type="rtsp_push",
@@ -568,15 +559,14 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             mux_height=args.height,
             rtsp_push_url=rtsp_url,
             bitrate=S.RTSP_PUSH_BITRATE,
-            input_counter=input_counter,
         )
         pipeline, nvdsosd, streammux, source_bins = ret_build
         tiler = pipeline.get_by_name("tiler")
 
-        _last_probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, input_counter=input_counter)
+        _last_probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
         ACTIVE_SPEED_PROBE.clear()
         ACTIVE_SPEED_PROBE.append(_last_probe)
-        _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler, input_counter=input_counter)
+        _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
         ret = pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:

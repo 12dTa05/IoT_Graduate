@@ -1048,11 +1048,7 @@ def test_probe_results_received_counter():
             return _StubCamCfg()
 
     probe = probe_mod.SpeedProbe(camera_manager=_StubCameraManager(), cooldown_s=0.1)
-    # Wire the stub input counter
-    class _InputCounter:
-        def drain(self):
-            return {"cam_01": 30}
-    probe.set_input_counter(_InputCounter())
+    # input FPS now derives from the shared OSD counter (no independent source probe)
 
     # Initially 0
     assert probe._results_received == 0
@@ -1104,10 +1100,6 @@ def test_writer_surfaces_all_counters():
             return _StubCamCfg()
 
     probe = probe_mod.SpeedProbe(camera_manager=_StubCameraManager(), cooldown_s=0.1)
-    class _InputCounter:
-        def drain(self):
-            return {"cam_01": 30}
-    probe.set_input_counter(_InputCounter())
 
     # Fake publisher + receiver with known counter values
     class _FakePub:

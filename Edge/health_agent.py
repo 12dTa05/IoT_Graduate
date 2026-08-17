@@ -177,12 +177,13 @@ def _detect_source_starved(
     Source-type gate (Phase 1 validity contract):
       ``source_type_map`` maps camera_id → ``"live"`` | ``"file"`` (derived
       from the camera URI in cameras.yml).  File-playback cameras are NEVER
-      classified as source-starved: their input FPS is decoder throughput
-      (bounded by the GPU, not by any upstream feed), so comparing it against
-      ``expected_source_rate`` would silently treat hardware-limited playback
-      as a starved live feed.  This is a DEVICE GATE — realtime enforcement
-      for file playback is not implemented in the current pipeline (see
-      core_pipeline.streammux ``live-source``); do not fake it with FPS math.
+      classified as source-starved: even with PTS-derived input FPS (which
+      reflects the native source rate, not decoder throughput), file playback
+      is not a live upstream feed — a low PTS-measured rate means the file
+      is playing slowly or the muxer is PTS-paced, not that the source is
+      starved.  This is a DEVICE GATE — realtime source-starvation enforcement
+      for file playback is not implemented (see core_pipeline.streammux
+      ``live-source``); do not apply live-feed starvation math to files.
       When source_type_map is None/missing the gate is inert — every camera
       is evaluated exactly as before (backward compatible).
 
@@ -1172,8 +1173,10 @@ class HealthAgent:
                         # fps_per_camera is kept for backward compatibility.
                         "fps_per_camera":        fps_stats,
                         "output_fps_per_camera": fps_stats,
-                        # input_fps_per_camera = raw frames arriving from the
-                        # source (decoder/demux probe), before any drop.
+                        # input_fps_per_camera = PTS-derived native source
+                        # frame rate (SpeedProbe measures buf_pts deltas),
+                        # falling back to bounded OSD output rate when PTS
+                        # is unavailable.  Used for source-starved detection.
                         "input_fps_per_camera":  input_fps if snapshot_valid else {},
                         "avg_fps":        avg_fps,
                         "active_cameras": active_cameras,
