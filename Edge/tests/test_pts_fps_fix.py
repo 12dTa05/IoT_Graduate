@@ -66,7 +66,7 @@ def _compute_pts_fps_bound(
 
     raw_cb_fps: Dict[str, float] = dict(fps)
     src_pts_fps: Dict[str, float] = {}
-    dropped_pts: Dict[str, int] = {}
+    reordered_pts: Dict[str, int] = {}
     burst_cams: Dict[str, float] = {}
     fps_bound_by: Dict[str, str] = {}
 
@@ -77,25 +77,21 @@ def _compute_pts_fps_bound(
         if len(pts_snapshot) < 2:
             continue
 
-        drops = sum(
+        reordered = sum(
             1 for i in range(1, len(pts_snapshot))
-            if pts_snapshot[i] <= pts_snapshot[i - 1]
+            if pts_snapshot[i] < pts_snapshot[i - 1]
         )
-        if drops:
-            dropped_pts[cam_id] = dropped_pts.get(cam_id, 0) + drops
+        if reordered:
+            reordered_pts[cam_id] = reordered_pts.get(cam_id, 0) + reordered
 
-        monotonic: List[int] = [pts_snapshot[0]]
-        for i in range(1, len(pts_snapshot)):
-            if pts_snapshot[i] > monotonic[-1]:
-                monotonic.append(pts_snapshot[i])
-        if len(monotonic) < 2:
+        valid_pts = sorted(set(pts_snapshot))
+        if len(valid_pts) < 2:
             continue
 
-        dt_ns = monotonic[-1] - monotonic[0]
-        n_frames = len(monotonic) - 1
+        dt_ns = valid_pts[-1] - valid_pts[0]
+        n_frames = len(valid_pts) - 1
         # A real source spans at least ~1 ms between frames.  Sub-ms
-        # spans come from garbage PTS (e.g. fully out-of-order sequences
-        # collapsing to a near-zero window) — treat as invalid.
+        # spans come from garbage PTS (duplicate or near-zero window) — treat as invalid.
         if dt_ns < 1_000_000 or dt_ns <= 0:
             continue
 
@@ -138,7 +134,8 @@ def _compute_pts_fps_bound(
         "src_pts_fps": src_pts_fps,
         "input_fps": input_fps,
         "fps_burst": burst_cams,
-        "pts_dropped": dropped_pts,
+        "pts_reordered": reordered_pts,
+        "pts_dropped": reordered_pts,
         "fps_bound_by": fps_bound_by,
     }
 
@@ -315,22 +312,51 @@ def test_out_of_order_pts_counted_in_dropped(ring_factory):
     assert result["src_pts_fps"][cam] > 0.0
 
 
-def test_all_pts_out_of_order_keeps_callback_rate(ring_factory):
+def test_all_pts_out_of_order_sorted_and_bounded(ring_factory):
     """
-    If every PTS is out-of-order (e.g. encoder never timestamped),
-    the monotonic subsequence has length 1 and the writer keeps the
-    callback rate for that camera.
+    Simulate ~30 frames with 9 out-of-order PTS delivery.
+    Sorted valid PTS aggregation must prevent artificial FPS halving and
+    assert ~30 published FPS, while tracking reordered count.
     """
-    cam = "cam_all_ooo"
+    cam = "cam_reordered"
+    frame_counts = {cam: 30}
+    ring = ring_factory
+    # 30 frames at 30 fps
+    pts = _make_pts_sequence(30.0, 30, 0)
+    # Shuffle/swap 9 timestamps to create 9 out-of-order events
+    # Swapping pairs: (2,3), (5,6), (8,9), (11,12), (14,15), (17,18), (20,21), (23,24), (26,27)
+    for idx in [2, 5, 8, 11, 14, 17, 20, 23, 26]:
+        pts[idx], pts[idx + 1] = pts[idx + 1], pts[idx]
+
+    ring[cam].extend(pts)
+
+    result = _compute_pts_fps_bound(frame_counts, ring, WINDOW_DUR)
+
+    assert result["pts_reordered"][cam] == 9, (
+        f"expected 9 reordered PTS, got {result['pts_reordered'].get(cam)}"
+    )
+    assert result["pts_dropped"][cam] == 9, (
+        "backward-compatibility alias pts_dropped must match pts_reordered"
+    )
+    assert result["src_pts_fps"][cam] == pytest.approx(30.0, abs=0.5)
+    assert result["fps"][cam] == pytest.approx(30.0, abs=0.5)
+
+
+def test_all_pts_sub_ms_invalid_keeps_callback_rate(ring_factory):
+    """
+    If PTS timestamps collapse to a sub-ms span (e.g. invalid/garbage timestamps
+    all within <1ms), the writer treats them as invalid and keeps the callback rate.
+    """
+    cam = "cam_sub_ms"
     frame_counts = {cam: 25}
     ring = ring_factory
-    # Completely non-monotonic: [10, 5, 8, 3, 7, ...]
-    ring[cam].extend([10, 5, 8, 3, 7, 2, 9, 1, 6, 4, 11, 0])
+    # Timestamps spaced by only 10 microseconds (total span 0.11 ms < 1 ms)
+    ring[cam].extend([1000 + i * 10_000 for i in range(12)])
 
     result = _compute_pts_fps_bound(frame_counts, ring, WINDOW_DUR)
 
     assert result["fps"][cam] == 25.0, (
-        "all-OOO PTS → must keep callback rate"
+        "sub-ms garbage PTS → must keep callback rate"
     )
     assert cam not in result["src_pts_fps"]
 

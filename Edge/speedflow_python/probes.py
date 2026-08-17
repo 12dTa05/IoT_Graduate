@@ -762,7 +762,7 @@ class SpeedProbe:
                 # reported it after the window end — not an error).
                 raw_cb_fps: Dict[str, float] = dict(fps)
                 src_pts_fps: Dict[str, float] = {}
-                dropped_pts: Dict[str, int] = {}
+                reordered_pts: Dict[str, int] = {}
                 burst_cams: Dict[str, float] = {}
                 fps_bound_by: Dict[str, str] = {}
                 with self._pts_ring_lock:
@@ -773,31 +773,27 @@ class SpeedProbe:
                         ring.clear()
                         if len(pts_snapshot) < 2:
                             continue
-                        # Count monotonicity drops (out-of-order PTS from
-                        # encoder resets / wraparound).
-                        drops = sum(
+                        # Count out-of-order PTS delivery (e.g. multi-threaded
+                        # decoding, ring jitter, or encoder resets).
+                        reordered = sum(
                             1 for i in range(1, len(pts_snapshot))
-                            if pts_snapshot[i] <= pts_snapshot[i - 1]
+                            if pts_snapshot[i] < pts_snapshot[i - 1]
                         )
-                        if drops:
-                            dropped_pts[cam_id] = dropped_pts.get(
+                        if reordered:
+                            reordered_pts[cam_id] = reordered_pts.get(
                                 cam_id, 0
-                            ) + drops
-                        # Keep only the monotonic subsequence.  We scan
-                        # linearly; a camera rarely exceeds a few hundred
-                        # entries per window so O(n) is fine.
-                        monotonic: List[int] = [pts_snapshot[0]]
-                        for i in range(1, len(pts_snapshot)):
-                            if pts_snapshot[i] > monotonic[-1]:
-                                monotonic.append(pts_snapshot[i])
-                        if len(monotonic) < 2:
+                            ) + reordered
+                        # Sort valid PTS values so out-of-order arrival does not
+                        # truncate the window span or halve FPS, and deduplicate
+                        # identical timestamps.
+                        valid_pts = sorted(set(pts_snapshot))
+                        if len(valid_pts) < 2:
                             continue
-                        dt_ns = monotonic[-1] - monotonic[0]
-                        n_frames = len(monotonic) - 1
+                        dt_ns = valid_pts[-1] - valid_pts[0]
+                        n_frames = len(valid_pts) - 1
                         # A real source spans at least ~1 ms between frames.
-                        # Sub-ms spans come from garbage PTS (fully out-of-
-                        # order sequences collapsing to a near-zero window)
-                        # and would produce absurd rates — treat as invalid.
+                        # Sub-ms spans come from garbage PTS (duplicate or
+                        # near-zero window) and would produce absurd rates — treat as invalid.
                         if dt_ns < 1_000_000 or dt_ns <= 0:
                             continue
                         measured_src_fps = round(
@@ -882,8 +878,8 @@ class SpeedProbe:
                         #   fps_burst_per_camera — camera_id: (callback FPS −
                         #     source FPS) for windows where delivery exceeded
                         #     the native source rate,
-                        #   pts_dropped_per_camera — out-of-order PTS count
-                        #     (encoder reset / wraparound) this window.
+                        #   pts_reordered_per_camera (and legacy pts_dropped_per_camera)
+                        #     — out-of-order PTS count this window.
                         #   fps_bound_by_per_camera — camera_id → "pts" |
                         #     "configured" indicating which upper bound
                         #     actually clamped published FPS (absent when
@@ -891,7 +887,8 @@ class SpeedProbe:
                         "raw_callback_fps_per_camera": raw_cb_fps,
                         "source_pts_fps_per_camera":   src_pts_fps,
                         "fps_burst_per_camera":        burst_cams,
-                        "pts_dropped_per_camera":      dropped_pts,
+                        "pts_reordered_per_camera":    reordered_pts,
+                        "pts_dropped_per_camera":      reordered_pts,
                         "fps_bound_by_per_camera":     fps_bound_by,
                     },
                     "_features":       feats,
