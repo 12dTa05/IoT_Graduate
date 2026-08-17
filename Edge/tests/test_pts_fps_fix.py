@@ -39,23 +39,27 @@ def _compute_pts_fps_bound(
     frame_counts: Dict[str, int],
     pts_ring: Dict[str, deque],
     window_dur: float,
+    configured_fps: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Dict]:
     """
-    Replicates the PTS-bounding logic in SpeedProbe._fps_writer_loop.
+    Replicates the PTS-bounding logic in SpeedProbe._fps_writer_loop,
+    including the configured-fps fallback bound.
 
-    Faithfully mirrors the production algorithm including the Oracle
-    remediation: PTS rings are *drained* (cleared) after the snapshot
-    so each call represents one writer window, and _input_fps is the
-    PTS-derived source rate with fallback to bounded output fps.
+    ``configured_fps`` maps camera_id → CameraConfig.fps.  When provided
+    and the PTS ring stays empty for a camera, the published FPS is
+    bounded by that value (the authoritative authored native rate).
 
     Returns a dict with:
       fps              – bounded FPS per camera (output)
       raw_cb_fps       – raw OSD callback rate
       src_pts_fps      – PTS-measured source rate (only cameras with ≥2 valid)
       input_fps        – PTS-derived source rate; fallback = bounded fps
-      fps_burst        – cameras where callback > PTS source rate
+      fps_burst        – cameras where callback > bound source rate
       pts_dropped      – out-of-order PTS count per camera
+      fps_bound_by     – camera → "pts" | "configured" when clamped
     """
+    configured_fps = configured_fps or {}
+
     fps: Dict[str, float] = {}
     for cam_id, n_frames in frame_counts.items():
         fps[cam_id] = round(n_frames / max(window_dur, 0.001), 1)
@@ -64,6 +68,7 @@ def _compute_pts_fps_bound(
     src_pts_fps: Dict[str, float] = {}
     dropped_pts: Dict[str, int] = {}
     burst_cams: Dict[str, float] = {}
+    fps_bound_by: Dict[str, str] = {}
 
     for cam_id, ring in list(pts_ring.items()):
         # Snapshot and drain — per-window; no stale state carries forward.
@@ -101,6 +106,25 @@ def _compute_pts_fps_bound(
         if cb_fps > measured_src_fps:
             fps[cam_id] = measured_src_fps
             burst_cams[cam_id] = round(cb_fps - measured_src_fps, 1)
+            fps_bound_by[cam_id] = "pts"
+
+    # Configured-fps bound (PTS-unavailable fallback): for cameras whose
+    # ring had <2 valid PTS entries (live CSI/USB with no buf_pts, sparse
+    # window, or all-OOO timestamps), bound published FPS by the authored
+    # native FPS (CameraConfig.fps).  PTS evidence is more precise, so
+    # cameras that already won in the PTS pass skip this.  Mirror of the
+    # storage-time filter in production _tick_fps (only positive values
+    # ever reach the writer's configured-fps cache).
+    for cam_id, cfg_fps in configured_fps.items():
+        if cfg_fps <= 0:
+            continue
+        if cam_id in src_pts_fps:
+            continue
+        cb_fps = raw_cb_fps.get(cam_id, 0.0)
+        if cb_fps > cfg_fps:
+            fps[cam_id] = cfg_fps
+            burst_cams[cam_id] = round(cb_fps - cfg_fps, 1)
+            fps_bound_by[cam_id] = "configured"
 
     # _input_fps: PTS-derived source rate when available, else bounded fps.
     input_fps: Dict[str, float] = {
@@ -115,6 +139,7 @@ def _compute_pts_fps_bound(
         "input_fps": input_fps,
         "fps_burst": burst_cams,
         "pts_dropped": dropped_pts,
+        "fps_bound_by": fps_bound_by,
     }
 
 
@@ -443,3 +468,121 @@ def test_ring_drain_clears_stale_camera_state(ring_factory):
         "no PTS after drain → src_pts_fps must be absent in window 2"
     )
     assert result2["fps"][cam] == 5.0, "fallback to callback rate when ring empty"
+
+
+# ── Test 10: configured-fps bound when PTS is unavailable ────────────────────
+# (Jetson live CSI/USB: buf_pts=0/None, raw callback rate bursts above 30)
+
+def test_no_pts_burst_clamped_to_configured_fps_30(ring_factory):
+    """Missing PTS + 45 callback frames in 1 s + configured fps=30 →
+    published FPS = 30.0 (not the raw 45)."""
+    cam = "cam_cfg30_burst"
+    frame_counts = {cam: 45}
+    ring = ring_factory
+    # Ring empty → no PTS evidence.
+    result = _compute_pts_fps_bound(
+        frame_counts, ring, WINDOW_DUR,
+        configured_fps={cam: 30.0},
+    )
+    assert result["fps"][cam] == 30.0, (
+        f"expected 30.0 (configured-fps bound), got {result['fps'][cam]}"
+    )
+    assert result["raw_cb_fps"][cam] == 45.0, "raw_cb_fps must not be clamped"
+    assert cam not in result["src_pts_fps"]
+    assert result["fps_bound_by"][cam] == "configured"
+    assert result["fps_burst"][cam] == pytest.approx(15.0, abs=0.1)
+
+
+def test_no_pts_callback_below_configured_unchanged(ring_factory):
+    """Missing PTS + 20 callback frames + configured fps=30 → callback
+    rate (20) ≤ configured fps (30), so no clamping occurs."""
+    cam = "cam_cfg30_normal"
+    frame_counts = {cam: 20}
+    ring = ring_factory
+    result = _compute_pts_fps_bound(
+        frame_counts, ring, WINDOW_DUR,
+        configured_fps={cam: 30.0},
+    )
+    assert result["fps"][cam] == 20.0
+    assert cam not in result["fps_bound_by"]
+    assert result["fps_burst"] == {}
+
+
+def test_valid_30fps_pts_wins_over_configured_fps(ring_factory):
+    """Valid 30fps PTS sequence + configured fps=30 → PTS path wins;
+    published FPS ~30, fps_bound_by='pts'."""
+    cam = "cam_pts_win"
+    frame_counts = {cam: 45}
+    ring = ring_factory
+    ring[cam].extend(_make_pts_sequence(30.0, 45, 0))
+    result = _compute_pts_fps_bound(
+        frame_counts, ring, WINDOW_DUR,
+        configured_fps={cam: 30.0},
+    )
+    assert result["fps"][cam] == pytest.approx(30.0, abs=0.1)
+    assert result["src_pts_fps"][cam] == pytest.approx(30.0, abs=0.1)
+    assert result["fps_bound_by"][cam] == "pts"
+    # The PTS path already knows this is a burst; configured-fps pass
+    # must NOT have overwritten fps_bound_by.
+    assert "configured" not in result["fps_bound_by"].values()
+
+
+def test_configured_fps_zero_ignored_falls_back_to_callback(ring_factory):
+    """configured_fps=0 or None → pass is skipped, callback rate
+    preserved (same as PTS-unavailable legacy behaviour)."""
+    cam = "cam_nocfg"
+    frame_counts = {cam: 50}
+    ring = ring_factory
+    result = _compute_pts_fps_bound(
+        frame_counts, ring, WINDOW_DUR,
+        configured_fps={cam: 0.0},  # explicitly zero
+    )
+    assert result["fps"][cam] == 50.0
+    assert result["fps_bound_by"] == {}
+
+
+def test_configured_fps_no_entry_in_dict_falls_back_to_callback(ring_factory):
+    """Camera not in configured_fps dict → callback rate preserved
+    (no configured value to bound by)."""
+    cam = "cam_uncfg"
+    frame_counts = {cam: 50}
+    ring = ring_factory
+    result = _compute_pts_fps_bound(
+        frame_counts, ring, WINDOW_DUR,
+        configured_fps={"other_cam": 30.0},
+    )
+    assert result["fps"][cam] == 50.0
+    assert cam not in result["fps_bound_by"]
+
+
+def test_configured_fps_respects_nonstandard_fps_value(ring_factory):
+    """configured_fps=15 (not 30) → bound to 15 when PTS unavailable."""
+    cam = "cam_15fps"
+    frame_counts = {cam: 40}
+    ring = ring_factory
+    result = _compute_pts_fps_bound(
+        frame_counts, ring, WINDOW_DUR,
+        configured_fps={cam: 15.0},
+    )
+    assert result["fps"][cam] == 15.0
+    assert result["fps_bound_by"][cam] == "configured"
+    assert result["fps_burst"][cam] == pytest.approx(25.0, abs=0.1)
+
+
+def test_multi_camera_configured_fps_independent(ring_factory):
+    """Each camera bound independently: cam_A burst, cam_B below configured."""
+    cam_a = "cam_A"
+    cam_b = "cam_B"
+    frame_counts = {cam_a: 60, cam_b: 20}
+    ring = ring_factory
+    # No PTS for either → both use configured-fps fallback.
+    cfg = {cam_a: 30.0, cam_b: 30.0}
+    result = _compute_pts_fps_bound(
+        frame_counts, ring, WINDOW_DUR, configured_fps=cfg,
+    )
+    assert result["fps"][cam_a] == 30.0
+    assert result["fps_bound_by"][cam_a] == "configured"
+    assert result["fps"][cam_b] == 20.0
+    assert cam_b not in result["fps_bound_by"]
+    assert result["raw_cb_fps"][cam_a] == 60.0
+    assert result["raw_cb_fps"][cam_b] == 20.0

@@ -330,6 +330,14 @@ class SpeedProbe:
             lambda: deque(maxlen=256)
         )
 
+        # ── Configured native FPS cache (per camera) ───────────────────────
+        # Authoritative fallback when buf_pts is unavailable (live CSI/USB
+        # sources on Jetson often expose buf_pts=0/None).  Updated from
+        # cam_cfg.fps on every frame inside _tick_fps, read by the writer
+        # to bound published FPS when the PTS ring stays empty.  Protected
+        # by _pts_ring_lock (same lock, same per-camera lifetime).
+        self._configured_fps: Dict[str, float] = {}
+
         # ── Proactive feature cache (per camera, updated every frame) ──────
         # Written on the GLib/GStreamer thread; read by the FPS writer thread
         # under _feature_lock.  Values are per-frame instantaneous counts that
@@ -634,7 +642,8 @@ class SpeedProbe:
     # FPS counter
     # ------------------------------------------------------------------
 
-    def _tick_fps(self, camera_id: str, pts_ns: Optional[int] = None) -> None:
+    def _tick_fps(self, camera_id: str, pts_ns: Optional[int] = None,
+                 configured_fps: Optional[float] = None) -> None:
         """Increment per-camera frame counter for the current writer window.
 
         ``pts_ns`` is the frame PTS (namespace from frame_meta.buf_pts, i.e.
@@ -643,12 +652,21 @@ class SpeedProbe:
         from PTS deltas; the callback counter remains the raw arrival rate
         (diagnostics).  ``None``/``0`` means "PTS unavailable" and keeps the
         legacy callback-only behaviour.
+
+        ``configured_fps`` is the camera's authored native FPS
+        (CameraConfig.fps).  Stored per-camera so the writer can bound
+        published FPS by it when PTS evidence is absent — e.g. live CSI/USB
+        sources on Jetson where buf_pts is never populated.  ``None`` or
+        non-positive values are ignored (fallback to raw callback rate).
         """
         with self._fps_frame_lock:
             self._fps_frame_count[camera_id] += 1
         if pts_ns:
             with self._pts_ring_lock:
                 self._pts_ring[camera_id].append(pts_ns)
+        if configured_fps is not None and configured_fps > 0:
+            with self._pts_ring_lock:
+                self._configured_fps[camera_id] = configured_fps
 
     def get_fps_stats(self) -> Dict[str, float]:
         """Return the last-published FPS snapshot — API-compatible."""
@@ -746,6 +764,7 @@ class SpeedProbe:
                 src_pts_fps: Dict[str, float] = {}
                 dropped_pts: Dict[str, int] = {}
                 burst_cams: Dict[str, float] = {}
+                fps_bound_by: Dict[str, str] = {}
                 with self._pts_ring_lock:
                     for cam_id, ring in list(self._pts_ring.items()):
                         # Snapshot and drain — source rate is per writer
@@ -794,6 +813,28 @@ class SpeedProbe:
                             burst_cams[cam_id] = round(
                                 cb_fps - measured_src_fps, 1
                             )
+                            fps_bound_by[cam_id] = "pts"
+
+                # ── Configured-fps bound (PTS-unavailable fallback) ────────
+                # Live CSI/USB sources on Jetson often expose buf_pts=0/None,
+                # so the PTS ring stays empty for a camera and the only rate
+                # available is the raw OSD callback count (which can burst
+                # above the native rate).  Use the camera's authored native
+                # FPS (CameraConfig.fps, pushed per frame by _tick_fps) as
+                # an authoritative upper bound — it cannot exceed what the
+                # user configured the camera to deliver.  Cameras with PTS
+                # evidence skip this pass: the more precise PTS-derived
+                # source rate already won above.
+                with self._pts_ring_lock:
+                    cfg_snapshot = dict(self._configured_fps)
+                for cam_id, cfg_fps in cfg_snapshot.items():
+                    if cam_id in src_pts_fps:
+                        continue   # PTS evidence is more precise
+                    cb_fps = raw_cb_fps.get(cam_id, 0.0)
+                    if cb_fps > cfg_fps:
+                        fps[cam_id] = cfg_fps
+                        burst_cams[cam_id] = round(cb_fps - cfg_fps, 1)
+                        fps_bound_by[cam_id] = "configured"
                 # Rebuild the API cache and the per-camera bare-float out dict
                 # with the now-bounded values.
                 with self._fps_stats_lock:
@@ -843,10 +884,15 @@ class SpeedProbe:
                         #     the native source rate,
                         #   pts_dropped_per_camera — out-of-order PTS count
                         #     (encoder reset / wraparound) this window.
+                        #   fps_bound_by_per_camera — camera_id → "pts" |
+                        #     "configured" indicating which upper bound
+                        #     actually clamped published FPS (absent when
+                        #     no clamping occurred).
                         "raw_callback_fps_per_camera": raw_cb_fps,
                         "source_pts_fps_per_camera":   src_pts_fps,
                         "fps_burst_per_camera":        burst_cams,
                         "pts_dropped_per_camera":      dropped_pts,
+                        "fps_bound_by_per_camera":     fps_bound_by,
                     },
                     "_features":       feats,
                 }
@@ -1210,9 +1256,13 @@ class SpeedProbe:
             # FPS counter tick.  buf_pts is the frame presentation timestamp
             # (ns) assigned by the source/encoder; it feeds the PTS source-rate
             # measurement that bounds published FPS against burst delivery.
+            # cam_cfg.fps is the authored native rate — cached per-camera so
+            # the writer can fall back to it when buf_pts is unavailable
+            # (live CSI/USB sources where buf_pts is never populated).
             self._tick_fps(
                 cam_cfg.camera_id,
                 pts_ns=getattr(frame_meta, "buf_pts", 0),
+                configured_fps=cam_cfg.fps,
             )
 
             # ── Pass 1: collect all vehicles and plates into flat lists ────
