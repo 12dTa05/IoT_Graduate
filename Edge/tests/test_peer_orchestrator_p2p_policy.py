@@ -25,6 +25,8 @@ import time
 import types
 import traceback
 import inspect
+import threading
+import unittest.mock
 from pathlib import Path
 from importlib.util import spec_from_file_location, module_from_spec
 
@@ -2233,6 +2235,133 @@ def test_failover_rescue_allowed_below_rescue_ceiling():
     assert _sent_control_commands(o._pubs["control"], "ADD", "cam_dead_1") != []
 
 
+def test_reclaim_mapping_retained_before_worker_completion():
+    """Reclaim initiates Make-before-Break and keeps _migrated_out mapping while waiting for ACK."""
+    o = _new_orch(overload_threshold=80.0, reclaim_margin=10.0, reclaim_stable_s=0.0, cooldown_s=0.0)
+    _stub_control_pub(o)
+    _register_fresh_peer(o, "node_holder", ["cam_reclaim"], last_seen_delta=1.0)
+    o._get_camera_config = lambda cid: {"camera_id": cid, "uri": "rtsp://localhost/test"}
+    o._migrated_out["cam_reclaim"] = "node_holder"
+    o._reclaim_eligible_since = time.time() - 100.0
+
+    # Intercept Thread.start to prevent background worker from running
+    started_threads = []
+    real_thread = threading.Thread
+    def fake_thread(*args, **kwargs):
+        t = real_thread(*args, **kwargs)
+        started_threads.append(t)
+        t.start = lambda: None  # don't actually run
+        return t
+
+    with unittest.mock.patch("threading.Thread", side_effect=fake_thread):
+        o._check_reclaim()
+
+    # Mapping must still be present because worker has not run / completed
+    assert o._migrated_out.get("cam_reclaim") == "node_holder", (
+        "_migrated_out must retain mapping when reclaim ADD is initiated"
+    )
+    # ADD command was sent to local control
+    assert _sent_control_commands(o._pubs["control"], "ADD", "cam_reclaim") != []
+
+
+def test_reclaim_success_clears_mapping():
+    """When reclaim ACK arrives and REMOVE is sent, _migrated_out is popped."""
+    o = _new_orch()
+    o._migrated_out["cam_reclaim"] = "node_holder"
+
+    # Fake session to capture put calls
+    class FakeSession:
+        def __init__(self):
+            self.puts = []
+        def put(self, key, payload):
+            self.puts.append((key, payload))
+    o._session = FakeSession()
+
+    # Trigger wait_and_remove_reclaim synchronously with pre-set event
+    # First, mock event creation inside _wait_and_remove_reclaim or set it
+    # Since _wait_and_remove_reclaim creates its own Event, we can start it in a thread and set ack
+    worker = threading.Thread(target=o._wait_and_remove_reclaim, args=("cam_reclaim", "node_holder"))
+    worker.start()
+
+    # Wait for pending ack event to be registered, then set it
+    for _ in range(50):
+        with o._lock:
+            ev = o._pending_acks.get("cam_reclaim")
+        if ev is not None:
+            ev.set()
+            break
+        time.sleep(0.01)
+
+    worker.join(timeout=2.0)
+    assert not worker.is_alive(), "Worker thread should complete promptly"
+    assert "cam_reclaim" not in o._migrated_out, (
+        "_migrated_out entry must be cleared after successful reclaim REMOVE"
+    )
+    assert len(o._session.puts) == 1
+    assert o._session.puts[0][0] == "peers/control/node_holder"
+
+
+def test_reclaim_timeout_retains_mapping():
+    """When reclaim local ADD ACK times out, _migrated_out mapping is retained."""
+    o = _new_orch(migration_timeout_s=0.05)
+    o._migrated_out["cam_reclaim"] = "node_holder"
+    class FakeSession:
+        def __init__(self):
+            self.puts = []
+        def put(self, key, payload):
+            self.puts.append((key, payload))
+    o._session = FakeSession()
+
+    # Run directly (will timeout after 0.05s)
+    o._wait_and_remove_reclaim("cam_reclaim", "node_holder")
+
+    assert o._migrated_out.get("cam_reclaim") == "node_holder", (
+        "_migrated_out must retain mapping when local ADD ACK times out"
+    )
+    assert len(o._session.puts) == 0, "No REMOVE should be sent if ADD ACK timed out"
+
+
+def test_reclaim_failed_remove_retains_mapping():
+    """When REMOVE put raises an exception, _migrated_out mapping is retained."""
+    o = _new_orch()
+    o._migrated_out["cam_reclaim"] = "node_holder"
+    class BrokenSession:
+        def put(self, key, payload):
+            raise RuntimeError("Zenoh network error")
+    o._session = BrokenSession()
+
+    worker = threading.Thread(target=o._wait_and_remove_reclaim, args=("cam_reclaim", "node_holder"))
+    worker.start()
+    for _ in range(50):
+        with o._lock:
+            ev = o._pending_acks.get("cam_reclaim")
+        if ev is not None:
+            ev.set()
+            break
+        time.sleep(0.01)
+    worker.join(timeout=2.0)
+
+    assert o._migrated_out.get("cam_reclaim") == "node_holder", (
+        "_migrated_out must retain mapping if REMOVE delivery fails"
+    )
+
+
+def test_reclaim_retry_eligibility_after_failure():
+    """Retained mapping allows subsequent _check_reclaim to retry after cooldown."""
+    o = _new_orch(overload_threshold=80.0, reclaim_margin=10.0, reclaim_stable_s=0.0, cooldown_s=0.1)
+    _stub_control_pub(o)
+    _register_fresh_peer(o, "node_holder", ["cam_reclaim"], last_seen_delta=1.0)
+    o._get_camera_config = lambda cid: {"camera_id": cid, "uri": "rtsp://localhost/test"}
+    o._migrated_out["cam_reclaim"] = "node_holder"
+    o._reclaim_eligible_since = time.time() - 100.0
+    o._cam_cooldown["cam_reclaim"] = time.time() - 1.0  # cooldown expired
+
+    # Check that _check_reclaim finds candidate and issues ADD
+    o._check_reclaim()
+    add_cmds = _sent_control_commands(o._pubs["control"], "ADD", "cam_reclaim")
+    assert len(add_cmds) == 1, "Should attempt reclaim ADD for retained mapping"
+
+
 def test_rebalance_warning_rate_limiting():
     """Per-camera rebalance warnings are rate-limited via _maybe_log_block."""
     o = _new_orch()
@@ -2340,6 +2469,11 @@ if __name__ == "__main__":
         test_failover_rescue_ceiling_blocks_when_capacity_reached,
         test_failover_rescue_allowed_below_rescue_ceiling,
         test_rebalance_warning_rate_limiting,
+        test_reclaim_mapping_retained_before_worker_completion,
+        test_reclaim_success_clears_mapping,
+        test_reclaim_timeout_retains_mapping,
+        test_reclaim_failed_remove_retains_mapping,
+        test_reclaim_retry_eligibility_after_failure,
         test_config_video_fps_matches_cameras_yml,
     ]
     passed = failed = 0

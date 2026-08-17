@@ -1173,7 +1173,6 @@ class PeerOrchestrator:
                 daemon=True,
             ).start()
 
-            self._migrated_out.pop(camera_id, None)
             self._cam_cooldown[camera_id] = now
             # Reset eligible timer to avoid immediately reclaiming next camera
             self._reclaim_eligible_since = now
@@ -2197,6 +2196,7 @@ class PeerOrchestrator:
                 holder_control_key,
                 msgpack.packb(remove_cmd, use_bin_type=True),
             )
+            self._migrated_out.pop(camera_id, None)
             logger.info(
                 "[PeerOrch] Reclaim: stream PLAYING on self — REMOVE sent to '%s' for '%s'. Reclaim complete.",
                 holder_node, camera_id,
