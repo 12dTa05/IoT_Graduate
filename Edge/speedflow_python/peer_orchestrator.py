@@ -1331,7 +1331,10 @@ class PeerOrchestrator:
 
         # Determine intended target level (0 = clear, 1 = L1 migration, 2 = L2, 3 = L3)
         # FIRST, so camera selection can differ per level (L1 → lightest, L2/L3 → heaviest).
-        if load >= thr1 and global_offload >= 1:
+        hard_fuse = float(cfg.get("proactive", {}).get("hard_fuse_threshold", 0.95))
+        fuse_active = state.risk_index >= hard_fuse
+
+        if fuse_active or (load >= thr1 and global_offload >= 1):
             intended_level = 1
         elif load >= thr2 and global_offload >= 2:
             intended_level = 2
@@ -1345,6 +1348,8 @@ class PeerOrchestrator:
                     self.set_offload_level(cam_id, 0)
             return
 
+        raw_intended_level = intended_level
+
         # Escalation ladder ladder-step clamp:
         # If hardware fuse is not active and global_offload supports higher offload levels,
         # do not jump directly to L1 or L2 from level 0 (or L1 from L3).
@@ -1353,8 +1358,6 @@ class PeerOrchestrator:
         #   0 -> 2 (if global_offload == 2)
         #   3 -> 2 (after l3_dwell)
         #   2 -> 1 (after l2_dwell)
-        hard_fuse = float(cfg.get("proactive", {}).get("hard_fuse_threshold", 0.95))
-        fuse_active = state.risk_index >= hard_fuse
 
         # Select candidate camera. For initial candidate selection when climbing the ladder,
         # use intended_level (or clamped level if stepping from 0).
@@ -1386,20 +1389,37 @@ class PeerOrchestrator:
 
         # In normal mode (no fuse), clamp escalation steps per camera
         if not fuse_active:
-            if current_level == 0:
-                if global_offload >= 3 and intended_level in (1, 2, 3):
-                    intended_level = 3
-                elif global_offload == 2 and intended_level in (1, 2):
-                    intended_level = 2
-            elif current_level == 3 and intended_level == 1:
-                intended_level = 2
+            def _clamp_intended_level(cur_lvl: int, raw_lvl: int, g_offload: int) -> int:
+                if cur_lvl == 0:
+                    if g_offload >= 3 and raw_lvl in (1, 2, 3):
+                        return 3
+                    elif g_offload == 2 and raw_lvl in (1, 2):
+                        return 2
+                    elif g_offload == 1 and raw_lvl == 1:
+                        return 1
+                    return 0
+                elif cur_lvl == 3:
+                    if raw_lvl in (1, 2) and g_offload >= 2:
+                        return 2
+                    return 3
+                elif cur_lvl == 2:
+                    if raw_lvl == 1 and g_offload >= 1:
+                        return 1
+                    return 2
+                elif cur_lvl == 1:
+                    return 1
+                return raw_lvl
 
-            # Re-pick camera if clamped level differs in selection polarity (L1 lightest vs L2/L3 heaviest)
-            # Level 2 & 3 both pick heaviest, Level 1 picks lightest
-            new_cam = self._pick_camera_to_offload(state, level=intended_level)
-            if new_cam:
-                cam_to_offload = new_cam
-                current_level = self.get_offload_level(cam_to_offload)
+            clamped = _clamp_intended_level(current_level, raw_intended_level, global_offload)
+            if clamped != intended_level:
+                intended_level = clamped
+                # Re-pick camera if clamped level differs in selection polarity (L1 lightest vs L2/L3 heaviest)
+                # Level 2 & 3 both pick heaviest, Level 1 picks lightest
+                new_cam = self._pick_camera_to_offload(state, level=intended_level)
+                if new_cam:
+                    cam_to_offload = new_cam
+                    current_level = self.get_offload_level(cam_to_offload)
+                    intended_level = _clamp_intended_level(current_level, raw_intended_level, global_offload)
 
         # Runtime diagnostic log immediately before overload action
         logger.info(

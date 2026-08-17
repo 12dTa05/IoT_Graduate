@@ -795,6 +795,85 @@ def test_l1_bypasses_dwell_when_hardware_fuse_active():
         )
 
 
+def test_level2_does_not_escalate_back_to_level3():
+    """Regression test: current_level=2 with load >= L3 threshold but below L1
+    must remain at L2 and never set level 3."""
+    o = _new_orch(
+        offload_level=3,
+        offload_level3_threshold=57.0,
+        offload_level2_threshold=65.0,
+        offload_level1_threshold=75.0,
+        l3_dwell_s=10.0,
+        l2_dwell_s=7.0,
+        overload_duration_s=0.0,
+        cooldown_s=0.0,
+    )
+    _add_peer_beta(o)
+    # Load 60 is >= L3 (57.0) and < L1 (75.0)
+    _setup_overloaded_self(o, load_score=60.0, cameras=["cam_a", "cam_b"])
+    _setup_state_for_dwell(o, level=2, cam_id="cam_b", since_s=15.0)
+
+    o._check_self_overload()
+
+    # cam_b was at level 2; it must not be moved to level 3
+    assert o.get_offload_level("cam_b") == 2, (
+        f"Expected cam_b to remain at level 2, got level={o.get_offload_level('cam_b')}"
+    )
+
+
+def test_level2_with_load_ge_l1_eventually_invokes_l1_path():
+    """Regression test: current_level=2 with load >= L1 eventually invokes L1 path
+    once L2 dwell duration is satisfied."""
+    o = _new_orch(
+        offload_level=3,
+        offload_level3_threshold=57.0,
+        offload_level2_threshold=65.0,
+        offload_level1_threshold=75.0,
+        l3_dwell_s=10.0,
+        l2_dwell_s=7.0,
+        overload_duration_s=0.0,
+        cooldown_s=0.0,
+    )
+    _add_peer_beta(o)
+    _setup_overloaded_self(o, load_score=80.0, cameras=["cam_a", "cam_b"])
+    o._get_owned_camera_ids = lambda: {"cam_a", "cam_b"}
+
+    # Set cam_a to level 2 with dwell satisfied (8s > 7s)
+    _setup_state_for_dwell(o, level=2, cam_id="cam_a", since_s=8.0)
+    _stub_vote_request_pub(o)
+
+    o._check_self_overload()
+
+    with o._lock:
+        assert "cam_a" in o._vote_in_progress, (
+            f"Expected L1 vote for cam_a from level 2 with load >= L1, vote_in_progress={o._vote_in_progress}"
+        )
+
+
+def test_level3_does_not_retrigger_level3_when_load_below_l2():
+    """Current level 3 remains L3 (not targeted as a new action) when load is below L2."""
+    o = _new_orch(
+        offload_level=3,
+        offload_level3_threshold=57.0,
+        offload_level2_threshold=65.0,
+        offload_level1_threshold=75.0,
+        l3_dwell_s=10.0,
+        overload_duration_s=0.0,
+        cooldown_s=0.0,
+    )
+    _add_peer_beta(o)
+    # Load 60 >= L3 (57) but < L2 (65)
+    _setup_overloaded_self(o, load_score=60.0, cameras=["cam_a", "cam_b"])
+    _setup_state_for_dwell(o, level=3, cam_id="cam_b", since_s=15.0)
+
+    o._check_self_overload()
+
+    # Must remain at level 3
+    assert o.get_offload_level("cam_b") == 3, (
+        f"Expected cam_b to remain at level 3, got level={o.get_offload_level('cam_b')}"
+    )
+
+
 def test_malformed_dwell_config_uses_defaults():
     """Malformed/missing dwell config falls back to safe defaults (10s L3, 7s L2)."""
     o = _new_orch(
