@@ -712,8 +712,9 @@ def test_l2_dwell_permits_escalation_to_l1_after_duration():
     )
 
 
-def test_l1_permitted_when_no_lower_level_active():
-    """Direct L1 (no L2/L3 active) remains permitted when no lower level active."""
+def test_l1_escalation_ladder_steps_to_l3_when_no_lower_level_active():
+    """When load jumps directly to >= L1 threshold from level 0 (offload_level=3),
+    ladder must start at L3 rather than directly jumping to L1."""
     o = _new_orch(
         offload_level=3,
         offload_level3_threshold=57.0,
@@ -726,17 +727,38 @@ def test_l1_permitted_when_no_lower_level_active():
     )
     _add_peer_beta(o)
     _setup_overloaded_self(o, load_score=80.0, cameras=["cam_a", "cam_b"])
-    # All active cameras owned (legacy test does not exercise the guard).
     o._get_owned_camera_ids = lambda: {"cam_a", "cam_b"}
     # No lower level active (level 0)
 
     _stub_vote_request_pub(o)
     o._check_self_overload()
 
-    # L1 should proceed (RFO triggered)
+    # In normal mode (no fuse), should start at Level 3 for heaviest camera (cam_b)
+    with o._lock:
+        assert not o._vote_in_progress, "Direct L1 jump from level 0 should be prevented"
+    assert o.get_offload_level("cam_b") == 3, (
+        f"Expected L3 offload on cam_b, got level={o.get_offload_level('cam_b')}"
+    )
+
+
+def test_l1_permitted_when_offload_level_is_zero():
+    """When global offload_level=0 (disabled), direct L1 is permitted."""
+    o = _new_orch(
+        offload_level=0,
+        offload_threshold=75.0,
+        overload_duration_s=0.0,
+        cooldown_s=0.0,
+    )
+    _add_peer_beta(o)
+    _setup_overloaded_self(o, load_score=80.0, cameras=["cam_a", "cam_b"])
+    o._get_owned_camera_ids = lambda: {"cam_a", "cam_b"}
+
+    _stub_vote_request_pub(o)
+    o._check_self_overload()
+
     with o._lock:
         assert "cam_a" in o._vote_in_progress, (
-            f"Expected L1 RFO for 'cam_a' (no lower level active), "
+            f"Expected L1 RFO for 'cam_a' when offload_level=0, "
             f"vote_in_progress={o._vote_in_progress}"
         )
 
@@ -2302,8 +2324,8 @@ def test_reclaim_success_clears_mapping():
 
 
 def test_reclaim_timeout_retains_mapping():
-    """When reclaim local ADD ACK times out, _migrated_out mapping is retained."""
-    o = _new_orch(migration_timeout_s=0.05)
+    """When reclaim local ADD ACK times out, _migrated_out mapping is retained and retry scheduled."""
+    o = _new_orch(migration_timeout_s=0.05, reclaim_retry_s=2.0)
     o._migrated_out["cam_reclaim"] = "node_holder"
     class FakeSession:
         def __init__(self):
@@ -2319,6 +2341,33 @@ def test_reclaim_timeout_retains_mapping():
         "_migrated_out must retain mapping when local ADD ACK times out"
     )
     assert len(o._session.puts) == 0, "No REMOVE should be sent if ADD ACK timed out"
+    with o._lock:
+        assert "cam_reclaim" not in o._reclaim_in_progress
+        assert "cam_reclaim" in o._reclaim_retry_at
+        assert o._reclaim_retry_at["cam_reclaim"] > time.time()
+
+
+def test_reclaim_retry_resilience_after_timeout():
+    """Reclaim timeout schedules a bounded retry and permits retry once retry_at elapses."""
+    o = _new_orch(overload_threshold=80.0, reclaim_margin=10.0, reclaim_stable_s=0.0, cooldown_s=0.0, reclaim_retry_s=5.0)
+    _stub_control_pub(o)
+    _register_fresh_peer(o, "node_holder", ["cam_reclaim"], last_seen_delta=1.0)
+    o._get_camera_config = lambda cid: {"camera_id": cid, "uri": "rtsp://localhost/test"}
+    o._migrated_out["cam_reclaim"] = "node_holder"
+    o._reclaim_eligible_since = time.time() - 100.0
+
+    # Set retry_at in future
+    now = time.time()
+    o._reclaim_retry_at["cam_reclaim"] = now + 10.0
+
+    # First attempt: blocked by retry_at
+    o._check_reclaim()
+    assert _sent_control_commands(o._pubs["control"], "ADD", "cam_reclaim") == []
+
+    # Second attempt: retry_at elapsed
+    o._reclaim_retry_at["cam_reclaim"] = now - 1.0
+    o._check_reclaim()
+    assert len(_sent_control_commands(o._pubs["control"], "ADD", "cam_reclaim")) == 1
 
 
 def test_reclaim_failed_remove_retains_mapping():
@@ -2406,7 +2455,8 @@ if __name__ == "__main__":
         test_l3_dwell_permits_escalation_to_l2_after_duration,
         test_l2_dwell_blocks_escalation_to_l1_before_duration,
         test_l2_dwell_permits_escalation_to_l1_after_duration,
-        test_l1_permitted_when_no_lower_level_active,
+        test_l1_escalation_ladder_steps_to_l3_when_no_lower_level_active,
+        test_l1_permitted_when_offload_level_is_zero,
         test_l1_bypasses_dwell_when_hardware_fuse_active,
         test_malformed_dwell_config_uses_defaults,
         test_negative_dwell_config_uses_defaults,
@@ -2472,6 +2522,7 @@ if __name__ == "__main__":
         test_reclaim_mapping_retained_before_worker_completion,
         test_reclaim_success_clears_mapping,
         test_reclaim_timeout_retains_mapping,
+        test_reclaim_retry_resilience_after_timeout,
         test_reclaim_failed_remove_retains_mapping,
         test_reclaim_retry_eligibility_after_failure,
         test_config_video_fps_matches_cameras_yml,

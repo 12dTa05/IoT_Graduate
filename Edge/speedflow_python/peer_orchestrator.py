@@ -352,6 +352,11 @@ class PeerOrchestrator:
         # migrated away again during its transient FPS warm-up window on this node.
         self._reclaim_completed_at: Dict[str, float] = {}
 
+        # Reclaim retry tracking: camera_id → timestamp when reclaim can be retried
+        self._reclaim_retry_at: Dict[str, float] = {}
+        # Cameras currently undergoing reclaim Make-before-Break
+        self._reclaim_in_progress: set = set()
+
         # ponytail: rate-limit blocked-decision diagnostics so they don't spew
         # every 1-second tick.  Keys are short reason strings; value is the Unix
         # timestamp of the last log.  Cooldown = 15 s (half a typical vote window);
@@ -1126,6 +1131,14 @@ class PeerOrchestrator:
             candidates = list(self._migrated_out.items())
 
         for camera_id, holder_node in candidates:
+            # Check in-progress and retry timing
+            with self._lock:
+                if camera_id in self._reclaim_in_progress:
+                    continue
+                retry_at = self._reclaim_retry_at.get(camera_id, 0.0)
+            if now < retry_at:
+                continue
+
             # Check cooldown
             last_mig = self._cam_cooldown.get(camera_id, 0.0)
             if now - last_mig < cooldown_s:
@@ -1164,10 +1177,14 @@ class PeerOrchestrator:
             # Clear any stale first-valid-fps snapshot so the warmup restarts
             # from zero for this new ADD event.
             self._camera_first_valid_fps_at.pop(camera_id, None)
+            with self._lock:
+                self._reclaim_in_progress.add(camera_id)
+
             logger.info(
-                "[PeerOrch] Reclaim: load=%.1f < threshold=%.1f — "
-                "ADD '%s' back to self (was held by '%s'), waiting for ack...",
-                load, reclaim_threshold, camera_id, holder_node,
+                "[PeerOrch] Reclaim: load=%.1f < threshold=%.1f (risk=%.2f, active=%d) — "
+                "ADD '%s' back to self (held by '%s'), waiting for ack...",
+                load, reclaim_threshold, self._self_state.risk_index,
+                len(self._self_state.active_cameras), camera_id, holder_node,
             )
 
             # Record reclaim start: this camera is ineligible for offload until
@@ -1328,13 +1345,27 @@ class PeerOrchestrator:
                     self.set_offload_level(cam_id, 0)
             return
 
+        # Escalation ladder ladder-step clamp:
+        # If hardware fuse is not active and global_offload supports higher offload levels,
+        # do not jump directly to L1 or L2 from level 0 (or L1 from L3).
+        # Normal escalation ladder must step through available intermediate levels:
+        #   0 -> 3 (if global_offload >= 3)
+        #   0 -> 2 (if global_offload == 2)
+        #   3 -> 2 (after l3_dwell)
+        #   2 -> 1 (after l2_dwell)
+        hard_fuse = float(cfg.get("proactive", {}).get("hard_fuse_threshold", 0.95))
+        fuse_active = state.risk_index >= hard_fuse
+
+        # Select candidate camera. For initial candidate selection when climbing the ladder,
+        # use intended_level (or clamped level if stepping from 0).
         cam_to_offload = self._pick_camera_to_offload(state, level=intended_level)
         if not cam_to_offload:
             if self._maybe_log_block("no_cam", now):
                 logger.warning(
-                    "[PeerOrch] Overloaded (load=%.1f, over_thresh) but no eligible camera to "
-                    "offload (active=%d, fps_data=%d) — cannot escalate",
-                    load, len(state.active_cameras),
+                    "[PeerOrch] Overloaded (load=%.1f, risk=%.2f, active=%d, fps_valid=%s) but no eligible camera to "
+                    "offload (fps_data=%d) — cannot escalate",
+                    load, state.risk_index, len(state.active_cameras),
+                    _has_valid_positive_fps(state.fps_per_camera),
                     len(state.fps_per_camera) if state.fps_per_camera else 0,
                 )
             return
@@ -1352,6 +1383,31 @@ class PeerOrchestrator:
             return
 
         current_level = self.get_offload_level(cam_to_offload)
+
+        # In normal mode (no fuse), clamp escalation steps per camera
+        if not fuse_active:
+            if current_level == 0:
+                if global_offload >= 3 and intended_level in (1, 2, 3):
+                    intended_level = 3
+                elif global_offload == 2 and intended_level in (1, 2):
+                    intended_level = 2
+            elif current_level == 3 and intended_level == 1:
+                intended_level = 2
+
+            # Re-pick camera if clamped level differs in selection polarity (L1 lightest vs L2/L3 heaviest)
+            # Level 2 & 3 both pick heaviest, Level 1 picks lightest
+            new_cam = self._pick_camera_to_offload(state, level=intended_level)
+            if new_cam:
+                cam_to_offload = new_cam
+                current_level = self.get_offload_level(cam_to_offload)
+
+        # Runtime diagnostic log immediately before overload action
+        logger.info(
+            "[PeerOrch] Overload decision check: load=%.1f (thr1=%.1f, thr2=%.1f, thr3=%.1f), "
+            "risk_index=%.2f, fps_valid=%s, active_cameras=%d, camera='%s', current_level=%d, target_level=%d, fuse=%s",
+            load, thr1, thr2, thr3, state.risk_index, _has_valid_positive_fps(state.fps_per_camera),
+            len(state.active_cameras), cam_to_offload, current_level, intended_level, fuse_active,
+        )
 
         # Escalation-aware cooldown: when moving toward greater urgency
         # (numeric level decreases, e.g. 3→2, 3→1, 2→1) use a shorter
@@ -1390,12 +1446,8 @@ class PeerOrchestrator:
         # Read dwell config (fail-safe defaults if missing/malformed)
         l3_dwell = _dwell_s(cfg, "l3_dwell_s", 10.0)
         l2_dwell = _dwell_s(cfg, "l2_dwell_s", 7.0)
-        # Hardware emergency fuse bypass: if risk_index >= hard_fuse_threshold,
-        # skip dwell gates entirely so L1 can trigger immediately.
-        hard_fuse = float(cfg.get("proactive", {}).get("hard_fuse_threshold", 0.95))
-        fuse_active = state.risk_index >= hard_fuse
 
-        if load >= thr1 and global_offload >= 1:
+        if intended_level == 1:
             # Full stream migration (Level 1) — existing RFO path.
             # Dwell gate: if this camera currently has L2 active, require L2
             # to have been active for l2_dwell seconds before escalating to L1.
@@ -1453,7 +1505,7 @@ class PeerOrchestrator:
             logger.warning("[PeerOrch] RFO trigger: %s reason=%s", cam_to_offload, trigger)
             self._trigger_rfo(cam_to_offload, relaxation_tier=0)
 
-        elif load >= thr2 and global_offload >= 2:
+        elif intended_level == 2:
             # Dwell gate: if this camera currently has L3 active, require L3
             # to have been active for l3_dwell seconds before escalating to L2.
             # Bypassed if hardware emergency fuse is active.
@@ -1486,7 +1538,7 @@ class PeerOrchestrator:
                 )
                 self.set_offload_level(cam_to_offload, 2, target_node=best_peer)
 
-        elif load >= thr3 and global_offload >= 3:
+        elif intended_level == 3:
             best_peer = self._pick_best_peer(for_offload_level=3)
             if not best_peer:
                 if self._maybe_log_block("no_peer_l3", now):
@@ -2180,8 +2232,8 @@ class PeerOrchestrator:
           - Then send REMOVE to holder node
 
         Reuses the same _pending_acks event mechanism as _wait_and_remove.
-        If timeout, log error but do NOT rollback — the ADD is already live
-        and the holder will eventually be cleaned up by rebalance.
+        If timeout, log error and schedule a quick retry instead of forcing
+        the full migration cooldown or clearing state.
         """
         event = threading.Event()
         with self._lock:
@@ -2194,11 +2246,16 @@ class PeerOrchestrator:
             self._pending_acks.pop(camera_id, None)
 
         if not confirmed:
+            retry_s = self._cfg.get("reclaim_retry_s", 5.0)
             logger.error(
-                "[PeerOrch] Reclaim: TIMEOUT (%ds) waiting for local ADD ack of '%s'. "
-                "Camera added to self but holder '%s' NOT removed — may cause duplicate stream.",
+                "[PeerOrch] Reclaim: TIMEOUT (%ds) waiting for local ADD ack of '%s' from holder '%s' "
+                "(active=%d) — scheduling retry in %.1fs",
                 int(timeout), camera_id, holder_node,
+                len(self._self_state.active_cameras), retry_s,
             )
+            with self._lock:
+                self._reclaim_in_progress.discard(camera_id)
+                self._reclaim_retry_at[camera_id] = time.time() + retry_s
             return
 
         # Stream confirmed PLAYING on self — safe to remove from holder
@@ -2209,16 +2266,23 @@ class PeerOrchestrator:
                 holder_control_key,
                 msgpack.packb(remove_cmd, use_bin_type=True),
             )
-            self._migrated_out.pop(camera_id, None)
+            with self._lock:
+                self._migrated_out.pop(camera_id, None)
+                self._reclaim_in_progress.discard(camera_id)
+                self._reclaim_retry_at.pop(camera_id, None)
             logger.info(
                 "[PeerOrch] Reclaim: stream PLAYING on self — REMOVE sent to '%s' for '%s'. Reclaim complete.",
                 holder_node, camera_id,
             )
         except Exception as exc:
+            retry_s = self._cfg.get("reclaim_retry_s", 5.0)
             logger.error(
-                "[PeerOrch] Reclaim: failed to send REMOVE to '%s' for '%s': %s",
-                holder_node, camera_id, exc,
+                "[PeerOrch] Reclaim: failed to send REMOVE to '%s' for '%s': %s — scheduling retry in %.1fs",
+                holder_node, camera_id, exc, retry_s,
             )
+            with self._lock:
+                self._reclaim_in_progress.discard(camera_id)
+                self._reclaim_retry_at[camera_id] = time.time() + retry_s
 
     # ------------------------------------------------------------------
     # Vote ack
