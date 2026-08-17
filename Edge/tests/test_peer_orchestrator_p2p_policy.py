@@ -2164,6 +2164,90 @@ def test_config_video_fps_matches_cameras_yml():
         )
 
 
+def test_failover_convergence_grace_suppresses_cascading_offline():
+    """While a failover was recently triggered (< failover_convergence_grace_s),
+    another silent peer is suppressed from triggering failover / offline declaration."""
+    o = _new_orch(heartbeat_timeout_s=5.0, failover_grace_s=5.0, failover_convergence_grace_s=15.0)
+    now = time.time()
+    # node_a triggered failover 5 seconds ago (inside 15s convergence window)
+    o._failover_triggered["node_a"] = now - 5.0
+
+    # node_b is silent beyond threshold (e.g. 12s > 5+5=10s)
+    _register_fresh_peer(o, "node_b", ["cam_b1"], last_seen_delta=12.0)
+    o._check_offline_peers()
+
+    # node_b should be suppressed from failover triggering during convergence grace
+    assert "node_b" not in o._failover_triggered, "node_b failover should be suppressed during convergence grace"
+
+
+def test_failover_convergence_grace_expiry_allows_detection():
+    """After failover_convergence_grace_s expires, offline detection proceeds normally."""
+    o = _new_orch(heartbeat_timeout_s=5.0, failover_grace_s=5.0, failover_convergence_grace_s=15.0)
+    now = time.time()
+    # node_a triggered failover 20 seconds ago (outside 15s convergence window)
+    o._failover_triggered["node_a"] = now - 20.0
+
+    # node_b is silent beyond threshold
+    _register_fresh_peer(o, "node_b", ["cam_b1"], last_seen_delta=12.0)
+    o._check_offline_peers()
+
+    # node_b failover should now trigger
+    assert "node_b" in o._failover_triggered, "node_b failover should trigger after convergence grace expires"
+
+
+def test_failover_rescue_ceiling_blocks_when_capacity_reached():
+    """Failover does not rescue beyond failover_rescue_max (default eps_streams_max - 1 = 3)."""
+    o = _new_orch(eps_streams_max=4)  # rescue_ceiling defaults to 3
+    _stub_control_pub(o)
+    # Self already has 3 streams active
+    o._self_state.active_cameras = ["cam_1", "cam_2", "cam_3"]
+
+    _register_fresh_peer(o, "node_dead", ["cam_dead_1"], last_seen_delta=20.0)
+    dead_peer = o._peers["node_dead"]
+    dead_peer.camera_configs = {"cam_dead_1": {"uri": "rtsp://localhost/test"}}
+
+    o._leaderless_failover("node_dead", ["cam_dead_1"])
+
+    # No rescue ADD should be issued because self is at rescue ceiling (3 >= 3)
+    assert "cam_dead_1" not in o._rescued_cameras, "cam_dead_1 should not be rescued beyond rescue ceiling"
+    assert _sent_control_commands(o._pubs["control"], "ADD", "cam_dead_1") == []
+
+
+def test_failover_rescue_allowed_below_rescue_ceiling():
+    """Failover rescues orphan when current streams are below the rescue ceiling."""
+    o = _new_orch(eps_streams_max=4)  # rescue_ceiling = 3
+    _stub_control_pub(o)
+    # Self has 2 streams active (< 3)
+    o._self_state.active_cameras = ["cam_1", "cam_2"]
+
+    # alive_peers will consist of only [self._node_id] if no other peers alive
+    # With alive = [self._node_id], consistent hash always returns self._node_id
+    _register_fresh_peer(o, "node_dead", ["cam_dead_1"], last_seen_delta=20.0)
+    dead_peer = o._peers["node_dead"]
+    dead_peer.camera_configs = {"cam_dead_1": {"camera_id": "cam_dead_1", "uri": "rtsp://localhost/test"}}
+    o._measure_rtt = lambda uri: 5.0
+
+    o._leaderless_failover("node_dead", ["cam_dead_1"])
+
+    assert "cam_dead_1" in o._rescued_cameras, "cam_dead_1 should be rescued"
+    assert _sent_control_commands(o._pubs["control"], "ADD", "cam_dead_1") != []
+
+
+def test_rebalance_warning_rate_limiting():
+    """Per-camera rebalance warnings are rate-limited via _maybe_log_block."""
+    o = _new_orch()
+    o._get_owned_camera_ids = lambda: {"cam_owned"}
+    # cam_owned is in _rescued_cameras (defensive scenario) and cam_owned is active
+    o._rescued_cameras["cam_owned"] = "node_beta"
+    o._self_state.active_cameras = ["cam_owned"]
+    _register_fresh_peer(o, "node_beta", ["cam_owned"], last_seen_delta=1.0)
+    _stub_control_pub(o)
+
+    # First call logs and records timestamp in _blocked_logged_at
+    o._check_rebalance()
+    assert "rebalance_owned_cam_owned" in o._blocked_logged_at
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2251,6 +2335,11 @@ if __name__ == "__main__":
         test_peer_inflight_decremented_on_timeout_rollback,
         test_self_inflight_blocks_back_to_back_bids,
         test_self_inflight_zero_after_decay,
+        test_failover_convergence_grace_suppresses_cascading_offline,
+        test_failover_convergence_grace_expiry_allows_detection,
+        test_failover_rescue_ceiling_blocks_when_capacity_reached,
+        test_failover_rescue_allowed_below_rescue_ceiling,
+        test_rebalance_warning_rate_limiting,
         test_config_video_fps_matches_cameras_yml,
     ]
     passed = failed = 0

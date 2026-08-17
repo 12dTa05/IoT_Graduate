@@ -309,7 +309,7 @@ class PeerOrchestrator:
         # so we don't re-trigger on the next decision-loop tick.  We no longer
         # clear active_cameras on the dead peer's PeerState (that would race
         # with _check_rebalance reading it to detect camera returns).
-        self._failover_triggered: set = set()
+        self._failover_triggered: Dict[str, float] = {}
 
         # Cameras rescued via failover: camera_id → original_owner_node_id
         # Used to return cameras when the original owner comes back online.
@@ -830,13 +830,26 @@ class PeerOrchestrator:
         ``heartbeat_timeout_s`` so the total wait is 2× the heartbeat
         timeout — configurable via ``p2p.failover_grace_s`` in
         ``Edge/configs/edge_node.yml``.
+
+        Failover convergence grace:
+        When a failover has just been triggered (within ``failover_convergence_grace_s``,
+        default 15s), suppress declaring other peers offline to prevent cascading
+        mutual false-offline cascades during convergence. Detection resumes once
+        the grace window expires.
         """
         now = time.time()
         timeout = self._cfg.get("heartbeat_timeout_s", 5.0)
         grace_s = self._cfg.get("failover_grace_s", timeout)
         offline_threshold = timeout + grace_s
+        convergence_grace_s = float(self._cfg.get("failover_convergence_grace_s", 15.0))
 
         with self._lock:
+            # Check if any failover was recently triggered within convergence_grace_s
+            recent_failovers = [
+                t for nid, t in self._failover_triggered.items()
+                if (now - t) < convergence_grace_s
+            ]
+            in_convergence = bool(recent_failovers)
             to_check = list(self._peers.items())
 
         for node_id, peer in to_check:
@@ -844,16 +857,26 @@ class PeerOrchestrator:
                 continue
             silent_s = now - peer.last_seen
             if silent_s > offline_threshold:
+                with self._lock:
+                    already_triggered = node_id in self._failover_triggered
+                # If failover not yet triggered for this peer, but cluster is in convergence grace
+                # from another recent failover, suppress declaring this peer offline.
+                if not already_triggered and in_convergence:
+                    continue
+
                 self._clear_offload_target(node_id)
                 if peer.active_cameras:
-                    # BUG-6 fix: use _failover_triggered set to prevent
+                    # BUG-6 fix: use _failover_triggered map to prevent
                     # re-triggering instead of clearing active_cameras.
                     # Clearing active_cameras races with _check_rebalance which
                     # reads it to decide whether the original owner has resumed
                     # a rescued camera.
-                    if node_id not in self._failover_triggered:
+                    with self._lock:
+                        should_trigger = node_id not in self._failover_triggered
+                        if should_trigger:
+                            self._failover_triggered[node_id] = now
+                    if should_trigger:
                         orphans = list(peer.active_cameras)
-                        self._failover_triggered.add(node_id)
                         logger.critical(
                             "[PeerOrch] Peer '%s' OFFLINE (silent %.1fs ≥ %.1fs) with %d cameras! "
                             "Triggering failover...",
@@ -873,7 +896,8 @@ class PeerOrchestrator:
                 # Peer is alive — clear the notified/failover flags so we
                 # react again if it goes offline a second time.
                 self._notified_offline.discard(node_id)
-                self._failover_triggered.discard(node_id)
+                with self._lock:
+                    self._failover_triggered.pop(node_id, None)
 
     def _clear_offload_target(self, node_id: str) -> None:
         """Clear Level 2/3 crop offload entries that target an offline peer."""
@@ -988,12 +1012,13 @@ class PeerOrchestrator:
             # transition window or a misconfigured yml could in principle
             # place an owned camera here.  Skip defensively.
             if camera_id in owned_ids:
-                logger.warning(
-                    "[PeerOrch][Rebalance] Skipping return of '%s' to '%s': "
-                    "camera is locally-owned; this rebalance path only "
-                    "handles foreign rescued cameras.",
-                    camera_id, original_owner,
-                )
+                if self._maybe_log_block(f"rebalance_owned_{camera_id}", now):
+                    logger.warning(
+                        "[PeerOrch][Rebalance] Skipping return of '%s' to '%s': "
+                        "camera is locally-owned; this rebalance path only "
+                        "handles foreign rescued cameras.",
+                        camera_id, original_owner,
+                    )
                 continue
             peer = peers_snapshot.get(original_owner)
             if peer is None:
@@ -1007,11 +1032,12 @@ class PeerOrchestrator:
                 continue
             if camera_id in remaining_after and len(remaining_after) <= 1:
                 # Last-active-camera guard: would leave zero streams locally.
-                logger.warning(
-                    "[PeerOrch][Rebalance] Skipping return of '%s' to '%s': "
-                    "it is the last active camera on this node (active=%d).",
-                    camera_id, original_owner, len(remaining_after),
-                )
+                if self._maybe_log_block(f"rebalance_last_cam_{camera_id}", now):
+                    logger.warning(
+                        "[PeerOrch][Rebalance] Skipping return of '%s' to '%s': "
+                        "it is the last active camera on this node (active=%d).",
+                        camera_id, original_owner, len(remaining_after),
+                    )
                 continue
             remaining_after.discard(camera_id)
             to_return.append(camera_id)
@@ -2219,7 +2245,7 @@ class PeerOrchestrator:
 
             if expected_winner is not None and ack_node not in ("", expected_winner):
                 # Wrong/forged/stale sender for an in-flight migration — fail closed.
-                logger.warning(
+                logger.debug(
                     "[PeerOrch] Ignoring ACK for '%s': sender='%s' != expected winner='%s'.",
                     camera_id, ack_node, expected_winner,
                 )
@@ -2227,7 +2253,7 @@ class PeerOrchestrator:
             if expected_winner is None and ack_node not in ("", self._node_id):
                 # No pending migration but a foreign sender claims this camera —
                 # ambiguous, fail closed (do not set event, do not release).
-                logger.warning(
+                logger.debug(
                     "[PeerOrch] Ignoring ACK for '%s': no pending migration but "
                     "sender='%s' != self.", camera_id, ack_node,
                 )
@@ -2300,6 +2326,10 @@ class PeerOrchestrator:
         now = time.time()
         timeout = cfg.get("heartbeat_timeout_s", 5.0)
 
+        eps_max = int(self._cfg.get("eps_streams_max", 4))
+        # Configurable rescue ceiling, default eps_streams_max - 1 (e.g. 3 when eps_streams_max=4)
+        rescue_ceiling = int(self._cfg.get("failover_rescue_max", eps_max - 1))
+
         # Read dead peer's camera configs AND build alive_peers in a single lock
         # acquisition to prevent torn reads between the two operations.
         with self._lock:
@@ -2313,7 +2343,7 @@ class PeerOrchestrator:
         with self._lock:
             self_eligible = (
                 self._node_id != dead_node_id
-                and self_streams < self._cfg.get("eps_streams_max", 4)
+                and self_streams < rescue_ceiling
             )
             alive_peers = sorted([
                 nid for nid, peer in self._peers.items()
@@ -2379,14 +2409,14 @@ class PeerOrchestrator:
                         )
                         continue
 
-                # Re-check capacity including cameras accepted earlier in this loop
+                # Re-check capacity including cameras accepted earlier in this loop against rescue ceiling
                 # BUG-1 fix: read active_cameras under _self_lock
                 with self._self_lock:
                     current_streams = len(self._self_state.active_cameras)
-                if current_streams + self_accepted >= self._cfg.get("eps_streams_max", 4):
+                if current_streams + self_accepted >= rescue_ceiling:
                     logger.warning(
-                        "[Failover] Cannot rescue '%s': at stream capacity (%d). Skipping.",
-                        camera_id, current_streams + self_accepted,
+                        "[Failover] Cannot rescue '%s': at rescue ceiling (%d >= %d). Skipping.",
+                        camera_id, current_streams + self_accepted, rescue_ceiling,
                     )
                     continue
 

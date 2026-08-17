@@ -19,6 +19,7 @@ p2p:
   migration_timeout_s: 15.0    # wait for ADD ack before rollback (restored to safe default;
                                  # 2 s was too tight for slow RTSP sources across LAN)
   heartbeat_timeout_s: 5.0      # peer declared OFFLINE after this silence
+  failover_convergence_grace_s: 15.0 # suppress mutual false-offline cascade during failover convergence
   vote_window_s: 2.0            # proposal collection duration
   failover_jitter_max_s: 3.0    # random delay before failover ADD (race prevention)
   reclaim_margin: 7.0          # reclaim only when load < (overload_threshold - reclaim_margin)
