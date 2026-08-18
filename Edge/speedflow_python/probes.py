@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import queue
+import tempfile
 import time
 import threading
 import uuid
@@ -826,20 +827,37 @@ class SpeedProbe:
                     if self._load_score_breakdown is not None:
                         out["load_score_breakdown"] = dict(self._load_score_breakdown)
 
-                # ── Atomic write: temp file + os.replace ───────────────────
+                # ── Atomic write: unique temp file + os.replace ───────────
                 # Filesystem hardening: os.replace raises ENOENT when the
                 # destination's parent directory does not exist (e.g. a
                 # nested /dev/shm/<subdir>/ path whose subdir was never
                 # created, or a tmpfs that was cleared/recreated under us).
-                # Recreate the parent first so the atomic swap can land.
-                tmp_path = FPS_STATS_FILE + ".tmp"
+                # Recreate the parent first, use unique tempfile in same dir,
+                # fsync, close, atomically replace, and clean up temp on failure.
+                tmp_path = None
                 try:
                     _parent = os.path.dirname(os.path.abspath(FPS_STATS_FILE))
                     if _parent and not os.path.isdir(_parent):
                         os.makedirs(_parent, exist_ok=True)
-                    with open(tmp_path, "w") as f:
-                        json.dump(out, f)
-                    os.replace(tmp_path, FPS_STATS_FILE)
+                    fd, tmp_path = tempfile.mkstemp(
+                        prefix=".speedflow_fps_",
+                        suffix=".tmp",
+                        dir=_parent or None,
+                    )
+                    try:
+                        with os.fdopen(fd, "w", encoding="utf-8") as f:
+                            json.dump(out, f)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(tmp_path, FPS_STATS_FILE)
+                        tmp_path = None
+                    except Exception:
+                        if tmp_path and os.path.exists(tmp_path):
+                            try:
+                                os.remove(tmp_path)
+                            except OSError:
+                                pass
+                        raise
                 except OSError as exc:
                     logger.warning(
                         "[FPSWriter] atomic write failed — retrying: %s",

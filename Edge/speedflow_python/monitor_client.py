@@ -161,6 +161,7 @@ class MonitorClient:
 
                 def on_error(wsapp, error):
                     logger.warning("[MonitorClient] WS error: %s", error)
+                    self._ws_closed.set()
 
                 def on_close(wsapp, close_status, close_msg):
                     logger.warning("[MonitorClient] WS closed: status=%s msg=%s", close_status, close_msg)

@@ -193,6 +193,12 @@ def _attach_camera_manager(
 # GLib bus helpers
 # ---------------------------------------------------------------------------
 
+def _is_transient_nvmm_buffer_error(err, debug: Optional[str]) -> bool:
+    """Narrow check for transient decoder buffer exhaustion."""
+    text = f"{err} {debug or ''}"
+    return "OutputBufferUnavailable" in text or "cbAllocPictureBuffer" in text
+
+
 def _run_loop_until_eos_or_error(
     pipeline: Gst.Pipeline,
     camera_manager: CameraManager
@@ -205,7 +211,14 @@ def _run_loop_until_eos_or_error(
         t = message.type
         if t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
-            print(f"ERROR from {message.src.get_name()}: {err}", file=sys.stderr)
+            src_name = message.src.get_name() if message.src else "unknown"
+            if _is_transient_nvmm_buffer_error(err, debug):
+                print(f"WARNING (recoverable): Transient decoder buffer exhaustion from {src_name}: {err}", file=sys.stderr)
+                if debug:
+                    print(f"DEBUG INFO: {debug}", file=sys.stderr)
+                return
+
+            print(f"ERROR from {src_name}: {err}", file=sys.stderr)
             if debug:
                 print(f"DEBUG INFO: {debug}", file=sys.stderr)
             loop.quit()
@@ -502,7 +515,7 @@ def _health_push_loop(peer_orch=None) -> None:
                 "[HealthPush] Exception in health loop (will retry): %s", _exc, exc_info=True
             )
         # ponytail: deadline sleep — work duration does not extend the period.
-        _next_deadline += HEALTH_INTERVAL
+        _next_deadline += float(HEALTH_INTERVAL)
         _remaining = _next_deadline - _time.monotonic()
         if _remaining > 0:
             _time.sleep(_remaining)
@@ -590,10 +603,13 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             t = message.type
             if t == Gst.MessageType.ERROR:
                 err, debug = message.parse_error()
-                src_name = message.src.get_name()
-                print(f"ERROR from {src_name}: {err}", file=sys.stderr)
-                if debug:
-                    print(f"DEBUG INFO: {debug}", file=sys.stderr)
+                src_name = message.src.get_name() if message.src else "unknown"
+
+                if _is_transient_nvmm_buffer_error(err, debug):
+                    print(f"WARNING (recoverable): Transient decoder buffer exhaustion from {src_name}: {err}", file=sys.stderr)
+                    if debug:
+                        print(f"DEBUG INFO: {debug}", file=sys.stderr)
+                    return
 
                 # If the error comes from a source bin, remove just that
                 # stream instead of killing the whole pipeline.
@@ -608,6 +624,9 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
 
                 if cam_id and cam_id in source_bins and cam_id not in _removing:
                     _removing.add(cam_id)
+                    print(f"ERROR (source) from {src_name} ({cam_id}): {err}", file=sys.stderr)
+                    if debug:
+                        print(f"DEBUG INFO: {debug}", file=sys.stderr)
                     print(f"[Pipeline] Removing failed source '{cam_id}'", file=sys.stderr)
                     sid = None
                     for cfg in camera_manager.get_enabled_configs():
@@ -617,6 +636,15 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
                     if sid is not None:
                         dynamic_remove_stream(pipeline, streammux, cam_id, sid, tiler, source_bins)
                     return  # don't quit the pipeline
+
+                # Distinguish sink vs other pipeline errors
+                is_rtsp_sink = (
+                    elem_name := (src_name or "")
+                ) and ("rtsp_push_sink" in elem_name or "sink" in elem_name or "rtsp" in elem_name)
+                err_category = "sink" if is_rtsp_sink else "pipeline"
+                print(f"ERROR ({err_category}) from {src_name}: {err}", file=sys.stderr)
+                if debug:
+                    print(f"DEBUG INFO: {debug}", file=sys.stderr)
 
                 _error_flag[0] = True
                 loop.quit()
