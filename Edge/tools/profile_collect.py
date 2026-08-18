@@ -52,6 +52,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -197,8 +198,10 @@ FIELDNAMES = [
     "pipeline_window_started_monotonic", "pipeline_window_ended_monotonic",
     "pipeline_window_duration_s", "pipeline_updated_at",
     "fps_avg",
+    "expected_fps",
     "input_fps_avg",
     "n_active_cameras",
+    "n_cameras_total",
     "n_track_total", "n_plate_total",
     "stationary_fraction_mean",
     "offload_crops_received_per_s",
@@ -316,11 +319,27 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
             # 6) Sample hardware ONCE only after accepting the snapshot
             hw = _read_hw(jtop)
 
-            # 7) Compute FPS average from payload
-            fps_vals = [v for k, v in payload.items()
-                        if not k.startswith("_") and isinstance(v, (int, float)) and v > 0.0]
+            # 7) Compute FPS average and camera totals from payload
+            all_fps_keys = [k for k, v in payload.items()
+                            if not k.startswith("_") and isinstance(v, (int, float))]
+            fps_vals = [payload[k] for k in all_fps_keys if payload[k] > 0.0]
             fps_avg = sum(fps_vals) / len(fps_vals) if fps_vals else 0.0
             n_active_cameras = len(fps_vals)
+            n_cameras_total = len(all_fps_keys)
+
+            # Expected FPS derivation:
+            # 1. From _telemetry.configured_fps_per_camera if available
+            # 2. Else from settings.TARGET_FPS / env fallback (27.0 or 25.0)
+            tmeta = payload.get("_telemetry", {})
+            cfg_fps_dict = tmeta.get("configured_fps_per_camera", {}) if isinstance(tmeta, dict) else {}
+            active_cfg_fps = [
+                float(cfg_fps_dict[k]) for k in all_fps_keys
+                if k in cfg_fps_dict and isinstance(cfg_fps_dict[k], (int, float)) and cfg_fps_dict[k] > 0
+            ]
+            if active_cfg_fps:
+                expected_fps = min(active_cfg_fps)
+            else:
+                expected_fps = float(os.environ.get("TARGET_FPS", 27.0))
 
             # 8) Compute input FPS average from the same snapshot
             input_fps_dict = payload.get("_input_fps", {})
@@ -334,14 +353,15 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
 
             # 9) Aggregate features across active cameras
             feat_dict = payload.get("_features", {})
-            _active_ids = {k for k, v in payload.items()
-                           if not k.startswith("_") and isinstance(v, (int, float)) and v > 0.0}
+            _active_ids = {k for k in all_fps_keys if payload[k] > 0.0}
+            active_feat_stats = {
+                k: v for k, v in feat_dict.items()
+                if k in _active_ids and isinstance(v, dict)
+            } if isinstance(feat_dict, dict) else {}
             n_track_total  = 0.0
             n_plate_total  = 0.0
             stat_frac_vals = []
-            for cam_id, cam_feats in feat_dict.items():
-                if cam_id not in _active_ids:
-                    continue
+            for cam_feats in active_feat_stats.values():
                 n_track_total  += cam_feats.get("n_track", 0.0)
                 n_plate_total  += cam_feats.get("n_plate", 0.0)
                 stat_frac_vals.append(cam_feats.get("stationary_fraction", 0.0))
@@ -356,15 +376,15 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
 
             # 11) Compute load_score from the payload fps
             # Build fps_dict as health_agent expects: {cam_id: float}
-            fps_dict = {k: v for k, v in payload.items()
-                        if not k.startswith("_") and isinstance(v, (int, float))}
-            load_score, _preset = _compute_load_score(hw, fps_dict)
+            fps_dict = {k: payload[k] for k in all_fps_keys}
+            load_score, _preset = _compute_load_score(
+                hw, fps_dict, feature_stats=active_feat_stats
+            )
 
             # 12) Snapshot metadata directly from the gate-verified payload
-            tmeta = payload["_telemetry"]  # safe — _extract_telemetry confirmed a dict
-            win_started = tmeta.get("pipeline_window_started_monotonic", 0.0)
-            win_ended   = tmeta.get("pipeline_window_ended_monotonic", 0.0)
-            win_dur     = tmeta.get("pipeline_window_duration_s", 0.0)
+            win_started = tmeta.get("pipeline_window_started_monotonic", 0.0) if isinstance(tmeta, dict) else 0.0
+            win_ended   = tmeta.get("pipeline_window_ended_monotonic", 0.0) if isinstance(tmeta, dict) else 0.0
+            win_dur     = tmeta.get("pipeline_window_duration_s", 0.0) if isinstance(tmeta, dict) else 0.0
             updated_at  = payload.get("_updated_at", 0.0)
 
             writer.writerow({
@@ -380,8 +400,10 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
                 "pipeline_window_duration_s":         round(win_dur, 3),
                 "pipeline_updated_at":                round(updated_at, 3),
                 "fps_avg":                            round(fps_avg, 2),
+                "expected_fps":                       round(expected_fps, 2),
                 "input_fps_avg":                       round(input_fps_avg, 2),
                 "n_active_cameras":                   n_active_cameras,
+                "n_cameras_total":                    n_cameras_total,
                 "n_track_total":                      round(n_track_total, 2),
                 "n_plate_total":                      round(n_plate_total, 2),
                 "stationary_fraction_mean":           round(stat_mean, 3),

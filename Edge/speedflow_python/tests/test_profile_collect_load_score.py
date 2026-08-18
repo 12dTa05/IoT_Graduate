@@ -631,6 +631,18 @@ def test_profile_collect_cadence_guard_in_source():
     )
 
 
+def test_profile_collect_passes_feature_stats_in_source():
+    """
+    Verify profile_collect.py passes feature_stats into _compute_load_score.
+    """
+    _src = (_EDGE / "tools" / "profile_collect.py").read_text()
+    assert 'feature_stats=active_feat_stats' in _src, (
+        "profile_collect.py must pass active feature_stats into _compute_load_score"
+    )
+    assert '"expected_fps"' in _src, "profile_collect.py must record expected_fps"
+    assert '"n_cameras_total"' in _src, "profile_collect.py must record n_cameras_total"
+
+
 # ---------------------------------------------------------------------------
 # source_starved_cameras exclusion tests
 # ---------------------------------------------------------------------------
@@ -1407,6 +1419,7 @@ if __name__ == "__main__":
         test_health_interval_is_one_in_stub,
         test_telemetry_interval_is_one_in_stub,
         test_profile_collect_cadence_guard_in_source,
+        test_profile_collect_passes_feature_stats_in_source,
         # source-starvation detection
         test_starvation_both_input_and_output_below_threshold,
         test_starvation_zero_input_zero_output,

@@ -789,6 +789,7 @@ class SpeedProbe:
                         # FPS diagnostics under _telemetry:
                         #   raw_callback_fps_per_camera — OSD callback rate
                         #     this window (legacy arrival-rate semantics),
+                        #   configured_fps_per_camera — configured camera FPS map
                         #   fps_burst_per_camera — camera_id: (callback FPS −
                         #     configured FPS) for windows where delivery exceeded
                         #     the configured rate,
@@ -796,6 +797,7 @@ class SpeedProbe:
                         #     indicating upper bound clamped published FPS
                         #     (absent when no clamping occurred).
                         "raw_callback_fps_per_camera": raw_cb_fps,
+                        "configured_fps_per_camera":   cfg_snapshot,
                         "fps_burst_per_camera":        burst_cams,
                         "fps_bound_by_per_camera":     fps_bound_by,
                     },

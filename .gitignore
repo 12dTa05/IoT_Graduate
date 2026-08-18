@@ -19,4 +19,4 @@ Camera/videos/sim_cameras.yml
 .slim/deepwork/
 
 DoAn
-data/*
+data*
