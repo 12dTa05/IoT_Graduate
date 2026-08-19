@@ -3,7 +3,7 @@ Unit tests for the weighted multi-signal composite load_score formula.
 
 Formula:
   load_score = min(100, w_fps * fps_comp + w_work * workload_comp + w_therm * thermal_comp + w_recv * recv_comp + w_trend * trend_comp)
-  Weights default: 50/25/10/5/10 (sum = 100).
+  Weights default: 50/20/5/17.5/17.5 (sum = 100).
   Ladder defaults: L3 = 42.0, L2 = 50.0, L1 = 60.0.
 """
 
@@ -93,20 +93,20 @@ def test_pure_fps_component():
 def test_workload_component_early_warning():
     """
     Early warning property: High traffic (30 tracks + 30 plates = 60 total)
-    at 25 FPS (healthy) raises score from 11.4 to 26.4 (11.4 + 15.0).
+    at 25 FPS (healthy) raises score from 11.4 to 31.4 (11.4 + 20.0).
     """
     feat = {"cam1": {"n_track": 30, "n_plate": 30}}
     s_healthy_busy, _ = _compute_load_score(
         _metrics(), _fps(cam1=25.0), feature_stats=feat,
     )
     # fps_score = 50 * (0.57 * 2/5) = 11.4
-    # workload_comp = 60 / 60 = 1.0 -> 15.0
-    # total = 26.4
-    assert abs(s_healthy_busy - 26.4) < 0.1
+    # workload_comp = 60 / 60 = 1.0 -> 20.0
+    # total = 31.4
+    assert abs(s_healthy_busy - 31.4) < 0.1
 
 
 def test_thermal_component_contribution():
-    """Thermal ramp from 70C to 85C adds up to 10.0."""
+    """Thermal ramp from 70C to 85C adds up to 5.0."""
     s_onset, _ = _compute_load_score(
         _metrics(gpu_temp_c=70.0), _fps(cam1=27.0),
     )
@@ -115,34 +115,34 @@ def test_thermal_component_contribution():
     s_mid, _ = _compute_load_score(
         _metrics(gpu_temp_c=77.5), _fps(cam1=27.0),
     )
-    assert abs(s_mid - 5.0) < 0.05
+    assert abs(s_mid - 2.5) < 0.05
 
     s_crit, _ = _compute_load_score(
         _metrics(gpu_temp_c=85.0), _fps(cam1=27.0),
     )
-    assert abs(s_crit - 10.0) < 0.05
+    assert abs(s_crit - 5.0) < 0.05
 
 
 def test_recv_crops_component():
-    """Incoming offloaded crops (10 crops/s with capacity 10) add 10.0."""
+    """Incoming offloaded crops (10 crops/s with capacity 10) add 17.5."""
     s_recv, _ = _compute_load_score(
         _metrics(offload_crops_received_per_s=10.0), _fps(cam1=27.0),
     )
-    assert abs(s_recv - 10.0) < 0.05
+    assert abs(s_recv - 17.5) < 0.05
 
 
 def test_fps_trend_decline_component():
-    """Falling FPS slope over window contributes trend score."""
+    """Falling FPS slope over window contributes trend score (up to 17.5)."""
     _FPS_HISTORY.clear()
     t0 = time.monotonic()
     _FPS_HISTORY.append((t0 - 3.0, 27.0))
-    # FPS drops from 27 to 21 in 3s (rate = 2.0 FPS/s -> max_decline = 2.0 -> trend_comp = 1.0 -> 15.0)
+    # FPS drops from 27 to 21 in 3s (rate = 2.0 FPS/s -> max_decline = 2.0 -> trend_comp = 1.0 -> 17.5)
     s_falling, _ = _compute_load_score(
         _metrics(), _fps(cam1=21.0),
     )
     # fps 21: fps_comp = 0.57 + 0.08 * (1/3) = 0.5967 -> 50 * 0.5967 = 29.83
-    # trend = 15.0 -> composite ≈ 44.83
-    assert s_falling > 40.0
+    # trend = 17.5 -> composite ≈ 47.33
+    assert s_falling > 45.0
 
 
 def test_breakdown_full_dictionary():
@@ -162,6 +162,6 @@ def test_breakdown_full_dictionary():
     assert "load_score" in br
 
     assert abs(br["fps_score"] - 28.5) < 0.05
-    assert abs(br["workload_bonus"] - 7.5) < 0.05   # 30/60 * 15
-    assert abs(br["thermal_bonus"] - 5.0) < 0.05    # (77.5-70)/15 * 10
-    assert abs(br["recv_bonus"] - 5.0) < 0.05       # 5/10 * 10
+    assert abs(br["workload_bonus"] - 10.0) < 0.05  # 30/60 * 20.0
+    assert abs(br["thermal_bonus"] - 2.5) < 0.05    # (77.5-70)/15 * 5.0
+    assert abs(br["recv_bonus"] - 8.8) < 0.05       # 5/10 * 17.5 = 8.75 -> 8.8

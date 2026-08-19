@@ -583,10 +583,10 @@ def _compute_load_score(
     if not isinstance(w_cfg, dict):
         w_cfg = {}
     w_fps   = float(w_cfg.get("fps", 50.0))
-    w_work  = float(w_cfg.get("workload", 15.0))
-    w_therm = float(w_cfg.get("thermal", 10.0))
-    w_recv  = float(w_cfg.get("recv", 10.0))
-    w_trend = float(w_cfg.get("trend", 15.0))
+    w_work  = float(w_cfg.get("workload", 20.0))
+    w_therm = float(w_cfg.get("thermal", 5.0))
+    w_recv  = float(w_cfg.get("recv", 17.5))
+    w_trend = float(w_cfg.get("trend", 17.5))
 
     raw_composite = (
         w_fps * fps_comp +
@@ -726,10 +726,10 @@ def _compute_load_score_breakdown(
     if not isinstance(w_cfg, dict):
         w_cfg = {}
     w_fps   = float(w_cfg.get("fps", 50.0))
-    w_work  = float(w_cfg.get("workload", 15.0))
-    w_therm = float(w_cfg.get("thermal", 10.0))
-    w_recv  = float(w_cfg.get("recv", 10.0))
-    w_trend = float(w_cfg.get("trend", 15.0))
+    w_work  = float(w_cfg.get("workload", 20.0))
+    w_therm = float(w_cfg.get("thermal", 5.0))
+    w_recv  = float(w_cfg.get("recv", 17.5))
+    w_trend = float(w_cfg.get("trend", 17.5))
 
     fps_weighted   = w_fps * fps_comp
     work_weighted  = w_work * workload_comp

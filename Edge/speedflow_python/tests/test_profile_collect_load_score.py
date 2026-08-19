@@ -361,14 +361,14 @@ def test_breakdown_workload_bonus_in_composite():
     try:
         br = _compute_load_score_breakdown(
             _metrics(), _fps(camA=27.0),
-            feature_stats={"camA": {"n_track": 15, "n_plate": 5}},  # total 20 / 40 -> 0.5 * 15 = 7.5
+            feature_stats={"camA": {"n_track": 15, "n_plate": 5}},  # total 20 / 40 -> 0.5 * 20 = 10.0
         )
     finally:
         _ha._EDGE_CFG = {}
     assert br["fps_score"] == 0.0
-    assert abs(br["workload_bonus"] - 7.5) < 0.05
-    assert abs(br["composite_score"] - 7.5) < 0.05
-    assert abs(br["load_score"] - 7.5) < 0.05
+    assert abs(br["workload_bonus"] - 10.0) < 0.05
+    assert abs(br["composite_score"] - 10.0) < 0.05
+    assert abs(br["load_score"] - 10.0) < 0.05
 
 
 def test_breakdown_thermal_bonus_in_composite():
@@ -381,9 +381,9 @@ def test_breakdown_thermal_bonus_in_composite():
     finally:
         _ha._EDGE_CFG = {}
     assert br["fps_score"] == 0.0
-    assert abs(br["thermal_bonus"] - 10.0) < 0.05
-    assert abs(br["composite_score"] - 10.0) < 0.05
-    assert abs(br["load_score"] - 10.0) < 0.05
+    assert abs(br["thermal_bonus"] - 5.0) < 0.05
+    assert abs(br["composite_score"] - 5.0) < 0.05
+    assert abs(br["load_score"] - 5.0) < 0.05
 
 
 def test_breakdown_composite_capped_at_100():
@@ -1135,7 +1135,7 @@ def test_bonus_workload_normal_ramp():
     """Workload component linear: half capacity → half weight."""
     _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0})
     try:
-        # fps 0 (TARGET) → fps_score 0.0; workload 20/40 -> 0.5 * 15 = 7.5
+        # fps 0 (TARGET) → fps_score 0.0; workload 20/40 -> 0.5 * 20 = 10.0
         score, preset = _compute_load_score(
             _metrics(), _fps(camA=27.0),
             feature_stats={"camA": {"n_track": 15, "n_plate": 5}},
@@ -1143,7 +1143,7 @@ def test_bonus_workload_normal_ramp():
     finally:
         _ha._EDGE_CFG = {}
     assert preset == "fps_dominant"
-    assert abs(score - 7.5) < 0.05
+    assert abs(score - 10.0) < 0.05
 
 
 def test_bonus_workload_clamped_at_capacity():
@@ -1160,8 +1160,8 @@ def test_bonus_workload_clamped_at_capacity():
         )
     finally:
         _ha._EDGE_CFG = {}
-    assert abs(s_at - 15.0) < 0.05
-    assert abs(s_over - 15.0) < 0.05
+    assert abs(s_at - 20.0) < 0.05
+    assert abs(s_over - 20.0) < 0.05
 
 
 def test_bonus_workload_starved_camera_excluded():
@@ -1172,7 +1172,7 @@ def test_bonus_workload_starved_camera_excluded():
             _metrics(), _fps(camA=27.0, camB=27.0),
             source_starved_cameras={"camB"},
             feature_stats={
-                "camA": {"n_track": 10, "n_plate": 2},   # 12 / 40 -> 0.3 * 15 = 4.5
+                "camA": {"n_track": 10, "n_plate": 2},   # 12 / 40 -> 0.3 * 20 = 6.0
                 "camB": {"n_track": 30, "n_plate": 18},  # 48 starved → excluded
             },
         )
@@ -1185,7 +1185,7 @@ def test_bonus_workload_starved_camera_excluded():
         )
     finally:
         _ha._EDGE_CFG = {}
-    assert abs(s_excl - 4.5) < 0.05       # only camA's 12
+    assert abs(s_excl - 6.0) < 0.05       # only camA's 12
     assert s_excl < s_none                 # starved exclusion reduced bonus
 
 
@@ -1243,7 +1243,7 @@ def test_bonus_thermal_normal_ramp():
     cfg = {"enabled": True, "onset_c": 70.0, "critical_c": 85.0}
     _ha._EDGE_CFG = _ha_cfg(thermal=cfg)
     try:
-        # temp = critical → full component (w_therm=10)
+        # temp = critical → full component (w_therm=5.0)
         s_full, _ = _compute_load_score(
             _metrics(gpu_temp_c=85.0), _fps(camA=27.0),
         )
@@ -1255,16 +1255,16 @@ def test_bonus_thermal_normal_ramp():
         s_onset, _ = _compute_load_score(
             _metrics(gpu_temp_c=70.0), _fps(camA=27.0),
         )
-        # temp = midpoint 77.5 → 10 * 7.5/15 = 5.0
+        # temp = midpoint 77.5 → 5.0 * 7.5/15 = 2.5
         s_mid, _ = _compute_load_score(
             _metrics(gpu_temp_c=77.5), _fps(camA=27.0),
         )
     finally:
         _ha._EDGE_CFG = {}
-    assert abs(s_full - 10.0) < 0.05
+    assert abs(s_full - 5.0) < 0.05
     assert abs(s_zero - 0.0) < 0.05
     assert abs(s_onset - 0.0) < 0.05
-    assert abs(s_mid - 5.0) < 0.05
+    assert abs(s_mid - 2.5) < 0.05
 
 
 def test_bonus_thermal_malformed_no_bonus():
