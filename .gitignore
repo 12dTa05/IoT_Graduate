@@ -2,6 +2,7 @@
 .cortexkit
 
 Edge/logs
+Edge/tests
 Edge/__pycache__
 Edge/speedflow_python/__pycache__
 Edge/speedflow_python/tests/__pycache__
