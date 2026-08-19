@@ -8,8 +8,8 @@
 # ============================================================
 
 p2p:
-  overload_threshold: 55.0      # load_score at or above this triggers RFO; L3 anchor
-                                   # under weighted composite load_score (L3=42)
+  overload_threshold: 60.0      # load_score at or above this triggers RFO; L3 anchor
+                                   # under Base + Bonus load_score (L3=60)
   overload_duration_s: 7.0     # must be overloaded this long before RFO
                                    # slightly exceeds one traffic-light cycle (6s)
                                    # to filter transient GPU bursts with healthy FPS
@@ -23,7 +23,7 @@ p2p:
   vote_window_s: 2.0            # proposal collection duration
   failover_jitter_max_s: 5.0    # random delay before failover ADD (race prevention)
   reclaim_margin: 7.0          # reclaim only when load < (overload_threshold - reclaim_margin)
-                                # 42 - 7 = 35; enables reclaim once score drops below 35
+                                # 60 - 7 = 53; enables reclaim once score drops below 53
   reclaim_stable_s: 15.0       # load must stay below reclaim threshold this long before
                                 # reclaiming — one full signal cycle to confirm genuine
                                 # capacity recovery rather than a momentary green phase
@@ -93,59 +93,60 @@ p2p:
   lpd_engine_path: "models/lpd.engine"
 
 # ---------------------------------------------------------------------------
-# Load score — Weighted Multi-Signal Composite + Hardware Emergency Floor
+# Load score — Base + Additive Bonus + Hardware Emergency Floor
 #
 # Form:
 #   load_score = clamp(0, 100,
-#       w_fps    * fps_comp
-#     + w_work   * workload_comp
-#     + w_therm  * thermal_comp
-#     + w_recv   * recv_comp
-#     + w_trend  * trend_comp
+#       fps_score
+#     + workload_bonus
+#     + thermal_bonus
+#     + recv_bonus
+#     + trend_bonus
+#     + proactive_bonus   # when proactive.enabled: true
 #   )
 #
 # Components:
-#   fps_comp:       piecewise linear (27->0, 22->0.57, 19->0.65, 17->0.75, 0->1.0)
-#   workload_comp:  min(1.0, (n_track + n_plate) / capacity)
-#   thermal_comp:   linear ramp onset_c -> critical_c, clamped [0, 1]
-#   recv_comp:      min(1.0, offload_crops_received_per_s / recv_capacity)
-#   trend_comp:     FPS slope/trend decline clamped [0, 1]
+#   fps_score:      piecewise linear on 0-100 scale:
+#                   27->0, 22->57, 19->65, 17->75, 0->100
+#   workload_bonus: min(max_bonus (15), max_bonus * (n_track + n_plate) / capacity (40))
+#   thermal_bonus:  min(max_bonus (5), max_bonus * ramp(onset_c=70, critical_c=85))
+#   recv_bonus:     min(max_bonus (5), max_bonus * (offload_crops_received_per_s / capacity (10)))
+#   trend_bonus:    min(max_bonus (5), max_bonus * (FPS decline slope / max_decline (2.0)))
 #
 # Hardware emergency floor:
 #   If ANY of {CPU, RAM} >= hw_fuse_threshold (90) AND fps_clamped < TARGET_FPS - 2:
-#       score = max(composite, hw_fuse_score_floor) (60.0 = L1 threshold)
+#       score = max(composite, hw_fuse_score_floor) (80.0 = L1 threshold)
 #
 # Returns preset = "composite" every cycle — stable preset string.
 # ---------------------------------------------------------------------------
 load_score:
   hw_fuse_threshold: 90.0
-  hw_fuse_score_floor: 60.0
-
-  weights:
-    fps: 50.0
-    workload: 20.0
-    thermal: 5.0
-    recv: 17.5
-    trend: 17.5
+  hw_fuse_score_floor: 80.0
 
   workload:
     enabled: true
-    capacity: 60.0
+    capacity: 40.0
+    max_bonus: 15.0
 
   thermal:
     enabled: true
     onset_c: 70.0
     critical_c: 85.0
+    max_bonus: 5.0
 
   recv:
     enabled: true
     capacity: 10.0
+    max_bonus: 5.0
 
   trend:
     enabled: true
     window_s: 3.0
     max_decline_fps_per_s: 2.0
     max_bonus: 5.0
+
+  proactive_bonus:
+    max_bonus: 10.0
 
 # ---------------------------------------------------------------------------
 # Proactive load model — Vehicle-Driven Proactive Load Profiling

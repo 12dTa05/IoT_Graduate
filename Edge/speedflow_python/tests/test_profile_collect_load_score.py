@@ -128,7 +128,7 @@ def _feature_stats(**cams) -> dict:
 
 
 def _ha_cfg(workload=None, thermal=None, hw_fuse_threshold=90.0,
-            hw_fuse_score_floor=60.0, weights=None, recv=None, trend=None):
+            hw_fuse_score_floor=80.0, recv=None, trend=None):
     """Build edge_node.yml 'load_score' subsection for stubbing."""
     cfg = {
         "hw_fuse_threshold": hw_fuse_threshold,
@@ -138,8 +138,6 @@ def _ha_cfg(workload=None, thermal=None, hw_fuse_threshold=90.0,
         cfg["workload"] = workload
     if thermal is not None:
         cfg["thermal"] = thermal
-    if weights is not None:
-        cfg["weights"] = weights
     if recv is not None:
         cfg["recv"] = recv
     if trend is not None:
@@ -186,44 +184,44 @@ def test_fps_score_is_dominant_no_hardware_bonus():
         _metrics(gpu=95, cpu=30, ram=30),
         _fps(cam_01=25.0),
     )
-    # w_fps=50: 50 * (0.57 * 2 / 5) = 11.4
-    assert abs(score_b - 11.4) < 0.5
+    # Piecewise 0-100: 57.0 * 2 / 5 = 22.8
+    assert abs(score_b - 22.8) < 0.5
 
 
 def test_hardware_floor_cpu_saturated_fps22():
-    """CPU >= threshold + degraded fps=22 (< 25) → floor 60."""
+    """CPU >= threshold + degraded fps=22 (< 25) → floor 80."""
     score, _ = _compute_load_score(
         _metrics(gpu=30, cpu=92, ram=30),
         _fps(cam_01=22.0),
     )
-    assert abs(score - 60.0) < 0.5
+    assert abs(score - 80.0) < 0.5
 
 
 def test_hardware_floor_ram_saturated_fps22():
-    """RAM >= threshold + degraded fps=22 → floor 60."""
+    """RAM >= threshold + degraded fps=22 → floor 80."""
     score, _ = _compute_load_score(
         _metrics(gpu=30, cpu=30, ram=92),
         _fps(cam_01=22.0),
     )
-    assert abs(score - 60.0) < 0.5
+    assert abs(score - 80.0) < 0.5
 
 
 def test_gpu_saturated_never_triggers_floor():
-    """GPU=95 + degraded fps=22 → pure FPS score (w_fps=50 -> 28.5), NO floor."""
+    """GPU=95 + degraded fps=22 → pure FPS score (57.0), NO floor."""
     score, _ = _compute_load_score(
         _metrics(gpu=95, cpu=30, ram=30),
         _fps(cam_01=22.0),
     )
-    assert abs(score - 28.5) < 0.5
+    assert abs(score - 57.0) < 0.5
 
 
 def test_no_hardware_emergency_normal_fps():
-    """No hardware saturation → pure FPS weighted score."""
+    """No hardware saturation → pure FPS score."""
     score, _ = _compute_load_score(
         _metrics(gpu=60, cpu=40, ram=50),
         _fps(cam_01=25.0),
     )
-    expected = 50.0 * 0.57 * (27.0 - 25.0) / (27.0 - 22.0)
+    expected = 57.0 * (27.0 - 25.0) / (27.0 - 22.0)
     assert abs(score - expected) < 0.5
 
 
@@ -246,20 +244,17 @@ def test_anchor_27_fps_zero():
 
 def test_anchor_22_fps():
     score, _ = _compute_load_score(_metrics(gpu=30, cpu=20, ram=10), _fps(cam_01=22.0))
-    # w_fps = 50.0 -> 50.0 * 0.57 = 28.5
-    assert abs(score - 28.5) < 0.05
+    assert abs(score - 57.0) < 0.05
 
 
 def test_anchor_19_fps():
     score, _ = _compute_load_score(_metrics(gpu=30, cpu=20, ram=10), _fps(cam_01=19.0))
-    # w_fps = 50.0 -> 50.0 * 0.65 = 32.5
-    assert abs(score - 32.5) < 0.05
+    assert abs(score - 65.0) < 0.05
 
 
 def test_anchor_17_fps():
     score, _ = _compute_load_score(_metrics(gpu=30, cpu=20, ram=10), _fps(cam_01=17.0))
-    # w_fps = 50.0 -> 50.0 * 0.75 = 37.5
-    assert abs(score - 37.5) < 0.05
+    assert abs(score - 75.0) < 0.05
 
 
 def test_anchor_zero_fps():
@@ -276,7 +271,7 @@ def test_anchor_exact_upper_bound():
 
 def test_interpolation_mid():
     score, _ = _compute_load_score(_metrics(gpu=30, cpu=20, ram=10), _fps(cam_01=24.5))
-    expected = 50.0 * 0.57 * (27.0 - 24.5) / (27.0 - 22.0)
+    expected = 57.0 * (27.0 - 24.5) / (27.0 - 22.0)
     assert abs(score - expected) < 0.5
 
 
@@ -293,7 +288,7 @@ def test_gpu_saturated_healthy_25_fps_no_floor():
         _metrics(gpu=95, cpu=50, ram=50),
         _fps(cam_01=25.0),
     )
-    assert abs(score - 11.4) < 0.5
+    assert abs(score - 22.8) < 0.5
 
 
 def test_degraded_fps_no_cpu_ram_saturation_no_floor():
@@ -301,7 +296,7 @@ def test_degraded_fps_no_cpu_ram_saturation_no_floor():
         _metrics(gpu=95, cpu=50, ram=50),
         _fps(cam_01=17.0),
     )
-    assert abs(score - 37.5) < 0.5
+    assert abs(score - 75.0) < 0.5
 
 
 def test_degraded_fps_cpu_ram_both_saturated_floor():
@@ -309,7 +304,7 @@ def test_degraded_fps_cpu_ram_both_saturated_floor():
         _metrics(gpu=30, cpu=91, ram=93),
         _fps(cam_01=17.0),
     )
-    assert score >= 60.0
+    assert score >= 80.0
 
 
 # ---------------------------------------------------------------------------
@@ -323,21 +318,21 @@ def test_breakdown_normal_fps_no_bonuses():
         "fps_score", "workload_bonus", "thermal_bonus",
         "recv_bonus", "trend_bonus", "composite_score", "load_score"
     }
-    assert abs(br["fps_score"] - 28.5) < 0.05
+    assert abs(br["fps_score"] - 57.0) < 0.05
     assert br["workload_bonus"] == 0.0
     assert br["thermal_bonus"] == 0.0
     assert br["recv_bonus"] == 0.0
     assert br["trend_bonus"] == 0.0
-    assert abs(br["composite_score"] - 28.5) < 0.05
-    assert abs(br["load_score"] - 28.5) < 0.05  # no fuse
+    assert abs(br["composite_score"] - 57.0) < 0.05
+    assert abs(br["load_score"] - 57.0) < 0.05  # no fuse
 
 
 def test_breakdown_composite_vs_load_score_distinction():
     """composite_score (post cap) vs load_score (post fuse) must be distinct when fuse triggers."""
-    # fps 22 -> fps_score 28.5; cpu 92 -> hw_saturated; fps_clamped=22 < 25 -> fuse
+    # fps 22 -> fps_score 57.0; cpu 92 -> hw_saturated; fps_clamped=22 < 25 -> fuse
     br = _compute_load_score_breakdown(_metrics(cpu=92.0), _fps(camA=22.0))
-    assert abs(br["composite_score"] - 28.5) < 0.05
-    assert br["load_score"] == 60.0  # floor applied
+    assert abs(br["composite_score"] - 57.0) < 0.05
+    assert br["load_score"] == 80.0  # floor applied
     assert br["load_score"] > br["composite_score"]
 
 
@@ -351,8 +346,8 @@ def test_breakdown_no_fuse_when_fps_healthy():
 def test_breakdown_no_fuse_gpu_saturated():
     """GPU saturation alone never triggers the fuse."""
     br = _compute_load_score_breakdown(_metrics(gpu=95), _fps(camA=22.0))
-    assert abs(br["composite_score"] - 28.5) < 0.05
-    assert abs(br["load_score"] - 28.5) < 0.05  # no fuse
+    assert abs(br["composite_score"] - 57.0) < 0.05
+    assert abs(br["load_score"] - 57.0) < 0.05  # no fuse
 
 
 def test_breakdown_workload_bonus_in_composite():
@@ -361,14 +356,14 @@ def test_breakdown_workload_bonus_in_composite():
     try:
         br = _compute_load_score_breakdown(
             _metrics(), _fps(camA=27.0),
-            feature_stats={"camA": {"n_track": 15, "n_plate": 5}},  # total 20 / 40 -> 0.5 * 20 = 10.0
+            feature_stats={"camA": {"n_track": 15, "n_plate": 5}},  # total 20 / 40 -> 0.5 * 15 = 7.5
         )
     finally:
         _ha._EDGE_CFG = {}
     assert br["fps_score"] == 0.0
-    assert abs(br["workload_bonus"] - 10.0) < 0.05
-    assert abs(br["composite_score"] - 10.0) < 0.05
-    assert abs(br["load_score"] - 10.0) < 0.05
+    assert abs(br["workload_bonus"] - 7.5) < 0.05
+    assert abs(br["composite_score"] - 7.5) < 0.05
+    assert abs(br["load_score"] - 7.5) < 0.05
 
 
 def test_breakdown_thermal_bonus_in_composite():
@@ -1117,7 +1112,7 @@ def test_starvation_valid_behavior_preserved():
 # ---------------------------------------------------------------------------
 
 def test_bonus_legacy_no_config_section():
-    """No workload/thermal sections → bonus 0; pure FPS weighted score."""
+    """No workload/thermal sections → bonus 0; pure FPS score."""
     _ha._EDGE_CFG = {}
     try:
         s_legacy, _ = _compute_load_score(_metrics(), _fps(camA=22.0))
@@ -1128,14 +1123,14 @@ def test_bonus_legacy_no_config_section():
     finally:
         _ha._EDGE_CFG = {}
     assert s_legacy == s_feat
-    assert abs(s_feat - 28.5) < 0.5
+    assert abs(s_feat - 57.0) < 0.5
 
 
 def test_bonus_workload_normal_ramp():
-    """Workload component linear: half capacity → half weight."""
-    _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0})
+    """Workload component linear: half capacity → half max bonus."""
+    _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0, "max_bonus": 15.0})
     try:
-        # fps 0 (TARGET) → fps_score 0.0; workload 20/40 -> 0.5 * 20 = 10.0
+        # fps 0 (TARGET) → fps_score 0.0; workload 20/40 -> 0.5 * 15 = 7.5
         score, preset = _compute_load_score(
             _metrics(), _fps(camA=27.0),
             feature_stats={"camA": {"n_track": 15, "n_plate": 5}},
@@ -1143,12 +1138,12 @@ def test_bonus_workload_normal_ramp():
     finally:
         _ha._EDGE_CFG = {}
     assert preset == "fps_dominant"
-    assert abs(score - 10.0) < 0.05
+    assert abs(score - 7.5) < 0.05
 
 
 def test_bonus_workload_clamped_at_capacity():
-    """Above capacity → workload component clamped at 1.0 (w_work=15)."""
-    _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0})
+    """Above capacity → workload bonus clamped at max_bonus=15.0."""
+    _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0, "max_bonus": 15.0})
     try:
         s_at, _ = _compute_load_score(
             _metrics(), _fps(camA=27.0),
@@ -1160,19 +1155,19 @@ def test_bonus_workload_clamped_at_capacity():
         )
     finally:
         _ha._EDGE_CFG = {}
-    assert abs(s_at - 20.0) < 0.05
-    assert abs(s_over - 20.0) < 0.05
+    assert abs(s_at - 15.0) < 0.05
+    assert abs(s_over - 15.0) < 0.05
 
 
 def test_bonus_workload_starved_camera_excluded():
     """Starved cameras contribute zero workload."""
-    _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0})
+    _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0, "max_bonus": 15.0})
     try:
         s_excl, _ = _compute_load_score(
             _metrics(), _fps(camA=27.0, camB=27.0),
             source_starved_cameras={"camB"},
             feature_stats={
-                "camA": {"n_track": 10, "n_plate": 2},   # 12 / 40 -> 0.3 * 20 = 6.0
+                "camA": {"n_track": 10, "n_plate": 2},   # 12 / 40 -> 0.3 * 15 = 4.5
                 "camB": {"n_track": 30, "n_plate": 18},  # 48 starved → excluded
             },
         )
@@ -1185,7 +1180,7 @@ def test_bonus_workload_starved_camera_excluded():
         )
     finally:
         _ha._EDGE_CFG = {}
-    assert abs(s_excl - 6.0) < 0.05       # only camA's 12
+    assert abs(s_excl - 4.5) < 0.05       # only camA's 12
     assert s_excl < s_none                 # starved exclusion reduced bonus
 
 
@@ -1310,15 +1305,15 @@ def test_bonus_cpu_fuse_still_applies():
         workload={"enabled": True, "capacity": 40.0},
     )
     try:
-        # fps 22 → fps_comp 0.57 -> 28.5; workload 20 (half cap) → 12.5
-        # composite = 41.0; cpu >= 90 + fps<25 → fuse → max(41, 60) = 60
+        # fps 22 → fps_score 57.0; workload 20 (half cap) → 7.5
+        # composite = 64.5; cpu >= 90 + fps<25 → fuse → max(64.5, 80) = 80
         score, _ = _compute_load_score(
             _metrics(cpu=92.0), _fps(camA=22.0),
             feature_stats={"camA": {"n_track": 15, "n_plate": 5}},
         )
     finally:
         _ha._EDGE_CFG = {}
-    assert abs(score - 60.0) < 0.05
+    assert abs(score - 80.0) < 0.05
 
 
 def test_bonus_ram_fuse_still_applies():
@@ -1328,15 +1323,15 @@ def test_bonus_ram_fuse_still_applies():
         thermal={"enabled": True, "onset_c": 70.0, "critical_c": 85.0},
     )
     try:
-        # fps 19 → fps_comp 0.65 -> 32.5; workload 8/40 -> 5.0; thermal @75 -> 10*(5/15)≈3.333
-        # composite ≈ 40.833; ram fuse → floor 60
+        # fps 19 → fps_score 65.0; workload 8/40 -> 3.0; thermal @75 -> 5.0*(5/15)≈1.667
+        # composite ≈ 69.667; ram fuse → floor 80
         score, _ = _compute_load_score(
             _metrics(ram=92.0, gpu_temp_c=75.0), _fps(camA=19.0),
             feature_stats={"camA": {"n_track": 3, "n_plate": 5}},
         )
     finally:
         _ha._EDGE_CFG = {}
-    assert abs(score - 60.0) < 0.05
+    assert abs(score - 80.0) < 0.05
 
 
 # ---------------------------------------------------------------------------

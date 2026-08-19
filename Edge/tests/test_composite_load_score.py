@@ -1,13 +1,13 @@
 """
-Unit tests for the weighted multi-signal composite load_score formula.
+Unit tests for the Base + Additive Bonus load_score formula.
 
 Formula:
-  load_score = min(100, w_fps * fps_comp + w_work * workload_comp + w_therm * thermal_comp + w_recv * recv_comp + w_trend * trend_comp)
-  Weights default: 50/20/5/17.5/17.5 (sum = 100).
-  Ladder defaults: L3 = 42.0, L2 = 50.0, L1 = 60.0.
+  load_score = min(100, fps_score + workload_bonus + thermal_bonus + recv_bonus + trend_bonus)
+  Thresholds: L3 = 60.0, L2 = 67.0, L1 = 80.0.
 """
 
 from __future__ import annotations
+import importlib
 import sys
 import time
 import types
@@ -38,12 +38,18 @@ def _install_stubs():
         "HEALTH_INTERVAL": 1.0,
         "HEALTH_LOG_EVERY": 30,
         "TARGET_FPS": 27.0,
-        "FPS_STATS_FILE": "/tmp/fps_stats.json",
-        "MONITOR_URL": "",
-        "ADVERTISE_IP": "",
-        "LOAD_POLICY": "fps_dominant",
+        "CAMERAS_FILE": "cameras.yml",
+        "EDGE_NODE_FILE": "edge_node.yml",
+        "ZENOH_CONNECT": "",
+        "ZENOH_MODE": "peer",
+        "SOURCE_FPS_OVERRIDE": -1.0,
+        "LOAD_POLICY": "predict_with_base",
         "LOAD_MODEL": "",
         "TELEMETRY_INTERVAL": 1.0,
+        "FPS_STATS_FILE": "fps_stats.json",
+        "HARDWARE_METRICS_FILE": "hardware_metrics.json",
+        "MONITOR_URL": "",
+        "ADVERTISE_IP": "127.0.0.1",
     }.items():
         setattr(settings, key, value)
 
@@ -75,93 +81,105 @@ def _fps(**cams) -> dict:
     return cams
 
 
-def test_pure_fps_component():
-    """At TARGET_FPS (27), fps_score is 0; at 22 FPS, fps_score is 28.5 (50 * 0.57)."""
+def test_pure_fps_scaling():
+    """At TARGET_FPS (27), fps_score is 0; at 22 FPS it is 57.0; at 19 FPS it is 65.0; at 17 FPS it is 75.0."""
     s_27, _ = _compute_load_score(_metrics(), _fps(cam1=27.0))
     assert s_27 == 0.0
 
+    s_25, _ = _compute_load_score(_metrics(), _fps(cam1=25.0))
+    # 57.0 * (27 - 25) / 5 = 22.8
+    assert abs(s_25 - 22.8) < 0.1
+
     s_22, _ = _compute_load_score(_metrics(), _fps(cam1=22.0))
-    assert abs(s_22 - 28.5) < 0.05
+    assert abs(s_22 - 57.0) < 0.1
 
     s_19, _ = _compute_load_score(_metrics(), _fps(cam1=19.0))
-    assert abs(s_19 - 32.5) < 0.05
+    assert abs(s_19 - 65.0) < 0.1
 
     s_17, _ = _compute_load_score(_metrics(), _fps(cam1=17.0))
-    assert abs(s_17 - 37.5) < 0.05
+    assert abs(s_17 - 75.0) < 0.1
 
 
-def test_workload_component_early_warning():
-    """
-    Early warning property: High traffic (30 tracks + 30 plates = 60 total)
-    at 25 FPS (healthy) raises score from 11.4 to 31.4 (11.4 + 20.0).
-    """
-    feat = {"cam1": {"n_track": 30, "n_plate": 30}}
-    s_healthy_busy, _ = _compute_load_score(
-        _metrics(), _fps(cam1=25.0), feature_stats=feat,
-    )
-    # fps_score = 50 * (0.57 * 2/5) = 11.4
-    # workload_comp = 60 / 60 = 1.0 -> 20.0
-    # total = 31.4
-    assert abs(s_healthy_busy - 31.4) < 0.1
+def test_workload_bonus_capacity_40():
+    """Workload bonus adds up to 15.0 points with capacity 40.0."""
+    # 20 tracks on cam1 -> 20 / 40 * 15 = 7.5 points
+    feat = {"cam1": {"n_track": 15.0, "n_plate": 5.0, "stationary_fraction": 0.0}}
+    s_27, _ = _compute_load_score(_metrics(), _fps(cam1=27.0), feature_stats=feat)
+    assert abs(s_27 - 7.5) < 0.1
+
+    # 40 tracks on cam1 -> 15.0 points (max)
+    feat_max = {"cam1": {"n_track": 30.0, "n_plate": 10.0, "stationary_fraction": 0.0}}
+    s_max, _ = _compute_load_score(_metrics(), _fps(cam1=27.0), feature_stats=feat_max)
+    assert abs(s_max - 15.0) < 0.1
+
+    # Over 40 tracks -> clamped to 15.0
+    feat_over = {"cam1": {"n_track": 50.0, "n_plate": 20.0, "stationary_fraction": 0.0}}
+    s_over, _ = _compute_load_score(_metrics(), _fps(cam1=27.0), feature_stats=feat_over)
+    assert abs(s_over - 15.0) < 0.1
 
 
-def test_thermal_component_contribution():
-    """Thermal ramp from 70C to 85C adds up to 5.0."""
-    s_onset, _ = _compute_load_score(
-        _metrics(gpu_temp_c=70.0), _fps(cam1=27.0),
-    )
-    assert s_onset == 0.0
+def test_thermal_bonus_ramp():
+    """Thermal bonus ramps from 70C (0.0) to 85C (5.0 max)."""
+    s_65, _ = _compute_load_score(_metrics(gpu_temp_c=65.0), _fps(cam1=27.0))
+    assert s_65 == 0.0
 
-    s_mid, _ = _compute_load_score(
-        _metrics(gpu_temp_c=77.5), _fps(cam1=27.0),
-    )
-    assert abs(s_mid - 2.5) < 0.05
+    s_77_5, _ = _compute_load_score(_metrics(gpu_temp_c=77.5), _fps(cam1=27.0))
+    assert abs(s_77_5 - 2.5) < 0.1
 
-    s_crit, _ = _compute_load_score(
-        _metrics(gpu_temp_c=85.0), _fps(cam1=27.0),
-    )
-    assert abs(s_crit - 5.0) < 0.05
+    s_85, _ = _compute_load_score(_metrics(gpu_temp_c=85.0), _fps(cam1=27.0))
+    assert abs(s_85 - 5.0) < 0.1
+
+    s_90, _ = _compute_load_score(_metrics(gpu_temp_c=90.0), _fps(cam1=27.0))
+    assert abs(s_90 - 5.0) < 0.1
 
 
-def test_recv_crops_component():
-    """Incoming offloaded crops (10 crops/s with capacity 10) add 17.5."""
-    s_recv, _ = _compute_load_score(
-        _metrics(offload_crops_received_per_s=10.0), _fps(cam1=27.0),
-    )
-    assert abs(s_recv - 17.5) < 0.05
+def test_recv_crops_bonus():
+    """Received crops scale up to 5.0 points at capacity 10.0."""
+    s_5, _ = _compute_load_score(_metrics(offload_crops_received_per_s=5.0), _fps(cam1=27.0))
+    assert abs(s_5 - 2.5) < 0.1
+
+    s_10, _ = _compute_load_score(_metrics(offload_crops_received_per_s=10.0), _fps(cam1=27.0))
+    assert abs(s_10 - 5.0) < 0.1
 
 
-def test_fps_trend_decline_component():
-    """Falling FPS slope over window contributes trend score (up to 17.5)."""
+def test_fps_trend_bonus():
+    """Declining FPS adds up to 5.0 points for decline rate >= 2.0 FPS/s."""
     _FPS_HISTORY.clear()
-    t0 = time.monotonic()
-    _FPS_HISTORY.append((t0 - 3.0, 27.0))
-    # FPS drops from 27 to 21 in 3s (rate = 2.0 FPS/s -> max_decline = 2.0 -> trend_comp = 1.0 -> 17.5)
-    s_falling, _ = _compute_load_score(
-        _metrics(), _fps(cam1=21.0),
-    )
-    # fps 21: fps_comp = 0.57 + 0.08 * (1/3) = 0.5967 -> 50 * 0.5967 = 29.83
-    # trend = 17.5 -> composite ≈ 47.33
-    assert s_falling > 45.0
+    now = time.monotonic()
+    _FPS_HISTORY.append((now - 1.0, 27.0))
+
+    # Current fps = 25.0 -> slope = -2.0 FPS/s over 1s -> trend_bonus = 5.0
+    s_trend, _ = _compute_load_score(_metrics(), _fps(cam1=25.0))
+    # fps_score (22.8) + trend_bonus (5.0) = 27.8
+    assert abs(s_trend - 27.8) < 0.2
 
 
-def test_breakdown_full_dictionary():
-    """_compute_load_score_breakdown exposes all individual signals."""
-    feat = {"cam1": {"n_track": 15, "n_plate": 15}}
-    br = _compute_load_score_breakdown(
-        _metrics(gpu_temp_c=77.5, offload_crops_received_per_s=5.0),
-        _fps(cam1=22.0),
-        feature_stats=feat,
-    )
-    assert "fps_score" in br
-    assert "workload_bonus" in br
-    assert "thermal_bonus" in br
-    assert "recv_bonus" in br
-    assert "trend_bonus" in br
-    assert "composite_score" in br
-    assert "load_score" in br
+def test_early_warning_trigger():
+    """At 22 FPS (57.0) + moderate traffic (20 objects -> 7.5), score = 64.5 -> triggers L3 (60.0)."""
+    feat = {"cam1": {"n_track": 15.0, "n_plate": 5.0, "stationary_fraction": 0.0}}
+    score, _ = _compute_load_score(_metrics(), _fps(cam1=22.0), feature_stats=feat)
+    assert score >= 60.0  # L3 threshold passed
 
-    assert abs(br["fps_score"] - 28.5) < 0.05
-    assert abs(br["workload_bonus"] - 10.0) < 0.05  # 30/60 * 20.0
-    assert abs(br["thermal_bonus"] - 2.5) < 0.05    # (77.5-70)/15 * 5.0
-    assert abs(br["recv_bonus"] - 8.8) < 0.05       # 5/10 * 17.5 = 8.75 -> 8.8
+
+def test_breakdown_schema_and_values():
+    """Breakdown returns all 7 audit keys with accurate values."""
+    _FPS_HISTORY.clear()
+    feat = {"cam1": {"n_track": 20.0, "n_plate": 20.0, "stationary_fraction": 0.0}}
+    metrics = _metrics(gpu_temp_c=85.0, offload_crops_received_per_s=10.0)
+    bd = _compute_load_score_breakdown(metrics, _fps(cam1=22.0), feature_stats=feat)
+
+    assert "fps_score" in bd
+    assert "workload_bonus" in bd
+    assert "thermal_bonus" in bd
+    assert "recv_bonus" in bd
+    assert "trend_bonus" in bd
+    assert "composite_score" in bd
+    assert "load_score" in bd
+
+    assert bd["fps_score"] == 57.0
+    assert bd["workload_bonus"] == 15.0  # 40 / 40 * 15
+    assert bd["thermal_bonus"] == 5.0    # 85C -> max 5
+    assert bd["recv_bonus"] == 5.0       # 10 / 10 * 5
+    assert bd["trend_bonus"] == 0.0
+    assert bd["composite_score"] == 82.0
+    assert bd["load_score"] == 82.0

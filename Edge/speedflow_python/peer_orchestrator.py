@@ -1315,9 +1315,9 @@ class PeerOrchestrator:
         # for threshold comparisons so Level 1/2/3 boundaries are consistent
         # whether proactive mode is on or off.
         load = self._effective_load(state.load_score, state.risk_index)
-        thr3          = cfg.get("offload_level3_threshold", 65.0)
-        thr2          = cfg.get("offload_level2_threshold", 75.0)
-        thr1          = cfg.get("offload_level1_threshold", 85.0)
+        thr3          = cfg.get("offload_level3_threshold", 60.0)
+        thr2          = cfg.get("offload_level2_threshold", 67.0)
+        thr1          = cfg.get("offload_level1_threshold", 80.0)
         level_cd      = cfg.get("offload_level_cooldown_s", 20.0)
         global_offload = cfg.get("offload_level", 0)
         logger.debug("[PeerOrch] Overload check: load=%.1f, thr1=%.1f, thr2=%.1f, thr3=%.1f, "
