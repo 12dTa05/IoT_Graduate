@@ -361,14 +361,14 @@ def test_breakdown_workload_bonus_in_composite():
     try:
         br = _compute_load_score_breakdown(
             _metrics(), _fps(camA=27.0),
-            feature_stats={"camA": {"n_track": 15, "n_plate": 5}},  # total 20 / 40 -> 0.5 * 25 = 12.5
+            feature_stats={"camA": {"n_track": 15, "n_plate": 5}},  # total 20 / 40 -> 0.5 * 15 = 7.5
         )
     finally:
         _ha._EDGE_CFG = {}
     assert br["fps_score"] == 0.0
-    assert abs(br["workload_bonus"] - 12.5) < 0.05
-    assert abs(br["composite_score"] - 12.5) < 0.05
-    assert abs(br["load_score"] - 12.5) < 0.05
+    assert abs(br["workload_bonus"] - 7.5) < 0.05
+    assert abs(br["composite_score"] - 7.5) < 0.05
+    assert abs(br["load_score"] - 7.5) < 0.05
 
 
 def test_breakdown_thermal_bonus_in_composite():
@@ -1135,7 +1135,7 @@ def test_bonus_workload_normal_ramp():
     """Workload component linear: half capacity → half weight."""
     _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0})
     try:
-        # fps 0 (TARGET) → fps_score 0.0; workload 20/40 -> 0.5 * 25 = 12.5
+        # fps 0 (TARGET) → fps_score 0.0; workload 20/40 -> 0.5 * 15 = 7.5
         score, preset = _compute_load_score(
             _metrics(), _fps(camA=27.0),
             feature_stats={"camA": {"n_track": 15, "n_plate": 5}},
@@ -1143,11 +1143,11 @@ def test_bonus_workload_normal_ramp():
     finally:
         _ha._EDGE_CFG = {}
     assert preset == "fps_dominant"
-    assert abs(score - 12.5) < 0.05
+    assert abs(score - 7.5) < 0.05
 
 
 def test_bonus_workload_clamped_at_capacity():
-    """Above capacity → workload component clamped at 1.0 (w_work=25)."""
+    """Above capacity → workload component clamped at 1.0 (w_work=15)."""
     _ha._EDGE_CFG = _ha_cfg(workload={"enabled": True, "capacity": 40.0})
     try:
         s_at, _ = _compute_load_score(
@@ -1160,8 +1160,8 @@ def test_bonus_workload_clamped_at_capacity():
         )
     finally:
         _ha._EDGE_CFG = {}
-    assert abs(s_at - 25.0) < 0.05
-    assert abs(s_over - 25.0) < 0.05
+    assert abs(s_at - 15.0) < 0.05
+    assert abs(s_over - 15.0) < 0.05
 
 
 def test_bonus_workload_starved_camera_excluded():
@@ -1172,7 +1172,7 @@ def test_bonus_workload_starved_camera_excluded():
             _metrics(), _fps(camA=27.0, camB=27.0),
             source_starved_cameras={"camB"},
             feature_stats={
-                "camA": {"n_track": 10, "n_plate": 2},   # 12 / 40 -> 0.3 * 25 = 7.5
+                "camA": {"n_track": 10, "n_plate": 2},   # 12 / 40 -> 0.3 * 15 = 4.5
                 "camB": {"n_track": 30, "n_plate": 18},  # 48 starved → excluded
             },
         )
@@ -1185,7 +1185,7 @@ def test_bonus_workload_starved_camera_excluded():
         )
     finally:
         _ha._EDGE_CFG = {}
-    assert abs(s_excl - 7.5) < 0.05       # only camA's 12
+    assert abs(s_excl - 4.5) < 0.05       # only camA's 12
     assert s_excl < s_none                 # starved exclusion reduced bonus
 
 

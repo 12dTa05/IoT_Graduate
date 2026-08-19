@@ -123,10 +123,10 @@ load_score:
 
   weights:
     fps: 50.0
-    workload: 25.0
+    workload: 15.0
     thermal: 10.0
-    recv: 5.0
-    trend: 10.0
+    recv: 10.0
+    trend: 15.0
 
   workload:
     enabled: true
