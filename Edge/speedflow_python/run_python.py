@@ -385,6 +385,8 @@ def _health_push_loop(peer_orch=None) -> None:
         "fps_score": 100.0,
         "workload_bonus": 0.0,
         "thermal_bonus": 0.0,
+        "recv_bonus": 0.0,
+        "trend_bonus": 0.0,
         "composite_score": 100.0,
         "load_score": 100.0,
     }

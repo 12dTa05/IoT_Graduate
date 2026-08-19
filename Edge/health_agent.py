@@ -16,8 +16,9 @@ import math
 import sys
 import time
 import threading
+import collections
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Deque, Tuple
 
 import msgpack
 
@@ -462,6 +463,7 @@ try:
     _EDGE_CFG_MTIME = _EDGE_NODE_YML.stat().st_mtime
 except OSError:
     _EDGE_CFG_MTIME = 0.0
+_FPS_HISTORY: Deque[Tuple[float, float]] = collections.deque(maxlen=20)
 
 
 def _compute_load_score(
@@ -471,125 +473,138 @@ def _compute_load_score(
     feature_stats: Optional[dict] = None,
 ) -> tuple:
     """
-    FPS-dominant load score with piecewise-linear FPS anchors, a configurable
-    hardware emergency floor, and optional additive bonuses (workload + thermal).
+    Weighted multi-signal composite load score with hardware emergency floor.
 
-    FPS score (bounded piecewise-linear, input clamped to [0, TARGET_FPS=27]):
-        avg_fps >= 27  →   0
-        avg_fps  = 22  →  57
-        avg_fps  = 19  →  65
-        avg_fps  = 17  →  75
-        avg_fps <=  0  → 100
-        Linear interpolation between anchors.
+    Components (each in [0, 1]):
+        fps_comp:       piecewise linear (27->0, 22->0.57, 19->0.65, 17->0.75, 0->1.0)
+        workload_comp:  min(1.0, (n_track + n_plate) / capacity)
+        thermal_comp:   linear ramp onset_c -> critical_c, clamped [0, 1]
+        recv_comp:      min(1.0, offload_crops_received_per_s / capacity)
+        trend_comp:     FPS decline slope clamped [0, 1]
+
+    Composite:
+        min(100.0, w_fps*fps_comp + w_work*workload_comp + w_therm*thermal_comp
+                   + w_recv*recv_comp + w_trend*trend_comp)
 
     Hardware emergency floor:
-        (GPU utilization is burst-aliased — it must NOT participate in
-         the floor at any FPS.  FPS anchors are the GPU saturation signal.)
-        If CPU >= hw_fuse_threshold (default 90) OR RAM >= hw_fuse_threshold
+        If CPU >= hw_fuse_threshold (90) OR RAM >= hw_fuse_threshold
         AND fps_clamped < TARGET_FPS - 2.0:
-            score = max(composite, hw_fuse_score_floor)  (default floor 75.0)
-        Transient hardware saturation with healthy FPS does NOT trigger the floor.
-
-    Conservative composite bonuses (config-driven via edge_node.yml
-    load_score.workload / load_score.thermal):
-        workload_bonus: total n_track + n_plate across active, non-source-starved
-                        cameras, linear ramp 0–max_bonus up to capacity.
-        thermal_bonus:  linear ramp on metrics['gpu_temp_c'] from onset_c
-                        (0 bonus) to critical_c (max_bonus), clamped.
-        composite = min(100, fps_score + workload_bonus + thermal_bonus)
-        then the hardware emergency floor is applied as before.
-        Absent / malformed sections = legacy FPS-only behaviour (bonus 0).
-
-    source_starved_cameras:
-        Optional set of camera_ids confirmed as source-starved. These cameras
-        are excluded from the FPS average (treated like zero-FPS cameras).
-        When None or empty, behaviour is unchanged from the prior release.
-
-    feature_stats:
-        Optional dict {camera_id: {n_track, n_plate, ...}} from the same
-        telemetry snapshot.  Only required when workload bonus is enabled;
-        absent/None = workload bonus 0 (no crash).
-
-    Returns (score: float, "fps_dominant") — single stable preset string.
+            score = max(composite, hw_fuse_score_floor) (default floor 60.0 = L1)
     """
     _starved = source_starved_cameras or set()
 
     _maybe_reload_edge_cfg()
     ls_cfg = _EDGE_CFG.get("load_score", {})
+    if not isinstance(ls_cfg, dict):
+        ls_cfg = {}
     hw_fuse_threshold   = float(ls_cfg.get("hw_fuse_threshold",   90.0))
-    hw_fuse_score_floor = float(ls_cfg.get("hw_fuse_score_floor", 75.0))
+    hw_fuse_score_floor = float(ls_cfg.get("hw_fuse_score_floor", 60.0))
 
-    # ── FPS score (piecewise linear) ──────────────────────────
+    # ── FPS component (piecewise linear, normalized to [0, 1]) ──
     active_fps_vals = [
         v for k, v in fps_stats.items()
         if v > 0.0 and k not in _starved
-    ]
+    ] if isinstance(fps_stats, dict) else []
     if active_fps_vals:
         avg_fps = sum(active_fps_vals) / len(active_fps_vals)
     else:
-        # No active cameras: startup, missing payload, all cameras idle.
-        # Report explicitly unavailable (score 100 = worst) rather than
-        # healthy TARGET_FPS, so the dashboard shows "unavailable" not "0% load".
         return 100.0, "fps_dominant"
 
-    fps_clamped = max(0.0, min(TARGET_FPS, avg_fps))
+    fps_clamped = max(0.0, min(float(TARGET_FPS), avg_fps))
 
-    # Anchor points: (fps, score)
-    # ponytail: inline list is clearer than a dict-of-tuples loop;
-    #           add anchors only when the curve needs more resolution.
-    if fps_clamped >= TARGET_FPS:
-        fps_score = 0.0
+    if fps_clamped >= float(TARGET_FPS):
+        fps_comp = 0.0
     elif fps_clamped >= 22.0:
-        fps_score = 57.0 * (TARGET_FPS - fps_clamped) / (TARGET_FPS - 22.0)
+        fps_comp = 0.57 * (float(TARGET_FPS) - fps_clamped) / (float(TARGET_FPS) - 22.0)
     elif fps_clamped >= 19.0:
-        fps_score = 57.0 + (65.0 - 57.0) * (22.0 - fps_clamped) / (22.0 - 19.0)
+        fps_comp = 0.57 + (0.65 - 0.57) * (22.0 - fps_clamped) / (22.0 - 19.0)
     elif fps_clamped >= 17.0:
-        fps_score = 65.0 + (75.0 - 65.0) * (19.0 - fps_clamped) / (19.0 - 17.0)
+        fps_comp = 0.65 + (0.75 - 0.65) * (19.0 - fps_clamped) / (19.0 - 17.0)
     else:
-        fps_score = 75.0 + (100.0 - 75.0) * (17.0 - fps_clamped) / (17.0 - 0.0)
+        fps_comp = 0.75 + (1.00 - 0.75) * (17.0 - fps_clamped) / (17.0 - 0.0)
 
-    # ── Workload bonus (n_track + n_plate, active + non-starved only) ─
-    # Config-driven; absent/malformed section → 0 bonus (legacy).
-    workload_bonus = 0.0
+    # ── Workload component (n_track + n_plate / capacity) ───────
+    workload_comp = 0.0
     wl_cfg = ls_cfg.get("workload", {})
     if (isinstance(wl_cfg, dict) and wl_cfg.get("enabled") is True
             and isinstance(feature_stats, dict)):
         wl_total = sum(
             _derive_camera_workload(feature_stats, fps_stats, _starved).values()
         )
-        wl_cap  = _finite_positive(wl_cfg.get("capacity"))
-        wl_max  = _finite_positive(wl_cfg.get("max_bonus"))
-        if wl_cap is not None and wl_max is not None:
-            workload_bonus = min(wl_max, wl_max * wl_total / wl_cap)
+        wl_cap = _finite_positive(wl_cfg.get("capacity"))
+        if wl_cap is not None:
+            workload_comp = min(1.0, max(0.0, wl_total / wl_cap))
 
-    # ── Thermal bonus (gpu_temp_c linear ramp) ───────────────────
-    # Config-driven; absent/malformed section → 0 bonus.
-    thermal_bonus = 0.0
+    # ── Thermal component (gpu_temp_c ramp [onset, critical]) ───
+    thermal_comp = 0.0
     th_cfg = ls_cfg.get("thermal", {})
-    if isinstance(th_cfg, dict) and th_cfg.get("enabled") is True:
-        temp_val  = _finite_nonneg(metrics.get("gpu_temp_c"))
-        onset     = _finite_nonneg(th_cfg.get("onset_c"))
-        critical  = _finite_nonneg(th_cfg.get("critical_c"))
-        th_max    = _finite_positive(th_cfg.get("max_bonus"))
+    if isinstance(th_cfg, dict) and th_cfg.get("enabled") is True and isinstance(metrics, dict):
+        temp_val = _finite_nonneg(metrics.get("gpu_temp_c"))
+        onset    = _finite_nonneg(th_cfg.get("onset_c"))
+        critical = _finite_nonneg(th_cfg.get("critical_c"))
         if (temp_val is not None and onset is not None
-                and critical is not None and th_max is not None
-                and onset < critical):
+                and critical is not None and onset < critical):
             if temp_val >= critical:
-                thermal_bonus = th_max
+                thermal_comp = 1.0
             elif temp_val > onset:
-                thermal_bonus = th_max * (temp_val - onset) / (critical - onset)
+                thermal_comp = (temp_val - onset) / (critical - onset)
 
-    # ── Composite + hardware emergency floor ────────────────────
-    composite = min(100.0, fps_score + workload_bonus + thermal_bonus)
+    # ── Received crops component (offload_crops_received_per_s) ─
+    recv_comp = 0.0
+    recv_cfg = ls_cfg.get("recv", {})
+    if isinstance(recv_cfg, dict) and recv_cfg.get("enabled") is True and isinstance(metrics, dict):
+        recv_val = _finite_nonneg(metrics.get("offload_crops_received_per_s"))
+        recv_cap = _finite_positive(recv_cfg.get("capacity")) or 10.0
+        if recv_val is not None:
+            recv_comp = min(1.0, max(0.0, recv_val / recv_cap))
 
-    # ponytail: hardware saturation alone is not an emergency; the floor
-    #           only fires when FPS is actually degraded (TARGET_FPS - 2 margin).
-    #           Healthy FPS with transient GPU spikes stays pure FPS score.
-    hw_saturated = (
-        metrics.get("cpu_percent", 0.0) >= hw_fuse_threshold or
-        metrics.get("ram_percent", 0.0) >= hw_fuse_threshold
+    # ── FPS trend component (decline rate) ──────────────────────
+    trend_comp = 0.0
+    trend_cfg = ls_cfg.get("trend", {})
+    now = time.monotonic()
+    if isinstance(trend_cfg, dict) and trend_cfg.get("enabled") is True:
+        max_decline = _finite_positive(trend_cfg.get("max_decline_fps_per_s")) or 2.0
+        if _FPS_HISTORY:
+            # find oldest sample within window
+            t_past, fps_past = _FPS_HISTORY[0]
+            for t_h, f_h in _FPS_HISTORY:
+                if now - t_h >= 0.5:
+                    t_past, fps_past = t_h, f_h
+                    break
+            dt = now - t_past
+            if dt >= 0.5:
+                slope = (avg_fps - fps_past) / dt
+                decline = max(0.0, -slope)
+                trend_comp = min(1.0, max(0.0, decline / max_decline))
+    _FPS_HISTORY.append((now, avg_fps))
+
+    # ── Weights & Weighted Composite ────────────────────────────
+    w_cfg = ls_cfg.get("weights", {})
+    if not isinstance(w_cfg, dict):
+        w_cfg = {}
+    w_fps   = float(w_cfg.get("fps", 50.0))
+    w_work  = float(w_cfg.get("workload", 25.0))
+    w_therm = float(w_cfg.get("thermal", 10.0))
+    w_recv  = float(w_cfg.get("recv", 5.0))
+    w_trend = float(w_cfg.get("trend", 10.0))
+
+    raw_composite = (
+        w_fps * fps_comp +
+        w_work * workload_comp +
+        w_therm * thermal_comp +
+        w_recv * recv_comp +
+        w_trend * trend_comp
     )
-    fps_emergency = fps_clamped < TARGET_FPS - 2.0
+    composite = min(100.0, max(0.0, raw_composite))
+
+    # ── Hardware emergency floor ────────────────────────────────
+    hw_saturated = (
+        isinstance(metrics, dict) and (
+            float(metrics.get("cpu_percent", 0.0)) >= hw_fuse_threshold or
+            float(metrics.get("ram_percent", 0.0)) >= hw_fuse_threshold
+        )
+    )
+    fps_emergency = fps_clamped < float(TARGET_FPS) - 2.0
 
     if hw_saturated and fps_emergency:
         score = max(composite, hw_fuse_score_floor)
@@ -607,26 +622,16 @@ def _compute_load_score_breakdown(
 ) -> dict:
     """
     Pure helper yielding auditable breakdown of the load score computation.
-
-    Returns a dict with fields:
-        fps_score         — piecewise-linear FPS score [0, 100]
-        workload_bonus    — additive workload bonus (clamped to max_bonus)
-        thermal_bonus     — additive thermal bonus (clamped to max_bonus)
-        composite_score   — min(100, fps_score + workload_bonus + thermal_bonus)  (post-cap, pre-fuse)
-        load_score        — final score after hardware emergency floor (post-fuse)
-
-    This function mirrors _compute_load_score exactly but exposes internals.
-    Malformed values never crash and preserve score behavior.
     """
     _starved = source_starved_cameras or set()
 
-    # ponytail: malformed fps_stats (None / non-dict) → no active cameras
-    # → unavailable 100, preserving _compute_load_score's empty-dict behavior.
     if not isinstance(fps_stats, dict):
         return {
             "fps_score": 100.0,
             "workload_bonus": 0.0,
             "thermal_bonus": 0.0,
+            "recv_bonus": 0.0,
+            "trend_bonus": 0.0,
             "composite_score": 100.0,
             "load_score": 100.0,
         }
@@ -635,10 +640,9 @@ def _compute_load_score_breakdown(
     ls_cfg = _EDGE_CFG.get("load_score", {})
     if not isinstance(ls_cfg, dict):
         ls_cfg = {}
-    hw_fuse_threshold = float(ls_cfg.get("hw_fuse_threshold", 90.0))
-    hw_fuse_score_floor = float(ls_cfg.get("hw_fuse_score_floor", 75.0))
+    hw_fuse_threshold   = float(ls_cfg.get("hw_fuse_threshold",   90.0))
+    hw_fuse_score_floor = float(ls_cfg.get("hw_fuse_score_floor", 60.0))
 
-    # ── FPS score (piecewise linear) ──────────────────────────
     active_fps_vals = [
         v for k, v in fps_stats.items()
         if v > 0.0 and k not in _starved
@@ -650,25 +654,26 @@ def _compute_load_score_breakdown(
             "fps_score": 100.0,
             "workload_bonus": 0.0,
             "thermal_bonus": 0.0,
+            "recv_bonus": 0.0,
+            "trend_bonus": 0.0,
             "composite_score": 100.0,
             "load_score": 100.0,
         }
 
-    fps_clamped = max(0.0, min(TARGET_FPS, avg_fps))
+    fps_clamped = max(0.0, min(float(TARGET_FPS), avg_fps))
 
-    if fps_clamped >= TARGET_FPS:
-        fps_score = 0.0
+    if fps_clamped >= float(TARGET_FPS):
+        fps_comp = 0.0
     elif fps_clamped >= 22.0:
-        fps_score = 57.0 * (TARGET_FPS - fps_clamped) / (TARGET_FPS - 22.0)
+        fps_comp = 0.57 * (float(TARGET_FPS) - fps_clamped) / (float(TARGET_FPS) - 22.0)
     elif fps_clamped >= 19.0:
-        fps_score = 57.0 + (65.0 - 57.0) * (22.0 - fps_clamped) / (22.0 - 19.0)
+        fps_comp = 0.57 + (0.65 - 0.57) * (22.0 - fps_clamped) / (22.0 - 19.0)
     elif fps_clamped >= 17.0:
-        fps_score = 65.0 + (75.0 - 65.0) * (19.0 - fps_clamped) / (19.0 - 17.0)
+        fps_comp = 0.65 + (0.75 - 0.65) * (19.0 - fps_clamped) / (19.0 - 17.0)
     else:
-        fps_score = 75.0 + (100.0 - 75.0) * (17.0 - fps_clamped) / (17.0 - 0.0)
+        fps_comp = 0.75 + (1.00 - 0.75) * (17.0 - fps_clamped) / (17.0 - 0.0)
 
-    # ── Workload bonus ────────────────────────────────────────
-    workload_bonus = 0.0
+    workload_comp = 0.0
     wl_cfg = ls_cfg.get("workload", {})
     if (isinstance(wl_cfg, dict) and wl_cfg.get("enabled") is True
             and isinstance(feature_stats, dict)):
@@ -676,35 +681,72 @@ def _compute_load_score_breakdown(
             _derive_camera_workload(feature_stats, fps_stats, _starved).values()
         )
         wl_cap = _finite_positive(wl_cfg.get("capacity"))
-        wl_max = _finite_positive(wl_cfg.get("max_bonus"))
-        if wl_cap is not None and wl_max is not None:
-            workload_bonus = min(wl_max, wl_max * wl_total / wl_cap)
+        if wl_cap is not None:
+            workload_comp = min(1.0, max(0.0, wl_total / wl_cap))
 
-    # ── Thermal bonus ─────────────────────────────────────────
-    thermal_bonus = 0.0
+    thermal_comp = 0.0
     th_cfg = ls_cfg.get("thermal", {})
-    if isinstance(th_cfg, dict) and th_cfg.get("enabled") is True:
+    if isinstance(th_cfg, dict) and th_cfg.get("enabled") is True and isinstance(metrics, dict):
         temp_val = _finite_nonneg(metrics.get("gpu_temp_c"))
-        onset = _finite_nonneg(th_cfg.get("onset_c"))
+        onset    = _finite_nonneg(th_cfg.get("onset_c"))
         critical = _finite_nonneg(th_cfg.get("critical_c"))
-        th_max = _finite_positive(th_cfg.get("max_bonus"))
         if (temp_val is not None and onset is not None
-                and critical is not None and th_max is not None
-                and onset < critical):
+                and critical is not None and onset < critical):
             if temp_val >= critical:
-                thermal_bonus = th_max
+                thermal_comp = 1.0
             elif temp_val > onset:
-                thermal_bonus = th_max * (temp_val - onset) / (critical - onset)
+                thermal_comp = (temp_val - onset) / (critical - onset)
 
-    # ── Composite (post cap, pre fuse) ────────────────────────
-    composite = min(100.0, fps_score + workload_bonus + thermal_bonus)
+    recv_comp = 0.0
+    recv_cfg = ls_cfg.get("recv", {})
+    if isinstance(recv_cfg, dict) and recv_cfg.get("enabled") is True and isinstance(metrics, dict):
+        recv_val = _finite_nonneg(metrics.get("offload_crops_received_per_s"))
+        recv_cap = _finite_positive(recv_cfg.get("capacity")) or 10.0
+        if recv_val is not None:
+            recv_comp = min(1.0, max(0.0, recv_val / recv_cap))
 
-    # ── Hardware emergency floor (fuse) ───────────────────────
+    trend_comp = 0.0
+    trend_cfg = ls_cfg.get("trend", {})
+    now = time.monotonic()
+    if isinstance(trend_cfg, dict) and trend_cfg.get("enabled") is True:
+        max_decline = _finite_positive(trend_cfg.get("max_decline_fps_per_s")) or 2.0
+        if _FPS_HISTORY:
+            t_past, fps_past = _FPS_HISTORY[0]
+            for t_h, f_h in _FPS_HISTORY:
+                if now - t_h >= 0.5:
+                    t_past, fps_past = t_h, f_h
+                    break
+            dt = now - t_past
+            if dt >= 0.5:
+                slope = (avg_fps - fps_past) / dt
+                decline = max(0.0, -slope)
+                trend_comp = min(1.0, max(0.0, decline / max_decline))
+
+    w_cfg = ls_cfg.get("weights", {})
+    if not isinstance(w_cfg, dict):
+        w_cfg = {}
+    w_fps   = float(w_cfg.get("fps", 50.0))
+    w_work  = float(w_cfg.get("workload", 25.0))
+    w_therm = float(w_cfg.get("thermal", 10.0))
+    w_recv  = float(w_cfg.get("recv", 5.0))
+    w_trend = float(w_cfg.get("trend", 10.0))
+
+    fps_weighted   = w_fps * fps_comp
+    work_weighted  = w_work * workload_comp
+    therm_weighted = w_therm * thermal_comp
+    recv_weighted  = w_recv * recv_comp
+    trend_weighted = w_trend * trend_comp
+
+    raw_composite = fps_weighted + work_weighted + therm_weighted + recv_weighted + trend_weighted
+    composite = min(100.0, max(0.0, raw_composite))
+
     hw_saturated = (
-        metrics.get("cpu_percent", 0.0) >= hw_fuse_threshold or
-        metrics.get("ram_percent", 0.0) >= hw_fuse_threshold
+        isinstance(metrics, dict) and (
+            float(metrics.get("cpu_percent", 0.0)) >= hw_fuse_threshold or
+            float(metrics.get("ram_percent", 0.0)) >= hw_fuse_threshold
+        )
     )
-    fps_emergency = fps_clamped < TARGET_FPS - 2.0
+    fps_emergency = fps_clamped < float(TARGET_FPS) - 2.0
 
     if hw_saturated and fps_emergency:
         load_score = max(composite, hw_fuse_score_floor)
@@ -712,9 +754,11 @@ def _compute_load_score_breakdown(
         load_score = composite
 
     return {
-        "fps_score": round(fps_score, 1),
-        "workload_bonus": round(workload_bonus, 1),
-        "thermal_bonus": round(thermal_bonus, 1),
+        "fps_score": round(fps_weighted, 1),
+        "workload_bonus": round(work_weighted, 1),
+        "thermal_bonus": round(therm_weighted, 1),
+        "recv_bonus": round(recv_weighted, 1),
+        "trend_bonus": round(trend_weighted, 1),
         "composite_score": round(composite, 1),
         "load_score": round(load_score, 1),
     }
@@ -1124,6 +1168,8 @@ class HealthAgent:
                         "fps_score": 100.0,
                         "workload_bonus": 0.0,
                         "thermal_bonus": 0.0,
+                        "recv_bonus": 0.0,
+                        "trend_bonus": 0.0,
                         "composite_score": 100.0,
                         "load_score": 100.0,
                     }

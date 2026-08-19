@@ -11,12 +11,5 @@ Edge/.pytest_cache
 
 Server/__pycache__
 
-Camera/videos/videos
-Camera/videos/ground_truth.csv
-Camera/videos/sim_cameras.yml
-
-.pytest_cache
-.slim/deepwork/
-
 DoAn
 data*

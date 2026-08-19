@@ -8,22 +8,22 @@
 # ============================================================
 
 p2p:
-  overload_threshold: 57.0      # load_score at or above this triggers RFO; L3 anchor
-                                   # (22 FPS → score 57) under FPS-dominant piecewise curve
+  overload_threshold: 55.0      # load_score at or above this triggers RFO; L3 anchor
+                                   # under weighted composite load_score (L3=42)
   overload_duration_s: 7.0     # must be overloaded this long before RFO
                                    # slightly exceeds one traffic-light cycle (6s)
                                    # to filter transient GPU bursts with healthy FPS
   cooldown_s: 30.0              # per-camera cooldown between migrations
-                                  # prevents ping-pong while allowing rebalancing
-                                  # after migration effect is observable
+                                   # prevents ping-pong while allowing rebalancing
+                                   # after migration effect is observable
   migration_timeout_s: 15.0    # wait for ADD ack before rollback (restored to safe default;
                                  # 2 s was too tight for slow RTSP sources across LAN)
   heartbeat_timeout_s: 5.0      # peer declared OFFLINE after this silence
   failover_convergence_grace_s: 15.0 # suppress mutual false-offline cascade during failover convergence
   vote_window_s: 2.0            # proposal collection duration
-  failover_jitter_max_s: 3.0    # random delay before failover ADD (race prevention)
+  failover_jitter_max_s: 5.0    # random delay before failover ADD (race prevention)
   reclaim_margin: 7.0          # reclaim only when load < (overload_threshold - reclaim_margin)
-                                # 57 - 7 = 50; enables reclaim once score drops below 50
+                                # 42 - 7 = 35; enables reclaim once score drops below 35
   reclaim_stable_s: 15.0       # load must stay below reclaim threshold this long before
                                 # reclaiming — one full signal cycle to confirm genuine
                                 # capacity recovery rather than a momentary green phase
@@ -72,11 +72,11 @@ p2p:
   offload_level: 3
 
   # Load thresholds that trigger each escalation step
-  # Anchors from the FPS-dominant piecewise-linear curve:
-  #   avg_fps 22 → score 57  (L3) · avg_fps 19 → score 65 (L2) · avg_fps 17 → score 75 (L1)
-  offload_level3_threshold: 57.0   # L3: crop offload → plate-crop offload first
-  offload_level2_threshold: 65.0   # L2: vehicle-crop offload when load worsens
-  offload_level1_threshold: 75.0   # L1: fall-stream RTSP migration at critical load
+  # Calibrated for the weighted multi-signal composite load_score:
+  #   L3: 42.0 (plate crops) · L2: 50.0 (vehicle crops) · L1: 60.0 (stream migration)
+  offload_level3_threshold: 60.0   # L3: crop offload → plate-crop offload first
+  offload_level2_threshold: 67.0   # L2: vehicle-crop offload when load worsens
+  offload_level1_threshold: 80.0   # L1: fall-stream RTSP migration at critical load
 
   # Cooldown between level changes for the same camera (seconds)
   offload_level_cooldown_s: 12.0
@@ -85,69 +85,66 @@ p2p:
   # Prevents premature escalation while the lower-level offload takes effect.
   # Dwell starts when set_offload_level commits L3/L2 for that camera.
   # Bypassed if a hardware emergency fuse is explicitly active.
-  l3_dwell_s: 10.0    # L3 must remain active this long before L2
-  l2_dwell_s: 7.0     # L2 must remain active this long before L1
+  l3_dwell_s: 12.0    # L3 must remain active this long before L2
+  l2_dwell_s: 10.0     # L2 must remain active this long before L1
 
   # TensorRT engine paths used by the offload receiver (Level 2 + 3)
   lpr_engine_path: "models/lpr.engine"
   lpd_engine_path: "models/lpd.engine"
 
 # ---------------------------------------------------------------------------
-# Load score — FPS-dominant piecewise-linear curve + hardware emergency floor
+# Load score — Weighted Multi-Signal Composite + Hardware Emergency Floor
 #
-# FPS score (bounded, input FPS clamped to [0, TARGET_FPS=27]):
-#   avg_fps >= 27  →   0
-#   avg_fps  = 22  →  57  (L3/overload threshold)
-#   avg_fps  = 19  →  65  (L2)
-#   avg_fps  = 17  →  75  (L1)
-#   avg_fps <=  0  → 100
-#   Linear interpolation between anchors.
+# Form:
+#   load_score = clamp(0, 100,
+#       w_fps    * fps_comp
+#     + w_work   * workload_comp
+#     + w_therm  * thermal_comp
+#     + w_recv   * recv_comp
+#     + w_trend  * trend_comp
+#   )
+#
+# Components:
+#   fps_comp:       piecewise linear (27->0, 22->0.57, 19->0.65, 17->0.75, 0->1.0)
+#   workload_comp:  min(1.0, (n_track + n_plate) / capacity)
+#   thermal_comp:   linear ramp onset_c -> critical_c, clamped [0, 1]
+#   recv_comp:      min(1.0, offload_crops_received_per_s / recv_capacity)
+#   trend_comp:     FPS slope/trend decline clamped [0, 1]
 #
 # Hardware emergency floor:
-#   If ANY of {CPU, RAM} >= hw_fuse_threshold (90):
-#       score = max(fps_score, hw_fuse_score_floor) (75.0 = L1)
-#   This ensures hardware saturation immediately triggers Level 1 but
-#   never falsely reports score 100.
+#   If ANY of {CPU, RAM} >= hw_fuse_threshold (90) AND fps_clamped < TARGET_FPS - 2:
+#       score = max(composite, hw_fuse_score_floor) (60.0 = L1 threshold)
 #
-# Conservative composite bonuses (config-driven; disabled when their section
-# is absent or enabled is false):
-#   workload: n_track + n_plate of active non-starved cameras, linear
-#             ramp to capacity, clamped to max_bonus.
-#   thermal:  gpu_temp_c linear ramp onset_c -> critical_c, clamped
-#             to max_bonus.
-#   composite = min(100, fps_score + workload_bonus + thermal_bonus)
-#   then the hardware floor is applied as before.
-#
-# Returns preset = "fps_dominant" every cycle — stable preset string.
+# Returns preset = "composite" every cycle — stable preset string.
 # ---------------------------------------------------------------------------
 load_score:
-  # Anchor points are hardcoded in the piecewise linear function
-  # (health_agent._compute_load_score).  This file carries only the
-  # tuneable hardware-fuse parameters.
-
-  # Hardware saturation threshold — when ANY single metric (GPU, CPU,
-  # or RAM) reaches/exceeds this threshold, the emergency floor activates.
   hw_fuse_threshold: 90.0
+  hw_fuse_score_floor: 60.0
 
-  # Emergency floor — score cannot drop below this while any hardware
-  # metric is saturated.  Set to 75.0 (L1 threshold) so hardware crisis
-  # immediately triggers full-stream migration (L1) but not 100.
-  hw_fuse_score_floor: 75.0
+  weights:
+    fps: 50.0
+    workload: 25.0
+    thermal: 10.0
+    recv: 5.0
+    trend: 10.0
 
-  # Workload bonus — additive bonus derived from per-camera n_track+n_plate.
-  # Only active (fps > 0), non-source-starved cameras contribute.
-  # Linear from 0..capacity, clamped to max_bonus.
   workload:
     enabled: true
-    capacity: 40.0
-    max_bonus: 10.0
+    capacity: 60.0
 
-  # Thermal bonus — additive bonus from GPU temperature.
-  # Linear ramp from onset_c to critical_c, clamped 0..max_bonus.
   thermal:
     enabled: true
     onset_c: 70.0
     critical_c: 85.0
+
+  recv:
+    enabled: true
+    capacity: 10.0
+
+  trend:
+    enabled: true
+    window_s: 3.0
+    max_decline_fps_per_s: 2.0
     max_bonus: 5.0
 
 # ---------------------------------------------------------------------------
