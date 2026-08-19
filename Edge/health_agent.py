@@ -1203,6 +1203,7 @@ class HealthAgent:
                         "active_cameras": active_cameras,
                         "source_starved_cameras": sorted(starved_cams),
                         "camera_workload": camera_workload,
+                        "camera_features": feature_stats if snapshot_valid else {},
                         "camera_configs": self._cam_configs_cache,
                         "max_streams":    int(self._max_streams or 8),
                     },

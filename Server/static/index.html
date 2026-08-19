@@ -774,6 +774,7 @@ function createSidebarCard(edge) {
       <span class="metric-value" data-metric="load-text" style="min-width:36px;">--</span>
     </div>
     <div class="fps-row" data-metric="fps-list"></div>
+    <div class="fps-row" data-metric="workload-list" style="margin-top:2px;"></div>
   `;
 
   SIDEBAR.appendChild(card);
@@ -834,6 +835,29 @@ function updateSidebarCard(card, edge) {
         .join('');
     } else {
       fpsEl.innerHTML = '<span style="color:#555">No active cameras</span>';
+    }
+  }
+
+  const wlEl = card.querySelector('[data-metric="workload-list"]');
+  if (wlEl) {
+    const feats = pipeline.camera_features || {};
+    const wl = pipeline.camera_workload || {};
+    const cams = Object.keys(feats).length > 0 ? Object.keys(feats) : Object.keys(wl);
+    if (cams.length > 0) {
+      wlEl.innerHTML = cams
+        .map(cam => {
+          const cf = feats[cam];
+          if (cf && (cf.n_track != null || cf.n_plate != null)) {
+            const tr = cf.n_track != null ? cf.n_track : 0;
+            const pl = cf.n_plate != null ? cf.n_plate : 0;
+            return `<span>${escHtml(cam)}: <strong style="color:#3498db">${tr}</strong>T/<strong style="color:#e67e22">${pl}</strong>P</span>`;
+          }
+          const w = wl[cam];
+          return `<span>${escHtml(cam)}: <strong style="color:#3498db">${w != null ? w.toFixed(0) : '--'}</strong>W</span>`;
+        })
+        .join('');
+    } else {
+      wlEl.innerHTML = '';
     }
   }
 }

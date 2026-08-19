@@ -471,6 +471,7 @@ def _health_push_loop(peer_orch=None) -> None:
                     "active_cameras":  active_cameras,
                     "camera_configs":  _cam_configs,
                     "camera_workload": camera_workload,
+                    "camera_features": feature_stats if snapshot_valid else {},
                     "source_starved_cameras": sorted(source_starved_cameras),
                 },
             }
