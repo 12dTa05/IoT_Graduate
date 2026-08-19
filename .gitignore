@@ -1,8 +1,10 @@
 .codegraph
 .cortexkit
+.pytest_cache
 
 Edge/logs
 Edge/tests
+Edge/snapshots
 Edge/__pycache__
 Edge/speedflow_python/__pycache__
 Edge/speedflow_python/tests/__pycache__
@@ -11,6 +13,7 @@ Edge/tests/__pycache__
 Edge/.pytest_cache
 
 Server/__pycache__
+Server/violations
 
 DoAn
 data*
