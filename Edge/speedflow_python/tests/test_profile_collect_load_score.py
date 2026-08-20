@@ -24,6 +24,7 @@ import sys
 import time
 from pathlib import Path
 from types import ModuleType
+import pytest
 
 _EDGE = Path(__file__).resolve().parents[2]  # .../Edge
 
@@ -66,6 +67,14 @@ _make_stubs({
         "TELEMETRY_INTERVAL": 1.0,
     },
 })
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _cleanup_profile_collect_stubs():
+    yield
+    for mod_name in ("msgpack", "dotenv", "yaml", "zenoh", "jtop", "gi", "gi.repository"):
+        sys.modules.pop(mod_name, None)
+    importlib.invalidate_caches()
 
 
 def _exec_deps_stubbed(path: Path, attrs: dict) -> ModuleType:

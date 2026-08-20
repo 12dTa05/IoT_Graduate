@@ -330,6 +330,8 @@ class PeerOrchestrator:
         # Cameras rescued via failover: camera_id → original_owner_node_id
         # Used to return cameras when the original owner comes back online.
         self._rescued_cameras: Dict[str, str] = {}
+        # Timestamps when cameras were rescued: camera_id → timestamp
+        self._rescued_at: Dict[str, float] = {}
 
         # Cameras migrated away due to overload: camera_id → winner_node_id
         # Used to reclaim cameras when this node's load drops below threshold.
@@ -407,6 +409,10 @@ class PeerOrchestrator:
         # gate — this keeps the existing L1/L2/L3 selector tests passing
         # without forcing every test to set a fake ADD timestamp.
         self._camera_added_at: Dict[str, float] = {}
+
+        # Track when any peer was detected offline (node_id -> timestamp)
+        # to ensure failover_convergence_grace activates for all peer departures.
+        self._peer_offline_at: Dict[str, float] = {}
 
         # ponytail: per-camera "first valid positive FPS" timestamp.  Sticky
         # within the lifetime of the dict entry; cleared (overwritten) when we
@@ -911,12 +917,13 @@ class PeerOrchestrator:
         convergence_grace_s = float(self._cfg.get("failover_convergence_grace_s", 15.0))
 
         with self._lock:
-            # Check if any failover was recently triggered within convergence_grace_s
-            recent_failovers = [
-                t for nid, t in self._failover_triggered.items()
+            # Check if any failover or peer offline event occurred within convergence_grace_s
+            all_offline_events = {**self._failover_triggered, **self._peer_offline_at}
+            recent_events = [
+                t for nid, t in all_offline_events.items()
                 if (now - t) < convergence_grace_s
             ]
-            in_convergence = bool(recent_failovers)
+            in_convergence = bool(recent_events)
             to_check = list(self._peers.items())
 
         for node_id, peer in to_check:
@@ -927,10 +934,12 @@ class PeerOrchestrator:
                 with self._lock:
                     already_triggered = node_id in self._failover_triggered
                 # If failover not yet triggered for this peer, but cluster is in convergence grace
-                # from another recent failover, suppress declaring this peer offline.
-                if not already_triggered and in_convergence:
+                # from another recent failover/offline event, suppress declaring this peer offline.
+                if not already_triggered and in_convergence and node_id not in all_offline_events:
                     continue
 
+                with self._lock:
+                    self._peer_offline_at[node_id] = now
                 self._clear_offload_target(node_id)
                 if peer.active_cameras:
                     # BUG-6 fix: use _failover_triggered map to prevent
@@ -965,6 +974,7 @@ class PeerOrchestrator:
                 self._notified_offline.discard(node_id)
                 with self._lock:
                     self._failover_triggered.pop(node_id, None)
+                    self._peer_offline_at.pop(node_id, None)
 
     def _clear_offload_target(self, node_id: str) -> None:
         """Clear Level 2/3 crop offload entries that target an offline peer."""
@@ -1046,6 +1056,33 @@ class PeerOrchestrator:
             owned_ids = set()
         owned_active_snapshot = owned_ids & self_active_snapshot
 
+        # Release rescues whose owner remains dead beyond the bounded hold
+        # window.  This check must run before the owned-camera guard: a node
+        # with healthy local streams can still be overloaded by a stale rescue.
+        rescue_hold_s = float(self._cfg.get("failover_rescue_hold_s", 60.0))
+        expired_rescues = []
+        with self._lock:
+            for cam_id, orig_owner in list(self._rescued_cameras.items()):
+                rescued_t = self._rescued_at.get(cam_id, now)
+                peer = self._peers.get(orig_owner)
+                is_dead = peer is None or (now - peer.last_seen > timeout)
+                if is_dead and (now - rescued_t) >= rescue_hold_s:
+                    expired_rescues.append((cam_id, orig_owner))
+
+        for cam_id, orig_owner in expired_rescues:
+            with self._lock:
+                self._rescued_cameras.pop(cam_id, None)
+                self._rescued_at.pop(cam_id, None)
+            remove_cmd = {"cmd": "REMOVE", "camera_id": cam_id}
+            pub = self._pubs.get("control")
+            if pub:
+                pub.put(msgpack.packb(remove_cmd, use_bin_type=True))
+            logger.warning(
+                "[PeerOrch][Rebalance] Rescue hold timeout (%.1fs) expired for camera '%s' "
+                "(owner '%s' remains dead). Force-releasing camera.",
+                rescue_hold_s, cam_id, orig_owner,
+            )
+
         # Aggregate owned-camera guard: zero locally-owned active cameras
         # means the node cannot satisfy the L1 ownership invariant for
         # migration decisions (see _pick_camera_to_offload).  Returning
@@ -1057,7 +1094,9 @@ class PeerOrchestrator:
         # tick while the node is in the degraded state; one log per
         # BLOCKED_LOG_COOLDOWN (15 s) is enough to alert without spam.
         if not owned_active_snapshot:
-            if self._maybe_log_block("rebalance_no_owned", now):
+            with self._lock:
+                has_rescues = bool(self._rescued_cameras)
+            if has_rescues and self._maybe_log_block("rebalance_no_owned", now):
                 logger.warning(
                     "[PeerOrch][Rebalance] BLOCKED: no locally-owned active "
                     "cameras (owned_active=0, rescued=%d). Holding rescued "
@@ -1112,6 +1151,7 @@ class PeerOrchestrator:
         for camera_id in to_return:
             with self._lock:
                 original_owner = self._rescued_cameras.pop(camera_id, None)
+                self._rescued_at.pop(camera_id, None)
             if original_owner is None:
                 continue
             remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
@@ -1962,7 +2002,9 @@ class PeerOrchestrator:
         # measurement, and rolled back via the finally block below on every
         # downstream rejection/exception — so a bid that never ships does not
         # hold capacity, and one that ships is counted exactly once.
-        eps_streams_max = self._cfg.get("eps_streams_max", 4)
+        cm = self._camera_manager
+        default_max = cm.get_max_streams() if cm is not None else 4
+        eps_streams_max = int(self._cfg.get("eps_streams_max", default_max))
         with self._self_inflight_lock:
             accounted_streams = current_streams + self._self_inflight
             if accounted_streams >= eps_streams_max:
@@ -2577,7 +2619,9 @@ class PeerOrchestrator:
         now = time.time()
         timeout = cfg.get("heartbeat_timeout_s", 5.0)
 
-        eps_max = int(self._cfg.get("eps_streams_max", 4))
+        cm = self._camera_manager
+        default_max = cm.get_max_streams() if cm is not None else 4
+        eps_max = int(self._cfg.get("eps_streams_max", default_max))
         # Configurable rescue ceiling, default eps_streams_max - 1 (e.g. 3 when eps_streams_max=4)
         rescue_ceiling = int(self._cfg.get("failover_rescue_max", eps_max - 1))
 
@@ -2706,7 +2750,8 @@ class PeerOrchestrator:
                     continue
 
                 # Fix E: Broadcast rescue claim to resolve membership-divergence split-brain
-                my_weight = int(hashlib.sha256(f"{camera_id}:{self._node_id}".encode()).hexdigest(), 16)
+                # ponytail: mask to 63-bit int so msgpack integer serialization never overflows
+                my_weight = int(hashlib.sha256(f"{camera_id}:{self._node_id}".encode()).hexdigest()[:15], 16)
                 claim_payload = {
                     "dead_node_id": dead_node_id,
                     "camera_id": camera_id,
@@ -2755,6 +2800,7 @@ class PeerOrchestrator:
                 self_accepted += 1
                 with self._lock:
                     self._rescued_cameras[camera_id] = dead_node_id
+                    self._rescued_at[camera_id] = time.time()
                 # ponytail: rescue ADD — record so _pick_camera_to_offload
                 # applies the per-camera warmup gate to this camera too.
                 self._camera_added_at[camera_id] = time.time()
@@ -2934,7 +2980,7 @@ class PeerOrchestrator:
                 with cm._lock:
                     return {
                         c.camera_id for c in cm._configs.values()
-                        if getattr(c, "enabled", False)
+                        if getattr(c, "enabled", False) and not getattr(c, "is_dynamic", False)
                     }
             except Exception as exc:
                 logger.debug(

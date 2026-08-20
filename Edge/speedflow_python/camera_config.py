@@ -62,6 +62,9 @@ class CameraConfig:
     record: bool
     record_path: str
 
+    # Dynamic / foreign stream flag (set True when added via P2P migration or failover rescue)
+    is_dynamic: bool = False
+
     # --- Derived speed validation params (from fps) ---
     @property
     def min_track_age_frames(self) -> int:
@@ -82,9 +85,9 @@ class StreamDelta:
 def _parse_cameras_yml(yml_path: Path) -> Dict[str, CameraConfig]:
     """Read cameras.yml, return dict camera_id -> CameraConfig."""
     with open(yml_path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
+        raw = yaml.safe_load(f) or {}
 
-    cameras = raw.get("cameras", {})
+    cameras = raw.get("cameras", {}) or {}
     result: Dict[str, CameraConfig] = {}
 
     for cam_id, cfg in cameras.items():
@@ -187,6 +190,7 @@ class CameraManager:
         self._watcher_thread: Optional[threading.Thread] = None
         self._processor_thread: Optional[threading.Thread] = None
         self._observer = None   # watchdog Observer
+        self._max_streams: int = 4
 
         # Initial load
         self._load_initial()
@@ -322,6 +326,7 @@ class CameraManager:
             roi_polygon=roi_arr,
             record=bool(out_cfg.get("record", False)),
             record_path=str(out_cfg.get("record_path", f"output/{cam_id}.mp4")),
+            is_dynamic=True,
         )
 
         with self._lock:
@@ -356,8 +361,9 @@ class CameraManager:
     def _load_initial(self) -> None:
         """Initial load, no delta creation."""
         try:
-            raw = yaml.safe_load(self.yml_path.read_text(encoding="utf-8"))
+            raw = yaml.safe_load(self.yml_path.read_text(encoding="utf-8")) or {}
             self._max_streams = int(raw.get("max_streams", 4))
+            logger.info("[CameraManager] Loaded max_streams=%d from %s", self._max_streams, self.yml_path)
             new_configs = _parse_cameras_yml(self.yml_path)
             with self._lock:
                 self._configs = new_configs
