@@ -226,8 +226,6 @@ def _start_zenoh_subscriber(state: ServerState) -> Optional[Any]:
                 is_new = state.registry.register(node_id, ip)
                 if is_new:
                     state.broadcast({"type": "edge_registered", "node_id": node_id, "ip": ip})
-                else:
-                    state.broadcast({"type": "edge_reconnected", "node_id": node_id, "ip": ip})
                 return
 
             state.registry.update_health(node_id, payload)

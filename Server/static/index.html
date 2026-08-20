@@ -1078,15 +1078,18 @@ function handleWSMessage(msg) {
     case 'edge_registered':
       if (!edges[msg.node_id]) {
         edges[msg.node_id] = { node_id: msg.node_id, online: true, health: {} };
+        edges[msg.node_id].ip = msg.ip || edges[msg.node_id].ip;
+        edges[msg.node_id].online = true;
+        rebuildClusters();
+        renderClusterNav();
+        renderVideoGrid();
+        updateSidebar();
+        populateNodeFilter();
+        pollStreams();
+      } else {
+        edges[msg.node_id].ip = msg.ip || edges[msg.node_id].ip;
+        edges[msg.node_id].online = true;
       }
-      edges[msg.node_id].ip = msg.ip || edges[msg.node_id].ip;
-      edges[msg.node_id].online = true;
-      rebuildClusters();
-      renderClusterNav();
-      renderVideoGrid();
-      updateSidebar();
-      populateNodeFilter();
-      pollStreams();
       break;
 
     case 'edge_offline':
@@ -1099,10 +1102,19 @@ function handleWSMessage(msg) {
       updateSidebar();
       break;
 
+    case 'edge_reconnected':
+      if (edges[msg.node_id]) {
+        edges[msg.node_id].ip = msg.ip || edges[msg.node_id].ip;
+        edges[msg.node_id].online = true;
+      }
+      break;
+
     case 'health_update':
       {
+        let isNewEdge = false;
         if (!edges[msg.node_id]) {
           edges[msg.node_id] = { node_id: msg.node_id, online: true, health: {} };
+          isNewEdge = true;
         }
         const edge = edges[msg.node_id];
         edge.online = true;
@@ -1111,22 +1123,32 @@ function handleWSMessage(msg) {
         delete health.type;
         delete health.node_id;
         edge.health = health;
-        // Refresh the video cell label to show updated active cameras
-        const labelEl = VIDEO_GRID.querySelector(`[data-node-id="${msg.node_id}"]`);
-        if (labelEl) {
-          const activeCams = (health.pipeline && health.pipeline.active_cameras) || [];
-          labelEl.textContent = activeCams.length > 0
-            ? `${msg.node_id} (${activeCams.join(', ')})`
-            : msg.node_id;
-        }
-        // In-place sidebar update for current cluster
-        const cluster = getCurrentCluster();
-        if (cluster && cluster.edges.some(e => e.node_id === msg.node_id)) {
-          const card = SIDEBAR.querySelector(`[data-node-id="${msg.node_id}"]`);
-          if (card) {
-            updateSidebarCard(card, edge);
-          } else {
-            updateSidebar();
+
+        if (isNewEdge) {
+          rebuildClusters();
+          renderClusterNav();
+          renderVideoGrid();
+          updateSidebar();
+          populateNodeFilter();
+          pollStreams();
+        } else {
+          // Refresh the video cell label to show updated active cameras
+          const labelEl = VIDEO_GRID.querySelector(`[data-node-id="${msg.node_id}"]`);
+          if (labelEl) {
+            const activeCams = (health.pipeline && health.pipeline.active_cameras) || [];
+            labelEl.textContent = activeCams.length > 0
+              ? `${msg.node_id} (${activeCams.join(', ')})`
+              : msg.node_id;
+          }
+          // In-place sidebar update for current cluster
+          const cluster = getCurrentCluster();
+          if (cluster && cluster.edges.some(e => e.node_id === msg.node_id)) {
+            const card = SIDEBAR.querySelector(`[data-node-id="${msg.node_id}"]`);
+            if (card) {
+              updateSidebarCard(card, edge);
+            } else {
+              updateSidebar();
+            }
           }
         }
       }
