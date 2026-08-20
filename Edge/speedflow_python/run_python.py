@@ -26,7 +26,6 @@ from .settings import (
     ADVERTISE_IP,
     MUX_WIDTH,
     MUX_HEIGHT,
-    MONITOR_URL,
     FPS_STATS_FILE,
     TARGET_FPS,
     HEALTH_INTERVAL,
@@ -193,10 +192,54 @@ def _attach_camera_manager(
 # GLib bus helpers
 # ---------------------------------------------------------------------------
 
-def _is_transient_nvmm_buffer_error(err, debug: Optional[str]) -> bool:
+# Track NVMM buffer errors to detect persistent decoder starvation
+_NVMM_ERROR_TIMESTAMPS: dict = {}  # src_name -> list of timestamps
+_NVMM_ERROR_RATE_LIMIT = 10        # errors in 30s triggers critical warning
+
+
+def _is_transient_nvmm_buffer_error(err, debug: Optional[str], src_name: str = "unknown") -> bool:
     """Narrow check for transient decoder buffer exhaustion."""
     text = f"{err} {debug or ''}"
-    return "OutputBufferUnavailable" in text or "cbAllocPictureBuffer" in text
+    if "OutputBufferUnavailable" not in text and "cbAllocPictureBuffer" not in text:
+        return False
+
+    now = time.monotonic()
+    hist = _NVMM_ERROR_TIMESTAMPS.setdefault(src_name, [])
+    hist.append(now)
+    _NVMM_ERROR_TIMESTAMPS[src_name] = [t for t in hist if now - t < 30.0]
+    if len(_NVMM_ERROR_TIMESTAMPS[src_name]) >= _NVMM_ERROR_RATE_LIMIT:
+        logger.critical(
+            "[Pipeline] Frequent NVDEC buffer starvation on %s (%d errors in 30s) — stream degraded",
+            src_name, len(_NVMM_ERROR_TIMESTAMPS[src_name]),
+        )
+        _NVMM_ERROR_TIMESTAMPS[src_name].clear()
+    return True
+
+
+def _graceful_stop_pipeline(pipeline: Gst.Pipeline) -> None:
+    """
+    Tear down a GStreamer pipeline safely on Jetson (Tegra).
+    Transitions sequentially PLAYING -> PAUSED -> READY -> NULL
+    with get_state() checks to allow hardware NVDEC/NVENC blocks
+    to release registers and kernel dmabuf pools gracefully.
+    """
+    if pipeline is None:
+        return
+    try:
+        # 1. PAUSED — stops data flow, drains in-flight buffers
+        pipeline.set_state(Gst.State.PAUSED)
+        pipeline.get_state(1 * Gst.SECOND)
+        # 2. READY — tears down element-specific hardware contexts (NVDEC/NVENC)
+        pipeline.set_state(Gst.State.READY)
+        pipeline.get_state(1 * Gst.SECOND)
+        # 3. NULL — frees GStreamer structures and closes file descriptors
+        pipeline.set_state(Gst.State.NULL)
+        pipeline.get_state(1 * Gst.SECOND)
+    except Exception:
+        try:
+            pipeline.set_state(Gst.State.NULL)
+        except Exception:
+            pass
 
 
 def _run_loop_until_eos_or_error(
@@ -212,7 +255,7 @@ def _run_loop_until_eos_or_error(
         if t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
             src_name = message.src.get_name() if message.src else "unknown"
-            if _is_transient_nvmm_buffer_error(err, debug):
+            if _is_transient_nvmm_buffer_error(err, debug, src_name):
                 print(f"WARNING (recoverable): Transient decoder buffer exhaustion from {src_name}: {err}", file=sys.stderr)
                 if debug:
                     print(f"DEBUG INFO: {debug}", file=sys.stderr)
@@ -234,7 +277,7 @@ def _run_loop_until_eos_or_error(
         print("\nInterrupted by user")
     finally:
         camera_manager.stop()
-        pipeline.set_state(Gst.State.NULL)
+        _graceful_stop_pipeline(pipeline)
         print("Pipeline stopped")
 
 
@@ -445,6 +488,7 @@ def _health_push_loop(peer_orch=None) -> None:
             payload = {
                 "type":         "health",
                 "node_id":      NODE_ID,
+                "advertise_ip": ADVERTISE_IP,
                 "timestamp":    _time.time(),
                 "load_score":   load_score,
                 "load_score_breakdown": lb,
@@ -663,7 +707,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             print("\nInterrupted by user")
             # BUG-11 fix: stop the manager on intentional exit only (see below)
             camera_manager.stop()
-            pipeline.set_state(Gst.State.NULL)
+            _graceful_stop_pipeline(pipeline)
             print("Pipeline stopped")
             return _last_probe
         finally:
@@ -671,11 +715,11 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             # iteration — that kills the watchdog observer and processor thread
             # permanently.  On a restart those threads must stay alive so that
             # hot-reload and dynamic ADD/REMOVE keep working.
-            # We only null the pipeline state; _attach_camera_manager() at the
+            # We gracefully stop the pipeline state; _attach_camera_manager() at the
             # top of the next iteration re-registers on_add/on_remove callbacks
             # and calls camera_manager.start() again (which is idempotent for
             # the watchdog if it is still running).
-            pipeline.set_state(Gst.State.NULL)
+            _graceful_stop_pipeline(pipeline)
             print("Pipeline stopped")
 
         if _error_flag[0]:
@@ -803,35 +847,12 @@ def run_python_mode(args) -> None:
         except Exception as exc:
             print(f"[OffloadPub/Rcv] Failed to start: {exc}", file=sys.stderr)
 
-    # --- MonitorClient ---
-    # Do NOT open a MonitorClient here by default.  health_agent.py is the
-    # sole owner of the WebSocket connection and Zenoh health heartbeat for
-    # this node_id.  Opening a second client from main.py causes the server to
-    # close the health_agent's connection (code 1000 normal closure) every
-    # time main.py starts, triggering an endless close/reconnect loop between
-    # the two competing clients for the same node_id.
-    #
-    # The _health_push_loop below updates PeerOrchestrator self-state only;
-    # health metrics are published externally by health_agent.py.
-    #
-    # If you run main.py WITHOUT health_agent.py (standalone / dev mode),
-    # set the env var PIPELINE_OWN_WS=1 to re-enable the client here.
-    if MONITOR_URL and os.environ.get("PIPELINE_OWN_WS") == "1":
-        from speedflow_python.monitor_client import MonitorClient, set_default_client
-        _client = MonitorClient(MONITOR_URL, NODE_ID, ADVERTISE_IP)
-        _client.start()
-        set_default_client(_client)
-        print(f"[MonitorClient] Started → {MONITOR_URL} (PIPELINE_OWN_WS mode)")
-
     # --- Health Push (periodic metrics → local PeerOrchestrator state) ---
     _health_thread = threading.Thread(
         target=_health_push_loop, args=(peer_orch,), daemon=True,
     )
     _health_thread.start()
-    if os.environ.get("PIPELINE_OWN_WS") == "1":
-        print("[HealthPush] Started (PIPELINE_OWN_WS: Zenoh heartbeat + WebSocket)")
-    else:
-        print("[HealthPush] Started (Zenoh heartbeat; WebSocket via health_agent)")
+    print("[HealthPush] Started (Zenoh heartbeat / peer orchestration)")
 
     # Run pipeline — offload_pub + zenoh_pub references passed so SpeedProbe can use them
     if args.mode == "display":

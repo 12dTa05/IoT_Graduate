@@ -190,9 +190,11 @@ class ZenohCommandSubscriber:
                 # Poll until the source_id appears in the live lookup table
                 # (populated by on_add on the GLib main loop thread after
                 # dynamic_add_stream completes) or until timeout.
+                # FIX: Lock is acquired ONLY for the dict lookup and released BEFORE sleeping.
                 while _time.monotonic() < deadline:
                     _time.sleep(0.25)
                     try:
+                        live_cfg = None
                         with _cam_manager._lock:
                             live_cfg = _cam_manager._by_source_id.get(_source_id)
                         if live_cfg is not None and live_cfg.camera_id == _cam_id and live_cfg.enabled:

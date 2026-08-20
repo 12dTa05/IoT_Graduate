@@ -33,7 +33,6 @@ from speedflow_python.settings import (
     HEALTH_LOG_EVERY,
     TARGET_FPS,
     FPS_STATS_FILE,
-    MONITOR_URL,
     ADVERTISE_IP,
     LOAD_POLICY,
     LOAD_MODEL,
@@ -825,17 +824,6 @@ class HealthAgent:
 
     def start(self) -> None:
         """Start agent in daemon thread."""
-        # Open own MonitorClient if running standalone
-        if MONITOR_URL:
-            try:
-                from speedflow_python.monitor_client import MonitorClient, set_default_client
-                self._monitor_client = MonitorClient(MONITOR_URL, NODE_ID, ADVERTISE_IP)
-                self._monitor_client.start()
-                set_default_client(self._monitor_client)
-                logger.info("[HealthAgent] MonitorClient started → %s", MONITOR_URL)
-            except Exception as exc:
-                logger.warning("[HealthAgent] MonitorClient failed to start: %s", exc)
-
         self._running = True
         self._thread = threading.Thread(
             target=self._run,
@@ -856,11 +844,6 @@ class HealthAgent:
             except Exception:
                 pass
             self._jtop = None
-        if self._monitor_client is not None:
-            try:
-                self._monitor_client.stop()
-            except Exception:
-                pass
         if self._session:
             try:
                 self._session.close()
@@ -868,36 +851,16 @@ class HealthAgent:
                 pass
 
     def _connect_zenoh(self):
-        """Open Zenoh session, declare publisher, subscribe to traffic events."""
+        """Open Zenoh session and declare status publisher."""
         import zenoh
         try:
             session = make_session()
             pub = session.declare_publisher(f"peers/status/{NODE_ID}")
-
-            # Subscribe to overspeed events from the pipeline process and
-            # forward them to the Central Monitor Server via MonitorClient.
-            # This avoids having two MonitorClient WS connections for the
-            # same node_id (which causes a reconnect loop on the Server).
-            session.declare_subscriber(
-                f"traffic/events/{NODE_ID}/**",
-                self._on_traffic_event,
-            )
-
             logger.info("[HealthAgent] Zenoh session opened (peer mode).")
             return session, pub
         except Exception as exc:
             logger.error("[HealthAgent] Cannot open Zenoh session: %s", exc)
             return None, None
-
-    def _on_traffic_event(self, sample) -> None:
-        """Forward overspeed events from pipeline → Central Monitor."""
-        try:
-            payload = msgpack.unpackb(sample.payload.to_bytes(), raw=False)
-            if payload.get("type") == "overspeed":
-                from speedflow_python.monitor_client import send_to_monitor
-                send_to_monitor(payload)
-        except Exception as exc:
-            logger.debug("[HealthAgent] Traffic event forward error: %s", exc)
 
     def _open_jtop(self):
         """Try to open a persistent jtop session; return it or None.
@@ -1054,218 +1017,232 @@ class HealthAgent:
 
     def _run(self) -> None:
         """Main loop — collect and publish periodically."""
-        self._session, self._pub = self._connect_zenoh()
-        if not self._session:
-            logger.error("[HealthAgent] Zenoh unavailable. Running in log-only mode.")
+        import traceback
+        try:
+            self._session, self._pub = self._connect_zenoh()
+            if not self._session:
+                logger.error("[HealthAgent] Zenoh unavailable. Running in log-only mode.")
 
-        self._jtop = self._open_jtop()
+            self._jtop = self._open_jtop()
 
-        # Instantiate proactive model using the proactive: section of edge_node.yml.
-        get_edge_cfg()
-        from speedflow_python.load_model import ProactiveModel
-        self._proactive_model = ProactiveModel(
-            _EDGE_CFG.get("proactive", {}),
-            policy=LOAD_POLICY,
-            model_type=LOAD_MODEL,
-        )
-        logger.info("[HealthAgent] LOAD_POLICY=%s LOAD_MODEL=%s", LOAD_POLICY, LOAD_MODEL)
-        if self._proactive_model.enabled:
-            logger.info("[HealthAgent] Proactive load model ENABLED "
-                        "(risk_threshold=%.2f)", self._proactive_model.risk_threshold)
-        else:
-            logger.info("[HealthAgent] Proactive load model disabled "
-                        "(set proactive.enabled: true in edge_node.yml to activate)")
-
-        _zenoh_retry_interval = 30.0  # seconds between Zenoh reconnect attempts
-        _last_zenoh_attempt = time.time()
-        _log_cycle = 0  # counts health cycles; log LoadScore every HEALTH_LOG_EVERY
-        _cfg_reload_interval = 30.0
-        self._last_cfg_reload = 0.0
-
-        # ponytail: monotonic deadline sleep so work duration doesn't extend the period.
-        _next_deadline = time.monotonic()
-
-        while self._running:
-            try:
-                if time.monotonic() - self._last_cfg_reload >= _cfg_reload_interval:
-                    _maybe_reload_edge_cfg()
-                    if self._proactive_model is not None:
-                        self._proactive_model.reload_cfg(
-                            get_edge_cfg().get("proactive", {})
-                        )
-                    self._reload_cam_configs()
-                    self._last_cfg_reload = time.monotonic()
-
-                # Periodically retry Zenoh if the session is not established
-                if self._session is None:
-                    if time.time() - _last_zenoh_attempt >= _zenoh_retry_interval:
-                        logger.info("[HealthAgent] Retrying Zenoh connection...")
-                        self._session, self._pub = self._connect_zenoh()
-                        _last_zenoh_attempt = time.time()
-                        if self._session:
-                            logger.info("[HealthAgent] Zenoh reconnected successfully.")
-
-                metrics = self._collect_metrics()
-
-                snapshot_valid, fps_stats, feature_stats, offload_crops, input_fps, source_modes = \
-                    _read_pipeline_snapshot()
-
-                # ── Pipeline unavailable guard ─────────────────────────
-                # When snapshot is invalid (stale, missing telemetry,
-                # non-advancing seq), do NOT convert garbage into a
-                # healthy TARGET_FPS score.  Report unavailable
-                # (load_score 100 = worst) + empty pipeline section.
-                if snapshot_valid:
-                    starved_cams = _detect_source_starved(
-                        fps_stats, input_fps, get_edge_cfg(),
-                        source_type_map=source_modes,
-                    )
-                    load_score, omega_preset = _compute_load_score(
-                        metrics, fps_stats, source_starved_cameras=starved_cams,
-                        feature_stats=feature_stats,
-                    )
-                    # Compute breakdown for auditable payload
-                    load_score_breakdown = _compute_load_score_breakdown(
-                        metrics, fps_stats, source_starved_cameras=starved_cams,
-                        feature_stats=feature_stats,
-                    )
-                    offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
-                    # BUG-I fix: exclude 0-fps cameras from avg_fps,
-                    # matching the exclusion applied in _compute_load_score()
-                    # so the reported avg_fps is consistent with the load_score value.
-                    active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
-                    avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
-                    active_cameras = [k for k, v in fps_stats.items() if v > 0.0]
-                else:
-                    starved_cams = set()
-                    load_score, omega_preset = 100.0, "fps_dominant"
-                    load_score_breakdown = {
-                        "fps_score": 100.0,
-                        "workload_bonus": 0.0,
-                        "thermal_bonus": 0.0,
-                        "recv_bonus": 0.0,
-                        "trend_bonus": 0.0,
-                        "composite_score": 100.0,
-                        "load_score": 100.0,
-                    }
-                    offload_crops_received_per_s = 0.0
-                    active_fps_vals = []
-                    avg_fps = None
-                    active_cameras = []
-                    # Zero out telemetry so downstream code (proactive model,
-                    # logging) sees empty inputs, not stale data.
-                    fps_stats = {}
-                    feature_stats = {}
-                    offload_crops = {"received_per_s": 0.0}
-
-                # Consume one-shot warmup_ms written by run_python.py after
-                # pipeline.set_state(PLAYING).  After the first heartbeat
-                # it appears in, reset so it only fires once per cold-start.
-                warmup_ms = self._warmup_ms
-                self._warmup_ms = None
-
-                # Active, non-source-starved cameras only.  Empty in the
-                # invalid-snapshot branch (feature_stats/fps_stats are {}) —
-                # nothing to derive from, matching the unavailable report.
-                camera_workload = _derive_camera_workload(
-                    feature_stats, fps_stats, starved_cams
-                )
-
-                payload = {
-                    "type":          "health",
-                    "node_id":       NODE_ID,
-                    "timestamp":     time.time(),
-                    "load_score":    load_score,
-                    "omega_preset":  omega_preset,
-                    "load_score_breakdown": load_score_breakdown,
-                    "gpu_percent":   metrics["gpu_percent"],
-                    "cpu_percent":   metrics["cpu_percent"],
-                    "ram_percent":   metrics["ram_percent"],
-                    "gpu_temp_c":    metrics["gpu_temp_c"],
-                    "power_mw":      metrics["power_mw"],
-                    "source":        metrics.get("source", "jtop"),
-                    "pipeline": {
-                        # pipeline_available distinguishes "pipeline not yet
-                        # started / stale snapshot" (False, load_score=100)
-                        # from real overload (True, load_score=100).
-                        "pipeline_available": snapshot_valid,
-                        # output_fps_per_camera = frames the probe actually
-                        # processed this window (pipeline throughput).
-                        # fps_per_camera is kept for backward compatibility.
-                        "fps_per_camera":        fps_stats,
-                        "output_fps_per_camera": fps_stats,
-                        # input_fps_per_camera = PTS-derived native source
-                        # frame rate (SpeedProbe measures buf_pts deltas),
-                        # falling back to bounded OSD output rate when PTS
-                        # is unavailable.  Used for source-starved detection.
-                        "input_fps_per_camera":  input_fps if snapshot_valid else {},
-                        "avg_fps":        avg_fps,
-                        "active_cameras": active_cameras,
-                        "source_starved_cameras": sorted(starved_cams),
-                        "camera_workload": camera_workload,
-                        "camera_features": feature_stats if snapshot_valid else {},
-                        "camera_configs": self._cam_configs_cache,
-                        "max_streams":    int(self._max_streams or 8),
-                    },
-                }
-
-                if warmup_ms is not None:
-                    payload["warmup_ms"] = warmup_ms
-
-                # ── Proactive model ────────────────────────────────────────
-                # Skip when snapshot is invalid — no features to compute on.
-                if snapshot_valid and self._proactive_model is not None:
-                    _active_ids = {k for k, v in fps_stats.items() if v > 0.0}
-                    proactive_result = self._proactive_model.compute(
-                        metrics,
-                        {k: v for k, v in feature_stats.items() if k in _active_ids},
-                        offload_crops_received_per_s=offload_crops_received_per_s,
-                        fps_stats={k: v for k, v in fps_stats.items() if k in _active_ids},
-                    )
-                    payload.update(proactive_result)
-
-                if self._pub:
-                    self._pub.put(msgpack.packb(payload, use_bin_type=True))
-
-                _log_cycle += 1
-                if _log_cycle % HEALTH_LOG_EVERY == 1:
-                    _risk_str = (
-                        f" | U={payload.get('risk_index', 0.0):.3f}"
-                        f" L={payload.get('l_proactive', 0.0):.3f}"
-                        f" H={payload.get('h_reactive', 0.0):.3f}"
-                        if payload.get("proactive_enabled") else ""
-                    )
-                    logger.info(
-                        "LoadScore=%.1f [%s] | GPU=%.1f%% CPU=%.1f%% RAM=%.1f%% "
-                        "Temp=%.1f°C Power=%.0fmW | FPS=%s%s",
-                        load_score, omega_preset,
-                        metrics["gpu_percent"],
-                        metrics["cpu_percent"],
-                        metrics["ram_percent"],
-                        metrics["gpu_temp_c"],
-                        metrics["power_mw"],
-                        fps_stats,
-                        _risk_str,
-                    )
-
-                # Push to Central Monitor Server (qua MonitorClient)
-                try:
-                    from speedflow_python.monitor_client import send_to_monitor
-                    send_to_monitor(payload)
-                except ImportError:
-                    pass
-
-            except Exception as exc:
-                logger.error("[HealthAgent] Error in collect loop: %s", exc)
-
-            # ponytail: deadline sleep — work duration does not extend the period.
-            _next_deadline += HEALTH_INTERVAL
-            _remaining = _next_deadline - time.monotonic()
-            if _remaining > 0:
-                time.sleep(_remaining)
+            # Instantiate proactive model using the proactive: section of edge_node.yml.
+            get_edge_cfg()
+            from speedflow_python.load_model import ProactiveModel
+            self._proactive_model = ProactiveModel(
+                _EDGE_CFG.get("proactive", {}),
+                policy=LOAD_POLICY,
+                model_type=LOAD_MODEL,
+            )
+            logger.info("[HealthAgent] LOAD_POLICY=%s LOAD_MODEL=%s", LOAD_POLICY, LOAD_MODEL)
+            if self._proactive_model.enabled:
+                logger.info("[HealthAgent] Proactive load model ENABLED "
+                            "(risk_threshold=%.2f)", self._proactive_model.risk_threshold)
             else:
-                # Overran the interval — reset to next cycle to avoid burst.
-                _next_deadline = time.monotonic()
+                logger.info("[HealthAgent] Proactive load model disabled "
+                            "(set proactive.enabled: true in edge_node.yml to activate)")
+
+            _zenoh_retry_interval = 30.0  # seconds between Zenoh reconnect attempts
+            _last_zenoh_attempt = time.time()
+            _log_cycle = 0  # counts health cycles; log LoadScore every HEALTH_LOG_EVERY
+            _cfg_reload_interval = 30.0
+            self._last_cfg_reload = 0.0
+
+            # ponytail: monotonic deadline sleep so work duration doesn't extend the period.
+            _next_deadline = time.monotonic()
+
+            while self._running:
+                try:
+                    if time.monotonic() - self._last_cfg_reload >= _cfg_reload_interval:
+                        _maybe_reload_edge_cfg()
+                        if self._proactive_model is not None:
+                            self._proactive_model.reload_cfg(
+                                get_edge_cfg().get("proactive", {})
+                            )
+                        self._reload_cam_configs()
+                        self._last_cfg_reload = time.monotonic()
+
+                    # Periodically retry Zenoh if the session is not established
+                    if self._session is None:
+                        if time.time() - _last_zenoh_attempt >= _zenoh_retry_interval:
+                            logger.info("[HealthAgent] Retrying Zenoh connection...")
+                            self._session, self._pub = self._connect_zenoh()
+                            _last_zenoh_attempt = time.time()
+                            if self._session:
+                                logger.info("[HealthAgent] Zenoh reconnected successfully.")
+
+                    metrics = self._collect_metrics()
+
+                    snapshot_valid, fps_stats, feature_stats, offload_crops, input_fps, source_modes = \
+                        _read_pipeline_snapshot()
+
+                    # ── Pipeline unavailable guard ─────────────────────────
+                    # When snapshot is invalid (stale, missing telemetry,
+                    # non-advancing seq), do NOT convert garbage into a
+                    # healthy TARGET_FPS score.  Report unavailable
+                    # (load_score 100 = worst) + empty pipeline section.
+                    if snapshot_valid:
+                        starved_cams = _detect_source_starved(
+                            fps_stats, input_fps, get_edge_cfg(),
+                            source_type_map=source_modes,
+                        )
+                        load_score, omega_preset = _compute_load_score(
+                            metrics, fps_stats, source_starved_cameras=starved_cams,
+                            feature_stats=feature_stats,
+                        )
+                        # Compute breakdown for auditable payload
+                        load_score_breakdown = _compute_load_score_breakdown(
+                            metrics, fps_stats, source_starved_cameras=starved_cams,
+                            feature_stats=feature_stats,
+                        )
+                        offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
+                        # BUG-I fix: exclude 0-fps cameras from avg_fps,
+                        # matching the exclusion applied in _compute_load_score()
+                        # so the reported avg_fps is consistent with the load_score value.
+                        active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
+                        avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
+                        active_cameras = [k for k, v in fps_stats.items() if v > 0.0]
+                    else:
+                        starved_cams = set()
+                        load_score, omega_preset = 100.0, "fps_dominant"
+                        load_score_breakdown = {
+                            "fps_score": 100.0,
+                            "workload_bonus": 0.0,
+                            "thermal_bonus": 0.0,
+                            "recv_bonus": 0.0,
+                            "trend_bonus": 0.0,
+                            "composite_score": 100.0,
+                            "load_score": 100.0,
+                        }
+                        offload_crops_received_per_s = 0.0
+                        active_fps_vals = []
+                        avg_fps = None
+                        active_cameras = []
+                        # Zero out telemetry so downstream code (proactive model,
+                        # logging) sees empty inputs, not stale data.
+                        fps_stats = {}
+                        feature_stats = {}
+                        offload_crops = {"received_per_s": 0.0}
+
+                    # Consume one-shot warmup_ms written by run_python.py after
+                    # pipeline.set_state(PLAYING).  After the first heartbeat
+                    # it appears in, reset so it only fires once per cold-start.
+                    warmup_ms = self._warmup_ms
+                    self._warmup_ms = None
+
+                    # Active, non-source-starved cameras only.  Empty in the
+                    # invalid-snapshot branch (feature_stats/fps_stats are {}) —
+                    # nothing to derive from, matching the unavailable report.
+                    camera_workload = _derive_camera_workload(
+                        feature_stats, fps_stats, starved_cams
+                    )
+
+                    payload = {
+                        "type":          "health",
+                        "node_id":       NODE_ID,
+                        "advertise_ip":  ADVERTISE_IP,
+                        "timestamp":     time.time(),
+                        "load_score":    load_score,
+                        "omega_preset":  omega_preset,
+                        "load_score_breakdown": load_score_breakdown,
+                        "gpu_percent":   metrics["gpu_percent"],
+                        "cpu_percent":   metrics["cpu_percent"],
+                        "ram_percent":   metrics["ram_percent"],
+                        "gpu_temp_c":    metrics["gpu_temp_c"],
+                        "power_mw":      metrics["power_mw"],
+                        "source":        metrics.get("source", "jtop"),
+                        "pipeline": {
+                            # pipeline_available distinguishes "pipeline not yet
+                            # started / stale snapshot" (False, load_score=100)
+                            # from real overload (True, load_score=100).
+                            "pipeline_available": snapshot_valid,
+                            # output_fps_per_camera = frames the probe actually
+                            # processed this window (pipeline throughput).
+                            # fps_per_camera is kept for backward compatibility.
+                            "fps_per_camera":        fps_stats,
+                            "output_fps_per_camera": fps_stats,
+                            # input_fps_per_camera = PTS-derived native source
+                            # frame rate (SpeedProbe measures buf_pts deltas),
+                            # falling back to bounded OSD output rate when PTS
+                            # is unavailable.  Used for source-starved detection.
+                            "input_fps_per_camera":  input_fps if snapshot_valid else {},
+                            "avg_fps":        avg_fps,
+                            "active_cameras": active_cameras,
+                            "source_starved_cameras": sorted(starved_cams),
+                            "camera_workload": camera_workload,
+                            "camera_features": feature_stats if snapshot_valid else {},
+                            "camera_configs": self._cam_configs_cache,
+                            "max_streams":    int(self._max_streams or 8),
+                            "offload_crops_received_per_s": float(offload_crops_received_per_s or 0.0),
+                        },
+                    }
+
+                    if warmup_ms is not None:
+                        payload["warmup_ms"] = warmup_ms
+
+                    # ── Proactive model ────────────────────────────────────────
+                    # Skip when snapshot is invalid — no features to compute on.
+                    if snapshot_valid and self._proactive_model is not None:
+                        _active_ids = {k for k, v in fps_stats.items() if v > 0.0}
+                        proactive_result = self._proactive_model.compute(
+                            metrics,
+                            {k: v for k, v in feature_stats.items() if k in _active_ids},
+                            offload_crops_received_per_s=offload_crops_received_per_s,
+                            fps_stats={k: v for k, v in fps_stats.items() if k in _active_ids},
+                        )
+                        payload.update(proactive_result)
+
+                    if self._pub:
+                        self._pub.put(msgpack.packb(payload, use_bin_type=True))
+
+                    _log_cycle += 1
+                    if _log_cycle % HEALTH_LOG_EVERY == 1:
+                        _risk_str = (
+                            f" | U={payload.get('risk_index', 0.0):.3f}"
+                            f" L={payload.get('l_proactive', 0.0):.3f}"
+                            f" H={payload.get('h_reactive', 0.0):.3f}"
+                            if payload.get("proactive_enabled") else ""
+                        )
+                        logger.info(
+                            "LoadScore=%.1f [%s] | GPU=%.1f%% CPU=%.1f%% RAM=%.1f%% "
+                            "Temp=%.1f°C Power=%.0fmW | FPS=%s%s",
+                            load_score, omega_preset,
+                            metrics["gpu_percent"],
+                            metrics["cpu_percent"],
+                            metrics["ram_percent"],
+                            metrics["gpu_temp_c"],
+                            metrics["power_mw"],
+                            fps_stats,
+                            _risk_str,
+                        )
+
+                except Exception as exc:
+                    logger.error("[HealthAgent] Error in collect loop: %s", exc)
+
+                # ponytail: deadline sleep — work duration does not extend the period.
+                _next_deadline += HEALTH_INTERVAL
+                _remaining = _next_deadline - time.monotonic()
+                if _remaining > 0:
+                    time.sleep(_remaining)
+                else:
+                    # Overran the interval — reset to next cycle to avoid burst.
+                    _next_deadline = time.monotonic()
+
+        except Exception:
+            logger.critical("[HealthAgent] Fatal unhandled exception in _run:\n%s", traceback.format_exc())
+            raise
+        finally:
+            logger.info("[HealthAgent] Cleaning up resources before exit...")
+            if self._jtop:
+                try:
+                    self._jtop.close()
+                except Exception:
+                    pass
+            if self._session:
+                try:
+                    self._session.close()
+                except Exception:
+                    pass
+            logger.info("[HealthAgent] Stopped.")
 
 
 # ---------------------------------------------------------------------------

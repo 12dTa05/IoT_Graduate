@@ -34,7 +34,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import msgpack
 
@@ -81,6 +81,8 @@ class PeerState:
     # Camera IDs reported as source-starved by the health agent.
     # These are excluded from offload candidate selection (fail safe).
     source_starved_cameras: List[str] = field(default_factory=list)
+    # Rate of offload crops received per second (for Level 2/3 peer evaluation)
+    offload_crops_received_per_s: float = 0.0
 
 
 def _parse_camera_workload(raw) -> Dict[str, float]:
@@ -237,6 +239,16 @@ class MigrationLogger:
             round(blind_spot_ms, 0) if blind_spot_ms is not None else "",
         ]
         try:
+            # File size rotation guard: rotate if CSV exceeds 10MB to avoid filling Jetson eMMC
+            if self._path.exists() and self._path.stat().st_size > 10 * 1024 * 1024:
+                backup = self._path.with_suffix(".csv.old")
+                try:
+                    self._path.replace(backup)
+                except Exception:
+                    pass
+                with open(self._path, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(self.HEADER)
+
             with open(self._path, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(row)
         except Exception as exc:
@@ -311,6 +323,10 @@ class PeerOrchestrator:
         # with _check_rebalance reading it to detect camera returns).
         self._failover_triggered: Dict[str, float] = {}
 
+        # Rescue claims received from other nodes: (dead_node_id, camera_id) → (node_id, timestamp, priority_weight)
+        self._failover_claims: Dict[Tuple[str, str], Tuple[str, float, int]] = {}
+        self._claims_lock = threading.Lock()
+
         # Cameras rescued via failover: camera_id → original_owner_node_id
         # Used to return cameras when the original owner comes back online.
         self._rescued_cameras: Dict[str, str] = {}
@@ -351,6 +367,9 @@ class PeerOrchestrator:
         # completion.  Prevents the reclaimed camera from being immediately
         # migrated away again during its transient FPS warm-up window on this node.
         self._reclaim_completed_at: Dict[str, float] = {}
+
+        # Round-robin counter for baseline experiment policy
+        self._rr_counter: int = 0
 
         # Reclaim retry tracking: camera_id → timestamp when reclaim can be retried
         self._reclaim_retry_at: Dict[str, float] = {}
@@ -438,12 +457,13 @@ class PeerOrchestrator:
         self._session = make_session()
         logger.info("[PeerOrch] Zenoh session opened (peer mode).")
 
-        # Declare publishers once
+        # Declared publishers
         self._pubs["status"]        = self._session.declare_publisher(f"peers/status/{self._node_id}")
         self._pubs["vote_request"]  = self._session.declare_publisher("peers/vote/request")
         self._pubs["vote_proposal"] = self._session.declare_publisher("peers/vote/proposal")
         self._pubs["vote_decision"] = self._session.declare_publisher("peers/vote/decision")
         self._pubs["control"]       = self._session.declare_publisher(f"peers/control/{self._node_id}")
+        self._pubs["failover_claim"] = self._session.declare_publisher("peers/failover/claim")
 
         # Subscribe to all P2P topics
         self._session.declare_subscriber("peers/status/**",      self._on_sample)
@@ -451,7 +471,8 @@ class PeerOrchestrator:
         self._session.declare_subscriber("peers/vote/proposal",  self._on_sample)
         self._session.declare_subscriber("peers/vote/decision",  self._on_sample)
         self._session.declare_subscriber("peers/vote/ack/**",    self._on_sample)
-        logger.info("[PeerOrch] Subscribed to: peers/status/**, peers/vote/*, peers/vote/ack/**")
+        self._session.declare_subscriber("peers/failover/claim", self._on_sample)
+        logger.info("[PeerOrch] Subscribed to: peers/status/**, peers/vote/*, peers/vote/ack/**, peers/failover/claim")
 
         self._running = True
         self._ready_event.set()
@@ -502,6 +523,9 @@ class PeerOrchestrator:
             )
             self._self_state.source_starved_cameras = _parse_starved_cameras(
                 pipeline.get("source_starved_cameras", [])
+            )
+            self._self_state.offload_crops_received_per_s = float(
+                pipeline.get("offload_crops_received_per_s", 0.0) or 0.0
             )
             self._self_state.last_seen = time.time()
             # max_streams sourced from health payload; malformed values fall back to 8
@@ -627,6 +651,8 @@ class PeerOrchestrator:
             self._on_vote_decision(payload)
         elif key.startswith("peers/vote/ack/"):
             self._on_vote_ack(payload)
+        elif key == "peers/failover/claim":
+            self._on_failover_claim(payload)
         else:
             logger.debug("[PeerOrch] Unknown key: %s", key)
 
@@ -736,6 +762,9 @@ class PeerOrchestrator:
             peer.source_starved_cameras = _parse_starved_cameras(
                 pipeline.get("source_starved_cameras", [])
             )
+            peer.offload_crops_received_per_s = float(
+                pipeline.get("offload_crops_received_per_s", 0.0) or 0.0
+            )
             peer.last_seen = time.time()
             # max_streams from peer health payload; malformed values fall back to 8
             try:
@@ -758,6 +787,26 @@ class PeerOrchestrator:
                     peer.overload_since = time.time()
             else:
                 peer.overload_since = None
+
+            # Phase 6 / Reviewer Finding 2.4: compute migration blind-spot metric (Δτ)
+            # Check if any camera migrated out to this peer is now reporting valid FPS on the peer.
+            for cam_id, mig_ts in list(self._migration_complete_ts.items()):
+                if self._migrated_out.get(cam_id) == node_id:
+                    cam_fps = peer.fps_per_camera.get(cam_id, 0.0) if peer.fps_per_camera else 0.0
+                    if isinstance(cam_fps, (int, float)) and cam_fps > 0.0:
+                        blind_spot_ms = max(0.0, (time.time() - mig_ts) * 1000.0)
+                        logger.info(
+                            "[PeerOrch] Migration blind-spot resolved for '%s' on peer '%s': %.0fms",
+                            cam_id, node_id, blind_spot_ms,
+                        )
+                        # ponytail: log resolved blind spot row to CSV
+                        self._migration_log.log(
+                            self._node_id, node_id, cam_id,
+                            "blind_spot_resolved", peer.load_score, cam_fps,
+                            0.0, "RESOLVED",
+                            blind_spot_ms=blind_spot_ms,
+                        )
+                        self._migration_complete_ts.pop(cam_id, None)
 
     # ------------------------------------------------------------------
     # Overload classification helper (proactive-aware)
@@ -1627,36 +1676,59 @@ class PeerOrchestrator:
         # Edge/configs/edge_node.yml p2p.thermal section.
         # Reuses the shared _thermal_admission_ok so sender and receiver
         # rules cannot drift.
+        # Allow policy override for baseline comparison experiments (Finding 2.5)
+        policy_name = self._cfg.get("policy", "p2p_pareto")
+        if policy_name == "no_offload":
+            return None
+
         therm_cfg = self._cfg.get("thermal")
         best_id : Optional[str] = None
         best_load = float("inf")
 
         with self._lock:
+            # Baseline: Round-Robin offload policy
+            if policy_name == "round_robin":
+                eligible = [
+                    nid for nid, peer in sorted(self._peers.items())
+                    if nid != self._node_id and (now - peer.last_seen <= timeout)
+                ]
+                if not eligible:
+                    return None
+                rr_counter = self._rr_counter
+                selected = eligible[rr_counter % len(eligible)]
+                self._rr_counter = rr_counter + 1
+                return selected
+
             for nid, peer in self._peers.items():
                 if nid == self._node_id:
                     continue
                 if now - peer.last_seen > timeout:
                     continue
-                if for_offload_level <= 1 and (
-                    len(peer.active_cameras) + self._peer_inflight.get(nid, 0)
-                    >= peer.max_streams
-                ):
-                    # ponytail: count in-flight reservations so simultaneous
-                    # RFOs from this node don't both pick the same peer and
-                    # overflow its stream capacity before ACKs arrive.
-                    continue
-                if not _thermal_admission_ok(peer.gpu_temp_c, therm_cfg):
-                    logger.info(
-                        "[PeerOrch] Peer '%s' rejected by thermal gate: "
-                        "gpu_temp_c=%s (max=%.1f)",
-                        nid, peer.gpu_temp_c,
-                        self._cfg.get("thermal", {}).get("max_gpu_temp_c", 85.0),
-                    )
-                    continue
-                if now < peer.penalty_until:
-                    continue
-                if peer.load_score < best_load:
-                    best_load = peer.load_score
+                # For pure least-load greedy baseline, skip stream capacity and thermal admission gates
+                if policy_name not in ("least_load_greedy", "centralized_greedy"):
+                    if for_offload_level <= 1 and (
+                        len(peer.active_cameras) + self._peer_inflight.get(nid, 0)
+                        >= peer.max_streams
+                    ):
+                        continue
+                    if not _thermal_admission_ok(peer.gpu_temp_c, therm_cfg):
+                        continue
+                    if now < peer.penalty_until:
+                        continue
+
+                # For Level 2/3 (crop offload), peer selection scores inference/recv capacity
+                # instead of pipeline stream load_score, since crop offload does not decode.
+                # Normalized composite: 50% load pressure + 50% crop saturation (cap=10.0 crops/s)
+                if for_offload_level >= 2 and policy_name not in ("least_load_greedy", "centralized_greedy"):
+                    recv_rate = peer.offload_crops_received_per_s
+                    recv_cap = float(self._cfg.get("crop_recv_capacity", 10.0))
+                    recv_ratio = max(0.0, min(1.0, recv_rate / max(1.0, recv_cap)))
+                    candidate_score = (peer.load_score * 0.5) + (recv_ratio * 50.0)
+                else:
+                    candidate_score = peer.load_score
+
+                if candidate_score < best_load:
+                    best_load = candidate_score
                     best_id   = nid
 
         return best_id
@@ -1821,7 +1893,15 @@ class PeerOrchestrator:
         logger.info("[PeerOrch] RFO received from '%s' for camera '%s'", requester, camera_id)
 
         # Offload the blocking work immediately so this callback returns fast
-        self._executor.submit(self._evaluate_and_bid, payload)
+        self._safe_submit(self._evaluate_and_bid, payload)
+
+    def _safe_submit(self, fn, *args, **kwargs):
+        """Submit to executor safely; silently ignores if executor is shut down."""
+        try:
+            return self._executor.submit(fn, *args, **kwargs)
+        except RuntimeError:
+            logger.debug("[PeerOrch] Executor already shut down; dropped async task.")
+            return None
 
     def _evaluate_and_bid(self, payload: dict) -> None:
         """
@@ -1957,9 +2037,34 @@ class PeerOrchestrator:
                 )
                 return
 
-            # All constraints pass — compute F(x)
-            # F(x) = estimated load score after accepting this stream
-            f_x = self_load + (100.0 - self_load) * 0.25
+            # All constraints pass — compute multi-objective cost F(x)
+            # Incorporates load pressure, predicted FPS degradation, network RTT, and thermal headroom.
+            bid_weights = self._cfg.get("p2p", {}).get("bid_weights", {})
+            w_load = float(bid_weights.get("w_load", 0.50))
+            w_fps = float(bid_weights.get("w_fps", 0.25))
+            w_rtt = float(bid_weights.get("w_rtt", 0.15))
+            w_therm = float(bid_weights.get("w_therm", 0.10))
+
+            target_fps = float(self._cfg.get("target_fps", 25.0))
+            fps_degrade_ratio = max(0.0, min(1.0, (target_fps - (predicted_fps or target_fps)) / max(1.0, target_fps)))
+            rtt_ratio = max(0.0, min(1.0, (rtt_ms or 0.0) / max(1.0, eps_net_ms)))
+            
+            # Thermal headroom cost above onset (70C -> 85C)
+            onset_c = float(self._cfg.get("thermal", {}).get("onset_gpu_temp_c", 70.0))
+            crit_c = float(self._cfg.get("thermal", {}).get("max_gpu_temp_c", 85.0))
+            if self_temp is not None:
+                therm_ratio = max(0.0, min(1.0, (self_temp - onset_c) / max(1.0, (crit_c - onset_c))))
+            else:
+                therm_ratio = 0.0
+                logger.debug("[PeerOrch] Bid F(x): gpu_temp_c is None, w_therm contribution is 0.0")
+
+            # ponytail: multi-objective incremental cost; lowest cost wins vote
+            f_x = (
+                w_load * (self_load / 100.0)
+                + w_fps * fps_degrade_ratio
+                + w_rtt * rtt_ratio
+                + w_therm * therm_ratio
+            ) * 100.0
 
             proposal = {
                 "bidder":        self._node_id,
@@ -2374,6 +2479,39 @@ class PeerOrchestrator:
         elif event is not None:
             logger.info("[PeerOrch] Ack received for '%s' — stream is PLAYING.", camera_id)
 
+    def _on_failover_claim(self, payload: dict) -> None:
+        """Handle incoming rescue claim broadcast on peers/failover/claim.
+
+        Used for contention resolution when multiple nodes detect the same dead peer.
+        Record the claim to resolve split-brain duplicate rescues.
+        """
+        dead_node_id = payload.get("dead_node_id", "")
+        camera_id = payload.get("camera_id", "")
+        claimer_node_id = payload.get("claimer_node_id", "")
+        priority_weight = payload.get("priority_weight", 0)
+        ts = payload.get("ts", time.time())
+
+        if not dead_node_id or not camera_id or not claimer_node_id:
+            return
+
+        with self._claims_lock:
+            # Claims are only needed during the short contention window.  Bound
+            # this cache even when a failover exits early or the cluster churns.
+            claim_ttl_s = max(2.0, float(self._cfg.get("rescue_claim_window_s", 0.5)) * 4.0)
+            cutoff = time.time() - claim_ttl_s
+            self._failover_claims = {
+                key: claim for key, claim in self._failover_claims.items()
+                if claim[1] >= cutoff
+            }
+            key = (dead_node_id, camera_id)
+            existing = self._failover_claims.get(key)
+            if existing is None or priority_weight > existing[2]:
+                self._failover_claims[key] = (claimer_node_id, ts, priority_weight)
+                logger.info(
+                    "[Failover] Recorded rescue claim for '%s' (dead='%s') by '%s' (weight=%d)",
+                    camera_id, dead_node_id, claimer_node_id, priority_weight,
+                )
+
     # ------------------------------------------------------------------
     # Leaderless failover (Phase 5)
     # ------------------------------------------------------------------
@@ -2381,11 +2519,27 @@ class PeerOrchestrator:
     @staticmethod
     def _consistent_hash(camera_id: str, peer_ids: List[str]) -> str:
         """
-        Deterministic hash: all nodes use sorted(peer_ids) → same input → same output.
+        Rendezvous / Highest Random Weight (HRW) hashing:
+        Computes sha256(camera_id:peer_id) for each candidate peer; highest hash wins.
+        
+        Properties over modulo hashing:
+          1. Minimal disruption on membership change: when a node leaves/fails,
+             only its assigned cameras are reassigned; remaining cameras stay bound.
+          2. Uniform distribution across alive peers.
+          3. Deterministic across all nodes that see the same peer set.
         """
-        alive = sorted(peer_ids)
-        key = int(hashlib.sha256(camera_id.encode()).hexdigest(), 16)
-        return alive[key % len(alive)]
+        if not peer_ids:
+            return ""
+        # ponytail: HRW rendezvous hash ensures true consistent hashing property
+        best_peer = ""
+        best_weight = -1
+        for pid in sorted(peer_ids):
+            combined = f"{camera_id}:{pid}".encode("utf-8")
+            weight = int(hashlib.sha256(combined).hexdigest(), 16)
+            if weight > best_weight:
+                best_weight = weight
+                best_peer = pid
+        return best_peer
 
     def _leaderless_failover(self, dead_node_id: str, orphaned_cameras: List[str]) -> None:
         """
@@ -2507,13 +2661,23 @@ class PeerOrchestrator:
                         continue
 
                 # Re-check capacity including cameras accepted earlier in this loop against rescue ceiling
-                # BUG-1 fix: read active_cameras under _self_lock
+                # BUG-1 fix: read active_cameras and load_score under _self_lock
                 with self._self_lock:
                     current_streams = len(self._self_state.active_cameras)
+                    current_load = self._self_state.load_score
                 if current_streams + self_accepted >= rescue_ceiling:
                     logger.warning(
                         "[Failover] Cannot rescue '%s': at rescue ceiling (%d >= %d). Skipping.",
                         camera_id, current_streams + self_accepted, rescue_ceiling,
+                    )
+                    continue
+
+                # Capacity load-score gate: do not rescue if node is already near/above overload
+                overload_thresh = self._cfg.get("overload_threshold", 60.0)
+                if current_load >= overload_thresh:
+                    logger.warning(
+                        "[Failover] Cannot rescue '%s': self load_score (%.1f) >= overload threshold (%.1f). Skipping.",
+                        camera_id, current_load, overload_thresh,
                     )
                     continue
 
@@ -2540,6 +2704,40 @@ class PeerOrchestrator:
                 if cam_config is None:
                     logger.error("[Failover] No config for '%s'. Skipping.", camera_id)
                     continue
+
+                # Fix E: Broadcast rescue claim to resolve membership-divergence split-brain
+                my_weight = int(hashlib.sha256(f"{camera_id}:{self._node_id}".encode()).hexdigest(), 16)
+                claim_payload = {
+                    "dead_node_id": dead_node_id,
+                    "camera_id": camera_id,
+                    "claimer_node_id": self._node_id,
+                    "priority_weight": my_weight,
+                    "ts": time.time(),
+                }
+                if "failover_claim" in self._pubs:
+                    try:
+                        self._pubs["failover_claim"].put(msgpack.packb(claim_payload, use_bin_type=True))
+                    except Exception as e:
+                        logger.warning("[Failover] Could not publish rescue claim: %s", e)
+
+                # Record own claim locally
+                with self._claims_lock:
+                    self._failover_claims[(dead_node_id, camera_id)] = (self._node_id, time.time(), my_weight)
+
+                # Wait short claim window to detect contention from other surviving nodes
+                claim_window_s = cfg.get("rescue_claim_window_s", 0.5)
+                if claim_window_s > 0:
+                    time.sleep(claim_window_s)
+
+                # Check if a peer claimed with higher weight during the window
+                with self._claims_lock:
+                    best_claim = self._failover_claims.get((dead_node_id, camera_id))
+                    if best_claim is not None and best_claim[0] != self._node_id and best_claim[2] > my_weight:
+                        logger.info(
+                            "[Failover] Yielding rescue of '%s' to '%s' (higher weight %d > %d)",
+                            camera_id, best_claim[0], best_claim[2], my_weight,
+                        )
+                        continue
 
                 # Verify the camera RTSP source is reachable before adding.
                 # If the source is hosted on the dead node, it's unreachable.
@@ -2568,6 +2766,12 @@ class PeerOrchestrator:
                     "node_offline", 0.0, 0.0,
                     0.0, "FAILOVER_ADD",
                 )
+
+        # A completed failover must not retain one claim per rescued camera.
+        # Keep only claims that may still be observed by a peer in flight.
+        with self._claims_lock:
+            for camera_id in orphaned_cameras:
+                self._failover_claims.pop((dead_node_id, camera_id), None)
 
     # ------------------------------------------------------------------
     # Helpers

@@ -36,27 +36,27 @@ from Server.violation_store import ViolationStore
 class ServerState:
     def __init__(self) -> None:
         self.registry: EdgeRegistry = None
-        self.edge_ws: Dict[str, web.WebSocketResponse] = {}
         self.browser_ws: List[web.WebSocketResponse] = []
         self.store: ViolationStore = None
         self.http_session: aiohttp.ClientSession = None
-        # BUG-05: keep a strong reference to the watchdog task so the GC
-        # cannot collect it while it is still pending.
         self._watchdog_task: asyncio.Task = None
+        self._zenoh_session = None
+        self._zenoh_sub = None
+        self._loop: asyncio.AbstractEventLoop = None
 
     def broadcast(self, msg: Dict[str, Any]) -> None:
-        """Queue a JSON push to all connected browsers.
-
-        BUG-F fix: create_task() raises RuntimeError when called outside a
-        running event loop (e.g. tests, CLI tools).  Guard explicitly so
-        callers in non-async contexts get a warning instead of a crash.
-        """
+        """Queue a JSON push to all connected browsers (thread-safe)."""
         payload = json.dumps(msg, default=str)
-        try:
-            asyncio.get_running_loop()
-            asyncio.create_task(self._send_all(payload))
-        except RuntimeError:
-            logger.warning("[ServerState] broadcast() called outside event loop — message dropped")
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(self._send_all(payload))
+            )
+        else:
+            try:
+                loop = asyncio.get_running_loop()
+                asyncio.create_task(self._send_all(payload))
+            except RuntimeError:
+                logger.warning("[ServerState] broadcast() called outside event loop — message dropped")
 
     async def _send_all(self, payload: str) -> None:
         dead: List[web.WebSocketResponse] = []
@@ -189,105 +189,59 @@ async def handle_streams(request: web.Request) -> web.Response:
         return web.json_response({"error": str(exc)}, status=502)
 
 
-async def handle_ws_edge(request: web.Request) -> web.WebSocketResponse:
-    state: ServerState = request.app["state"]
-
-    node_id = request.query.get("node_id", "").strip()
-    advertise_ip = request.query.get("advertise_ip", "").strip()
-    ip = advertise_ip or request.remote or ""
-
-    if not node_id:
-        return web.Response(text="node_id query param required", status=400)
-
-    ws = web.WebSocketResponse(heartbeat=HEARTBEAT_TIMEOUT)
-    await ws.prepare(request)
-
-    # BUG-C/D fix: close the old WebSocket BEFORE registering the new one.
-    # Closing first ensures the old connection's finally-block (mark_offline)
-    # runs and completes before register() sets online=True.  This prevents
-    # the race where the old WS's finally fires after the new registration,
-    # re-marking a freshly connected edge as offline.
-    old_ws = state.edge_ws.pop(node_id, None)
-    if old_ws and not old_ws.closed:
-        await old_ws.close()
-
-    is_new = state.registry.register(node_id, ip)
-    state.edge_ws[node_id] = ws
-
-    logger.info("[EDGE-WS] '%s' connected (%s). Edges online: %d",
-                node_id, ip, len(state.edge_ws))
-
-    # Fix #10: only broadcast edge_registered for genuinely new nodes; for
-    # reconnects the registry keeps the node online so a spurious second
-    # edge_registered event would confuse the dashboard.
-    if is_new:
-        state.broadcast({
-            "type": "edge_registered",
-            "node_id": node_id,
-            "ip": ip,
-        })
-    else:
-        state.broadcast({
-            "type": "edge_reconnected",
-            "node_id": node_id,
-            "ip": ip,
-        })
-
+def _start_zenoh_subscriber(state: ServerState) -> Optional[Any]:
+    """
+    Start Zenoh peer-mode subscriber for edge status messages.
+    Server listens on TCP for edges outside LAN, plus multicast scouting.
+    Read-only — Server never sends commands back to edges.
+    """
     try:
-        async for msg in ws:
-            if msg.type == WSMsgType.TEXT:
-                try:
-                    data = json.loads(msg.data)
-                    await _process_edge_message(state, node_id, data)
-                except json.JSONDecodeError:
-                    pass
-                except Exception as exc:
-                    logger.warning("[EDGE-WS] '%s' message error: %s", node_id, exc)
-            elif msg.type == WSMsgType.ERROR:
-                logger.warning("[EDGE-WS] '%s' WS error: %s", node_id, ws.exception())
-    finally:
-        is_current = state.edge_ws.get(node_id) is ws
-        if is_current:
-            state.edge_ws.pop(node_id, None)
-            state.registry.mark_offline(node_id)
-        logger.info("[EDGE-WS] '%s' disconnected (current=%s). Edges online: %d",
-                    node_id, is_current, len(state.edge_ws))
+        import msgpack
+        import zenoh
 
-    return ws
+        cfg = zenoh.Config()
+        cfg.insert_json5("mode", '"peer"')
+        cfg.insert_json5("scouting/multicast/enabled", "true")
+        zenoh_listen = os.getenv("ZENOH_LISTEN", "tcp/0.0.0.0:7447")
+        if zenoh_listen:
+            cfg.insert_json5("listen/endpoints", f'["{zenoh_listen}"]')
 
+        session = zenoh.open(cfg)
+        logger.info("[Zenoh Server] Session opened (peer mode, listening on %s)", zenoh_listen)
 
-async def _process_edge_message(
-    state: ServerState,
-    node_id: str,
-    data: Dict[str, Any],
-) -> None:
-    msg_type = data.get("type", "")
+        def _on_status(sample) -> None:
+            try:
+                payload = msgpack.unpackb(sample.payload.to_bytes(), raw=False)
+            except Exception as exc:
+                logger.warning("[Zenoh Server] Failed to unpack status: %s", exc)
+                return
 
-    if msg_type == "health":
-        # Log every health payload at DEBUG level so you can inspect what
-        # each edge is sending.  Run the server with DEBUG logging to see it:
-        #   python3 app.py --log-level debug
-        # or set the env var: LOG_LEVEL=DEBUG python3 app.py
-        logger.debug(
-            "[EDGE-HEALTH] '%s' → load=%.1f%% gpu=%.1f%% cpu=%.1f%% "
-            "ram=%.1f%% temp=%.1f°C power=%.0fmW fps=%s active=%s source=%s",
-            node_id,
-            data.get("load_score", 0),
-            data.get("gpu_percent", 0),
-            data.get("cpu_percent", 0),
-            data.get("ram_percent", 0),
-            data.get("gpu_temp_c", 0),
-            data.get("power_mw", 0),
-            data.get("pipeline", {}).get("fps_per_camera", {}),
-            data.get("pipeline", {}).get("active_cameras", []),
-            data.get("source", "?"),
-        )
-        state.registry.update_health(node_id, data)
-        health_msg = {**data, "type": "health_update", "node_id": node_id}
-        state.broadcast(health_msg)
+            node_id = payload.get("node_id", "")
+            if not node_id:
+                return
 
-    elif msg_type in ("violation", "overspeed"):
-        pass  # violation capture disabled
+            event = payload.get("event")
+            if event == "NODE_ONLINE":
+                ip = payload.get("advertise_ip", "")
+                is_new = state.registry.register(node_id, ip)
+                if is_new:
+                    state.broadcast({"type": "edge_registered", "node_id": node_id, "ip": ip})
+                else:
+                    state.broadcast({"type": "edge_reconnected", "node_id": node_id, "ip": ip})
+                return
+
+            state.registry.update_health(node_id, payload)
+            health_msg = {**payload, "type": "health_update", "node_id": node_id}
+            state.broadcast(health_msg)
+
+        sub = session.declare_subscriber("peers/status/**", _on_status)
+        logger.info("[Zenoh Server] Subscribed to 'peers/status/**'")
+        state._zenoh_session = session
+        state._zenoh_sub = sub
+        return session
+    except Exception as exc:
+        logger.warning("[Zenoh Server] Failed to start Zenoh subscriber: %s", exc)
+        return None
 
 
 async def handle_ws_server(request: web.Request) -> web.WebSocketResponse:
@@ -347,19 +301,28 @@ def create_app() -> web.Application:
     app["state"] = state
 
     async def on_startup(app: web.Application) -> None:
+        state._loop = asyncio.get_running_loop()
         state.http_session = aiohttp.ClientSession()
         # BUG-05: store the task reference so GC cannot collect a pending task
         state._watchdog_task = state.registry.start_watchdog()
         logger.info("[Server] Watchdog started, HTTP session created")
+        _start_zenoh_subscriber(state)
 
     async def on_shutdown(app: web.Application) -> None:
         if state._watchdog_task and not state._watchdog_task.done():
             state._watchdog_task.cancel()
         if state.http_session and not state.http_session.closed:
             await state.http_session.close()
-        for node_id, ws in list(state.edge_ws.items()):
-            if not ws.closed:
-                await ws.close()
+        if state._zenoh_sub:
+            try:
+                state._zenoh_sub.undeclare()
+            except Exception:
+                pass
+        if state._zenoh_session:
+            try:
+                state._zenoh_session.close()
+            except Exception:
+                pass
         logger.info("[Server] All connections closed")
 
     app.on_startup.append(on_startup)
@@ -372,7 +335,6 @@ def create_app() -> web.Application:
     app.router.add_get("/api/violations", handle_violations)
     app.router.add_get("/api/streams", handle_streams)
     app.router.add_get("/api/snapshots/{node_id}/{filename}", handle_snapshot)
-    app.router.add_get("/ws/edge", handle_ws_edge)
     app.router.add_get("/ws/server", handle_ws_server)
     app.router.add_get("/health", handle_health_check)
 

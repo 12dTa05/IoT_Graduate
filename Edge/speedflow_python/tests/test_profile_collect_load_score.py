@@ -59,7 +59,7 @@ _make_stubs({
         "HEALTH_LOG_EVERY": 15,
         "TARGET_FPS": 27.0,
         "FPS_STATS_FILE": "/dev/null",
-        "MONITOR_URL": "",
+        "ZENOH_ROUTER": "",
         "ADVERTISE_IP": "127.0.0.1",
         "LOAD_POLICY": "actual",
         "LOAD_MODEL": "formula",

@@ -52,6 +52,17 @@ p2p:
   eps_network_ms_tier1: 60.0    # Tier 1 relaxation
   eps_streams_max: 4            # Hard capacity ceiling (must match max key in fps_model)
 
+  # Multi-objective bid scoring weights for RFO F(x)
+  bid_weights:
+    w_load: 0.50   # current load pressure (0-100 normalized)
+    w_fps: 0.25    # predicted FPS degradation relative to target_fps
+    w_rtt: 0.15    # network latency relative to eps_net_ms
+    w_therm: 0.10  # thermal headroom consumption above onset_c
+
+  # Offload policy: "p2p_pareto" (default), "no_offload", "round_robin",
+  # "least_load_greedy", "centralized_greedy" (for baseline comparison)
+  policy: "p2p_pareto"
+
   # FPS prediction model — calibrate offline per Jetson model
   # key = number of streams AFTER accepting the new camera
   fps_model:

@@ -12,5 +12,7 @@ docker compose -f docker-compose.media.yml up -d
 echo "[start.sh] MediaMTX started."
 
 # ── 2. Python dashboard server ────────────────────────────────
+echo "[start.sh] Checking/installing dependencies..."
+pip install -q -r requirements.txt || true
 echo "[start.sh] Starting dashboard server..."
 exec python3 app.py "$@"

@@ -332,12 +332,27 @@ fi
 # ---------------------------------------------------------------------------
 # Watch loop — exits when collector finishes (collect/calibrate), or on error
 # ---------------------------------------------------------------------------
+MAX_HEALTH_RESTARTS=3
+HEALTH_RESTART_COUNT=0
+HEALTH_BACKOFF=3
+
 while true; do
     sleep 2
 
     if ! kill -0 "$HEALTH_PID" 2>/dev/null; then
-        echo "[run_edge] ERROR: health_agent exited unexpectedly. Stopping pipeline." >&2
-        exit 1
+        echo "[run_edge] WARNING: health_agent exited. Restart attempt $((HEALTH_RESTART_COUNT + 1))/$MAX_HEALTH_RESTARTS..." >&2
+        if [[ $HEALTH_RESTART_COUNT -ge $MAX_HEALTH_RESTARTS ]]; then
+            echo "[run_edge] ERROR: health_agent exceeded max restarts ($MAX_HEALTH_RESTARTS). Stopping pipeline." >&2
+            exit 1
+        fi
+        sleep $HEALTH_BACKOFF
+        "$PYTHON" health_agent.py &
+        HEALTH_PID=$!
+        _pids+=("$HEALTH_PID")
+        ((HEALTH_RESTART_COUNT++)) || true
+        HEALTH_BACKOFF=$((HEALTH_BACKOFF * 2))
+        echo "[run_edge] health_agent restarted with PID=$HEALTH_PID (restart count: $HEALTH_RESTART_COUNT)"
+        continue
     fi
 
     if ! kill -0 "$PIPELINE_PID" 2>/dev/null; then

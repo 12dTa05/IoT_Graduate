@@ -38,9 +38,9 @@ def _get(key: str, cast=str):
     return cast(_require(key))
 
 # -----------------------------------------------------------
-# Central Monitoring Server
+# Central Monitoring Server / Zenoh Router
 # -----------------------------------------------------------
-MONITOR_URL = os.environ.get("MONITOR_URL", "").strip()   # empty → disabled
+ZENOH_ROUTER = os.environ.get("ZENOH_ROUTER", "").strip()   # empty → multicast only
 
 # -----------------------------------------------------------
 # Node identity

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger("edge_registry")
 
 # Must match Edge/configs/edge_node.yml peer.heartbeat_timeout_s.
-HEARTBEAT_TIMEOUT = 5.0
+HEARTBEAT_TIMEOUT = 10.0
 WATCHDOG_INTERVAL = 5.0
 
 
@@ -47,67 +48,87 @@ class EdgeRegistry:
     def __init__(self, on_change: Optional[Callable[[str, str], None]] = None) -> None:
         self._edges: Dict[str, EdgeInfo] = {}
         self._on_change = on_change
+        self._lock = threading.Lock()
 
     def register(self, node_id: str, ip: str) -> bool:
-        existing = self._edges.get(node_id)
-        if existing:
-            existing.ip = ip
-            existing.online = True
-            existing.last_heartbeat = time.time()
-            logger.info("[Registry] Edge '%s' re-registered at %s", node_id, ip)
-            return False
-        self._edges[node_id] = EdgeInfo(node_id, ip)
-        logger.info("[Registry] Edge '%s' registered at %s", node_id, ip)
+        with self._lock:
+            existing = self._edges.get(node_id)
+            if existing:
+                if ip:
+                    existing.ip = ip
+                existing.online = True
+                existing.last_heartbeat = time.time()
+                logger.info("[Registry] Edge '%s' re-registered at %s", node_id, existing.ip)
+                return False
+            self._edges[node_id] = EdgeInfo(node_id, ip)
+            logger.info("[Registry] Edge '%s' registered at %s", node_id, ip)
         self._emit("registered", node_id)
         return True
 
     def update_health(self, node_id: str, payload: Dict[str, Any]) -> None:
-        info = self._edges.get(node_id)
-        if not info:
-            return
-        info.online = True
-        info.last_heartbeat = time.time()
-        health = {k: v for k, v in payload.items() if k not in ("type", "node_id")}
-        info.health = health
+        with self._lock:
+            info = self._edges.get(node_id)
+            if not info:
+                # Auto-register if not yet registered
+                ip = payload.get("advertise_ip", "")
+                self._edges[node_id] = EdgeInfo(node_id, ip)
+                info = self._edges[node_id]
+                logger.info("[Registry] Edge '%s' auto-registered via status", node_id)
+            info.online = True
+            info.last_heartbeat = time.time()
+            if payload.get("advertise_ip"):
+                info.ip = payload["advertise_ip"]
+            health = {k: v for k, v in payload.items() if k not in ("type", "node_id")}
+            info.health = health
         self._emit("health_updated", node_id)
 
     def mark_offline(self, node_id: str) -> None:
-        info = self._edges.get(node_id)
-        if not info or not info.online:
-            return
-        info.online = False
+        with self._lock:
+            info = self._edges.get(node_id)
+            if not info or not info.online:
+                return
+            info.online = False
         logger.info("[Registry] Edge '%s' marked offline", node_id)
         self._emit("offline", node_id)
 
     def get(self, node_id: str) -> Optional[EdgeInfo]:
-        return self._edges.get(node_id)
+        with self._lock:
+            return self._edges.get(node_id)
 
     def get_all(self) -> List[Dict[str, Any]]:
-        return [info.to_dict() for info in self._edges.values()]
+        with self._lock:
+            return [info.to_dict() for info in self._edges.values()]
 
     def get_online(self) -> List[Dict[str, Any]]:
-        return [info.to_dict() for info in self._edges.values() if info.online]
+        with self._lock:
+            return [info.to_dict() for info in self._edges.values() if info.online]
 
     def get_clusters(self) -> Dict[str, List[Dict[str, Any]]]:
         clusters: Dict[str, List[Dict[str, Any]]] = {}
-        for info in self._edges.values():
-            cid = info.cluster_id
-            if cid not in clusters:
-                clusters[cid] = []
-            clusters[cid].append(info.to_dict())
+        with self._lock:
+            for info in self._edges.values():
+                cid = info.cluster_id
+                if cid not in clusters:
+                    clusters[cid] = []
+                clusters[cid].append(info.to_dict())
         return clusters
 
     def get_online_node_ids(self) -> List[str]:
         """Return node_ids of all currently-online edges."""
-        return [info.node_id for info in self._edges.values() if info.online]
+        with self._lock:
+            return [info.node_id for info in self._edges.values() if info.online]
 
     async def _watchdog_loop(self) -> None:
         while True:
             await asyncio.sleep(WATCHDOG_INTERVAL)
             now = time.time()
-            for node_id, info in list(self._edges.items()):
-                if info.online and (now - info.last_heartbeat) > HEARTBEAT_TIMEOUT:
-                    self.mark_offline(node_id)
+            offline_candidates = []
+            with self._lock:
+                for node_id, info in self._edges.items():
+                    if info.online and (now - info.last_heartbeat) > HEARTBEAT_TIMEOUT:
+                        offline_candidates.append(node_id)
+            for node_id in offline_candidates:
+                self.mark_offline(node_id)
 
     def start_watchdog(self) -> asyncio.Task:
         return asyncio.create_task(self._watchdog_loop())

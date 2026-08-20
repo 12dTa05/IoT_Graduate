@@ -153,6 +153,52 @@ class _TRTEngine:
         self._stream = cuda.Stream()
         logger.info("[TRTEngine] Loaded %s — %d I/O tensor(s)", engine_path, len(self._bindings))
 
+    def close(self) -> None:
+        """Explicitly free CUDA device memory and destroy CUDA streams."""
+        if hasattr(self, "_dev_inputs") and self._dev_inputs:
+            for dev in self._dev_inputs:
+                try:
+                    dev.free()
+                except Exception:
+                    pass
+            self._dev_inputs.clear()
+
+        if hasattr(self, "_dev_outputs") and self._dev_outputs:
+            for dev in self._dev_outputs:
+                try:
+                    dev.free()
+                except Exception:
+                    pass
+            self._dev_outputs.clear()
+
+        if hasattr(self, "_stream") and self._stream is not None:
+            try:
+                # pycuda stream cleanup if applicable
+                del self._stream
+                self._stream = None
+            except Exception:
+                pass
+
+        if hasattr(self, "_context") and self._context is not None:
+            try:
+                del self._context
+                self._context = None
+            except Exception:
+                pass
+
+        if hasattr(self, "_engine") and self._engine is not None:
+            try:
+                del self._engine
+                self._engine = None
+            except Exception:
+                pass
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def _allocate_trt10(self, trt, cuda) -> None:
         """TensorRT 10 name-based tensor API with dynamic profile 0 support."""
         n_io = int(self._engine.num_io_tensors)
@@ -610,6 +656,19 @@ class OffloadReceiver:
         self._work_q.put(None)
         if self._thread:
             self._thread.join(timeout=5)
+        # Clean up CUDA TRT engines on stop to prevent device memory leak
+        if self._lpr_engine is not None:
+            try:
+                self._lpr_engine.close()
+            except Exception:
+                pass
+            self._lpr_engine = None
+        if self._lpd_engine is not None:
+            try:
+                self._lpd_engine.close()
+            except Exception:
+                pass
+            self._lpd_engine = None
         logger.info(
             "[OffloadReceiver] Stopped. received=%d processed=%d queue_dropped=%d errors=%d results_sent=%d",
             self._received, self._processed, self._queue_dropped,

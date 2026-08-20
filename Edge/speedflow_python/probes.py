@@ -195,7 +195,8 @@ class SpeedProbe:
         self._peer_orch = peer_orch
 
         # Per-track state  (stid = (source_id, track_id))
-        self.history_positions  = defaultdict(deque)   # world-Y history
+        # maxlen=45 bounds history to ~1.5s at 30fps to prevent unbounded memory growth
+        self.history_positions  = defaultdict(lambda: deque(maxlen=45))   # world-Y history
         self.last_speed_text    = defaultdict(str)
         self.last_update_frame  = defaultdict(lambda: -1000)
         self.last_alert_ts      = defaultdict(float)

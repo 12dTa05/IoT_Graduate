@@ -190,8 +190,8 @@ LOAD_MODEL=formula
 # --- Network ---
 ADVERTISE_IP=$ADVERTISE_IP
 
-# --- Central Monitoring Server ---
-MONITOR_URL=http://$SERVER_IP:9090
+# --- Central Monitoring Server / Zenoh Router ---
+ZENOH_ROUTER=tcp/$SERVER_IP:7447
 
 # --- RTSP Push (→ MediaMTX on Server) ---
 RTSP_PUSH_URL=rtsp://$SERVER_IP:8554/$NODE_ID
