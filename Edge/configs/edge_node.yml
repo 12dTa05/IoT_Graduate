@@ -23,15 +23,18 @@ p2p:
   failover_rescue_hold_s: 60.0  # max hold time (s) before force-releasing rescued camera if original owner remains dead
   vote_window_s: 5.0            # proposal collection duration
   failover_jitter_max_s: 5.0    # random delay before failover ADD (race prevention)
-  reclaim_margin: 5.0          # reclaim only when load < (overload_threshold - reclaim_margin)
-                                # 60 - 5 = 55; enables reclaim once score drops below 55
-  reclaim_stable_s: 10.0       # load must stay below reclaim threshold this long before
+  reclaim_margin: 15.0         # reclaim only when load < (overload_threshold - reclaim_margin)
+                                # 60 - 15 = 45; enables reclaim once score drops below 45
+  reclaim_stable_s: 30.0       # load must stay below reclaim threshold this long before
                                 # reclaiming — one full signal cycle to confirm genuine
                                 # capacity recovery rather than a momentary green phase
-  reclaim_stability_s: 10.0    # post-reclaim observation window (seconds): a just-returned
+  reclaim_stability_s: 30.0    # post-reclaim observation window (seconds): a just-returned
                                 # camera cannot be offloaded during this window; prevents oscillation
                                 # from transient FPS spikes during stream warm-up.
                                 # Same cadence as reclaim_stable_s; treat as a pair — change both together.
+  bounce_max: 3                # max migrations per camera in bounce_window_s before L1 exclusion
+  bounce_window_s: 300.0       # bounce observation window (seconds)
+  zombie_timeout_count: 3      # consecutive migration timeouts before excluding peer from selection
 
 # Thermal admission gate for peer selection
 # Refuses to offload to a peer whose gpu_temp_c suggests unsafe conditions.

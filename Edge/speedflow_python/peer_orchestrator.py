@@ -337,6 +337,12 @@ class PeerOrchestrator:
         # Used to reclaim cameras when this node's load drops below threshold.
         self._migrated_out: Dict[str, str] = {}
 
+        # Per-camera migration timestamp history for bounce dampening: camera_id -> list[timestamp]
+        self._cam_migration_history: Dict[str, List[float]] = {}
+
+        # Consecutive migration ACK timeouts per target peer: node_id -> count
+        self._peer_consecutive_timeouts: Dict[str, int] = {}
+
         # Phase 3 — bounded in-flight reservation accounting.
         #
         # Sender side: _peer_inflight[peer_node_id] counts how many L1 stream
@@ -1178,6 +1184,8 @@ class PeerOrchestrator:
         Reclaim condition:
           - This node's load_score has been below (overload_threshold - reclaim_margin)
             for at least reclaim_stable_s seconds.
+          - This node stays below the capacity ceiling after taking the camera back
+            (active_cameras + 1 < effective_capacity).
           - The camera is still being held by the peer it was migrated to
             (confirmed via peer heartbeat).
           - Cooldown has expired since the migration.
@@ -1190,17 +1198,32 @@ class PeerOrchestrator:
         cfg = self._cfg
         now = time.time()
 
-        reclaim_threshold = cfg.get("overload_threshold", 75.0) - cfg.get("reclaim_margin", 15.0)
-        reclaim_stable_s  = cfg.get("reclaim_stable_s", 20.0)
+        reclaim_threshold = cfg.get("overload_threshold", 75.0) - cfg.get("reclaim_margin", 25.0)
+        reclaim_stable_s  = cfg.get("reclaim_stable_s", 30.0)
         cooldown_s        = cfg.get("cooldown_s", 45.0)
         heartbeat_timeout = cfg.get("heartbeat_timeout_s", 6.0)
 
         with self._self_lock:
             load         = self._self_state.load_score
             overload_since = self._self_state.overload_since
+            self_active_count = len(self._self_state.active_cameras)
+            self_max_streams = self._self_state.max_streams
+
+        # Capacity guard: block reclaim when adding a camera would reach/exceed local stream capacity
+        cm = self._camera_manager
+        local_max = cm.get_max_streams() if cm is not None else self_max_streams
+        configured_max = int(cfg.get("eps_streams_max", local_max))
+        effective_capacity = min(local_max, configured_max)
+        if self_active_count + 1 >= effective_capacity:
+            logger.debug(
+                "[PeerOrch] Reclaim blocked by local capacity: active=%d + 1 >= capacity=%d",
+                self_active_count, effective_capacity,
+            )
+            return
 
         # Only reclaim if load has been stable and low
         if load >= reclaim_threshold:
+            self._reclaim_eligible_since = None
             return
         # overload_since being None means load has dropped — good.
         # If it's still set, the node is still above overload_threshold.
@@ -1465,7 +1488,7 @@ class PeerOrchestrator:
         # Transition guard: this camera was recently reclaimed and its FPS is
         # still stabilising.  Re-escalating it would immediately undo reclaim.
         reclaim_age = now - self._reclaim_completed_at.get(cam_to_offload, 0.0)
-        reclaim_stable_s = cfg.get("reclaim_stable_s", 20.0)
+        reclaim_stable_s = cfg.get("reclaim_stable_s", 30.0)
         if reclaim_age < reclaim_stable_s:
             logger.info(
                 "[PeerOrch] Transition guard: '%s' was reclaimed %.0fs ago "
@@ -1739,10 +1762,14 @@ class PeerOrchestrator:
                 self._rr_counter = rr_counter + 1
                 return selected
 
+            zombie_timeout_count = int(self._cfg.get("zombie_timeout_count", 3))
+
             for nid, peer in self._peers.items():
                 if nid == self._node_id:
                     continue
                 if now - peer.last_seen > timeout:
+                    continue
+                if self._peer_consecutive_timeouts.get(nid, 0) >= zombie_timeout_count:
                     continue
                 # For pure least-load greedy baseline, skip stream capacity and thermal admission gates
                 if policy_name not in ("least_load_greedy", "centralized_greedy"):
@@ -2292,6 +2319,8 @@ class PeerOrchestrator:
             # reservation belonging to a different camera/winner.
             with self._lock:
                 owned = self._pending_winner.pop(camera_id, None)
+                curr_timeouts = self._peer_consecutive_timeouts.get(winner_node, 0) + 1
+                self._peer_consecutive_timeouts[winner_node] = curr_timeouts
             if owned == winner_node:
                 self._peer_inflight[winner_node] = max(
                     0, self._peer_inflight.get(winner_node, 0) - 1
@@ -2300,7 +2329,10 @@ class PeerOrchestrator:
                     "[PeerOrch] Timeout released reservation for '%s' (winner='%s', inflight=%d)",
                     camera_id, winner_node, self._peer_inflight[winner_node],
                 )
-            penalty_until = time.time() + self._cfg.get("cooldown_s", 45.0) * 2
+            base_cooldown = self._cfg.get("cooldown_s", 45.0)
+            multiplier = min(2 ** (curr_timeouts - 1), 8)
+            penalty_duration = max(base_cooldown * 2, base_cooldown * multiplier)
+            penalty_until = time.time() + penalty_duration
             if winner_node == self._node_id:
                 # The winner is ourselves — set our own penalty field
                 self._self_penalty_until = penalty_until
@@ -2364,6 +2396,11 @@ class PeerOrchestrator:
         # Update cooldown and track migration for future reclaim
         self._cam_cooldown[camera_id] = time.time()
         self._migrated_out[camera_id] = winner_node
+
+        with self._lock:
+            if camera_id not in self._cam_migration_history:
+                self._cam_migration_history[camera_id] = []
+            self._cam_migration_history[camera_id].append(time.time())
 
         elapsed_ms = time.time() * 1000 - start_ms
         # Δτ: time from migration complete to first valid speed on the new node.
@@ -2509,6 +2546,9 @@ class PeerOrchestrator:
                 self._peer_inflight[winner_id] = max(
                     0, self._peer_inflight.get(winner_id, 0) - 1
                 )
+                self._peer_consecutive_timeouts.pop(winner_id, None)
+            elif ack_node:
+                self._peer_consecutive_timeouts.pop(ack_node, None)
             if event is not None:
                 event.set()
 
@@ -3067,6 +3107,22 @@ class PeerOrchestrator:
         reclaim_stability = self._cfg.get("reclaim_stability_s", 30.0)
         starved = set(state.source_starved_cameras or [])
 
+        # Bounce dampening: exclude cameras that have reached bounce_max migrations within bounce_window_s
+        bounce_max = int(self._cfg.get("bounce_max", 3))
+        bounce_window_s = float(self._cfg.get("bounce_window_s", 300.0))
+        bounced_cameras = set()
+        with self._lock:
+            for cam_id, history in list(self._cam_migration_history.items()):
+                # Filter out expired timestamps
+                valid_history = [ts for ts in history if now - ts <= bounce_window_s]
+                if len(valid_history) != len(history):
+                    if valid_history:
+                        self._cam_migration_history[cam_id] = valid_history
+                    else:
+                        self._cam_migration_history.pop(cam_id, None)
+                if len(valid_history) >= bounce_max:
+                    bounced_cameras.add(cam_id)
+
         # ponytail: per-camera warmup gate.  A freshly-ADDed camera whose FPS
         # hasn't stabilised is ineligible for offload — its workload is
         # untrustworthy and offloading it would just thrash.  Cameras NOT
@@ -3110,6 +3166,11 @@ class PeerOrchestrator:
             return None
 
         if level == 1:
+            # Bounce dampening: filter out bounced cameras from L1 candidates
+            eligible_l1 = {c: w for c, w in eligible.items() if c not in bounced_cameras}
+            if not eligible_l1:
+                return None
+
             # L1 ownership guard: never migrate away the last owned camera.
             owned_active = self._get_owned_camera_ids() & set(state.active_cameras)
             if not owned_active:
@@ -3125,14 +3186,14 @@ class PeerOrchestrator:
             # Walk candidates lightest-first; skip any whose migration would
             # leave zero owned cameras active. The first one that preserves
             # ≥1 owned camera wins.
-            for c in sorted(eligible, key=lambda cam: eligible[cam]):
+            for c in sorted(eligible_l1, key=lambda cam: eligible_l1[cam]):
                 if c not in owned_active or (owned_active - {c}):
                     return c
             # Every eligible candidate would zero out owned cameras — fail safe.
             logger.warning(
                 "[PeerOrch] L1 fail-safe: every eligible candidate would leave "
                 "zero owned cameras active (eligible=%d, owned_active=%d).",
-                len(eligible), len(owned_active),
+                len(eligible_l1), len(owned_active),
             )
             return None
 
