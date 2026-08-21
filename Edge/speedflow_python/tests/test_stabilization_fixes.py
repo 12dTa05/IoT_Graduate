@@ -269,7 +269,11 @@ def test_dead_peer_migrated_camera_reclaim():
 
     # Simulate ACK from self
     orch._on_vote_ack({"camera_id": "cam_owned_01", "event": "PLAYING", "node_id": "node_local"})
-    time.sleep(0.05)
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if "cam_owned_01" not in orch._migrated_out and "cam_owned_01" not in orch._reclaim_in_progress:
+            break
+        time.sleep(0.01)
     # After ACK, _migrated_out entry is cleaned up and reclaim completes
     assert "cam_owned_01" not in orch._migrated_out
     assert "cam_owned_01" not in orch._reclaim_in_progress

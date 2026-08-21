@@ -1304,13 +1304,17 @@ class PeerOrchestrator:
             with self._lock:
                 peer = self._peers.get(holder_node)
             if peer is None:
+                # Peer unknown / gone — remove stale entry
+                with self._lock:
+                    self._migrated_out.pop(camera_id, None)
                 continue
             if now - peer.last_seen > heartbeat_timeout:
-                # Holder offline — _check_offline_peers / failover will handle it
+                # Holder offline — _check_offline_peers / dead-peer reclaim will handle it
                 continue
             if camera_id not in peer.active_cameras:
                 # Holder no longer running this camera — already returned or lost
-                self._migrated_out.pop(camera_id, None)
+                with self._lock:
+                    self._migrated_out.pop(camera_id, None)
                 continue
 
             # Send ADD to self (reclaim)
@@ -1322,7 +1326,14 @@ class PeerOrchestrator:
             # Make-before-Break: Step 1 — ADD to self first, wait for stream PLAYING ack
             # Step 2 — Only then REMOVE from holder
             add_cmd = {**cam_config, "cmd": "ADD"}
-            self._pubs["control"].put(msgpack.packb(add_cmd, use_bin_type=True))
+            event = threading.Event()
+            with self._lock:
+                # Register before publishing ADD: the receiver can ACK
+                # immediately, before the waiter thread gets scheduled.
+                self._pending_acks[camera_id] = event
+                self._reclaim_in_progress.add(camera_id)
+            if self._pubs.get("control") is not None:
+                self._pubs["control"].put(msgpack.packb(add_cmd, use_bin_type=True))
             # ponytail: record the ADD so the per-camera warmup gate in
             # _pick_camera_to_offload suppresses offload actions on this
             # camera until its FPS has been valid for camera_warmup_s seconds.
@@ -1330,8 +1341,6 @@ class PeerOrchestrator:
             # Clear any stale first-valid-fps snapshot so the warmup restarts
             # from zero for this new ADD event.
             self._camera_first_valid_fps_at.pop(camera_id, None)
-            with self._lock:
-                self._reclaim_in_progress.add(camera_id)
 
             logger.info(
                 "[PeerOrch] Reclaim: load=%.1f < threshold=%.1f (risk=%.2f, active=%d) — "
@@ -2519,7 +2528,33 @@ class PeerOrchestrator:
                 self._reclaim_retry_at[camera_id] = time.time() + retry_s
             return
 
-        # Stream confirmed PLAYING on self — safe to remove from holder
+        # Stream confirmed PLAYING on self
+        # Check if holder is known offline/dead. If so, skip sending REMOVE.
+        now = time.time()
+        timeout = self._cfg.get("heartbeat_timeout_s", 5.0)
+        grace_s = self._cfg.get("failover_grace_s", timeout)
+        offline_threshold = timeout + grace_s
+
+        with self._lock:
+            holder_peer = self._peers.get(holder_node)
+            is_dead = (
+                holder_node in self._failover_triggered
+                or holder_node in self._peer_offline_at
+                or (holder_peer is not None and (now - holder_peer.last_seen > offline_threshold))
+            )
+
+        if is_dead:
+            with self._lock:
+                self._migrated_out.pop(camera_id, None)
+                self._reclaim_in_progress.discard(camera_id)
+                self._reclaim_retry_at.pop(camera_id, None)
+            logger.info(
+                "[PeerOrch] Reclaim: stream PLAYING on self — skipped REMOVE to '%s' (holder dead/offline). Reclaim complete.",
+                holder_node,
+            )
+            return
+
+        # Holder is alive — safe to remove from holder
         remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
         holder_control_key = f"peers/control/{holder_node}"
         try:
