@@ -15,7 +15,5 @@ Edge/.pytest_cache
 Server/__pycache__
 Server/violations
 
-Camera/videos
-
 DoAn
 data*
