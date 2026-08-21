@@ -241,3 +241,35 @@ def test_escalating_timeout_penalty():
     assert orch._peer_consecutive_timeouts["peer_timeout"] == 4
     assert peer.penalty_until >= t3 + 79.0
     assert peer.penalty_until <= t3 + 82.0
+
+
+def test_dead_peer_migrated_camera_reclaim():
+    """Verify cameras in _migrated_out whose holder dies are re-added locally and preserved until ACK."""
+    orch = _make_orchestrator()
+    orch._pubs["control"] = MagicMock()
+    orch._session = MagicMock()
+    orch._get_camera_config = MagicMock(return_value={"camera_id": "cam_owned_01", "uri": "rtsp://..."})
+
+    # cam_owned_01 was migrated out to node_dead
+    orch._migrated_out["cam_owned_01"] = "node_dead"
+
+    peer = PeerState(node_id="node_dead")
+    peer.active_cameras = ["cam_owned_01", "cam_dead_own"]
+    peer.camera_configs = {"cam_dead_own": {"camera_id": "cam_dead_own"}}
+    peer.last_seen = time.time() - 15.0  # Silent > timeout + grace (10s)
+    orch._peers["node_dead"] = peer
+
+    orch._check_offline_peers()
+
+    # Control pub should have received ADD for cam_owned_01
+    orch._pubs["control"].put.assert_called_once()
+    assert "cam_owned_01" in orch._reclaim_in_progress
+    # Mapping preserved until ACK
+    assert orch._migrated_out.get("cam_owned_01") == "node_dead"
+
+    # Simulate ACK from self
+    orch._on_vote_ack({"camera_id": "cam_owned_01", "event": "PLAYING", "node_id": "node_local"})
+    time.sleep(0.05)
+    # After ACK, _migrated_out entry is cleaned up and reclaim completes
+    assert "cam_owned_01" not in orch._migrated_out
+    assert "cam_owned_01" not in orch._reclaim_in_progress

@@ -918,6 +918,8 @@ class PeerOrchestrator:
                 with self._lock:
                     self._peer_offline_at[node_id] = now
                 self._clear_offload_target(node_id)
+                # Reclaim cameras migrated out to this dead peer locally
+                self._reclaim_migrated_from_dead_peer(node_id)
                 if peer.active_cameras:
                     # BUG-6 fix: use _failover_triggered map to prevent
                     # re-triggering instead of clearing active_cameras.
@@ -969,6 +971,69 @@ class PeerOrchestrator:
                     "[PeerOrch] Offload target '%s' offline — clearing L%d for '%s'",
                     node_id, old_level, camera_id,
                 )
+
+    def _reclaim_migrated_from_dead_peer(self, dead_node_id: str) -> None:
+        """Reclaim cameras owned by this node that were migrated out to a peer that just died."""
+        with self._lock:
+            migrated_to_dead = [
+                cam_id for cam_id, holder in self._migrated_out.items()
+                if holder == dead_node_id
+            ]
+
+        if not migrated_to_dead:
+            return
+
+        now = time.time()
+        for camera_id in migrated_to_dead:
+            with self._lock:
+                if camera_id in self._reclaim_in_progress:
+                    continue
+                retry_at = self._reclaim_retry_at.get(camera_id, 0.0)
+                if now < retry_at:
+                    continue
+
+            # Check if camera is already running locally
+            with self._self_lock:
+                if camera_id in self._self_state.active_cameras:
+                    with self._lock:
+                        self._migrated_out.pop(camera_id, None)
+                        self._reclaim_in_progress.discard(camera_id)
+                        self._reclaim_retry_at.pop(camera_id, None)
+                    continue
+
+            cam_config = self._get_camera_config(camera_id)
+            if cam_config is None:
+                logger.warning(
+                    "[PeerOrch] Dead-peer reclaim: cannot get config for '%s', skipping",
+                    camera_id,
+                )
+                continue
+
+            add_cmd = {**cam_config, "cmd": "ADD"}
+            event = threading.Event()
+            with self._lock:
+                # Register before publishing ADD: the receiver can ACK
+                # immediately, before the waiter thread gets scheduled.
+                self._pending_acks[camera_id] = event
+            if self._pubs.get("control") is not None:
+                self._pubs["control"].put(msgpack.packb(add_cmd, use_bin_type=True))
+            self._camera_added_at[camera_id] = now
+            self._camera_first_valid_fps_at.pop(camera_id, None)
+            with self._lock:
+                self._reclaim_in_progress.add(camera_id)
+
+            logger.info(
+                "[PeerOrch] Dead-peer reclaim: ADD '%s' back to self (holder '%s' dead), waiting for ack...",
+                camera_id, dead_node_id,
+            )
+            self._reclaim_completed_at[camera_id] = now
+            self._transition_settle_until = now + self._cfg.get("transition_settle_s", 5.0)
+
+            threading.Thread(
+                target=self._wait_and_remove_reclaim,
+                args=(camera_id, dead_node_id),
+                daemon=True,
+            ).start()
 
     def _check_rebalance(self) -> None:
         """
@@ -1239,12 +1304,9 @@ class PeerOrchestrator:
             with self._lock:
                 peer = self._peers.get(holder_node)
             if peer is None:
-                # Peer gone — remove stale entry
-                self._migrated_out.pop(camera_id, None)
                 continue
             if now - peer.last_seen > heartbeat_timeout:
-                # Holder offline — failover will handle it
-                self._migrated_out.pop(camera_id, None)
+                # Holder offline — _check_offline_peers / failover will handle it
                 continue
             if camera_id not in peer.active_cameras:
                 # Holder no longer running this camera — already returned or lost
@@ -2432,9 +2494,11 @@ class PeerOrchestrator:
         If timeout, log error and schedule a quick retry instead of forcing
         the full migration cooldown or clearing state.
         """
-        event = threading.Event()
         with self._lock:
-            self._pending_acks[camera_id] = event
+            event = self._pending_acks.get(camera_id)
+            if event is None:
+                event = threading.Event()
+                self._pending_acks[camera_id] = event
 
         timeout = self._cfg.get("migration_timeout_s", 15.0)
         confirmed = event.wait(timeout=timeout)
@@ -2459,10 +2523,11 @@ class PeerOrchestrator:
         remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
         holder_control_key = f"peers/control/{holder_node}"
         try:
-            self._session.put(
-                holder_control_key,
-                msgpack.packb(remove_cmd, use_bin_type=True),
-            )
+            if self._session is not None:
+                self._session.put(
+                    holder_control_key,
+                    msgpack.packb(remove_cmd, use_bin_type=True),
+                )
             with self._lock:
                 self._migrated_out.pop(camera_id, None)
                 self._reclaim_in_progress.discard(camera_id)

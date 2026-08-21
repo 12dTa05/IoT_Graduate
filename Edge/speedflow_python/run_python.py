@@ -201,7 +201,12 @@ _NVMM_ERROR_RATE_LIMIT = 10        # errors in 30s triggers critical warning
 
 
 def _is_transient_nvmm_buffer_error(err, debug: Optional[str], src_name: str = "unknown") -> bool:
-    """Narrow check for transient decoder buffer exhaustion."""
+    """Narrow check for transient decoder buffer exhaustion.
+
+    Returns True if the error is considered transient (below rate limit).
+    Returns False if it is not an NVMM buffer error or if the rate limit is exceeded
+    (so callers can trigger recovery/restart/source removal).
+    """
     text = f"{err} {debug or ''}"
     if "OutputBufferUnavailable" not in text and "cbAllocPictureBuffer" not in text:
         return False
@@ -216,6 +221,7 @@ def _is_transient_nvmm_buffer_error(err, debug: Optional[str], src_name: str = "
             src_name, len(_NVMM_ERROR_TIMESTAMPS[src_name]),
         )
         _NVMM_ERROR_TIMESTAMPS[src_name].clear()
+        return False
     return True
 
 
@@ -427,7 +433,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
                 err, debug = message.parse_error()
                 src_name = message.src.get_name() if message.src else "unknown"
 
-                if _is_transient_nvmm_buffer_error(err, debug):
+                if _is_transient_nvmm_buffer_error(err, debug, src_name):
                     print(f"WARNING (recoverable): Transient decoder buffer exhaustion from {src_name}: {err}", file=sys.stderr)
                     if debug:
                         print(f"DEBUG INFO: {debug}", file=sys.stderr)
