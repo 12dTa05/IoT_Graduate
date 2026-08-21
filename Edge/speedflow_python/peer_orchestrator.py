@@ -510,6 +510,9 @@ class PeerOrchestrator:
         self._running = True
         self._ready_event.set()
 
+        # Startup preemption announcement: notify cluster of owned cameras so peers holding them release immediately
+        self._publish_startup_announcement()
+
         self._decision_thread = threading.Thread(
             target=self._decision_loop,
             name=f"PeerDecision-{self._node_id}",
@@ -765,6 +768,23 @@ class PeerOrchestrator:
                     peer.overload_since = time.time()
             else:
                 peer.overload_since = None
+
+            # Immediate yield on reconnect: if node_id is the original owner of any camera
+            # we currently hold in _rescued_cameras, yield it immediately now that node_id is back online.
+            cameras_to_yield = [
+                cam_id for cam_id, orig_owner in self._rescued_cameras.items()
+                if orig_owner == node_id
+            ]
+            for cam_id in cameras_to_yield:
+                self._rescued_cameras.pop(cam_id, None)
+                self._rescued_at.pop(cam_id, None)
+                remove_cmd = {"cmd": "REMOVE", "camera_id": cam_id}
+                if self._pubs.get("control") is not None:
+                    self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
+                logger.info(
+                    "[PeerOrch] Original owner '%s' is back online. Immediate yield: sent REMOVE for '%s'.",
+                    node_id, cam_id,
+                )
 
             # Phase 6 / Reviewer Finding 2.4: compute migration blind-spot metric (Δτ)
             # Check if any camera migrated out to this peer is now reporting valid FPS on the peer.
@@ -1168,6 +1188,9 @@ class PeerOrchestrator:
                         camera_id, original_owner,
                     )
                 continue
+            # If original owner has come back online (fresh heartbeat within timeout),
+            # IMMEDIATELY yield/REMOVE the rescued stream to prevent duplicate processing (split-brain)
+            # and allow the returning node to cleanly boot its native cameras.
             peer = peers_snapshot.get(original_owner)
             if peer is None:
                 # Owner absent from routing table.
@@ -1175,18 +1198,7 @@ class PeerOrchestrator:
             if now - peer.last_seen > timeout:
                 # Owner heartbeat older than configured timeout — stale.
                 continue
-            if camera_id not in peer.active_cameras:
-                # Owner is back but hasn't resumed running this camera yet.
-                continue
-            if camera_id in remaining_after and len(remaining_after) <= 1:
-                # Last-active-camera guard: would leave zero streams locally.
-                if self._maybe_log_block(f"rebalance_last_cam_{camera_id}", now):
-                    logger.warning(
-                        "[PeerOrch][Rebalance] Skipping return of '%s' to '%s': "
-                        "it is the last active camera on this node (active=%d).",
-                        camera_id, original_owner, len(remaining_after),
-                    )
-                continue
+            # Owner is alive! Yield unconditionally.
             remaining_after.discard(camera_id)
             to_return.append(camera_id)
 
@@ -2657,17 +2669,55 @@ class PeerOrchestrator:
     def _on_failover_claim(self, payload: dict) -> None:
         """Handle incoming rescue claim broadcast on peers/failover/claim.
 
-        Used for contention resolution when multiple nodes detect the same dead peer.
-        Record the claim to resolve split-brain duplicate rescues.
+        Used for contention resolution when multiple nodes detect the same dead peer,
+        or for startup preemption claims when the true owner boots up.
         """
         dead_node_id = payload.get("dead_node_id", "")
         camera_id = payload.get("camera_id", "")
         claimer_node_id = payload.get("claimer_node_id", "")
         priority_weight = payload.get("priority_weight", 0)
+        claim_type = payload.get("type", "")
         ts = payload.get("ts", time.time())
+
+        # Check for startup preemption claim: original owner booted and claims its cameras
+        if claim_type == "startup_claim" or payload.get("action") == "startup_preempt":
+            claimed_cameras = payload.get("cameras", [])
+            if not claimed_cameras and camera_id:
+                claimed_cameras = [camera_id]
+            logger.info(
+                "[Failover] Received startup preemption announcement from '%s' for cameras: %s",
+                claimer_node_id, claimed_cameras,
+            )
+            with self._lock:
+                for cam in claimed_cameras:
+                    if self._rescued_cameras.get(cam) == claimer_node_id or cam in self._rescued_cameras:
+                        orig = self._rescued_cameras.pop(cam, None)
+                        self._rescued_at.pop(cam, None)
+                        remove_cmd = {"cmd": "REMOVE", "camera_id": cam}
+                        if self._pubs.get("control") is not None:
+                            self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
+                        logger.info(
+                            "[Failover] Yielded rescued camera '%s' (orig owner '%s') due to startup announcement from '%s'.",
+                            cam, orig, claimer_node_id,
+                        )
+            return
 
         if not dead_node_id or not camera_id or not claimer_node_id:
             return
+
+        # If the claimer is the original owner claiming its camera back, yield immediately
+        with self._lock:
+            if self._rescued_cameras.get(camera_id) == claimer_node_id:
+                self._rescued_cameras.pop(camera_id, None)
+                self._rescued_at.pop(camera_id, None)
+                remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
+                if self._pubs.get("control") is not None:
+                    self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
+                logger.info(
+                    "[Failover] Yielded rescued camera '%s' to original owner '%s' via failover_claim.",
+                    camera_id, claimer_node_id,
+                )
+                return
 
         with self._claims_lock:
             # Claims are only needed during the short contention window.  Bound
@@ -2686,6 +2736,28 @@ class PeerOrchestrator:
                     "[Failover] Recorded rescue claim for '%s' (dead='%s') by '%s' (weight=%d)",
                     camera_id, dead_node_id, claimer_node_id, priority_weight,
                 )
+
+    def _publish_startup_announcement(self) -> None:
+        """Publish startup announcement on Zenoh to preemptively reclaim owned cameras from peers."""
+        try:
+            owned = list(self._get_owned_camera_ids())
+            if not owned:
+                return
+            claim_payload = {
+                "type": "startup_claim",
+                "action": "startup_preempt",
+                "claimer_node_id": self._node_id,
+                "cameras": owned,
+                "ts": time.time(),
+            }
+            if "failover_claim" in self._pubs and self._pubs["failover_claim"] is not None:
+                self._pubs["failover_claim"].put(msgpack.packb(claim_payload, use_bin_type=True))
+                logger.info(
+                    "[PeerOrch] Published startup announcement for owned cameras: %s",
+                    owned,
+                )
+        except Exception as exc:
+            logger.warning("[PeerOrch] Failed to publish startup announcement: %s", exc)
 
     # ------------------------------------------------------------------
     # Leaderless failover (Phase 5)
@@ -2780,11 +2852,21 @@ class PeerOrchestrator:
                 and len(peer.active_cameras) < peer.max_streams
             ] + ([self._node_id] if self_eligible else []))
 
-        # Dead-owner filtering: intersect orphans with the dead peer's
-        # authoritative camera_configs.  Anything in active_cameras but not in
-        # camera_configs is stale / offload / migrated-in — must NOT be rescued.
-        # Falls back to the full list when camera_configs was never populated.
-        if peer_cam_configs:
+        # Dead-owner filtering: camera MUST be originally owned by dead_node_id.
+        # Check static mapping / dead peer's camera_configs.
+        # Under NO circumstance can a node rescue a camera that belongs to itself or an alive peer.
+        dead_owned_set = self._get_node_owned_cameras(dead_node_id)
+        if dead_owned_set is not None:
+            before_n = len(orphaned_cameras)
+            orphaned_cameras = [c for c in orphaned_cameras if c in dead_owned_set]
+            filtered_out = before_n - len(orphaned_cameras)
+            if filtered_out:
+                logger.info(
+                    "[Failover] Filtered %d non-owned/stale entries from '%s' orphan list "
+                    "(only rescue cameras originally owned by '%s').",
+                    filtered_out, dead_node_id, dead_node_id,
+                )
+        elif peer_cam_configs:
             owned_set = set(peer_cam_configs.keys())
             before_n = len(orphaned_cameras)
             orphaned_cameras = [c for c in orphaned_cameras if c in owned_set]
@@ -2795,12 +2877,33 @@ class PeerOrchestrator:
                     "(active_cameras included offload/migrated-in cameras).",
                     filtered_out, dead_node_id,
                 )
-            if not orphaned_cameras:
+
+        # Strict exclusion: NEVER rescue cameras owned by self or by an alive peer
+        self_owned = self._get_owned_camera_ids()
+        alive_peer_owned = set()
+        with self._lock:
+            for nid, p in self._peers.items():
+                if nid != dead_node_id and nid != self._node_id and (now - p.last_seen <= timeout):
+                    p_owned = self._get_node_owned_cameras(nid)
+                    if p_owned:
+                        alive_peer_owned.update(p_owned)
+
+        excluded_cams = self_owned | alive_peer_owned
+        if excluded_cams:
+            before_ex = len(orphaned_cameras)
+            orphaned_cameras = [c for c in orphaned_cameras if c not in excluded_cams]
+            if len(orphaned_cameras) < before_ex:
                 logger.warning(
-                    "[Failover] No owned orphans from '%s' after dead-owner filtering. "
-                    "Skipping rescue.", dead_node_id,
+                    "[Failover] Excluded %d cameras belonging to self or alive peers from '%s' rescue.",
+                    before_ex - len(orphaned_cameras), dead_node_id,
                 )
-                return
+
+        if not orphaned_cameras:
+            logger.warning(
+                "[Failover] No valid owned orphans from '%s' to rescue. Skipping.",
+                dead_node_id,
+            )
+            return
 
         # BUG-11: Track how many cameras this node has accepted during this
         # failover loop so we don't exceed eps_streams_max across iterations.
@@ -3091,21 +3194,22 @@ class PeerOrchestrator:
         """
         Return the set of camera IDs this node is configured to own.
 
-        Ownership = cameras enabled in this node's local cameras.yml. Rescued
-        and migrated-in cameras are NOT owned by this node — they live on a
-        peer's cameras.yml. The helper is consumed by _pick_camera_to_offload
-        to enforce the invariant "at least one locally-owned camera remains
-        active during full-stream L1 offload".
+        Ownership is resolved in order:
+          1. Static node_camera_map in config: if configured for self._node_id,
+             this static assignment strictly defines the node's owned cameras.
+          2. Live CameraManager: enabled static cameras (is_dynamic=False).
+          3. Fallback cameras.yml on disk.
 
-        Hot reload:
-          * Preferred path: live CameraManager (inotify-watched inotify
-            handler reloads _configs on every cameras.yml change).
-          * Fallback path: cameras.yml on disk, cached by mtime so a change
-            is picked up on the next call after the file is rewritten.
-
-        Returns an empty set on any error — fail safe (the L1 caller
-        treats empty ownership as "fail safe, don't migrate").
+        Ownership = cameras enabled in this node's local cameras.yml or node_camera_map.
+        Rescued and migrated-in cameras are NOT owned by this node.
         """
+        # Highest priority: static node_camera_map configured for this node
+        node_cam_map = self._cfg.get("node_camera_map")
+        if isinstance(node_cam_map, dict) and self._node_id in node_cam_map:
+            cams = node_cam_map.get(self._node_id)
+            if isinstance(cams, (list, tuple, set)):
+                return set(cams)
+
         # Fast path: live CameraManager (hot-reloaded via inotify)
         cm = self._camera_manager
         if cm is not None:
@@ -3147,6 +3251,24 @@ class PeerOrchestrator:
                 "[PeerOrch] cameras.yml ownership lookup failed: %s", exc
             )
             return set()
+
+    def _get_node_owned_cameras(self, target_node_id: str) -> Optional[set]:
+        """
+        Return the set of cameras configured to be owned by target_node_id.
+        Checks static node_camera_map in config first, then target peer's camera_configs.
+        Returns None if ownership cannot be determined.
+        """
+        node_cam_map = self._cfg.get("node_camera_map")
+        if isinstance(node_cam_map, dict) and target_node_id in node_cam_map:
+            cams = node_cam_map.get(target_node_id)
+            if isinstance(cams, (list, tuple, set)):
+                return set(cams)
+        
+        with self._lock:
+            peer = self._peers.get(target_node_id)
+            if peer and peer.camera_configs:
+                return set(peer.camera_configs.keys())
+        return None
 
     def _pick_camera_to_offload(self, state: PeerState, level: int) -> Optional[str]:
         """

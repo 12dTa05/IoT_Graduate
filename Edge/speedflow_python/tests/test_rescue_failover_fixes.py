@@ -142,3 +142,67 @@ def test_camera_manager_max_streams_capacity(tmp_path):
     )
     cm = FreshCameraManager(yml_path=yml_file)
     assert cm.get_max_streams() == 3
+
+
+def test_static_ownership_and_failover_split_brain_guards(tmp_path):
+    """Test static camera ownership, immediate yield on reconnect, and preemption claim."""
+    from speedflow_python.peer_orchestrator import PeerOrchestrator, PeerState
+    
+    cfg = {
+        "node_camera_map": {
+            "jetson_A": ["cam_01", "cam_02"],
+            "jetson_B": ["cam_03", "cam_04"],
+            "jetson_C": ["cam_05", "cam_06"],
+        },
+        "heartbeat_timeout_s": 5.0,
+        "overload_threshold": 60.0,
+    }
+    
+    orch_A = PeerOrchestrator(node_id="jetson_A", cfg=cfg, camera_manager=None, camera_configs_dir=tmp_path)
+    orch_B = PeerOrchestrator(node_id="jetson_B", cfg=cfg, camera_manager=None, camera_configs_dir=tmp_path)
+
+    # 1. Verify static ownership
+    assert orch_A._get_owned_camera_ids() == {"cam_01", "cam_02"}
+    assert orch_A._get_node_owned_cameras("jetson_B") == {"cam_03", "cam_04"}
+    assert orch_A._get_node_owned_cameras("jetson_C") == {"cam_05", "cam_06"}
+    
+    # 2. Rescued camera ownership: orch_B rescues cam_01 (owned by jetson_A)
+    orch_B._rescued_cameras["cam_01"] = "jetson_A"
+    orch_B._rescued_at["cam_01"] = time.time()
+    
+    # Mock control publisher to verify REMOVE command
+    sent_cmds = []
+    class DummyPub:
+        def put(self, payload):
+            sent_cmds.append(msgpack.unpackb(payload, raw=False))
+    orch_B._pubs["control"] = DummyPub()
+    
+    # 3. Immediate yield on reconnect: jetson_A sends heartbeat
+    heartbeat_payload = {
+        "node_id": "jetson_A",
+        "load_score": 10.0,
+        "active_cameras": [],  # jetson_A hasn't booted cameras yet
+    }
+    orch_B._on_peer_status(heartbeat_payload)
+    
+    # Verify cam_01 was immediately yielded and REMOVE was published
+    assert "cam_01" not in orch_B._rescued_cameras
+    assert any(cmd.get("cmd") == "REMOVE" and cmd.get("camera_id") == "cam_01" for cmd in sent_cmds)
+
+    # 4. Startup preemption announcement: orch_B has rescued cam_02
+    orch_B._rescued_cameras["cam_02"] = "jetson_A"
+    orch_B._rescued_at["cam_02"] = time.time()
+    sent_cmds.clear()
+    
+    preempt_payload = {
+        "type": "startup_claim",
+        "action": "startup_preempt",
+        "claimer_node_id": "jetson_A",
+        "cameras": ["cam_01", "cam_02"],
+        "ts": time.time(),
+    }
+    orch_B._on_failover_claim(preempt_payload)
+    
+    assert "cam_02" not in orch_B._rescued_cameras
+    assert any(cmd.get("cmd") == "REMOVE" and cmd.get("camera_id") == "cam_02" for cmd in sent_cmds)
+

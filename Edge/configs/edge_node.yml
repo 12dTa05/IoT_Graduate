@@ -37,7 +37,13 @@ p2p:
   bounce_window_s: 300.0       # bounce observation window (seconds)
   zombie_timeout_count: 3      # consecutive migration timeouts before excluding peer from selection
 
-# Thermal admission gate for peer selection
+  # Static node-to-camera ownership mapping (for cluster topology & failover isolation)
+  node_camera_map:
+    jetson_A: ["cam_01", "cam_02"]
+    jetson_B: ["cam_03", "cam_04"]
+    jetson_C: ["cam_05", "cam_06"]
+
+  # Thermal admission gate for peer selection
 # Refuses to offload to a peer whose gpu_temp_c suggests unsafe conditions.
 # Unknown / missing values: behaviour controlled by reject_invalid + invalid_policy.
   thermal:
