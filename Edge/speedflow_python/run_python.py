@@ -166,7 +166,7 @@ def _attach_camera_manager(
         # This function runs in GLib Main Loop → safe, no lock needed.
         source_id_to_cam_id[cam_cfg.source_id] = cam_cfg.camera_id
 
-    def on_remove(source_id):
+    def on_remove(source_id, done_event=None):
         # Look up camera_id from the mapping dict.
         # Not using GStreamer pad scan because it's complex and not thread-safe.
         cam_id = source_id_to_cam_id.get(source_id)
@@ -176,12 +176,16 @@ def _attach_camera_manager(
                 "Possibly already removed or never registered.",
                 file=sys.stderr
             )
+            if done_event is not None:
+                done_event.set()
             return
 
         print(f"[Dynamic] Removing camera '{cam_id}' (source_id={source_id})")
-        dynamic_remove_stream(pipeline, streammux, cam_id, source_id, tiler, source_bins)
+        dynamic_remove_stream(
+            pipeline, streammux, cam_id, source_id, tiler, source_bins, done_event=done_event
+        )
 
-        # Clean up key after successful removal.
+        # Clean up key after initiating/scheduling removal.
         # Prevents memory leak during continuous operation over months
         # and avoids source_id conflicts if the same ID is reused later.
         removed = source_id_to_cam_id.pop(source_id, None)

@@ -182,7 +182,7 @@ class CameraManager:
 
         # Callbacks (set when start() is called)
         self._on_add: Optional[Callable[[CameraConfig], None]] = None
-        self._on_remove: Optional[Callable[[int], None]] = None
+        self._on_remove: Optional[Callable[..., None]] = None
         self._glib_idle_add: Optional[Callable] = None
 
         # Control flags
@@ -202,7 +202,7 @@ class CameraManager:
     def start(
         self,
         on_add: Callable[[CameraConfig], None],
-        on_remove: Callable[[int], None],
+        on_remove: Callable[..., None],
         glib_idle_add: Callable,
     ) -> None:
         """
@@ -566,8 +566,13 @@ class CameraManager:
 
                     def _remove_with_ack(source_id=sid, event=done):
                         try:
-                            self._on_remove(source_id)
-                        finally:
+                            self._on_remove(source_id, done_event=event)
+                        except Exception as exc:
+                            logger.error(
+                                "[CameraManager] Error in on_remove for source_id=%d: %s",
+                                source_id,
+                                exc,
+                            )
                             event.set()
                         return False
 
@@ -578,12 +583,19 @@ class CameraManager:
                     )
 
             if delta.to_remove and delta.to_add:
+                all_removed_cleanly = True
                 for sid, done in remove_events:
-                    if not done.wait(timeout=2.0):
+                    if not done.wait(timeout=8.0):
+                        all_removed_cleanly = False
                         logger.warning(
-                            "[CameraManager] REMOVE source_id=%d did not ack within 2s before ADD",
+                            "[CameraManager] REMOVE source_id=%d did not ack within 8s before ADD",
                             sid,
                         )
+                if not all_removed_cleanly:
+                    logger.error(
+                        "[CameraManager] Skipping ADD queue because previous REMOVE did not complete safely within timeout."
+                    )
+                    continue
 
             for cam_cfg in delta.to_add:
                 cfg = cam_cfg  # capture for lambda
