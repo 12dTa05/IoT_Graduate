@@ -139,13 +139,6 @@ load_score:
   hw_fuse_threshold: 90.0
   hw_fuse_score_floor: 80.0
 
-  # Adaptive PGIE interval adjustment
-  adaptive_pgie:
-    enabled: true
-    base_interval: 3
-    idle_interval: 5
-    idle_timeout_s: 5.0
-
   workload:
     enabled: true
     capacity: 40.0

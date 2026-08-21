@@ -91,10 +91,10 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
 
     # 3. Speed + LPR probe (pass peer_orch so it can query offload levels)
     probe = SpeedProbe(camera_manager, peer_orch=peer_orch)
-    # Adaptive PGIE controller: adjust interval 3 <-> 5 based on track activity
+    # Keep PGIE interval fixed at 3. Adaptive switching is intentionally disabled.
     pgie_elem = pipeline.get_by_name("primary-infer")
     if pgie_elem is not None:
-        probe.enable_adaptive_pgie(pgie_elem, base_interval=3, idle_interval=5, idle_timeout_s=5.0)
+        pgie_elem.set_property("interval", 3)
     # Wire camera -> source_type ("live" | "file") so probes.py can
     # publish source_modes in _telemetry and downstream consumers can
     # distinguish decoder-throughput file playback from live source FPS.
