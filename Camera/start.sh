@@ -17,6 +17,7 @@ VIDEO_BUFSIZE=${VIDEO_BUFSIZE:-3000k}
 
 sleep 5
 
+# Source videos are pre-encoded with 2s keyframes; copy avoids persistent CPU encoding.
 exec ffmpeg -re -stream_loop -1 \
     -i "$VIDEO_FILE" \
     -c:v copy \
@@ -25,7 +26,6 @@ exec ffmpeg -re -stream_loop -1 \
     -b:v "${VIDEO_BITRATE}" \
     -maxrate "${VIDEO_MAXRATE}" \
     -bufsize "${VIDEO_BUFSIZE}" \
-    -g $((TARGET_FPS * 2)) \
     -an \
     -f rtsp \
     -rtsp_transport tcp \
