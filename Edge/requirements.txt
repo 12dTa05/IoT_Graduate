@@ -13,8 +13,6 @@ python-dotenv>=1.0.0
 msgpack>=1.0.0
 
 # --- Networking / Messaging ---
-aiohttp>=3.9.0                   # PeerOrchestrator REST fallback
-aiofiles>=23.0.0                 # violation_store async file writes
 eclipse-zenoh>=1.0.0             # P2P peer orchestration and status broadcast
 
 # --- Dynamic Camera Config ---

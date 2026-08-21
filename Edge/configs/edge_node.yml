@@ -21,6 +21,7 @@ p2p:
   heartbeat_timeout_s: 5.0      # peer declared OFFLINE after this silence
   failover_convergence_grace_s: 15.0 # suppress mutual false-offline cascade during failover convergence
   failover_rescue_hold_s: 60.0  # max hold time (s) before force-releasing rescued camera if original owner remains dead
+  recovery_wait_s: 300.0        # wait 5 minutes in recovery before re-adding locally-owned cameras
   vote_window_s: 5.0            # proposal collection duration
   failover_jitter_max_s: 5.0    # random delay before failover ADD (race prevention)
   reclaim_margin: 15.0         # reclaim only when load < (overload_threshold - reclaim_margin)
@@ -137,6 +138,13 @@ p2p:
 load_score:
   hw_fuse_threshold: 90.0
   hw_fuse_score_floor: 80.0
+
+  # Adaptive PGIE interval adjustment
+  adaptive_pgie:
+    enabled: true
+    base_interval: 3
+    idle_interval: 5
+    idle_timeout_s: 5.0
 
   workload:
     enabled: true

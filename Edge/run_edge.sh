@@ -330,11 +330,15 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Watch loop — exits when collector finishes (collect/calibrate), or on error
+# Watch loop — exits when collector finishes (collect/calibrate), or supervises indefinitely
 # ---------------------------------------------------------------------------
-MAX_HEALTH_RESTARTS=3
+MAX_HEALTH_RESTARTS=5
 HEALTH_RESTART_COUNT=0
 HEALTH_BACKOFF=3
+
+MAX_PIPELINE_RESTARTS=5
+PIPELINE_RESTART_COUNT=0
+PIPELINE_BACKOFF=3
 
 while true; do
     sleep 2
@@ -342,22 +346,46 @@ while true; do
     if ! kill -0 "$HEALTH_PID" 2>/dev/null; then
         echo "[run_edge] WARNING: health_agent exited. Restart attempt $((HEALTH_RESTART_COUNT + 1))/$MAX_HEALTH_RESTARTS..." >&2
         if [[ $HEALTH_RESTART_COUNT -ge $MAX_HEALTH_RESTARTS ]]; then
-            echo "[run_edge] ERROR: health_agent exceeded max restarts ($MAX_HEALTH_RESTARTS). Stopping pipeline." >&2
-            exit 1
+            echo "[run_edge] Max health_agent restarts reached ($MAX_HEALTH_RESTARTS). Sleeping 60s before reset..." >&2
+            sleep 60
+            HEALTH_RESTART_COUNT=0
+            HEALTH_BACKOFF=3
+        else
+            sleep $HEALTH_BACKOFF
+            ((HEALTH_RESTART_COUNT++)) || true
+            HEALTH_BACKOFF=$((HEALTH_BACKOFF * 2))
+            [[ $HEALTH_BACKOFF -gt 30 ]] && HEALTH_BACKOFF=30
         fi
-        sleep $HEALTH_BACKOFF
         "$PYTHON" health_agent.py &
         HEALTH_PID=$!
         _pids+=("$HEALTH_PID")
-        ((HEALTH_RESTART_COUNT++)) || true
-        HEALTH_BACKOFF=$((HEALTH_BACKOFF * 2))
         echo "[run_edge] health_agent restarted with PID=$HEALTH_PID (restart count: $HEALTH_RESTART_COUNT)"
         continue
     fi
 
     if ! kill -0 "$PIPELINE_PID" 2>/dev/null; then
-        echo "[run_edge] ERROR: pipeline exited unexpectedly. Stopping health_agent." >&2
-        exit 1
+        echo "[run_edge] WARNING: pipeline exited unexpectedly. Restart attempt $((PIPELINE_RESTART_COUNT + 1))/$MAX_PIPELINE_RESTARTS..." >&2
+        if [[ $PIPELINE_RESTART_COUNT -ge $MAX_PIPELINE_RESTARTS ]]; then
+            echo "[run_edge] Max pipeline restarts reached ($MAX_PIPELINE_RESTARTS). Sleeping 60s before reset..." >&2
+            sleep 60
+            PIPELINE_RESTART_COUNT=0
+            PIPELINE_BACKOFF=3
+        else
+            sleep $PIPELINE_BACKOFF
+            ((PIPELINE_RESTART_COUNT++)) || true
+            PIPELINE_BACKOFF=$((PIPELINE_BACKOFF * 2))
+            [[ $PIPELINE_BACKOFF -gt 30 ]] && PIPELINE_BACKOFF=30
+        fi
+
+        if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
+            "$PYTHON" main.py --mode "$MODE" &
+        else
+            "$PYTHON" main.py "${EXTRA_ARGS[@]}" &
+        fi
+        PIPELINE_PID=$!
+        _pids+=("$PIPELINE_PID")
+        echo "[run_edge] pipeline restarted with PID=$PIPELINE_PID (restart count: $PIPELINE_RESTART_COUNT)"
+        continue
     fi
 
     if [[ -n "$COLLECT_PID" ]] && ! kill -0 "$COLLECT_PID" 2>/dev/null; then

@@ -36,8 +36,7 @@ import yaml
 logger = logging.getLogger(__name__)
 
 # Holder for the live SpeedProbe.  Set by the mode runners when a probe is
-# created (rtsp_push restarts create a fresh probe per iteration); read by
-# _health_push_loop each tick so it always feeds the current probe.
+# created (rtsp_push restarts create a fresh probe per iteration).
 ACTIVE_SPEED_PROBE: list = []
 
 # ---------------------------------------------------------------------------
@@ -92,6 +91,10 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
 
     # 3. Speed + LPR probe (pass peer_orch so it can query offload levels)
     probe = SpeedProbe(camera_manager, peer_orch=peer_orch)
+    # Adaptive PGIE controller: adjust interval 3 <-> 5 based on track activity
+    pgie_elem = pipeline.get_by_name("primary-infer")
+    if pgie_elem is not None:
+        probe.enable_adaptive_pgie(pgie_elem, base_interval=3, idle_interval=5, idle_timeout_s=5.0)
     # Wire camera -> source_type ("live" | "file") so probes.py can
     # publish source_modes in _telemetry and downstream consumers can
     # distinguish decoder-throughput file playback from live source FPS.
@@ -343,234 +346,6 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
     return probe
 
 
-# ---------------------------------------------------------------------------
-# Health push — periodic metrics to local PeerOrchestrator self-state, and a
-# heartbeat on peers/status/<NODE_ID> via PeerOrchestrator's shared Zenoh
-# session at the same 1 s cadence.  In the default run_edge.sh deployment a
-# standalone health_agent.py process also publishes on the same key from its
-# own session; in explicit PIPELINE_OWN_WS=1 standalone/dev mode this loop
-# additionally owns WebSocket forwarding to the Monitor Server so main.py can
-# run without health_agent.py.
-# ---------------------------------------------------------------------------
-
-def _health_push_loop(peer_orch=None) -> None:
-    import json as _json
-    import time as _time
-    from pathlib import Path as _Path
-    import yaml as _yaml
-
-    # Delegate metric collection and load-score computation to health_agent's
-    # functions so adaptive omega weights and the correct CPU formula are used.
-    from health_agent import (
-        _compute_load_score           as _compute_load_fn,
-        _compute_load_score_breakdown as _compute_lb_fn,
-        _detect_source_starved,
-        _derive_camera_workload,
-        _read_pipeline_snapshot       as _read_pipeline,
-        _maybe_reload_edge_cfg        as _reload_edge_cfg,
-        get_edge_cfg                  as _get_edge_cfg,
-        open_jtop_session,
-        collect_metrics,
-    )
-    _reload_edge_cfg()
-    from speedflow_python.load_model import ProactiveModel as _ProactiveModel
-    from speedflow_python.settings import LOAD_MODEL as _LOAD_MODEL, LOAD_POLICY as _LOAD_POLICY
-    _proactive_model = _ProactiveModel(
-        _get_edge_cfg().get("proactive", {}),
-        policy=_LOAD_POLICY,
-        model_type=_LOAD_MODEL,
-    )
-
-    _fps_file = _Path(FPS_STATS_FILE)
-
-    # Load camera configs once so peers know the original URIs for failover.
-    _cam_configs: dict = {}
-    # ponytail: uses dict, sufficient for periodic camera config reload
-
-    def _reload_cam_configs() -> dict:
-        try:
-            with open(CAMERAS_YML, "r", encoding="utf-8") as f:
-                raw = _yaml.safe_load(f)
-            result = {}
-            for cam_id, cfg in raw.get("cameras", {}).items():
-                if cfg and cfg.get("enabled", True):
-                    result[cam_id] = {
-                        "camera_id":       cam_id,
-                        "source_id":       int(cfg.get("source_id", 0)),
-                        "uri":             cfg.get("uri", ""),
-                        "name":            cfg.get("name", cam_id),
-                        "fps":             float(cfg.get("fps", 25.0)),
-                        "speed_limit_kmh": float(cfg.get("speed_limit_kmh", 80.0)),
-                        "homography":      cfg.get("homography", {}),
-                        "roi_polygon":     cfg.get("roi_polygon", []),
-                        "output":          cfg.get("output", {}),
-                    }
-            return result
-        except Exception:
-            return {}
-
-    _cam_configs = _reload_cam_configs()
-    _cam_configs_reload_interval = 30.0   # re-read cameras.yml every 30 s
-    _last_cam_reload = _time.monotonic()
-
-    # Open a persistent jtop session using standalone health_agent functions.
-    # This avoids the HealthAgent.__new__ stub hack and keeps the pipeline
-    # health loop independent.  This loop no longer publishes to Zenoh or
-    # WebSocket; health_agent.py is the single external telemetry owner.
-    _jtop_session = open_jtop_session()
-
-    # ponytail: monotonic deadline sleep so work duration doesn't extend period.
-    _next_deadline = _time.monotonic()
-
-    # Flat unavailable breakdown matching health_agent._compute_load_score_breakdown
-    # when fps_stats is invalid (non-dict or no active cams).
-    _UNAVAILABLE_BREAKDOWN = {
-        "fps_score": 100.0,
-        "workload_bonus": 0.0,
-        "thermal_bonus": 0.0,
-        "recv_bonus": 0.0,
-        "trend_bonus": 0.0,
-        "composite_score": 100.0,
-        "load_score": 100.0,
-    }
-
-    while True:
-        try:
-            # Periodically refresh camera configs to pick up dynamic changes
-            if _time.monotonic() - _last_cam_reload >= _cam_configs_reload_interval:
-                _cam_configs = _reload_cam_configs()
-                _last_cam_reload = _time.monotonic()
-                # Reload edge_node.yml so ProactiveModel sees fresh coefficients
-                _reload_edge_cfg()
-                _proactive_model.reload_cfg(_get_edge_cfg().get("proactive", {}))
-
-            # Use health_agent's metric collection via standalone function
-            metrics       = collect_metrics(_jtop_session)
-            snapshot_valid, fps_stats, feature_stats, offload_crops, _input_fps, _source_modes = _read_pipeline()
-
-            # ── Pipeline unavailable guard ──────────────────────────────
-            # Match health_agent's contract: invalid snapshot →
-            # load_score 100 (unavailable), skip proactive computation.
-            if snapshot_valid:
-                source_starved_cameras = _detect_source_starved(
-                    fps_stats, _input_fps, _get_edge_cfg(),
-                    source_type_map=_source_modes,
-                )
-                camera_workload = _derive_camera_workload(
-                    feature_stats, fps_stats, source_starved_cameras
-                )
-                load_score, omega_preset = _compute_load_fn(
-                    metrics, fps_stats, source_starved_cameras,
-                    feature_stats=feature_stats,
-                )
-                # Compute breakdown with same inputs for auditability
-                lb = _compute_lb_fn(
-                    metrics, fps_stats, source_starved_cameras,
-                    feature_stats=feature_stats,
-                )
-                offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
-                active_fps_vals = [v for v in fps_stats.values() if v > 0.0]
-                avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
-                active_cameras = [k for k, v in fps_stats.items() if v > 0.0]
-            else:
-                load_score, omega_preset = 100.0, "fps_dominant"
-                lb = _UNAVAILABLE_BREAKDOWN
-                offload_crops_received_per_s = 0.0
-                active_fps_vals = []
-                avg_fps = None
-                active_cameras = []
-                fps_stats = {}
-                feature_stats = {}
-                offload_crops = {"received_per_s": 0.0}
-                source_starved_cameras = set()
-                camera_workload = {}
-
-            payload = {
-                "type":         "health",
-                "node_id":      NODE_ID,
-                "advertise_ip": ADVERTISE_IP,
-                "timestamp":    _time.time(),
-                "load_score":   load_score,
-                "load_score_breakdown": lb,
-                "omega_preset": omega_preset,
-                "gpu_percent":  metrics["gpu_percent"],
-                "cpu_percent":  metrics["cpu_percent"],
-                "ram_percent":  metrics["ram_percent"],
-                "gpu_temp_c":   metrics["gpu_temp_c"],
-                "power_mw":     metrics.get("power_mw", 0.0),
-                "source":       metrics.get("source", "jtop"),
-                "pipeline": {
-                    # pipeline_available: False = snapshot not yet valid (pipeline
-                    # starting/stale); load_score=100 is "unavailable", not overload.
-                    "pipeline_available":    snapshot_valid,
-                    # output_fps_per_camera = pipeline throughput (frames processed).
-                    # fps_per_camera kept for backward compatibility.
-                    "fps_per_camera":        fps_stats,
-                    "output_fps_per_camera": fps_stats,
-                    # input_fps_per_camera = PTS-derived native source rate
-                    # (SpeedProbe.buf_pts deltas), falling back to bounded
-                    # OSD output rate when PTS is unavailable.
-                    "input_fps_per_camera":  _input_fps if snapshot_valid else {},
-                    "avg_fps":         avg_fps,
-                    "active_cameras":  active_cameras,
-                    "camera_configs":  _cam_configs,
-                    "camera_workload": camera_workload,
-                    "camera_features": feature_stats if snapshot_valid else {},
-                    "source_starved_cameras": sorted(source_starved_cameras),
-                },
-            }
-
-            # Push the breakdown to the live SpeedProbe so the FPS writer
-            # includes it in the next telemetry snapshot.  No blocking, no file I/O.
-            if ACTIVE_SPEED_PROBE:
-                ACTIVE_SPEED_PROBE[0].set_load_score_breakdown(lb)
-
-            # ── Proactive model ──────────────────────────────────────
-            # Skip when snapshot is invalid — no features to compute on.
-            if snapshot_valid:
-                _active_ids = {k for k, v in fps_stats.items() if v > 0.0}
-                proactive_result = _proactive_model.compute(
-                    metrics,
-                    {k: v for k, v in feature_stats.items() if k in _active_ids},
-                    offload_crops_received_per_s=offload_crops_received_per_s,
-                    fps_stats={k: v for k, v in fps_stats.items() if k in _active_ids},
-                )
-                payload.update(proactive_result)
-
-            # Keep local PeerOrchestrator state fresh and publish a fresh
-            # heartbeat on peers/status/<NODE_ID> via the shared session.
-            # health_agent.py may also publish from its own session in the
-            # default run_edge.sh deployment; that second source publishes
-            # under the SAME node_id so the Zenoh pub/sub contract is
-            # satisfied regardless of which process is running.
-            # send_to_monitor is deliberately inside the PIPELINE_OWN_WS=1
-            # block below (MonitorClient ownership = standalone / dev mode).
-            if peer_orch is not None:
-                peer_orch.update_self_state(payload)
-                import msgpack as _msgpack
-                peer_orch.publish_status(
-                    _msgpack.packb(payload, use_bin_type=True)
-                )
-
-            if os.environ.get("PIPELINE_OWN_WS") == "1":
-                from speedflow_python.monitor_client import send_to_monitor
-                send_to_monitor(payload)
-
-        except Exception as _exc:
-            import logging as _logging
-            _logging.getLogger("health_push").warning(
-                "[HealthPush] Exception in health loop (will retry): %s", _exc, exc_info=True
-            )
-        # ponytail: deadline sleep — work duration does not extend the period.
-        _next_deadline += float(HEALTH_INTERVAL)
-        _remaining = _next_deadline - _time.monotonic()
-        if _remaining > 0:
-            _time.sleep(_remaining)
-        else:
-            _next_deadline = _time.monotonic()
-
-
-
 def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, offload_rcv=None, zenoh_pub=None) -> Optional["SpeedProbe"]:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
@@ -802,7 +577,8 @@ def run_python_mode(args) -> None:
     zenoh_pub = None
     try:
         from .zenoh_publisher import ZenohPublisher
-        zenoh_pub = ZenohPublisher(node_id=NODE_ID)
+        shared_session = peer_orch._session if peer_orch else None
+        zenoh_pub = ZenohPublisher(node_id=NODE_ID, session=shared_session)
         zenoh_pub.start()
         print(f"[ZenohPub] Started. Key=traffic/events/{NODE_ID}/<camera_id>")
     except ImportError:
@@ -847,22 +623,54 @@ def run_python_mode(args) -> None:
         except Exception as exc:
             print(f"[OffloadPub/Rcv] Failed to start: {exc}", file=sys.stderr)
 
-    # --- Health Push (periodic metrics → local PeerOrchestrator state) ---
-    _health_thread = threading.Thread(
-        target=_health_push_loop, args=(peer_orch,), daemon=True,
-    )
-    _health_thread.start()
-    print("[HealthPush] Started (Zenoh heartbeat / peer orchestration)")
+    # Note: Production health_agent.py is the sole metrics/load-score publisher
+    # and publishes self-heartbeats to peers/status/<NODE_ID> over Zenoh.
 
     # Run pipeline — offload_pub + zenoh_pub references passed so SpeedProbe can use them
-    if args.mode == "display":
-        probe = run_display_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
-    elif args.mode == "file":
-        probe = run_file_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
-    elif args.mode == "rtsp_push":
-        probe = run_rtsp_push_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
-    else:
-        raise ValueError(f"Unknown mode: '{args.mode}'")
+    # Supervisor loop around pipeline execution to handle recovery / stream parking
+    # and keep Edge process alive without exiting when all streams are removed.
+    probe = None
+    while True:
+        try:
+            enabled_cams = camera_manager.get_enabled_configs()
+            if not enabled_cams:
+                recovery_wait = float(edge_cfg.get("p2p", {}).get("recovery_wait_s", 300.0))
+                print(f"[Supervisor] Zero active cameras configured/enabled. Entering recovery state for {recovery_wait:.0f}s...")
+                time.sleep(recovery_wait)
+                # Re-check cameras config file
+                camera_manager.reload()
+                enabled_cams = camera_manager.get_enabled_configs()
+                if not enabled_cams:
+                    print("[Supervisor] Still 0 active cameras after recovery wait. Retrying...")
+                    continue
+                print(f"[Supervisor] Found {len(enabled_cams)} enabled cameras after recovery. Resuming pipeline.")
+
+            if args.mode == "display":
+                probe = run_display_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
+            elif args.mode == "file":
+                probe = run_file_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
+            elif args.mode == "rtsp_push":
+                probe = run_rtsp_push_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
+            else:
+                raise ValueError(f"Unknown mode: '{args.mode}'")
+            # A GStreamer EOS/error returns here after the mode runner has
+            # stopped the old pipeline.  Keep the Edge supervisor alive and
+            # deliberately park before rebuilding; an empty-FPS interval is
+            # WAITING/RECOVERY, never a reason to terminate the node.
+            recovery_wait = float(edge_cfg.get("p2p", {}).get("recovery_wait_s", 300.0))
+            print(f"[Supervisor] Pipeline stopped. Entering recovery state for {recovery_wait:.0f}s...")
+            time.sleep(recovery_wait)
+            camera_manager.reload()
+            print("[Supervisor] Recovery wait complete. Rebuilding pipeline.")
+            continue
+        except KeyboardInterrupt:
+            print("\n[Supervisor] Interrupted by user. Exiting.")
+            break
+        except Exception as exc:
+            print(f"[Supervisor] Pipeline exception: {exc}. Retrying in 5s...", file=sys.stderr)
+            time.sleep(5)
+            continue
+        break
 
     # Fix #1 / #7: stop the FPS writer thread cleanly now that the pipeline
     # has exited, regardless of which mode was used.

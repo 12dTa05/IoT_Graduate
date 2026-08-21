@@ -468,6 +468,10 @@ class CameraManager:
             if c.enabled
         }
 
+    def reload(self) -> Optional[StreamDelta]:
+        """Public method to re-read YAML file and return StreamDelta if changed."""
+        return self._reload_and_diff()
+
     # ------------------------------------------------------------------
     # Internal — Watchdog (inotify)
     # ------------------------------------------------------------------

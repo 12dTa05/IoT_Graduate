@@ -7,7 +7,7 @@ Edge/tests
 Edge/snapshots
 Edge/__pycache__
 Edge/speedflow_python/__pycache__
-Edge/speedflow_python/tests/__pycache__
+Edge/speedflow_python/tests
 Edge/tools/__pycache__
 Edge/tests/__pycache__
 Edge/.pytest_cache

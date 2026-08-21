@@ -350,42 +350,6 @@ def _read_pipeline_snapshot() -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# FPS Reader (read JSON file written by SpeedProbe)
-# ---------------------------------------------------------------------------
-
-def _read_fps_stats() -> Dict[str, float]:
-    """
-    Read FPS per camera from the unified payload.
-    Return dict {camera_id: fps} or empty dict on error.
-    Delegates to _read_payload() for safe single-read.
-    """
-    fps_stats, _, _ = _payload_parts(_read_payload())
-    return fps_stats
-
-
-def _read_feature_stats() -> Dict[str, Dict[str, float]]:
-    """
-    Read per-camera proactive features from the unified payload.
-    Delegates to _read_payload() for safe single-read.
-
-    Returns {camera_id: {n_track, n_plate, stationary_fraction}} or {} on error.
-    """
-    _, feature_stats, _ = _payload_parts(_read_payload())
-    return feature_stats
-
-
-def _read_offload_crops() -> dict:
-    """
-    Read _offload_crops snapshot from the unified payload.
-    Delegates to _read_payload() for safe single-read.
-
-    Returns {processed_count, received_per_s, ts} or {"received_per_s": 0.0}.
-    """
-    _, _, offload_crops = _payload_parts(_read_payload())
-    return offload_crops
-
-
-# ---------------------------------------------------------------------------
 # Metric Collector
 # ---------------------------------------------------------------------------
 
@@ -1136,6 +1100,13 @@ class HealthAgent:
                         feature_stats, fps_stats, starved_cams
                     )
 
+                    # Pipeline status: 'running' if snapshot valid and active cameras > 0, else 'waiting'
+                    is_waiting = (
+                        (not snapshot_valid)
+                        or (not active_cameras)
+                    )
+                    pipeline_status = "waiting" if is_waiting else "running"
+
                     payload = {
                         "type":          "health",
                         "node_id":       NODE_ID,
@@ -1154,7 +1125,8 @@ class HealthAgent:
                             # pipeline_available distinguishes "pipeline not yet
                             # started / stale snapshot" (False, load_score=100)
                             # from real overload (True, load_score=100).
-                            "pipeline_available": snapshot_valid,
+                            "pipeline_available": (snapshot_valid and not is_waiting),
+                            "status":             pipeline_status,
                             # output_fps_per_camera = frames the probe actually
                             # processed this window (pipeline throughput).
                             # fps_per_camera is kept for backward compatibility.
@@ -1243,41 +1215,6 @@ class HealthAgent:
                 except Exception:
                     pass
             logger.info("[HealthAgent] Stopped.")
-
-
-# ---------------------------------------------------------------------------
-# Standalone functions for use by run_python.py's health_push_loop.
-# These expose a persistent jtop open/collect pattern without requiring
-# a HealthAgent instance (avoids the __new__ stub hack).
-# ---------------------------------------------------------------------------
-
-def open_jtop_session():
-    """
-    Open and return a persistent jtop session.
-    Identical to HealthAgent._open_jtop() — run_python.py can call this
-    directly without instantiating a full HealthAgent.
-    Returns the jtop object or None.
-    """
-    # ponytail: use a bare object with _open_jtop as an unbound method
-    # instead of creating a throwaway HealthAgent() that opens MonitorClient,
-    # builds ProactiveModel, etc.
-    class _Stub:
-        _open_jtop = HealthAgent._open_jtop
-    return _Stub()._open_jtop()
-
-
-def collect_metrics(jtop_session):
-    """
-    Read metrics from a persistent jtop session.
-    Identical to HealthAgent._collect_metrics() — takes the jtop object
-    returned by open_jtop_session().
-    If jtop_session is None, returns all-zero fallback metrics.
-    """
-    # ponytail: stub so _collect_metrics uses its jtop without a full HealthAgent.
-    class _Stub:
-        _jtop = jtop_session
-        _collect_metrics = HealthAgent._collect_metrics
-    return _Stub()._collect_metrics()
 
 
 # ---------------------------------------------------------------------------

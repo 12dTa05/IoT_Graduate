@@ -358,6 +358,15 @@ class SpeedProbe:
         # Feature snapshot cache for get_feature_stats() API compatibility.
         self._feature_snapshot_cache: Dict[str, Dict[str, float]] = {}
 
+        # ── Adaptive PGIE interval controller ──────────────────────────────
+        self._adaptive_pgie_enabled: bool = False
+        self._pgie_elem = None
+        self._base_interval: int = 3
+        self._idle_interval: int = 5
+        self._idle_timeout_s: float = 5.0
+        self._last_active_track_ts: float = time.monotonic()
+        self._current_pgie_interval: int = 3
+
         self._fps_writer_running = True
         self._fps_writer_thread  = threading.Thread(
             target=self._fps_writer_loop, name="FPSStatsWriter", daemon=True
@@ -367,6 +376,49 @@ class SpeedProbe:
     # ------------------------------------------------------------------
     # Publisher
     # ------------------------------------------------------------------
+
+    def enable_adaptive_pgie(
+        self,
+        pgie_elem,
+        base_interval: int = 3,
+        idle_interval: int = 5,
+        idle_timeout_s: float = 5.0,
+    ) -> None:
+        """Enable dynamic PGIE interval switching between base_interval and idle_interval."""
+        self._pgie_elem = pgie_elem
+        self._base_interval = int(base_interval)
+        self._idle_interval = int(idle_interval)
+        self._idle_timeout_s = float(idle_timeout_s)
+        self._adaptive_pgie_enabled = True
+        self._last_active_track_ts = time.monotonic()
+        self._current_pgie_interval = self._base_interval
+        logger.info(
+            "[SpeedProbe] Adaptive PGIE enabled: base_interval=%d, idle_interval=%d, idle_timeout=%.1fs",
+            self._base_interval, self._idle_interval, self._idle_timeout_s,
+        )
+
+    def _update_adaptive_pgie(self, active_track_count: int) -> None:
+        """Adjust PGIE interval: idle_interval after idle_timeout_s with no tracks, base_interval otherwise."""
+        if not self._adaptive_pgie_enabled:
+            return
+        now = time.monotonic()
+        if active_track_count > 0:
+            self._last_active_track_ts = now
+            target = self._base_interval
+        else:
+            if (now - self._last_active_track_ts) >= self._idle_timeout_s:
+                target = self._idle_interval
+            else:
+                target = self._base_interval
+
+        if target != self._current_pgie_interval:
+            self._current_pgie_interval = target
+            if self._pgie_elem is not None:
+                try:
+                    self._pgie_elem.set_property("interval", target)
+                    logger.info("[SpeedProbe] Adaptive PGIE interval switched to %d", target)
+                except Exception as exc:
+                    logger.warning("[SpeedProbe] Failed to set PGIE interval: %s", exc)
 
     def set_publisher(self, publisher) -> None:
         self.publisher = publisher
@@ -1139,6 +1191,9 @@ class SpeedProbe:
         # Rejection of inference-failure results happened at inject time.
         self._drain_offload_results()
 
+        # Update adaptive PGIE interval based on total tracks in this batch
+        total_tracks_in_batch = 0
+
         while l_frame:
             frame_meta   = pyds.NvDsFrameMeta.cast(l_frame.data)
             frame_number = frame_meta.frame_num
@@ -1205,6 +1260,7 @@ class SpeedProbe:
                         "width": r.width, "height": r.height,
                         "obj_meta": obj_meta,
                     }
+                    total_tracks_in_batch += 1
                     track_ids_ordered.append(tid)
                     raw_pts.extend([cx, bottom_y])
 
@@ -1501,4 +1557,5 @@ class SpeedProbe:
             self._periodic_cleanup(time.time(), frame_number)
             l_frame = l_frame.next
 
+        self._update_adaptive_pgie(total_tracks_in_batch)
         return Gst.PadProbeReturn.OK

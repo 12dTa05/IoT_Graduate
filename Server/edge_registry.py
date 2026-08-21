@@ -91,10 +91,6 @@ class EdgeRegistry:
         logger.info("[Registry] Edge '%s' marked offline", node_id)
         self._emit("offline", node_id)
 
-    def get(self, node_id: str) -> Optional[EdgeInfo]:
-        with self._lock:
-            return self._edges.get(node_id)
-
     def get_all(self) -> List[Dict[str, Any]]:
         with self._lock:
             return [info.to_dict() for info in self._edges.values()]
@@ -112,11 +108,6 @@ class EdgeRegistry:
                     clusters[cid] = []
                 clusters[cid].append(info.to_dict())
         return clusters
-
-    def get_online_node_ids(self) -> List[str]:
-        """Return node_ids of all currently-online edges."""
-        with self._lock:
-            return [info.node_id for info in self._edges.values() if info.online]
 
     async def _watchdog_loop(self) -> None:
         while True:

@@ -46,10 +46,11 @@ class ZenohPublisher:
         publisher.stop()
     """
 
-    def __init__(self, node_id: str) -> None:
+    def __init__(self, node_id: str, session=None) -> None:
         self._node_id = node_id
+        self._ext_sess = session        # shared Zenoh session if provided
 
-        self._queue: queue.Queue[Optional[Dict[str, Any]]] = queue.Queue(maxsize=ZENOH_QUEUE_MAXSIZE)
+        self._queue: queue.Queue[Optional[Dict[str, Any]]] = queue.Queue(maxsize=int(ZENOH_QUEUE_MAXSIZE))
         self._session = None
         self._publishers: Dict[str, Any] = {}   # cache: key_expr → publisher
         self._thread: Optional[threading.Thread] = None
@@ -62,10 +63,14 @@ class ZenohPublisher:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Open Zenoh session and start publisher thread."""
-        import zenoh
-        self._session = make_session()
-        logger.info("[ZenohPub] Session opened (peer mode).")
+        """Open Zenoh session (or use shared session) and start publisher thread."""
+        if self._ext_sess is not None:
+            self._session = self._ext_sess
+            logger.info("[ZenohPub] Using shared Zenoh session.")
+        else:
+            import zenoh
+            self._session = make_session()
+            logger.info("[ZenohPub] Session opened (peer mode).")
 
         self._running = True
         self._thread = threading.Thread(
@@ -76,19 +81,20 @@ class ZenohPublisher:
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop publisher, flush remaining queue, close session."""
+        """Stop publisher, flush remaining queue, close session if owned."""
         self._running = False
         self._queue.put(None)
         if self._thread:
             self._thread.join(timeout=10)
-        for pub in self._publishers.values():
-            try:
-                pub.undeclare()
-            except Exception:
-                pass
+        if self._ext_sess is None:
+            for pub in self._publishers.values():
+                try:
+                    pub.undeclare()
+                except Exception:
+                    pass
+            if self._session:
+                self._session.close()
         self._publishers.clear()
-        if self._session:
-            self._session.close()
         logger.info(
             "[ZenohPub] Stopped. Sent=%d, Dropped=%d",
             self._sent_count, self._drop_count,

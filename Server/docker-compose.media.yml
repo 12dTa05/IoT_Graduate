@@ -6,19 +6,3 @@ services:
     restart: unless-stopped
     volumes:
       - ./mediamtx.yml:/mediamtx.yml
-
-  # mediamtx has no shell/curl/wget inside, so this sidecar owns the API probe.
-  mediamtx-health:
-    image: alpine:3.20
-    container_name: mediamtx-health
-    network_mode: host
-    depends_on:
-      - mediamtx
-    command: ["tail", "-f", "/dev/null"]
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9997/v3/paths/list"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 10s

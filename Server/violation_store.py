@@ -78,67 +78,6 @@ class ViolationStore:
 
         return snapshot_path
 
-    def query(
-        self,
-        node_id: Optional[str] = None,
-        date: Optional[str] = None,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> List[Dict[str, Any]]:
-        results: List[Dict[str, Any]] = []
-
-        date_dirs: List[Path] = []
-        if date:
-            d = self._root / date
-            if d.is_dir():
-                date_dirs.append(d)
-        else:
-            for d in sorted(self._root.iterdir(), reverse=True):
-                if d.is_dir():
-                    date_dirs.append(d)
-
-        # Fix #11: collect only offset+limit records across all files so the
-        # in-memory footprint stays bounded regardless of how many violations
-        # are stored.  Records are sorted descending by timestamp, so we read
-        # the newest date directories first and stop as soon as we have enough.
-        need = offset + limit
-
-        for date_dir in date_dirs:
-            node_dirs: List[Path] = []
-            if node_id:
-                nd = date_dir / node_id
-                if nd.is_dir():
-                    node_dirs.append(nd)
-            else:
-                for nd in date_dir.iterdir():
-                    if nd.is_dir():
-                        node_dirs.append(nd)
-
-            for nd in node_dirs:
-                jsonl = nd / "violations.jsonl"
-                if not jsonl.exists():
-                    continue
-                try:
-                    with open(jsonl) as f:
-                        for line in f:
-                            line = line.strip()
-                            if line:
-                                try:
-                                    rec = json.loads(line)
-                                    results.append(rec)
-                                except json.JSONDecodeError:
-                                    continue
-                except Exception as exc:
-                    logger.warning("Failed to read %s: %s", jsonl, exc)
-
-            # Early-exit: once we have more than enough records for this
-            # page we can stop reading further (older) date directories.
-            if len(results) >= need:
-                break
-
-        results.sort(key=lambda r: r.get("timestamp", 0), reverse=True)
-        return results[offset:offset + limit]
-
     async def query_async(
         self,
         node_id: Optional[str] = None,
@@ -146,4 +85,59 @@ class ViolationStore:
         limit: int = 50,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        return await asyncio.to_thread(self.query, node_id=node_id, date=date, limit=limit, offset=offset)
+        def _query() -> List[Dict[str, Any]]:
+            results: List[Dict[str, Any]] = []
+
+            date_dirs: List[Path] = []
+            if date:
+                d = self._root / date
+                if d.is_dir():
+                    date_dirs.append(d)
+            else:
+                for d in sorted(self._root.iterdir(), reverse=True):
+                    if d.is_dir():
+                        date_dirs.append(d)
+
+            # Fix #11: collect only offset+limit records across all files so the
+            # in-memory footprint stays bounded regardless of how many violations
+            # are stored.  Records are sorted descending by timestamp, so we read
+            # the newest date directories first and stop as soon as we have enough.
+            need = offset + limit
+
+            for date_dir in date_dirs:
+                node_dirs: List[Path] = []
+                if node_id:
+                    nd = date_dir / node_id
+                    if nd.is_dir():
+                        node_dirs.append(nd)
+                else:
+                    for nd in date_dir.iterdir():
+                        if nd.is_dir():
+                            node_dirs.append(nd)
+
+                for nd in node_dirs:
+                    jsonl = nd / "violations.jsonl"
+                    if not jsonl.exists():
+                        continue
+                    try:
+                        with open(jsonl) as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    try:
+                                        rec = json.loads(line)
+                                        results.append(rec)
+                                    except json.JSONDecodeError:
+                                        continue
+                    except Exception as exc:
+                        logger.warning("Failed to read %s: %s", jsonl, exc)
+
+                # Early-exit: once we have more than enough records for this
+                # page we can stop reading further (older) date directories.
+                if len(results) >= need:
+                    break
+
+            results.sort(key=lambda r: r.get("timestamp", 0), reverse=True)
+            return results[offset:offset + limit]
+
+        return await asyncio.to_thread(_query)

@@ -83,6 +83,7 @@ class PeerState:
     source_starved_cameras: List[str] = field(default_factory=list)
     # Rate of offload crops received per second (for Level 2/3 peer evaluation)
     offload_crops_received_per_s: float = 0.0
+    load_score_breakdown: Dict[str, float] = field(default_factory=dict)
 
 
 def _parse_camera_workload(raw) -> Dict[str, float]:
@@ -145,6 +146,26 @@ def _has_valid_positive_fps(fps_per_camera) -> bool:
                 and math.isfinite(v)
                 and v > 0.0):
             return True
+    return False
+
+
+def is_waiting_state(fps_per_camera, active_cameras: Optional[List[str]] = None, status: Optional[str] = None) -> bool:
+    """Predicate for WAITING/RECOVERY state.
+
+    Returns True if:
+      - fps_per_camera is empty or has no valid positive FPS, OR
+      - active_cameras is empty or 0 length, OR
+      - status string is explicitly 'waiting', 'recovering', or 'recovery'.
+
+    In this state, the node is waiting/recovering and must NEVER be classified
+    as overloaded or offline, and must not trigger failover/rescue.
+    """
+    if status and str(status).strip().lower() in ("waiting", "recovering", "recovery"):
+        return True
+    if active_cameras is not None and len(active_cameras) == 0:
+        return True
+    if not _has_valid_positive_fps(fps_per_camera):
+        return True
     return False
 
 
@@ -508,92 +529,14 @@ class PeerOrchestrator:
     def update_self_state(self, payload: dict) -> None:
         """Update this node's local state without publishing a Zenoh heartbeat.
 
-        The standalone health_agent.py is the single publisher for
-        peers/status/<node_id>.  The pipeline process still needs a fresh
-        _self_state for local offload/migration decisions, so the internal
-        health loop calls this method directly instead of publishing a second
-        heartbeat for the same NODE_ID.
+        Thin compatibility wrapper routing directly to _on_peer_status(payload).
         """
-        with self._self_lock:
-            self._self_state.load_score  = payload.get("load_score",  0.0)
-            self._self_state.gpu_percent = payload.get("gpu_percent", 0.0)
-            self._self_state.cpu_percent = payload.get("cpu_percent", 0.0)
-            self._self_state.ram_percent = payload.get("ram_percent", 0.0)
-            self._self_state.gpu_temp_c  = payload.get("gpu_temp_c",  0.0)
-            self._self_state.risk_index  = payload.get("risk_index",  0.0)
-
-            pipeline = payload.get("pipeline", {}) or {}
-            self._self_state.avg_fps = pipeline.get("avg_fps")
-            # Prefer output_fps_per_camera (Phase 1 unambiguous key); fall back
-            # to fps_per_camera for backward compatibility with older firmware.
-            self._self_state.fps_per_camera = _pick_fps_dict(pipeline)
-            self._self_state.active_cameras = list(pipeline.get("active_cameras", []))
-            self._self_state.camera_configs = pipeline.get("camera_configs", {})
-            # Backwards-compatible: missing or malformed mapping → empty dict.
-            self._self_state.camera_workload = _parse_camera_workload(
-                pipeline.get("camera_workload", {})
-            )
-            self._self_state.source_starved_cameras = _parse_starved_cameras(
-                pipeline.get("source_starved_cameras", [])
-            )
-            self._self_state.offload_crops_received_per_s = float(
-                pipeline.get("offload_crops_received_per_s", 0.0) or 0.0
-            )
-            self._self_state.last_seen = time.time()
-            # max_streams sourced from health payload; malformed values fall back to 8
-            try:
-                self._self_state.max_streams = int(pipeline.get("max_streams", 8) or 8)
-            except (TypeError, ValueError):
-                self._self_state.max_streams = 8
-
-            # ponytail: track when valid positive FPS first appeared — drives the
-            # startup warmup gate in _check_self_overload.  Sticky: once set,
-            # never reset, so the gate measures elapsed time since first valid
-            # sample rather than the validity of the current sample.
-            fps_valid = _has_valid_positive_fps(self._self_state.fps_per_camera)
-            if fps_valid and self._self_first_valid_fps_at is None:
-                self._self_first_valid_fps_at = time.time()
-
-            # Per-camera first-valid-FPS timestamps (sticky, per camera).
-            # Drives the post-ADD warmup gate in _pick_camera_to_offload so a
-            # freshly-ADDed camera is ineligible for offload until its FPS has
-            # been valid for camera_warmup_s seconds.
-            if fps_valid:
-                now_ts = time.time()
-                for cam_id, fps_val in self._self_state.fps_per_camera.items():
-                    if not isinstance(cam_id, str):
-                        continue
-                    if (isinstance(fps_val, (int, float))
-                            and not isinstance(fps_val, bool)
-                            and math.isfinite(fps_val)
-                            and fps_val > 0.0):
-                        self._camera_first_valid_fps_at.setdefault(cam_id, now_ts)
-
-            # Overload onset: must be BOTH overloaded (legacy load_score or
-            # proactive risk_index) AND have valid positive FPS samples.
-            # load_score=100 with empty/zero/NaN fps is meaningless without
-            # running streams and must NOT escalate the node.
-            overloaded = (
-                self._is_overloaded(
-                    self._self_state.load_score, self._self_state.risk_index
-                )
-                and fps_valid
-            )
-            if overloaded:
-                if self._self_state.overload_since is None:
-                    self._self_state.overload_since = time.time()
-                # Only reset reclaim eligibility if we are NOT in a
-                # post-reclaim transition settle window.  Transient load
-                # spikes during stream warm-up after a reclaim ADD are
-                # expected and must not restart the reclaim_stable_s timer
-                # for the next pending reclaim — otherwise chained reclaims
-                # are impossible within tight run windows.
-                if time.time() <= self._transition_settle_until:
-                    pass  # preserve _reclaim_eligible_since
-                else:
-                    self._reclaim_eligible_since = None
-            else:
-                self._self_state.overload_since = None
+        if not isinstance(payload, dict):
+            return
+        if "node_id" not in payload:
+            payload = dict(payload)
+            payload["node_id"] = self._node_id
+        self._on_peer_status(payload)
 
     def get_offload_level(self, camera_id: str) -> int:
         """
@@ -684,6 +627,7 @@ class PeerOrchestrator:
             # always reads a consistent snapshot of _self_state.
             with self._self_lock:
                 self._self_state.load_score  = payload.get("load_score",  0.0)
+                self._self_state.load_score_breakdown = payload.get("load_score_breakdown", {})
                 self._self_state.gpu_percent = payload.get("gpu_percent", 0.0)
                 self._self_state.cpu_percent = payload.get("cpu_percent", 0.0)
                 self._self_state.ram_percent = payload.get("ram_percent", 0.0)
@@ -695,6 +639,7 @@ class PeerOrchestrator:
                 # to fps_per_camera for backward compatibility with older firmware.
                 self._self_state.fps_per_camera = _pick_fps_dict(pipeline)
                 self._self_state.active_cameras = list(pipeline.get("active_cameras", []))
+                self._self_state.camera_configs = pipeline.get("camera_configs", self._self_state.camera_configs)
                 # Backwards-compatible: missing or malformed mapping → empty.
                 self._self_state.camera_workload = _parse_camera_workload(
                     pipeline.get("camera_workload", {})
@@ -702,6 +647,14 @@ class PeerOrchestrator:
                 self._self_state.source_starved_cameras = _parse_starved_cameras(
                     pipeline.get("source_starved_cameras", [])
                 )
+                self._self_state.offload_crops_received_per_s = float(
+                    pipeline.get("offload_crops_received_per_s", 0.0) or 0.0
+                )
+                self._self_state.last_seen = time.time()
+                try:
+                    self._self_state.max_streams = int(pipeline.get("max_streams", 8) or 8)
+                except (TypeError, ValueError):
+                    self._self_state.max_streams = 8
 
                 # ponytail: startup + per-camera warmup timestamp tracking —
                 # same logic as update_self_state so the Zenoh-self path and
@@ -721,14 +674,20 @@ class PeerOrchestrator:
                             self._camera_first_valid_fps_at.setdefault(cam_id, now_ts)
 
                 # Overload onset: must be BOTH overloaded AND have valid
-                # positive FPS samples.  load_score=100 with empty/zero/NaN
-                # fps is meaningless without running streams — dashboard
-                # keeps the raw load_score, but the decision path is gated.
+                # positive FPS samples AND not be in waiting/recovery state.
+                # load_score=100 with empty/zero/NaN fps is meaningless without
+                # running streams — dashboard keeps the raw load_score, but the decision path is gated.
+                in_waiting = is_waiting_state(
+                    self._self_state.fps_per_camera,
+                    self._self_state.active_cameras,
+                    pipeline.get("status"),
+                )
                 overloaded = (
                     self._is_overloaded(
                         self._self_state.load_score, self._self_state.risk_index
                     )
                     and fps_valid
+                    and not in_waiting
                 )
                 if overloaded:
                     if self._self_state.overload_since is None:
@@ -754,6 +713,7 @@ class PeerOrchestrator:
             peer = self._peers[node_id]
 
             peer.load_score  = payload.get("load_score",  0.0)
+            peer.load_score_breakdown = payload.get("load_score_breakdown", {})
             peer.gpu_percent = payload.get("gpu_percent", 0.0)
             peer.cpu_percent = payload.get("cpu_percent", 0.0)
             peer.ram_percent = payload.get("ram_percent", 0.0)
@@ -786,13 +746,19 @@ class PeerOrchestrator:
 
             # Track overload onset using same proactive-aware helper.
             # Gate on valid positive FPS: load_score=100 with fps={} means the
-            # peer pipeline is unavailable (pipeline_available=False), NOT
-            # genuinely overloaded.  Without this gate a newly-started peer
+            # peer pipeline is unavailable (pipeline_available=False) or in waiting/recovery,
+            # NOT genuinely overloaded.  Without this gate a newly-started peer
             # would appear overloaded to election logic before its pipeline runs.
             peer_fps_valid = _has_valid_positive_fps(peer.fps_per_camera)
+            peer_in_waiting = is_waiting_state(
+                peer.fps_per_camera,
+                peer.active_cameras,
+                pipeline.get("status"),
+            )
             overloaded = (
                 self._is_overloaded(peer.load_score, peer.risk_index)
                 and peer_fps_valid
+                and not peer_in_waiting
             )
             if overloaded:
                 if peer.overload_since is None:
@@ -936,6 +902,11 @@ class PeerOrchestrator:
             if node_id == self._node_id:
                 continue
             silent_s = now - peer.last_seen
+            # Harden peer offline handling: ONLY heartbeat silence (silent_s > offline_threshold)
+            # can declare a peer offline.
+            # If peer heartbeat is arriving (silent_s <= offline_threshold), even with
+            # fps={}, 0 active cameras, or waiting/recovery state, the peer is alive
+            # and MUST NOT be declared offline or trigger failover rescue.
             if silent_s > offline_threshold:
                 with self._lock:
                     already_triggered = node_id in self._failover_triggered
@@ -1204,6 +1175,14 @@ class PeerOrchestrator:
         heartbeat_timeout = cfg.get("heartbeat_timeout_s", 6.0)
 
         with self._self_lock:
+            if self._self_state.last_seen == 0.0 or (now - self._self_state.last_seen > heartbeat_timeout):
+                if self._maybe_log_block("stale_self_reclaim", now):
+                    logger.warning(
+                        "[PeerOrch] Self heartbeat stale or missing (age=%.1fs > %.1fs). "
+                        "Skipping reclaim check.",
+                        now - self._self_state.last_seen, heartbeat_timeout,
+                    )
+                return
             load         = self._self_state.load_score
             overload_since = self._self_state.overload_since
             self_active_count = len(self._self_state.active_cameras)
@@ -1358,7 +1337,21 @@ class PeerOrchestrator:
                 risk_index=self._self_state.risk_index,
                 camera_workload=dict(self._self_state.camera_workload),
                 source_starved_cameras=list(self._self_state.source_starved_cameras),
+                last_seen=self._self_state.last_seen,
             )
+            self_last_seen = self._self_state.last_seen
+
+        # Stale self-heartbeat guard: if self state has never been received or
+        # is stale (last_seen > heartbeat_timeout_s), skip overload checks.
+        timeout = self._cfg.get("heartbeat_timeout_s", 5.0)
+        if self_last_seen == 0.0 or (now - self_last_seen > timeout):
+            if self._maybe_log_block("stale_self_heartbeat", now):
+                logger.warning(
+                    "[PeerOrch] Self heartbeat stale or missing (age=%.1fs > %.1fs). "
+                    "Skipping overload check.",
+                    now - self_last_seen, timeout,
+                )
+            return
 
         if state.overload_since is None:
             logger.debug("[PeerOrch] Not overloaded (overload_since=None)")
