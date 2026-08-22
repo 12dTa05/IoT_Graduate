@@ -643,8 +643,19 @@ class PeerOrchestrator:
                 # Prefer output_fps_per_camera (Phase 1 unambiguous key); fall back
                 # to fps_per_camera for backward compatibility with older firmware.
                 self._self_state.fps_per_camera = _pick_fps_dict(pipeline)
-                self._self_state.active_cameras = list(pipeline.get("active_cameras", []))
-                self._self_state.camera_configs = pipeline.get("camera_configs", self._self_state.camera_configs)
+                if isinstance(pipeline.get("active_cameras"), (list, tuple, set)):
+                    self._self_state.active_cameras = [str(c) for c in pipeline["active_cameras"] if isinstance(c, (str, int))]
+                raw_configs = pipeline.get("camera_configs")
+                if isinstance(raw_configs, dict) and raw_configs:
+                    self._self_state.camera_configs = raw_configs
+                elif isinstance(raw_configs, dict) and len(raw_configs) == 0:
+                    if (
+                        pipeline.get("status") is not None
+                        and str(pipeline.get("status")).strip().lower() not in ("waiting", "recovering", "recovery", "starting")
+                        and "active_cameras" in pipeline
+                        and len(self._self_state.active_cameras) == 0
+                    ):
+                        self._self_state.camera_configs = {}
                 # Backwards-compatible: missing or malformed mapping → empty.
                 self._self_state.camera_workload = _parse_camera_workload(
                     pipeline.get("camera_workload", {})
@@ -731,8 +742,22 @@ class PeerOrchestrator:
             # Prefer output_fps_per_camera (Phase 1 unambiguous key); fall back
             # to fps_per_camera for backward compatibility with older firmware.
             peer.fps_per_camera = _pick_fps_dict(pipeline)
-            peer.active_cameras = list(pipeline.get("active_cameras", []))
-            peer.camera_configs = pipeline.get("camera_configs", peer.camera_configs)
+            if isinstance(pipeline.get("active_cameras"), (list, tuple, set)):
+                peer.active_cameras = [str(c) for c in pipeline["active_cameras"] if isinstance(c, (str, int))]
+            # Preserve valid prior camera_configs when payload field is missing/malformed
+            raw_configs = pipeline.get("camera_configs")
+            if isinstance(raw_configs, dict) and raw_configs:
+                peer.camera_configs = raw_configs
+            elif isinstance(raw_configs, dict) and len(raw_configs) == 0:
+                # Explicit valid empty snapshot only if pipeline is running and status indicates explicit state
+                if (
+                    pipeline.get("status") is not None
+                    and str(pipeline.get("status")).strip().lower() not in ("waiting", "recovering", "recovery", "starting")
+                    and "active_cameras" in pipeline
+                    and len(peer.active_cameras) == 0
+                ):
+                    peer.camera_configs = {}
+                # Otherwise (e.g. transient empty dictionary during recovery or startup), preserve prior valid configs
             # Backwards-compatible: missing or malformed mapping → empty.
             peer.camera_workload = _parse_camera_workload(
                 pipeline.get("camera_workload", {})
@@ -952,18 +977,35 @@ class PeerOrchestrator:
                 self._clear_offload_target(node_id)
                 # Reclaim cameras migrated out to this dead peer locally
                 self._reclaim_migrated_from_dead_peer(node_id)
-                if peer.active_cameras:
-                    # BUG-6 fix: use _failover_triggered map to prevent
-                    # re-triggering instead of clearing active_cameras.
-                    # Clearing active_cameras races with _check_rebalance which
-                    # reads it to decide whether the original owner has resumed
-                    # a rescued camera.
+
+                # Compute orphan cameras from the strongest available last-known ownership snapshot
+                candidate_orphans: List[str] = []
+                seen_candidates = set()
+                # 1. active_cameras
+                for c in peer.active_cameras:
+                    if c and c not in seen_candidates:
+                        candidate_orphans.append(c)
+                        seen_candidates.add(c)
+                # 2. camera_configs keys
+                if isinstance(peer.camera_configs, dict):
+                    for c in peer.camera_configs.keys():
+                        if c and c not in seen_candidates:
+                            candidate_orphans.append(c)
+                            seen_candidates.add(c)
+                # 3. _migrated_out entries whose holder is the dead peer
+                with self._lock:
+                    for c, holder in self._migrated_out.items():
+                        if holder == node_id and c and c not in seen_candidates:
+                            candidate_orphans.append(c)
+                            seen_candidates.add(c)
+
+                if candidate_orphans:
                     with self._lock:
                         should_trigger = node_id not in self._failover_triggered
                         if should_trigger:
                             self._failover_triggered[node_id] = now
                     if should_trigger:
-                        orphans = list(peer.active_cameras)
+                        orphans = list(candidate_orphans)
                         logger.critical(
                             "[PeerOrch] Peer '%s' OFFLINE (silent %.1fs ≥ %.1fs) with %d cameras! "
                             "Triggering failover...",
