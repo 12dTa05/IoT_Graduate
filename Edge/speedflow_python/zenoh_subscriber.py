@@ -151,7 +151,7 @@ class ZenohCommandSubscriber:
                     "node_id": self._node_id,
                     "event": "ADD_REJECTED",
                     "camera_id": cam_id,
-                    "reason": "source_id_conflict",
+                    "reason": "camera_or_source_id_conflict",
                 })
                 return
 
@@ -255,6 +255,37 @@ class ZenohCommandSubscriber:
                         "reason": "not_active",
                     })
                     return
+                # If command specifies source_id, verify it matches current active source_id.
+                # Robustly reject malformed non-integer source_id without throwing out of Zenoh callback.
+                cmd_sid = payload.get("source_id")
+                if cmd_sid is not None:
+                    try:
+                        parsed_sid = int(cmd_sid)
+                    except (ValueError, TypeError):
+                        logger.warning(
+                            "[Zenoh C2] Malformed REMOVE source_id ignored: camera_id='%s' source_id=%r",
+                            cam_id, cmd_sid,
+                        )
+                        self.publish_status({
+                            "node_id": self._node_id,
+                            "event": "REMOVE_REJECTED",
+                            "camera_id": cam_id,
+                            "reason": "malformed_source_id",
+                        })
+                        return
+
+                    if parsed_sid != cfg.source_id:
+                        logger.warning(
+                            "[Zenoh C2] Stale REMOVE ignored: camera_id='%s' active source_id=%d != cmd source_id=%d",
+                            cam_id, cfg.source_id, parsed_sid,
+                        )
+                        self.publish_status({
+                            "node_id": self._node_id,
+                            "event": "REMOVE_REJECTED",
+                            "camera_id": cam_id,
+                            "reason": "stale_source_id",
+                        })
+                        return
                 source_id = cfg.source_id
                 cfg.enabled = False
                 self._camera_manager._rebuild_lookup()

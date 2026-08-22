@@ -125,8 +125,7 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
         pad_name = "nvdsosd sink"
 
     if not pad:
-        print(f"ERROR: Unable to get {pad_name} pad", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"Unable to get {pad_name} pad")
     pad.add_probe(Gst.PadProbeType.BUFFER, probe.osd_sink_pad_buffer_probe, None)
 
     return probe
@@ -319,8 +318,8 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
     t0_playing = time.monotonic()
     ret = pipeline.set_state(Gst.State.PLAYING)
     if ret == Gst.StateChangeReturn.FAILURE:
-        print("ERROR: Unable to set pipeline to PLAYING state", file=sys.stderr)
-        sys.exit(1)
+        _graceful_stop_pipeline(pipeline)
+        raise RuntimeError("Unable to set display pipeline to PLAYING state")
     warmup_ms = (time.monotonic() - t0_playing) * 1000.0
     probe.record_warmup_ms(warmup_ms)
     logger.info("[Display] Pipeline PLAYING after %.0f ms (warmup)", warmup_ms)
@@ -349,8 +348,8 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
     print(f"[Python File Mode] Processing multi-streams to output files...")
     ret = pipeline.set_state(Gst.State.PLAYING)
     if ret == Gst.StateChangeReturn.FAILURE:
-        print("ERROR: Unable to set pipeline to PLAYING state", file=sys.stderr)
-        sys.exit(1)
+        _graceful_stop_pipeline(pipeline)
+        raise RuntimeError("Unable to set file pipeline to PLAYING state")
 
     _run_loop_until_eos_or_error(pipeline, camera_manager)
     return probe
@@ -362,8 +361,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
 
     rtsp_url = args.rtsp_push_url or S.RTSP_PUSH_URL
     if not rtsp_url:
-        print("ERROR: --rtsp-push-url or RTSP_PUSH_URL required", file=sys.stderr)
-        sys.exit(1)
+        raise ValueError("--rtsp-push-url or RTSP_PUSH_URL required")
 
     # Guard against two instances of this process publishing to the same path.
     # A second instance would cause MediaMTX to kick the first (overridePublisher)

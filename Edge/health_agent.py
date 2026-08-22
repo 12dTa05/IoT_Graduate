@@ -20,6 +20,7 @@ import collections
 from pathlib import Path
 from typing import Dict, Optional, Deque, Tuple
 
+import os
 import msgpack
 
 from speedflow_python.zenoh_session import make_session
@@ -39,12 +40,32 @@ from speedflow_python.settings import (
     TELEMETRY_INTERVAL,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("health_agent")
+def _setup_logging() -> logging.Logger:
+    raw_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, raw_level, logging.INFO)
+    root_level = logging.INFO if raw_level == "DEBUG" else level
+
+    if not logging.root.handlers:
+        logging.basicConfig(
+            level=root_level,
+            format="[%(asctime)s] %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    else:
+        logging.root.setLevel(root_level)
+
+    if raw_level == "DEBUG":
+        for name in (
+            "peer_orchestrator",
+            "health_agent",
+            "speedflow_python.probes",
+            "speedflow_python.offload_receiver",
+        ):
+            logging.getLogger(name).setLevel(logging.DEBUG)
+
+    return logging.getLogger("health_agent")
+
+logger = _setup_logging()
 
 
 # ---------------------------------------------------------------------------
@@ -1294,6 +1315,7 @@ class HealthAgent:
                         or (not active_cameras)
                     )
                     pipeline_status = "waiting" if is_waiting else "running"
+                    pipeline_idle = bool(snapshot_valid and not active_cameras)
 
                     payload = {
                         "type":          "health",
@@ -1315,8 +1337,9 @@ class HealthAgent:
                         "pipeline": {
                             # pipeline_available distinguishes "pipeline not yet
                             # started / stale snapshot" (False, load_score=100)
-                            # from real overload (True, load_score=100).
-                            "pipeline_available": (snapshot_valid and not is_waiting),
+                            # from real overload or idle pipeline (True).
+                            "pipeline_available": bool(snapshot_valid),
+                            "pipeline_idle":      pipeline_idle,
                             "status":             pipeline_status,
                             # output_fps_per_camera = frames the probe actually
                             # processed this window (pipeline throughput).

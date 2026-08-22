@@ -15,7 +15,7 @@
 # NOTE: source_points and roi_polygon are in MUX resolution (1920×1080).
 # If MUX_WIDTH/MUX_HEIGHT changes, scale all coordinates by the new ratio.
 # ============================================================
-max_streams: 8
+max_streams: 4
 
 # Chế độ hiển thị lưới (chỉ áp dụng khi output mode = display)
 # auto: tự tính rows/cols dựa trên số camera đang bật

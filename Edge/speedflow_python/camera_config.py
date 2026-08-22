@@ -257,6 +257,11 @@ class CameraManager:
         with self._lock:
             return self._by_source_id.get(source_id)
 
+    def get_config_by_camera_id(self, camera_id: str) -> Optional[CameraConfig]:
+        """Look up CameraConfig by camera_id. Thread-safe."""
+        with self._lock:
+            return self._configs.get(camera_id)
+
     def handle_add_command(self, cmd: dict) -> bool:
         """
         Build a CameraConfig from an ADD command dict and enqueue it for
@@ -278,6 +283,14 @@ class CameraManager:
         cam_id    = cmd["camera_id"]
         source_id = int(cmd["source_id"])
         uri       = cmd["uri"]
+
+        existing_cam = self.get_config_by_camera_id(cam_id)
+        if existing_cam and existing_cam.enabled:
+            logger.warning(
+                "[CameraManager] ADD ignored: camera_id='%s' already active.",
+                cam_id,
+            )
+            return False
 
         existing = self.get_config(source_id)
         if existing and existing.enabled:

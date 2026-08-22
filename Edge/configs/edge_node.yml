@@ -61,7 +61,7 @@ p2p:
   eps_fps_tier2: 10.0           # Tier 2 relaxation
   eps_network_ms_strict: 30.0   # Tier 0 — RTSP RTT ceiling
   eps_network_ms_tier1: 60.0    # Tier 1 relaxation
-  eps_streams_max: 4            # Hard capacity ceiling (must match max key in fps_model)
+  eps_streams_max: 4            # Hard capacity ceiling
 
   # Multi-objective bid scoring weights for RFO F(x)
   bid_weights:

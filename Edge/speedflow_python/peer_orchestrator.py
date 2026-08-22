@@ -43,12 +43,32 @@ from .zenoh_session import make_session
 # Settings loaded from Edge/.env
 from .settings import ROOT as _ROOT
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s %(name)s — %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("peer_orchestrator")
+def _setup_logging() -> logging.Logger:
+    raw_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, raw_level, logging.INFO)
+    root_level = logging.INFO if raw_level == "DEBUG" else level
+
+    if not logging.root.handlers:
+        logging.basicConfig(
+            level=root_level,
+            format="[%(asctime)s] %(levelname)s %(name)s — %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    else:
+        logging.root.setLevel(root_level)
+
+    if raw_level == "DEBUG":
+        for name in (
+            "peer_orchestrator",
+            "health_agent",
+            "speedflow_python.probes",
+            "speedflow_python.offload_receiver",
+        ):
+            logging.getLogger(name).setLevel(logging.DEBUG)
+
+    return logging.getLogger("peer_orchestrator")
+
+logger = _setup_logging()
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -85,6 +105,7 @@ class PeerState:
     offload_crops_received_per_s: float = 0.0
     load_score_breakdown: Dict[str, float] = field(default_factory=dict)
     status: Optional[str] = None
+    pipeline_idle: bool = False
     workload_ema: Optional[float] = None
     fps_ema: Optional[float] = None
     qos_state: Optional[str] = None
@@ -658,6 +679,7 @@ class PeerOrchestrator:
                 self._self_state.risk_index  = payload.get("risk_index",  0.0)
                 pipeline = payload.get("pipeline", {}) or {}
                 self._self_state.status = pipeline.get("status")
+                self._self_state.pipeline_idle = bool(pipeline.get("pipeline_idle", False))
                 self._self_state.avg_fps = pipeline.get("avg_fps")
                 # Prefer output_fps_per_camera (Phase 1 unambiguous key); fall back
                 # to fps_per_camera for backward compatibility with older firmware.
@@ -762,6 +784,7 @@ class PeerOrchestrator:
 
             pipeline = payload.get("pipeline", {}) or {}
             peer.status         = pipeline.get("status")
+            peer.pipeline_idle  = bool(pipeline.get("pipeline_idle", False))
             peer.avg_fps        = pipeline.get("avg_fps")
             # Prefer output_fps_per_camera (Phase 1 unambiguous key); fall back
             # to fps_per_camera for backward compatibility with older firmware.
@@ -847,7 +870,7 @@ class PeerOrchestrator:
             for cam_id in cameras_to_yield:
                 self._rescued_cameras.pop(cam_id, None)
                 self._rescued_at.pop(cam_id, None)
-                remove_cmd = {"cmd": "REMOVE", "camera_id": cam_id}
+                remove_cmd = self._build_remove_cmd(cam_id, context="immediate_yield")
                 if self._pubs.get("control") is not None:
                     self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
                 logger.info(
@@ -1229,7 +1252,7 @@ class PeerOrchestrator:
             with self._lock:
                 self._rescued_cameras.pop(cam_id, None)
                 self._rescued_at.pop(cam_id, None)
-            remove_cmd = {"cmd": "REMOVE", "camera_id": cam_id}
+            remove_cmd = self._build_remove_cmd(cam_id, context="rescue_hold_timeout")
             pub = self._pubs.get("control")
             if pub:
                 pub.put(msgpack.packb(remove_cmd, use_bin_type=True))
@@ -1323,7 +1346,7 @@ class PeerOrchestrator:
                 self._rescued_at.pop(camera_id, None)
             if original_owner is None:
                 continue
-            remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
+            remove_cmd = self._build_remove_cmd(camera_id, context="rebalance_return")
             self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
             logger.info(
                 "[Rebalance] Returning '%s' to original owner '%s'. REMOVE sent.",
@@ -2308,26 +2331,17 @@ class PeerOrchestrator:
         # Flag flipped to False once the bid is fully shipped (no rollback).
         reservation_committed = False
         try:
-            # ε2 — FPS prediction
+            # ε2 — FPS prediction (demoted from hard reject gate to soft bid scoring)
             # YAML parses bare integer keys as int; look up both int and str forms
             fps_model = self._cfg.get("fps_model", {})
             streams_after = current_streams + 1
             predicted_fps = fps_model.get(streams_after,
                             fps_model.get(str(streams_after), None))
-            if predicted_fps is None:
-                logger.info(
-                    "[PeerOrch] RFO rejected for '%s': ε2 (FPS) — "
-                    "no fps_model entry for streams_after=%d (current=%d, max modeled=%d)",
-                    camera_id, streams_after, current_streams, max(fps_model.keys(), default=0),
-                )
-                return
-            if predicted_fps < eps_fps:
-                logger.info(
-                    "[PeerOrch] RFO rejected for '%s': ε2 (FPS) — "
-                    "predicted=%.1f, required=%.1f (streams_after=%d)",
-                    camera_id, predicted_fps, eps_fps, streams_after,
-                )
-                return
+            # ponytail: static fps_model is used for soft bid scoring rather than hard rejection
+            logger.debug(
+                "[PeerOrch] FPS model evaluation for '%s': streams_after=%d, predicted_fps=%s, eps_fps=%.1f (soft bid scoring only)",
+                camera_id, streams_after, predicted_fps, eps_fps,
+            )
 
             # ε3 — Network RTT to camera RTSP origin (blocking — safe here in thread pool)
             # Prefer URI from the RFO payload (sent by requester who owns the camera).
@@ -2408,8 +2422,8 @@ class PeerOrchestrator:
             self._pubs["vote_proposal"].put(msgpack.packb(proposal, use_bin_type=True))
             logger.info(
                 "[PeerOrch] RFO accepted for '%s' (ALL ε-constraints pass) — "
-                "Bid: score=%.1f, fps_pred=%.1f, rtt=%.0fms",
-                camera_id, f_x, predicted_fps, rtt_ms,
+                "Bid: score=%.1f, fps_pred=%s, rtt=%.0fms",
+                camera_id, f_x, f"{predicted_fps:.1f}" if predicted_fps is not None else "None", rtt_ms,
             )
             reservation_committed = True
 
@@ -2663,7 +2677,7 @@ class PeerOrchestrator:
             self._cam_cooldown[camera_id] = time.time()
             return
 
-        remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
+        remove_cmd = self._build_remove_cmd(camera_id, context="l1_migration")
         self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
         logger.info(
             "[PeerOrch] REMOVE sent to self for '%s'. Migration complete.",
@@ -2673,6 +2687,7 @@ class PeerOrchestrator:
         # Update cooldown and track migration for future reclaim
         self._cam_cooldown[camera_id] = time.time()
         self._migrated_out[camera_id] = winner_node
+        self.set_offload_level(camera_id, 0)
 
         with self._lock:
             if camera_id not in self._cam_migration_history:
@@ -2768,7 +2783,27 @@ class PeerOrchestrator:
             return
 
         # Holder is alive — safe to remove from holder
-        remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
+        # Note: on holder node, source_id cannot be locally resolved, so we query holder peer camera_configs
+        holder_sid: Optional[int] = None
+        with self._lock:
+            holder_p = self._peers.get(holder_node)
+            if holder_p and isinstance(holder_p.camera_configs, dict):
+                holder_c = holder_p.camera_configs.get(camera_id)
+                if isinstance(holder_c, dict) and "source_id" in holder_c:
+                    try:
+                        holder_sid = int(holder_c["source_id"])
+                    except (ValueError, TypeError):
+                        pass
+
+        remove_cmd: dict = {"cmd": "REMOVE", "camera_id": camera_id}
+        if holder_sid is not None:
+            remove_cmd["source_id"] = holder_sid
+        else:
+            logger.debug(
+                "[PeerOrch] Reclaim REMOVE for '%s' to '%s' emitted without source_id (holder config not reporting source_id).",
+                camera_id, holder_node,
+            )
+
         holder_control_key = f"peers/control/{holder_node}"
         try:
             if self._session is not None:
@@ -2942,7 +2977,7 @@ class PeerOrchestrator:
                             continue
                         orig = self._rescued_cameras.pop(cam, None)
                         self._rescued_at.pop(cam, None)
-                        remove_cmd = {"cmd": "REMOVE", "camera_id": cam}
+                        remove_cmd = self._build_remove_cmd(cam, context="startup_announcement_yield")
                         if self._pubs.get("control") is not None:
                             self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
                         logger.info(
@@ -2974,7 +3009,7 @@ class PeerOrchestrator:
                     return
                 self._rescued_cameras.pop(camera_id, None)
                 self._rescued_at.pop(camera_id, None)
-                remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
+                remove_cmd = self._build_remove_cmd(camera_id, context="failover_claim_yield")
                 if self._pubs.get("control") is not None:
                     self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
                 logger.info(
@@ -3298,6 +3333,15 @@ class PeerOrchestrator:
                     )
                     continue
 
+                # Re-check local active ownership immediately before publishing failover ADD
+                with self._self_lock:
+                    if camera_id in self._self_state.active_cameras:
+                        logger.info(
+                            "[Failover] Camera '%s' became active locally before publishing. Skipping.",
+                            camera_id,
+                        )
+                        continue
+
                 add_cmd = {**cam_config, "cmd": "ADD"}
                 self._pubs["control"].put(msgpack.packb(add_cmd, use_bin_type=True))
                 self_accepted += 1
@@ -3325,6 +3369,43 @@ class PeerOrchestrator:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _resolve_local_source_id(self, camera_id: str) -> Optional[int]:
+        """
+        Resolve the source_id for a locally active/configured camera.
+        Returns int source_id if resolved, or None if unknown/not found.
+        """
+        if self._camera_manager is not None:
+            try:
+                with self._camera_manager._lock:
+                    cfg_obj = self._camera_manager._configs.get(camera_id)
+                    if cfg_obj is not None and getattr(cfg_obj, "enabled", True):
+                        return int(cfg_obj.source_id)
+            except Exception as exc:
+                logger.debug("[PeerOrch] Could not resolve source_id from CameraManager for '%s': %s", camera_id, exc)
+
+        cfg = self._get_camera_config(camera_id)
+        if cfg and "source_id" in cfg:
+            try:
+                return int(cfg["source_id"])
+            except (ValueError, TypeError):
+                pass
+        return None
+
+    def _build_remove_cmd(self, camera_id: str, context: str = "") -> dict:
+        """
+        Build a REMOVE command dict for camera_id, attaching resolved source_id if available.
+        """
+        cmd: dict = {"cmd": "REMOVE", "camera_id": camera_id}
+        sid = self._resolve_local_source_id(camera_id)
+        if sid is not None:
+            cmd["source_id"] = sid
+        else:
+            logger.warning(
+                "[PeerOrch] REMOVE for '%s' (%s) emitted without source_id: could not resolve active source_id.",
+                camera_id, context or "unknown",
+            )
+        return cmd
 
     def _measure_rtt(self, rtsp_uri: str) -> Optional[float]:
         """

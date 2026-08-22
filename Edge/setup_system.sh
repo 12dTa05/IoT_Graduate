@@ -272,7 +272,7 @@ cat > "$CAMERAS_YML" <<EOF
 # source_points and roi_polygon are in MUX resolution (1920×1080).
 # If MUX_WIDTH/MUX_HEIGHT changes, scale all coordinates by the new ratio.
 # =============================================================
-max_streams: 8
+max_streams: 4
 
 tiler_mode: auto
 tiler_rows: 4
