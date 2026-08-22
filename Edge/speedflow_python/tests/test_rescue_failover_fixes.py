@@ -177,23 +177,49 @@ def test_static_ownership_and_failover_split_brain_guards(tmp_path):
             sent_cmds.append(msgpack.unpackb(payload, raw=False))
     orch_B._pubs["control"] = DummyPub()
     
-    # 3. Immediate yield on reconnect: jetson_A sends heartbeat
-    heartbeat_payload = {
+    # 3. Fresh heartbeat with active_cameras empty/no positive FPS must NOT yield rescued camera or publish REMOVE
+    heartbeat_payload_waiting = {
         "node_id": "jetson_A",
         "load_score": 10.0,
         "active_cameras": [],  # jetson_A hasn't booted cameras yet
     }
-    orch_B._on_peer_status(heartbeat_payload)
-    
-    # Verify cam_01 was immediately yielded and REMOVE was published
+    orch_B._on_peer_status(heartbeat_payload_waiting)
+    assert "cam_01" in orch_B._rescued_cameras
+    assert not any(cmd.get("cmd") == "REMOVE" and cmd.get("camera_id") == "cam_01" for cmd in sent_cmds)
+
+    # 4. Ready heartbeat with active_cameras containing cam_01, positive fps_per_camera, and PLAYING status
+    heartbeat_payload_ready = {
+        "node_id": "jetson_A",
+        "load_score": 10.0,
+        "pipeline": {
+            "status": "PLAYING",
+            "active_cameras": ["cam_01"],
+            "fps_per_camera": {"cam_01": 25.0},
+        },
+    }
+    orch_B._on_peer_status(heartbeat_payload_ready)
+
+    # Verify cam_01 was yielded and REMOVE was published
     assert "cam_01" not in orch_B._rescued_cameras
     assert any(cmd.get("cmd") == "REMOVE" and cmd.get("camera_id") == "cam_01" for cmd in sent_cmds)
 
-    # 4. Startup preemption announcement: orch_B has rescued cam_02
+    # 5. Startup preemption announcement: orch_B has rescued cam_02
     orch_B._rescued_cameras["cam_02"] = "jetson_A"
     orch_B._rescued_at["cam_02"] = time.time()
     sent_cmds.clear()
-    
+
+    # jetson_A sends ready status with cam_02 active
+    heartbeat_payload_ready_cam02 = {
+        "node_id": "jetson_A",
+        "load_score": 10.0,
+        "pipeline": {
+            "status": "PLAYING",
+            "active_cameras": ["cam_01", "cam_02"],
+            "fps_per_camera": {"cam_01": 25.0, "cam_02": 25.0},
+        },
+    }
+    orch_B._on_peer_status(heartbeat_payload_ready_cam02)
+
     preempt_payload = {
         "type": "startup_claim",
         "action": "startup_preempt",

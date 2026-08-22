@@ -84,6 +84,7 @@ class PeerState:
     # Rate of offload crops received per second (for Level 2/3 peer evaluation)
     offload_crops_received_per_s: float = 0.0
     load_score_breakdown: Dict[str, float] = field(default_factory=dict)
+    status: Optional[str] = None
 
 
 def _parse_camera_workload(raw) -> Dict[str, float]:
@@ -637,6 +638,7 @@ class PeerOrchestrator:
                 self._self_state.gpu_temp_c  = payload.get("gpu_temp_c",  0.0)
                 self._self_state.risk_index  = payload.get("risk_index",  0.0)
                 pipeline = payload.get("pipeline", {}) or {}
+                self._self_state.status = pipeline.get("status")
                 self._self_state.avg_fps = pipeline.get("avg_fps")
                 # Prefer output_fps_per_camera (Phase 1 unambiguous key); fall back
                 # to fps_per_camera for backward compatibility with older firmware.
@@ -724,6 +726,7 @@ class PeerOrchestrator:
             peer.risk_index  = payload.get("risk_index",  0.0)
 
             pipeline = payload.get("pipeline", {}) or {}
+            peer.status         = pipeline.get("status")
             peer.avg_fps        = pipeline.get("avg_fps")
             # Prefer output_fps_per_camera (Phase 1 unambiguous key); fall back
             # to fps_per_camera for backward compatibility with older firmware.
@@ -769,11 +772,20 @@ class PeerOrchestrator:
             else:
                 peer.overload_since = None
 
-            # Immediate yield on reconnect: if node_id is the original owner of any camera
-            # we currently hold in _rescued_cameras, yield it immediately now that node_id is back online.
+            # Return / yield rescued camera only when owner is alive AND ready:
+            # heartbeat fresh, peer not in waiting, valid positive FPS, not overloaded,
+            # and owner confirms destination active / PLAYING evidence.
+            peer_ready_to_resume = (
+                peer_fps_valid
+                and not peer_in_waiting
+                and not overloaded
+            )
             cameras_to_yield = [
                 cam_id for cam_id, orig_owner in self._rescued_cameras.items()
-                if orig_owner == node_id
+                if orig_owner == node_id and (
+                    peer_ready_to_resume
+                    and cam_id in peer.active_cameras
+                )
             ]
             for cam_id in cameras_to_yield:
                 self._rescued_cameras.pop(cam_id, None)
@@ -782,8 +794,8 @@ class PeerOrchestrator:
                 if self._pubs.get("control") is not None:
                     self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
                 logger.info(
-                    "[PeerOrch] Original owner '%s' is back online. Immediate yield: sent REMOVE for '%s'.",
-                    node_id, cam_id,
+                    "[PeerOrch] Original owner '%s' resumed '%s' (fps_valid=%s, load=%.1f). Immediate yield: sent REMOVE.",
+                    node_id, cam_id, peer_fps_valid, peer.load_score,
                 )
 
             # Phase 6 / Reviewer Finding 2.4: compute migration blind-spot metric (Δτ)
@@ -1188,9 +1200,9 @@ class PeerOrchestrator:
                         camera_id, original_owner,
                     )
                 continue
-            # If original owner has come back online (fresh heartbeat within timeout),
-            # IMMEDIATELY yield/REMOVE the rescued stream to prevent duplicate processing (split-brain)
-            # and allow the returning node to cleanly boot its native cameras.
+            # Return rescued camera only if original owner is online AND ready:
+            # heartbeat fresh, peer not in waiting, valid positive FPS, not overloaded,
+            # and owner has actually resumed running this camera (or in active_cameras).
             peer = peers_snapshot.get(original_owner)
             if peer is None:
                 # Owner absent from routing table.
@@ -1198,7 +1210,14 @@ class PeerOrchestrator:
             if now - peer.last_seen > timeout:
                 # Owner heartbeat older than configured timeout — stale.
                 continue
-            # Owner is alive! Yield unconditionally.
+            peer_fps_valid = _has_valid_positive_fps(peer.fps_per_camera)
+            peer_in_waiting = is_waiting_state(peer.fps_per_camera, peer.active_cameras, peer.status)
+            peer_overloaded = self._is_overloaded(peer.load_score, peer.risk_index)
+            if not peer_fps_valid or peer_in_waiting or peer_overloaded:
+                continue
+            if camera_id not in peer.active_cameras:
+                continue
+            # Owner is alive, ready, and running the camera! Yield.
             remaining_after.discard(camera_id)
             to_return.append(camera_id)
 
@@ -1421,6 +1440,7 @@ class PeerOrchestrator:
                 camera_workload=dict(self._self_state.camera_workload),
                 source_starved_cameras=list(self._self_state.source_starved_cameras),
                 last_seen=self._self_state.last_seen,
+                status=self._self_state.status,
             )
             self_last_seen = self._self_state.last_seen
 
@@ -1781,7 +1801,7 @@ class PeerOrchestrator:
         if not cam_to_offload:
             logger.debug("[PeerOrch] No camera to offload (all inactive or locked)")
             return
-        
+
         last_mig = self._cam_cooldown.get(cam_to_offload, 0.0)
         time_since_mig = now - last_mig
         if time_since_mig < cfg.get("cooldown_s", 45.0):
@@ -2055,6 +2075,20 @@ class PeerOrchestrator:
         eps_fps       = payload.get("eps_fps", 18.0)
         eps_net_ms    = payload.get("eps_network_ms", 50.0)
 
+        # In-flight guard: do not accept/bid on an RFO if camera is already
+        # undergoing uncommitted migration, rescue, or already active/held.
+        with self._lock:
+            if (camera_id in self._pending_acks
+                    or camera_id in self._pending_winner
+                    or camera_id in self._rescued_cameras
+                    or camera_id in self._migrated_out):
+                logger.info("[PeerOrch] RFO rejected for '%s': uncommitted state/already handled", camera_id)
+                return
+        with self._self_lock:
+            if camera_id in self._self_state.active_cameras:
+                logger.info("[PeerOrch] RFO rejected for '%s': already active locally", camera_id)
+                return
+
         # BUG-1 fix: read _self_state under its own lock
         with self._self_lock:
             current_streams = len(self._self_state.active_cameras)
@@ -2276,6 +2310,16 @@ class PeerOrchestrator:
         from_node = payload.get("from_node", "")
 
         if winner == self._node_id:
+            # Duplicate / uncommitted guard on winner side
+            with self._lock:
+                if camera_id in self._pending_acks or camera_id in self._rescued_cameras or camera_id in self._migrated_out:
+                    logger.warning("[PeerOrch] Decision ignored: camera '%s' is in-flight/uncommitted or held.", camera_id)
+                    return
+            with self._self_lock:
+                if camera_id in self._self_state.active_cameras:
+                    logger.warning("[PeerOrch] Decision ignored: camera '%s' is already active locally.", camera_id)
+                    return
+
             # --- I WON: ADD camera to pipeline ---
             cam_config = payload.get("cam_config", {})
             if not cam_config:
@@ -2666,6 +2710,31 @@ class PeerOrchestrator:
         elif event is not None:
             logger.info("[PeerOrch] Ack received for '%s' — stream is PLAYING.", camera_id)
 
+    def _is_peer_ready_for_yield(self, peer: Optional[PeerState], camera_id: str) -> bool:
+        """Check if a peer is ready to receive/resume an owned camera.
+
+        Requires:
+          - peer is known and heartbeat is fresh
+          - peer status is not waiting/recovering
+          - peer has valid positive FPS
+          - peer is not overloaded
+          - camera_id is in peer.active_cameras
+        """
+        if peer is None:
+            return False
+        now = time.time()
+        timeout = float(self._cfg.get("heartbeat_timeout_s", 5.0))
+        if (now - peer.last_seen) > timeout:
+            return False
+        peer_fps_valid = _has_valid_positive_fps(peer.fps_per_camera)
+        peer_in_waiting = is_waiting_state(peer.fps_per_camera, peer.active_cameras, peer.status)
+        peer_overloaded = self._is_overloaded(peer.load_score, peer.risk_index)
+        if not peer_fps_valid or peer_in_waiting or peer_overloaded:
+            return False
+        if camera_id not in peer.active_cameras:
+            return False
+        return True
+
     def _on_failover_claim(self, payload: dict) -> None:
         """Handle incoming rescue claim broadcast on peers/failover/claim.
 
@@ -2689,8 +2758,15 @@ class PeerOrchestrator:
                 claimer_node_id, claimed_cameras,
             )
             with self._lock:
+                peer = self._peers.get(claimer_node_id)
                 for cam in claimed_cameras:
                     if self._rescued_cameras.get(cam) == claimer_node_id or cam in self._rescued_cameras:
+                        if not self._is_peer_ready_for_yield(peer, cam):
+                            logger.info(
+                                "[Failover] Deferred yield of rescued camera '%s' on startup claim from '%s': owner not ready/active.",
+                                cam, claimer_node_id,
+                            )
+                            continue
                         orig = self._rescued_cameras.pop(cam, None)
                         self._rescued_at.pop(cam, None)
                         remove_cmd = {"cmd": "REMOVE", "camera_id": cam}
@@ -2705,9 +2781,16 @@ class PeerOrchestrator:
         if not dead_node_id or not camera_id or not claimer_node_id:
             return
 
-        # If the claimer is the original owner claiming its camera back, yield immediately
+        # If the claimer is the original owner claiming its camera back, yield only if ready
         with self._lock:
             if self._rescued_cameras.get(camera_id) == claimer_node_id:
+                peer = self._peers.get(claimer_node_id)
+                if not self._is_peer_ready_for_yield(peer, camera_id):
+                    logger.info(
+                        "[Failover] Deferred yield of rescued camera '%s' to original owner '%s' via failover_claim: owner not ready/active.",
+                        camera_id, claimer_node_id,
+                    )
+                    return
                 self._rescued_cameras.pop(camera_id, None)
                 self._rescued_at.pop(camera_id, None)
                 remove_cmd = {"cmd": "REMOVE", "camera_id": camera_id}
@@ -2923,13 +3006,16 @@ class PeerOrchestrator:
 
             if winner == self._node_id:
                 # Local-side duplicate guard: skip if WE already rescued this
-                # camera in a prior failover run, or if we're already running it.
+                # camera in a prior failover run, or if we're already running it or have uncommitted migration.
                 with self._lock:
-                    if camera_id in self._rescued_cameras:
+                    if (camera_id in self._rescued_cameras
+                            or camera_id in self._pending_acks
+                            or camera_id in self._pending_winner
+                            or camera_id in self._reclaim_in_progress):
                         logger.info(
-                            "[Failover] Camera '%s' already in _rescued_cameras (owner='%s'). "
+                            "[Failover] Camera '%s' in uncommitted state or already in _rescued_cameras (owner='%s'). "
                             "Skipping duplicate rescue.",
-                            camera_id, self._rescued_cameras[camera_id],
+                            camera_id, self._rescued_cameras.get(camera_id, "unknown"),
                         )
                         continue
                 with self._self_lock:
