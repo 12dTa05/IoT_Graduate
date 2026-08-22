@@ -85,6 +85,9 @@ class PeerState:
     offload_crops_received_per_s: float = 0.0
     load_score_breakdown: Dict[str, float] = field(default_factory=dict)
     status: Optional[str] = None
+    workload_ema: Optional[float] = None
+    fps_ema: Optional[float] = None
+    qos_state: Optional[str] = None
 
 
 def _parse_camera_workload(raw) -> Dict[str, float]:
@@ -645,6 +648,9 @@ class PeerOrchestrator:
             with self._self_lock:
                 self._self_state.load_score  = payload.get("load_score",  0.0)
                 self._self_state.load_score_breakdown = payload.get("load_score_breakdown", {})
+                self._self_state.workload_ema = payload.get("workload_ema")
+                self._self_state.fps_ema = payload.get("fps_ema")
+                self._self_state.qos_state = payload.get("qos_state")
                 self._self_state.gpu_percent = payload.get("gpu_percent", 0.0)
                 self._self_state.cpu_percent = payload.get("cpu_percent", 0.0)
                 self._self_state.ram_percent = payload.get("ram_percent", 0.0)
@@ -713,7 +719,9 @@ class PeerOrchestrator:
                 )
                 overloaded = (
                     self._is_overloaded(
-                        self._self_state.load_score, self._self_state.risk_index
+                        self._self_state.load_score,
+                        self._self_state.risk_index,
+                        self._self_state.qos_state,
                     )
                     and fps_valid
                     and not in_waiting
@@ -743,6 +751,9 @@ class PeerOrchestrator:
 
             peer.load_score  = payload.get("load_score",  0.0)
             peer.load_score_breakdown = payload.get("load_score_breakdown", {})
+            peer.workload_ema = payload.get("workload_ema")
+            peer.fps_ema = payload.get("fps_ema")
+            peer.qos_state = payload.get("qos_state")
             peer.gpu_percent = payload.get("gpu_percent", 0.0)
             peer.cpu_percent = payload.get("cpu_percent", 0.0)
             peer.ram_percent = payload.get("ram_percent", 0.0)
@@ -804,7 +815,11 @@ class PeerOrchestrator:
                 pipeline.get("status"),
             )
             overloaded = (
-                self._is_overloaded(peer.load_score, peer.risk_index)
+                self._is_overloaded(
+                    peer.load_score,
+                    peer.risk_index,
+                    peer.qos_state,
+                )
                 and peer_fps_valid
                 and not peer_in_waiting
             )
@@ -864,45 +879,45 @@ class PeerOrchestrator:
     # Overload classification helper (proactive-aware)
     # ------------------------------------------------------------------
 
-    def _is_overloaded(self, load_score: float, risk_index: float) -> bool:
+    def _is_overloaded(
+        self,
+        load_score: float,
+        risk_index: float,
+        qos_state: Optional[str] = None,
+    ) -> bool:
         """
         Determine if this node (or a peer) should be considered overloaded.
 
-        When proactive.enabled is True, use_index is driven by cycle-smoothed
-        risk_index (U) against proactive.risk_threshold.
+        When qos_state is supplied as a non-empty string matching the recognized
+        workload-primary states ('healthy', 'moderate', 'degraded', 'overloaded', 'critical'):
+        - 'healthy', 'moderate' -> False (even if load_score is 42..59)
+        - 'degraded', 'overloaded', 'critical' -> True
+        Proactive hard-fuse (risk_index >= hard_fuse) continues to override as a safety fuse.
 
-        Shadow mode (proactive.shadow_mode = true) emits proactive telemetry
-        (risk_index) while keeping ALL decisions on the legacy reactive path.
-        It returns load_score >= overload_threshold BEFORE any proactive risk
-        or hard-fuse check — so the proactive predictor can be observed
-        side-by-side without affecting migration behaviour.  Hard fuse is
-        also bypassed: shadow mode is audit-only.
-
-        A hard_fuse_threshold (default 0.95) forces overload regardless of
-        proactive.enabled — it is a safety fuse against hardware saturation that
-        load_score alone may under-report (e.g. when thermal throttling has just
-        started and the jtop reading hasn't caught up).
-
-        Falls back to legacy load_score >= overload_threshold when disabled.
+        When qos_state is None/blank/unrecognized (legacy peers or disabled workload policy):
+        Falls back to legacy reactive load_score >= overload_threshold (or proactive predictor).
         """
         proactive_cfg = self._cfg.get("proactive", {})
+        hard_fuse = float(proactive_cfg.get("hard_fuse_threshold", 0.95))
+
+        # Hard fuse — safety fuse against hardware saturation
+        if not proactive_cfg.get("shadow_mode", False) and risk_index >= hard_fuse:
+            return True
+
+        norm_qos = str(qos_state).strip().lower() if qos_state is not None else ""
+        if norm_qos in ("healthy", "moderate", "degraded", "overloaded", "critical"):
+            return norm_qos in ("degraded", "overloaded", "critical")
 
         # Shadow mode: telemetry only — strictly passive/reactive decisions
         if proactive_cfg.get("shadow_mode", False):
-            return load_score >= self._cfg.get("overload_threshold", 42.0)
-
-        hard_fuse = float(proactive_cfg.get("hard_fuse_threshold", 0.95))
-
-        # Hard fuse — always active regardless of proactive.enabled
-        if risk_index >= hard_fuse:
-            return True
+            return load_score >= self._cfg.get("overload_threshold", 60.0)
 
         if proactive_cfg.get("enabled", False) and risk_index > 0.0:
             threshold = float(proactive_cfg.get("risk_threshold", 0.85))
             return risk_index >= threshold
 
         # Legacy path
-        return load_score >= self._cfg.get("overload_threshold", 42.0)
+        return load_score >= self._cfg.get("overload_threshold", 60.0)
 
     # ------------------------------------------------------------------
     # Overload trigger score helper (for log messages + RFO payload)
@@ -1279,8 +1294,15 @@ class PeerOrchestrator:
                 # Owner heartbeat older than configured timeout — stale.
                 continue
             peer_in_waiting = is_waiting_state(peer.fps_per_camera, peer.active_cameras, peer.status)
-            peer_overloaded = self._is_overloaded(peer.load_score, peer.risk_index)
+            peer_overloaded = self._is_overloaded(
+                peer.load_score,
+                peer.risk_index,
+                peer.qos_state,
+            )
             if peer_in_waiting or peer_overloaded:
+                continue
+            # Accept return only if qos_state is healthy/moderate when supplied; legacy blank remains compatible.
+            if peer.qos_state is not None and str(peer.qos_state).strip().lower() not in ("healthy", "moderate", ""):
                 continue
             # Validate static ownership of the original owner
             owner_static_cameras = self._get_node_owned_cameras(original_owner)
@@ -1339,7 +1361,7 @@ class PeerOrchestrator:
         cfg = self._cfg
         now = time.time()
 
-        reclaim_threshold = cfg.get("overload_threshold", 75.0) - cfg.get("reclaim_margin", 25.0)
+        reclaim_threshold = cfg.get("overload_threshold", 60.0) - cfg.get("reclaim_margin", 15.0)
         reclaim_stable_s  = cfg.get("reclaim_stable_s", 30.0)
         cooldown_s        = cfg.get("cooldown_s", 45.0)
         heartbeat_timeout = cfg.get("heartbeat_timeout_s", 6.0)
@@ -1949,6 +1971,7 @@ class PeerOrchestrator:
         therm_cfg = self._cfg.get("thermal")
         best_id : Optional[str] = None
         best_load = float("inf")
+        best_workload_ema = float("inf")
 
         with self._lock:
             # Baseline: Round-Robin offload policy
@@ -1999,9 +2022,16 @@ class PeerOrchestrator:
                 else:
                     candidate_score = peer.load_score
 
+                peer_wl = peer.workload_ema if (peer.workload_ema is not None and math.isfinite(peer.workload_ema)) else float("inf")
                 if candidate_score < best_load:
                     best_load = candidate_score
+                    best_workload_ema = peer_wl
                     best_id   = nid
+                elif abs(candidate_score - best_load) < 1e-6:
+                    # Tiebreaker: workload_ema only
+                    if peer_wl < best_workload_ema:
+                        best_workload_ema = peer_wl
+                        best_id = nid
 
         return best_id
 
@@ -2856,7 +2886,11 @@ class PeerOrchestrator:
             return False
         peer_fps_valid = _has_valid_positive_fps(peer.fps_per_camera)
         peer_in_waiting = is_waiting_state(peer.fps_per_camera, peer.active_cameras, peer.status)
-        peer_overloaded = self._is_overloaded(peer.load_score, peer.risk_index)
+        peer_overloaded = self._is_overloaded(
+            peer.load_score,
+            peer.risk_index,
+            peer.qos_state,
+        )
         if not peer_fps_valid or peer_in_waiting or peer_overloaded:
             return False
         if camera_id not in peer.active_cameras:

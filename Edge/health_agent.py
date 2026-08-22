@@ -434,6 +434,8 @@ def _compute_load_score(
     fps_stats: dict,
     source_starved_cameras: set = None,
     feature_stats: Optional[dict] = None,
+    workload_ema: Optional[float] = None,
+    fps_ema: Optional[float] = None,
 ) -> tuple:
     """
     Base + Additive Bonus load score with hardware emergency floor.
@@ -474,6 +476,66 @@ def _compute_load_score(
         return 0.0, "no_fps"
 
     fps_clamped = max(0.0, min(float(TARGET_FPS), avg_fps))
+
+    # ── Workload-primary + FPS-confirmation policy gating ────────
+    wp_cfg = ls_cfg.get("workload_policy", {})
+    if isinstance(wp_cfg, dict) and wp_cfg.get("enabled") is True:
+        w_low = _finite_positive(wp_cfg.get("w_low")) or 6.0
+        w_high = _finite_positive(wp_cfg.get("w_high")) or 10.0
+        fps_confirm = _finite_positive(wp_cfg.get("fps_confirm")) or 22.0
+        fps_critical = _finite_positive(wp_cfg.get("fps_critical")) or 15.0
+
+        # Current or provided EMA values
+        curr_wl = sum(_derive_camera_workload(feature_stats or {}, fps_stats, _starved).values()) if isinstance(feature_stats, dict) else 0.0
+        eff_wl = workload_ema if (workload_ema is not None and math.isfinite(workload_ema)) else curr_wl
+        eff_fps = fps_ema if (fps_ema is not None and math.isfinite(fps_ema)) else avg_fps
+
+        # Threshold-state formula
+        if eff_wl < w_low:
+            base_score = 30.0 * max(0.0, eff_wl) / max(0.001, w_low)
+            if eff_fps < fps_critical:
+                score = max(base_score, hw_fuse_score_floor)
+            else:
+                score = base_score
+        elif eff_wl < w_high:
+            # Score 30..55 based on workload position in [w_low, w_high)
+            frac = (eff_wl - w_low) / max(0.001, (w_high - w_low))
+            base_score = 30.0 + 25.0 * max(0.0, min(1.0, frac))
+            if eff_fps < fps_critical:
+                score = max(base_score, hw_fuse_score_floor)
+            else:
+                score = base_score
+        else:
+            # eff_wl >= w_high
+            if eff_fps >= fps_confirm:
+                # QoS holds: score 55..59 (strictly < 60) so no offload
+                # Map fps in [TARGET_FPS, fps_confirm] -> [55.0, 59.0]
+                fps_range = max(0.001, float(TARGET_FPS) - fps_confirm)
+                fps_drop_ratio = max(0.0, min(1.0, (float(TARGET_FPS) - eff_fps) / fps_range))
+                score = 55.0 + 4.0 * fps_drop_ratio
+            elif eff_fps >= fps_critical:
+                # Progressively cross L3 (60) to L2 (75)
+                # Map fps in [fps_confirm, fps_critical] -> [60.0, 75.0]
+                fps_range = max(0.001, fps_confirm - fps_critical)
+                fps_drop_ratio = max(0.0, min(1.0, (fps_confirm - eff_fps) / fps_range))
+                score = 60.0 + 15.0 * fps_drop_ratio
+            else:
+                # eff_fps < fps_critical -> >= 76.0 (L1 critical)
+                # Map fps in [fps_critical, 0.0] -> [76.0, 100.0]
+                fps_drop_ratio = max(0.0, min(1.0, (fps_critical - eff_fps) / max(0.001, fps_critical)))
+                score = max(hw_fuse_score_floor, 76.0 + 24.0 * fps_drop_ratio)
+
+        # Hardware emergency fuse
+        hw_saturated = (
+            isinstance(metrics, dict) and (
+                float(metrics.get("cpu_percent", 0.0)) >= hw_fuse_threshold or
+                float(metrics.get("ram_percent", 0.0)) >= hw_fuse_threshold
+            )
+        )
+        if hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0:
+            score = max(score, hw_fuse_score_floor)
+
+        return round(min(100.0, max(0.0, score)), 1), "workload_primary"
 
     if fps_clamped >= float(TARGET_FPS):
         fps_score = 0.0
@@ -569,6 +631,8 @@ def _compute_load_score_breakdown(
     fps_stats: dict,
     source_starved_cameras: set = None,
     feature_stats: Optional[dict] = None,
+    workload_ema: Optional[float] = None,
+    fps_ema: Optional[float] = None,
 ) -> dict:
     """
     Pure helper yielding auditable breakdown of the load score computation.
@@ -611,6 +675,86 @@ def _compute_load_score_breakdown(
         }
 
     fps_clamped = max(0.0, min(float(TARGET_FPS), avg_fps))
+    curr_wl = sum(_derive_camera_workload(feature_stats or {}, fps_stats, _starved).values()) if isinstance(feature_stats, dict) else 0.0
+    eff_wl = workload_ema if (workload_ema is not None and math.isfinite(workload_ema)) else curr_wl
+    eff_fps = fps_ema if (fps_ema is not None and math.isfinite(fps_ema)) else avg_fps
+
+    # Determine qos_state based on load/fps
+    wp_cfg = ls_cfg.get("workload_policy", {})
+    if isinstance(wp_cfg, dict) and wp_cfg.get("enabled") is True:
+        w_low = _finite_positive(wp_cfg.get("w_low")) or 6.0
+        w_high = _finite_positive(wp_cfg.get("w_high")) or 10.0
+        fps_confirm = _finite_positive(wp_cfg.get("fps_confirm")) or 22.0
+        fps_critical = _finite_positive(wp_cfg.get("fps_critical")) or 15.0
+
+        # Threshold-state formula
+        if eff_wl < w_low:
+            base_score = 30.0 * max(0.0, eff_wl) / max(0.001, w_low)
+            if eff_fps < fps_critical:
+                load_score = max(base_score, hw_fuse_score_floor)
+            else:
+                load_score = base_score
+        elif eff_wl < w_high:
+            frac = (eff_wl - w_low) / max(0.001, (w_high - w_low))
+            base_score = 30.0 + 25.0 * max(0.0, min(1.0, frac))
+            if eff_fps < fps_critical:
+                load_score = max(base_score, hw_fuse_score_floor)
+            else:
+                load_score = base_score
+        else:
+            # eff_wl >= w_high
+            if eff_fps >= fps_confirm:
+                fps_range = max(0.001, float(TARGET_FPS) - fps_confirm)
+                fps_drop_ratio = max(0.0, min(1.0, (float(TARGET_FPS) - eff_fps) / fps_range))
+                base_score = 55.0 + 4.0 * fps_drop_ratio
+                load_score = base_score
+            elif eff_fps >= fps_critical:
+                fps_range = max(0.001, fps_confirm - fps_critical)
+                fps_drop_ratio = max(0.0, min(1.0, (fps_confirm - eff_fps) / fps_range))
+                base_score = 60.0 + 15.0 * fps_drop_ratio
+                load_score = base_score
+            else:
+                fps_drop_ratio = max(0.0, min(1.0, (fps_critical - eff_fps) / max(0.001, fps_critical)))
+                base_score = max(hw_fuse_score_floor, 76.0 + 24.0 * fps_drop_ratio)
+                load_score = base_score
+
+        hw_saturated = (
+            isinstance(metrics, dict) and (
+                float(metrics.get("cpu_percent", 0.0)) >= hw_fuse_threshold or
+                float(metrics.get("ram_percent", 0.0)) >= hw_fuse_threshold
+            )
+        )
+        if hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0:
+            load_score = max(load_score, hw_fuse_score_floor)
+
+        load_score = min(100.0, max(0.0, load_score))
+
+        if load_score >= 76.0 or eff_fps < fps_critical:
+            qos_state = "overloaded"
+        elif load_score >= 60.0:
+            qos_state = "degraded"
+        elif load_score >= 30.0:
+            qos_state = "moderate"
+        else:
+            qos_state = "healthy"
+
+        fps_loss = max(0.0, (float(TARGET_FPS) - eff_fps) / float(TARGET_FPS))
+        wl_ratio = max(0.0, eff_wl / max(1.0, w_high))
+
+        return {
+            "fps_score": round(100.0 * fps_loss, 1),
+            "workload_bonus": round(100.0 * wl_ratio, 1),
+            "thermal_bonus": 0.0,
+            "recv_bonus": 0.0,
+            "trend_bonus": 0.0,
+            "composite_score": round(base_score, 1),
+            "load_score": round(load_score, 1),
+            "workload_ema": round(eff_wl, 2),
+            "fps_ema": round(eff_fps, 2),
+            "raw_workload": round(curr_wl, 2),
+            "raw_fps": round(avg_fps, 2),
+            "qos_state": qos_state,
+        }
 
     if fps_clamped >= float(TARGET_FPS):
         fps_score = 0.0
@@ -750,6 +894,9 @@ class HealthAgent:
         self._cam_configs_cache: Dict[str, dict] = {}
         self._max_streams = 8   # from cameras.yml; fallback count of concurrent streams
         self._last_cfg_reload = 0.0
+        # EMA state for workload-primary + FPS-confirmation policy
+        self._workload_ema: Optional[float] = None
+        self._fps_ema: Optional[float] = None
 
     def _reload_cam_configs(self) -> Dict[str, dict]:
         """Read cameras.yml for peer failover metadata in health payloads."""
@@ -1049,14 +1196,48 @@ class HealthAgent:
                             fps_stats, input_fps, get_edge_cfg(),
                             source_type_map=source_modes,
                         )
+                        active_fps_vals_for_ema = [
+                            v for k, v in fps_stats.items()
+                            if v > 0.0 and k not in starved_cams
+                        ]
+                        raw_fps = sum(active_fps_vals_for_ema) / len(active_fps_vals_for_ema) if active_fps_vals_for_ema else 0.0
+                        raw_workload = sum(
+                            _derive_camera_workload(feature_stats or {}, fps_stats, starved_cams).values()
+                        ) if isinstance(feature_stats, dict) else 0.0
+
+                        # Update EMA state exactly once per HealthAgent cycle
+                        ls_cfg = get_edge_cfg().get("load_score", {})
+                        wp_cfg = ls_cfg.get("workload_policy", {}) if isinstance(ls_cfg, dict) else {}
+                        alpha_ema = _finite_positive(wp_cfg.get("alpha_ema")) if isinstance(wp_cfg, dict) else None
+                        if alpha_ema is None:
+                            alpha_ema = 0.33
+
+                        if active_fps_vals_for_ema:
+                            if self._workload_ema is None:
+                                self._workload_ema = raw_workload
+                            else:
+                                self._workload_ema = alpha_ema * raw_workload + (1.0 - alpha_ema) * self._workload_ema
+
+                            if self._fps_ema is None:
+                                self._fps_ema = raw_fps
+                            else:
+                                self._fps_ema = alpha_ema * raw_fps + (1.0 - alpha_ema) * self._fps_ema
+                        else:
+                            self._workload_ema = None
+                            self._fps_ema = None
+
                         load_score, omega_preset = _compute_load_score(
                             metrics, fps_stats, source_starved_cameras=starved_cams,
                             feature_stats=feature_stats,
+                            workload_ema=self._workload_ema,
+                            fps_ema=self._fps_ema,
                         )
                         # Compute breakdown for auditable payload
                         load_score_breakdown = _compute_load_score_breakdown(
                             metrics, fps_stats, source_starved_cameras=starved_cams,
                             feature_stats=feature_stats,
+                            workload_ema=self._workload_ema,
+                            fps_ema=self._fps_ema,
                         )
                         offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
                         # BUG-I fix: exclude 0-fps cameras from avg_fps,
@@ -1066,6 +1247,8 @@ class HealthAgent:
                         avg_fps = round(sum(active_fps_vals) / len(active_fps_vals), 1) if active_fps_vals else None
                         active_cameras = [k for k, v in fps_stats.items() if v > 0.0]
                     else:
+                        self._workload_ema = None
+                        self._fps_ema = None
                         starved_cams = set()
                         load_score, omega_preset = 0.0, "no_fps"
                         load_score_breakdown = {
@@ -1076,6 +1259,11 @@ class HealthAgent:
                             "trend_bonus": 0.0,
                             "composite_score": 0.0,
                             "load_score": 0.0,
+                            "workload_ema": 0.0,
+                            "fps_ema": 0.0,
+                            "raw_workload": 0.0,
+                            "raw_fps": 0.0,
+                            "qos_state": None,
                         }
                         offload_crops_received_per_s = 0.0
                         active_fps_vals = []
@@ -1115,6 +1303,9 @@ class HealthAgent:
                         "load_score":    load_score,
                         "omega_preset":  omega_preset,
                         "load_score_breakdown": load_score_breakdown,
+                        "workload_ema":  load_score_breakdown.get("workload_ema"),
+                        "fps_ema":       load_score_breakdown.get("fps_ema"),
+                        "qos_state":     load_score_breakdown.get("qos_state"),
                         "gpu_percent":   metrics["gpu_percent"],
                         "cpu_percent":   metrics["cpu_percent"],
                         "ram_percent":   metrics["ram_percent"],
