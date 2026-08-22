@@ -204,7 +204,7 @@ ZENOH_QUEUE_MAXSIZE=1000
 # --- Health Agent ---
 HEALTH_INTERVAL=1.0
 # Log the LoadScore line once every N health cycles.
-HEALTH_LOG_EVERY=12
+HEALTH_LOG_EVERY=1
 TARGET_FPS=27.0
 FPS_STATS_FILE=/dev/shm/speedflow_fps.json
 

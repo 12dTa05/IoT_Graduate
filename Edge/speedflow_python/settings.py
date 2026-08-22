@@ -78,7 +78,7 @@ HEALTH_INTERVAL  = _get("HEALTH_INTERVAL", float)
 # Log the LoadScore line only once every N health cycles.
 # e.g. HEALTH_LOG_EVERY=15 + HEALTH_INTERVAL=2.0 → log every 30 s.
 # Set to 1 to log every cycle (original behaviour).
-HEALTH_LOG_EVERY = int(os.environ.get("HEALTH_LOG_EVERY", "15"))
+HEALTH_LOG_EVERY = int(os.environ.get("HEALTH_LOG_EVERY", "1"))
 TARGET_FPS       = _get("TARGET_FPS", float)
 FPS_STATS_FILE   = _get("FPS_STATS_FILE")
 
