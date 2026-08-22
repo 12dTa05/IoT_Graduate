@@ -79,7 +79,13 @@ def _make_source_bin(
 
     def on_source_setup(decodebin, src):
         if not is_file:
-            for prop, val in [("latency", 200), ("drop-on-latency", True)]:
+            for prop, val in [
+                ("latency", 200),
+                ("drop-on-latency", True),
+                ("protocols", 0x4),  # rtspsrc TCP transport (GST_RTSP_LOWER_TRANS_TCP)
+                ("retry", 5),
+                ("timeout", 5_000_000),  # 5s in microseconds
+            ]:
                 try:
                     src.set_property(prop, val)
                 except (TypeError, Exception):
