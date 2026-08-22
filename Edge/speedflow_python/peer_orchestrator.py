@@ -440,6 +440,7 @@ class PeerOrchestrator:
 
         # Reclaim retry tracking: camera_id → timestamp when reclaim can be retried
         self._reclaim_retry_at: Dict[str, float] = {}
+        self._reclaim_retry_count: Dict[str, int] = {}
         # Cameras currently undergoing reclaim Make-before-Break
         self._reclaim_in_progress: set = set()
 
@@ -1164,6 +1165,8 @@ class PeerOrchestrator:
                 camera_id, dead_node_id,
             )
             self._reclaim_completed_at[camera_id] = now
+            with self._lock:
+                self._reclaim_retry_count[camera_id] = 0
             self._transition_settle_until = now + self._cfg.get("transition_settle_s", 5.0)
 
             threading.Thread(
@@ -1504,6 +1507,8 @@ class PeerOrchestrator:
             # Record reclaim start: this camera is ineligible for offload until
             # its FPS stabilises after returning home.
             self._reclaim_completed_at[camera_id] = now
+            with self._lock:
+                self._reclaim_retry_count[camera_id] = 0
 
             # Suppress overload decisions for the settle window once reclaim
             # ADD is initiated: incoming stream warm-up FPS can look like a
@@ -1524,7 +1529,7 @@ class PeerOrchestrator:
             self._migration_log.log(
                 holder_node, self._node_id, camera_id,
                 "reclaim", load, None,
-                0.0, "RECLAIMED",
+                0.0, "RECLAIM_INITIATED",
             )
             # Reclaim one at a time
             return
@@ -2503,6 +2508,10 @@ class PeerOrchestrator:
             # so _pick_camera_to_offload can apply the per-camera warmup gate.
             self._camera_added_at[camera_id] = time.time()
             self._camera_first_valid_fps_at.pop(camera_id, None)
+            self._transition_settle_until = max(
+                self._transition_settle_until,
+                time.time() + self._cfg.get("transition_settle_s", 5.0),
+            )
 
         elif from_node == self._node_id:
             # --- I AM REQUESTER: wait for ack then REMOVE ---
@@ -2728,8 +2737,7 @@ class PeerOrchestrator:
           - Then send REMOVE to holder node
 
         Reuses the same _pending_acks event mechanism as _wait_and_remove.
-        If timeout, log error and schedule a quick retry instead of forcing
-        the full migration cooldown or clearing state.
+        If timeout, log error and schedule a bounded exponential retry.
         """
         with self._lock:
             event = self._pending_acks.get(camera_id)
@@ -2744,16 +2752,44 @@ class PeerOrchestrator:
             self._pending_acks.pop(camera_id, None)
 
         if not confirmed:
-            retry_s = self._cfg.get("reclaim_retry_s", 5.0)
-            logger.error(
-                "[PeerOrch] Reclaim: TIMEOUT (%ds) waiting for local ADD ack of '%s' from holder '%s' "
-                "(active=%d) — scheduling retry in %.1fs",
-                int(timeout), camera_id, holder_node,
-                len(self._self_state.active_cameras), retry_s,
-            )
+            base_retry_s = self._cfg.get("reclaim_retry_s", 5.0)
+            max_retries = int(self._cfg.get("reclaim_max_retries", 3))
+            cooldown_s = float(self._cfg.get("cooldown_s", 45.0))
+
             with self._lock:
+                current_retries = self._reclaim_retry_count.get(camera_id, 0) + 1
+                self._reclaim_retry_count[camera_id] = current_retries
                 self._reclaim_in_progress.discard(camera_id)
-                self._reclaim_retry_at[camera_id] = time.time() + retry_s
+
+                if current_retries > max_retries:
+                    self._migrated_out.pop(camera_id, None)
+                    self._reclaim_retry_at.pop(camera_id, None)
+                    self._reclaim_retry_count.pop(camera_id, None)
+                    abandoned = True
+                    backoff_s = 0.0
+                else:
+                    backoff_s = min(base_retry_s * (2 ** (current_retries - 1)), cooldown_s)
+                    self._reclaim_retry_at[camera_id] = time.time() + backoff_s
+                    abandoned = False
+
+            if abandoned:
+                logger.error(
+                    "[PeerOrch] Reclaim: TIMEOUT (%ds) waiting for local ADD ack of '%s' from holder '%s' "
+                    "— max retries (%d) exceeded, RECLAIM_ABANDONED",
+                    int(timeout), camera_id, holder_node, max_retries,
+                )
+                self._migration_log.log(
+                    holder_node, self._node_id, camera_id,
+                    "reclaim", getattr(self._self_state, "load_score", 0.0), None,
+                    0.0, "RECLAIM_ABANDONED",
+                )
+            else:
+                logger.error(
+                    "[PeerOrch] Reclaim: TIMEOUT (%ds) waiting for local ADD ack of '%s' from holder '%s' "
+                    "(active=%d, retry=%d/%d) — scheduling retry in %.1fs",
+                    int(timeout), camera_id, holder_node,
+                    len(self._self_state.active_cameras), current_retries, max_retries, backoff_s,
+                )
             return
 
         # Stream confirmed PLAYING on self
@@ -2776,9 +2812,15 @@ class PeerOrchestrator:
                 self._migrated_out.pop(camera_id, None)
                 self._reclaim_in_progress.discard(camera_id)
                 self._reclaim_retry_at.pop(camera_id, None)
+                self._reclaim_retry_count.pop(camera_id, None)
             logger.info(
                 "[PeerOrch] Reclaim: stream PLAYING on self — skipped REMOVE to '%s' (holder dead/offline). Reclaim complete.",
                 holder_node,
+            )
+            self._migration_log.log(
+                holder_node, self._node_id, camera_id,
+                "reclaim", getattr(self._self_state, "load_score", 0.0), None,
+                0.0, "RECLAIMED",
             )
             return
 
@@ -2794,9 +2836,15 @@ class PeerOrchestrator:
                 self._migrated_out.pop(camera_id, None)
                 self._reclaim_in_progress.discard(camera_id)
                 self._reclaim_retry_at.pop(camera_id, None)
+                self._reclaim_retry_count.pop(camera_id, None)
             logger.info(
                 "[PeerOrch] Reclaim: holder '%s' no longer owns '%s'; skipped REMOVE.",
                 holder_node, camera_id,
+            )
+            self._migration_log.log(
+                holder_node, self._node_id, camera_id,
+                "reclaim", getattr(self._self_state, "load_score", 0.0), None,
+                0.0, "RECLAIMED",
             )
             return
 
@@ -2833,19 +2881,50 @@ class PeerOrchestrator:
                 self._migrated_out.pop(camera_id, None)
                 self._reclaim_in_progress.discard(camera_id)
                 self._reclaim_retry_at.pop(camera_id, None)
+                self._reclaim_retry_count.pop(camera_id, None)
             logger.info(
                 "[PeerOrch] Reclaim: stream PLAYING on self — REMOVE sent to '%s' for '%s'. Reclaim complete.",
                 holder_node, camera_id,
             )
-        except Exception as exc:
-            retry_s = self._cfg.get("reclaim_retry_s", 5.0)
-            logger.error(
-                "[PeerOrch] Reclaim: failed to send REMOVE to '%s' for '%s': %s — scheduling retry in %.1fs",
-                holder_node, camera_id, exc, retry_s,
+            self._migration_log.log(
+                holder_node, self._node_id, camera_id,
+                "reclaim", getattr(self._self_state, "load_score", 0.0), None,
+                0.0, "RECLAIMED",
             )
+        except Exception as exc:
+            base_retry_s = self._cfg.get("reclaim_retry_s", 5.0)
+            max_retries = int(self._cfg.get("reclaim_max_retries", 3))
+            cooldown_s = float(self._cfg.get("cooldown_s", 45.0))
             with self._lock:
+                current_retries = self._reclaim_retry_count.get(camera_id, 0) + 1
+                self._reclaim_retry_count[camera_id] = current_retries
                 self._reclaim_in_progress.discard(camera_id)
-                self._reclaim_retry_at[camera_id] = time.time() + retry_s
+                if current_retries > max_retries:
+                    self._migrated_out.pop(camera_id, None)
+                    self._reclaim_retry_at.pop(camera_id, None)
+                    self._reclaim_retry_count.pop(camera_id, None)
+                    abandoned = True
+                    backoff_s = 0.0
+                else:
+                    backoff_s = min(base_retry_s * (2 ** (current_retries - 1)), cooldown_s)
+                    self._reclaim_retry_at[camera_id] = time.time() + backoff_s
+                    abandoned = False
+
+            if abandoned:
+                logger.error(
+                    "[PeerOrch] Reclaim: failed to send REMOVE to '%s' for '%s': %s — max retries (%d) exceeded, RECLAIM_ABANDONED",
+                    holder_node, camera_id, exc, max_retries,
+                )
+                self._migration_log.log(
+                    holder_node, self._node_id, camera_id,
+                    "reclaim", getattr(self._self_state, "load_score", 0.0), None,
+                    0.0, "RECLAIM_ABANDONED",
+                )
+            else:
+                logger.error(
+                    "[PeerOrch] Reclaim: failed to send REMOVE to '%s' for '%s': %s — scheduling retry in %.1fs (retry=%d/%d)",
+                    holder_node, camera_id, exc, backoff_s, current_retries, max_retries,
+                )
 
     # ------------------------------------------------------------------
     # Vote ack

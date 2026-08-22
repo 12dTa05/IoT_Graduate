@@ -499,7 +499,6 @@ def dynamic_remove_stream(
                 return False
             cleanup_started = True
 
-        was_playing = False
         probe_removed = False
         try:
             # Capture elements and pads before state changes / unlink
@@ -508,20 +507,6 @@ def dynamic_remove_stream(
             conv_elem = pipeline.get_by_name(f"conv_{camera_id}")
             conv_pad = conv_src_pad or (conv_elem.get_static_pad("src") if conv_elem else None)
             mux_sinkpad = streammux.get_static_pad(f"sink_{source_id}")
-
-            # Determine initial pipeline state
-            _, current_state, _ = pipeline.get_state(0)
-            was_playing = (current_state == Gst.State.PLAYING)
-
-            # Pause pipeline and wait for transition before pad operations
-            if was_playing:
-                pipeline.set_state(Gst.State.PAUSED)
-                state_ret, current_state, _ = pipeline.get_state(5 * Gst.SECOND)
-                if state_ret == Gst.StateChangeReturn.FAILURE or current_state != Gst.State.PAUSED:
-                    raise RuntimeError(
-                        f"Pipeline did not reach PAUSED before removing {camera_id}: "
-                        f"state={current_state.value_nick} result={state_ret.value_nick}"
-                    )
 
             # Transition source branch elements sequentially PLAYING -> PAUSED -> READY -> NULL
             branch_elements = [el for el in [source_elem, q_elem, conv_elem] if el is not None]
@@ -578,10 +563,6 @@ def dynamic_remove_stream(
                     pad.remove_probe(probe_id)
                 except Exception:
                     pass
-            # Restore pipeline state if it was originally PLAYING
-            if was_playing:
-                pipeline.set_state(Gst.State.PLAYING)
-                pipeline.get_state(5 * Gst.SECOND)
             if done_event is not None:
                 done_event.set()
 

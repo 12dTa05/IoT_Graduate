@@ -207,8 +207,7 @@ class ZenohCommandSubscriber:
                             if cfg and cfg.enabled:
                                 cfg.enabled = False
                                 _cam_manager._rebuild_lookup()
-                        _cam_manager._delta_q.put(StreamDelta(to_remove=[_source_id]))
-                        logger.info("[Zenoh C2] Queued local REMOVE for timed-out stream '%s'", _cam_id)
+                        logger.info("[Zenoh C2] Disabled timed-out config for stream '%s'", _cam_id)
                     except Exception as exc:
                         logger.error("[Zenoh C2] Failed local cleanup after ADD timeout for '%s': %s", _cam_id, exc)
                     return
