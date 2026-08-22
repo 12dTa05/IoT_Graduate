@@ -471,7 +471,7 @@ def _compute_load_score(
     if active_fps_vals:
         avg_fps = sum(active_fps_vals) / len(active_fps_vals)
     else:
-        return 100.0, "fps_dominant"
+        return 0.0, "no_fps"
 
     fps_clamped = max(0.0, min(float(TARGET_FPS), avg_fps))
 
@@ -577,13 +577,13 @@ def _compute_load_score_breakdown(
 
     if not isinstance(fps_stats, dict):
         return {
-            "fps_score": 100.0,
+            "fps_score": 0.0,
             "workload_bonus": 0.0,
             "thermal_bonus": 0.0,
             "recv_bonus": 0.0,
             "trend_bonus": 0.0,
-            "composite_score": 100.0,
-            "load_score": 100.0,
+            "composite_score": 0.0,
+            "load_score": 0.0,
         }
 
     _maybe_reload_edge_cfg()
@@ -601,13 +601,13 @@ def _compute_load_score_breakdown(
         avg_fps = sum(active_fps_vals) / len(active_fps_vals)
     else:
         return {
-            "fps_score": 100.0,
+            "fps_score": 0.0,
             "workload_bonus": 0.0,
             "thermal_bonus": 0.0,
             "recv_bonus": 0.0,
             "trend_bonus": 0.0,
-            "composite_score": 100.0,
-            "load_score": 100.0,
+            "composite_score": 0.0,
+            "load_score": 0.0,
         }
 
     fps_clamped = max(0.0, min(float(TARGET_FPS), avg_fps))
@@ -1067,15 +1067,15 @@ class HealthAgent:
                         active_cameras = [k for k, v in fps_stats.items() if v > 0.0]
                     else:
                         starved_cams = set()
-                        load_score, omega_preset = 100.0, "fps_dominant"
+                        load_score, omega_preset = 0.0, "no_fps"
                         load_score_breakdown = {
-                            "fps_score": 100.0,
+                            "fps_score": 0.0,
                             "workload_bonus": 0.0,
                             "thermal_bonus": 0.0,
                             "recv_bonus": 0.0,
                             "trend_bonus": 0.0,
-                            "composite_score": 100.0,
-                            "load_score": 100.0,
+                            "composite_score": 0.0,
+                            "load_score": 0.0,
                         }
                         offload_crops_received_per_s = 0.0
                         active_fps_vals = []

@@ -165,13 +165,15 @@ def test_zombie_peer_degradation_and_reset():
     peer1.load_score = 20.0
     peer1.last_seen = time.time()
     peer1.max_streams = 4
-    peer1.active_cameras = []
+    peer1.active_cameras = ["cam_1"]
+    peer1.fps_per_camera = {"cam_1": 25.0}
 
     peer2 = PeerState(node_id="peer_2")
     peer2.load_score = 30.0
     peer2.last_seen = time.time()
     peer2.max_streams = 4
-    peer2.active_cameras = []
+    peer2.active_cameras = ["cam_2"]
+    peer2.fps_per_camera = {"cam_2": 25.0}
 
     orch._peers = {"peer_1": peer1, "peer_2": peer2}
 

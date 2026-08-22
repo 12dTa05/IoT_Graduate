@@ -167,9 +167,10 @@ def test_compute_load_score_returns_tuple():
 
 
 def test_no_cameras_unavailable():
-    """No active cameras → score 100 (unavailable, not healthy TARGET_FPS)."""
-    score, _ = _compute_load_score(_metrics(), {})
-    assert score == 100.0
+    """No active cameras → score 0.0 with reason 'no_fps'."""
+    score, reason = _compute_load_score(_metrics(), {})
+    assert score == 0.0
+    assert reason == "no_fps"
 
 
 def test_all_cameras_above_target():
@@ -267,9 +268,10 @@ def test_anchor_17_fps():
 
 
 def test_anchor_zero_fps():
-    score, _ = _compute_load_score(_metrics(gpu=30, cpu=20, ram=10), _fps(cam_01=0.0))
-    # Zero positive FPS means pipeline down / unavailable -> score 100.0
-    assert abs(score - 100.0) < 0.05
+    score, reason = _compute_load_score(_metrics(gpu=30, cpu=20, ram=10), _fps(cam_01=0.0))
+    # Zero positive FPS returns 0.0 with reason 'no_fps'
+    assert score == 0.0
+    assert reason == "no_fps"
 
 
 def test_anchor_exact_upper_bound():
@@ -400,26 +402,26 @@ def test_breakdown_composite_capped_at_100():
     )
     try:
         br = _compute_load_score_breakdown(
-            _metrics(gpu_temp_c=85.0, offload_crops_received_per_s=20.0), _fps(camA=0.0),
+            _metrics(gpu_temp_c=85.0, offload_crops_received_per_s=20.0), _fps(camA=10.0),
             feature_stats={"camA": {"n_track": 50, "n_plate": 50}},
         )
     finally:
         _ha._EDGE_CFG = {}
-    # fps_score (50) + workload (25) + thermal (10) + recv (5) = 90
+    # fps_score (approx 85.3) + workload (15) + thermal (5) + recv (5) = 100 capped
     assert br["composite_score"] >= 80.0
     assert br["load_score"] >= 80.0
 
 
 def test_breakdown_malformed_telemetry_config_never_crashes():
     """Malformed inputs never crash; returns valid breakdown with safe defaults."""
-    # None fps_stats -> treated as no active cameras -> 100
+    # None fps_stats -> treated as no active cameras -> 0.0
     br = _compute_load_score_breakdown(_metrics(), None)
-    assert br["load_score"] == 100.0
-    assert br["fps_score"] == 100.0
+    assert br["load_score"] == 0.0
+    assert br["fps_score"] == 0.0
 
     # Non-dict fps_stats
     br = _compute_load_score_breakdown(_metrics(), "bad")
-    assert br["load_score"] == 100.0
+    assert br["load_score"] == 0.0
 
     # Malformed config - load_score missing
     _ha._EDGE_CFG = {"load_score": "not_a_dict"}
@@ -432,11 +434,11 @@ def test_breakdown_malformed_telemetry_config_never_crashes():
 
 
 def test_breakdown_no_cameras_unavailable():
-    """No active cameras -> all scores 100 (unavailable)."""
+    """No active cameras -> all scores 0.0 (no_fps)."""
     br = _compute_load_score_breakdown(_metrics(), {})
-    assert br["fps_score"] == 100.0
-    assert br["composite_score"] == 100.0
-    assert br["load_score"] == 100.0
+    assert br["fps_score"] == 0.0
+    assert br["composite_score"] == 0.0
+    assert br["load_score"] == 0.0
 
 
 def test_breakdown_payload_presence():
@@ -725,11 +727,12 @@ def test_starved_camera_excluded_from_load_score():
 
 
 def test_starved_camera_all_starved_reports_unavailable():
-    """All cameras starved → score 100 (unavailable, same as zero cameras)."""
-    score, _ = _compute_load_score(
+    """All cameras starved → score 0.0 with reason 'no_fps' (same as zero cameras)."""
+    score, reason = _compute_load_score(
         _metrics(), _fps(camA=2.0, camB=3.0), source_starved_cameras={"camA", "camB"},
     )
-    assert score == 100.0
+    assert score == 0.0
+    assert reason == "no_fps"
 
 
 def test_starved_camera_empty_set_preserves_legacy_behavior():
@@ -1299,7 +1302,7 @@ def test_bonus_composite_capped_at_100():
     )
     try:
         score, _ = _compute_load_score(
-            _metrics(gpu_temp_c=85.0, offload_crops_received_per_s=20.0), _fps(camA=0.0),
+            _metrics(gpu_temp_c=85.0, offload_crops_received_per_s=20.0), _fps(camA=10.0),
             feature_stats={"camA": {"n_track": 50, "n_plate": 50}},
         )
     finally:
