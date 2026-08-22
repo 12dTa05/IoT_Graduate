@@ -61,6 +61,7 @@ def _make_source_bin(
     pipeline: Gst.Pipeline,
     streammux: Gst.Element,
     cam_cfg: CameraConfig,
+    ready_event: Optional[threading.Event] = None,
 ) -> Gst.Element:
     """
     Create a source bin for one camera and connect it to streammux.
@@ -110,6 +111,11 @@ def _make_source_bin(
             pad.link(q.get_static_pad("sink"))
             gst_link(q, conv)
             conv_src_pad = conv.get_static_pad("src")
+            if ready_event is not None:
+                def _first_buffer(pad, info, event=ready_event):
+                    event.set()
+                    return Gst.PadProbeReturn.REMOVE
+                conv_src_pad.add_probe(Gst.PadProbeType.BUFFER, _first_buffer)
             conv_src_pad.link(sinkpad)
 
             logger.info(
@@ -407,6 +413,7 @@ def dynamic_add_stream(
     cam_cfg: CameraConfig,
     tiler: Gst.Element,
     source_bins: dict,
+    ready_event: Optional[threading.Event] = None,
 ) -> Gst.Element:
     # 1. Read current batch-size from the live streammux rather than trusting
     #    a caller-supplied value that may have been stale before GLib idle_add
@@ -428,7 +435,7 @@ def dynamic_add_stream(
             recording_added = True
 
         # 3. Add and start the new source
-        src = _make_source_bin(pipeline, streammux, cam_cfg)
+        src = _make_source_bin(pipeline, streammux, cam_cfg, ready_event=ready_event)
         src.sync_state_with_parent()
     except Exception:
         # Rollback: restore batch-size and tear down any partially-created

@@ -160,10 +160,23 @@ def _attach_camera_manager(
 
     def on_add(cam_cfg):
         print(f"[Dynamic] Adding camera '{cam_cfg.camera_id}' (source_id={cam_cfg.source_id})")
-        dynamic_add_stream(pipeline, streammux, cam_cfg, tiler, source_bins)
-        # Register mapping immediately after successful add.
-        # This function runs in GLib Main Loop → safe, no lock needed.
-        source_id_to_cam_id[cam_cfg.source_id] = cam_cfg.camera_id
+        ready_ev = camera_manager.stream_ready_event(cam_cfg.source_id)
+        try:
+            dynamic_add_stream(
+                pipeline, streammux, cam_cfg, tiler, source_bins,
+                ready_event=ready_ev,
+            )
+            # Register mapping immediately after successful add.
+            # This function runs in GLib Main Loop → safe, no lock needed.
+            source_id_to_cam_id[cam_cfg.source_id] = cam_cfg.camera_id
+        except Exception as exc:
+            print(f"[Dynamic] ERROR adding camera '{cam_cfg.camera_id}': {exc}", file=sys.stderr)
+            with camera_manager._lock:
+                if cam_cfg.camera_id in camera_manager._configs:
+                    camera_manager._configs[cam_cfg.camera_id].enabled = False
+                    camera_manager._rebuild_lookup()
+            camera_manager.cleanup_stream_ready(cam_cfg.source_id)
+            raise
 
     def on_remove(source_id, done_event=None):
         # Look up camera_id from the mapping dict.
@@ -190,6 +203,7 @@ def _attach_camera_manager(
         removed = source_id_to_cam_id.pop(source_id, None)
         if removed:
             print(f"[Dynamic] Cleaned up mapping: source_id={source_id} → '{removed}'")
+        camera_manager.cleanup_stream_ready(source_id)
 
     camera_manager.start(on_add, on_remove, GLib.idle_add)
 

@@ -2782,6 +2782,24 @@ class PeerOrchestrator:
             )
             return
 
+        # Re-check ownership immediately before REMOVE. Heartbeat state may
+        # have changed while the local ADD was waiting for PLAYING.
+        with self._lock:
+            holder_peer = self._peers.get(holder_node)
+            holder_still_has_camera = bool(
+                holder_peer is None or camera_id in holder_peer.active_cameras
+            )
+        if not holder_still_has_camera:
+            with self._lock:
+                self._migrated_out.pop(camera_id, None)
+                self._reclaim_in_progress.discard(camera_id)
+                self._reclaim_retry_at.pop(camera_id, None)
+            logger.info(
+                "[PeerOrch] Reclaim: holder '%s' no longer owns '%s'; skipped REMOVE.",
+                holder_node, camera_id,
+            )
+            return
+
         # Holder is alive — safe to remove from holder
         # Note: on holder node, source_id cannot be locally resolved, so we query holder peer camera_configs
         holder_sid: Optional[int] = None
