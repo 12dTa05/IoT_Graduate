@@ -487,6 +487,9 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         _error_flag = [False]
         _error_reason = ["unknown"]
         _removing = set()  # guard against double-remove from multiple error msgs
+        _sink_reconnect_attempts = [0]
+        _MAX_SINK_RETRIES = int(os.environ.get("RTSP_PUSH_MAX_RETRIES", "3"))
+        _SINK_RETRY_DELAY_S = float(os.environ.get("RTSP_PUSH_RETRY_DELAY_S", "1.0"))
 
         def on_message(bus, message):
             t = message.type
@@ -526,12 +529,63 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
                         dynamic_remove_stream(pipeline, streammux, cam_id, sid, tiler, source_bins)
                     return  # don't quit the pipeline
 
-                # Distinguish sink vs other pipeline errors
-                is_rtsp_sink = (
-                    elem_name := (src_name or "")
-                ) and ("rtsp_push_sink" in elem_name or "sink" in elem_name or "rtsp" in elem_name)
-                err_category = "sink" if is_rtsp_sink else "pipeline"
-                _error_reason[0] = f"{err_category}_error:{src_name}:{err}"
+                # Distinguish RTSP push sink (rtsp_push_sink / rtspclientsink) vs other pipeline errors
+                is_rtsp_sink = False
+                elem = message.src
+                while elem is not None:
+                    ename = elem.get_name()
+                    fact = elem.get_factory()
+                    fact_name = fact.get_name() if fact else ""
+                    if ename == "rtsp_push_sink" or fact_name == "rtspclientsink":
+                        is_rtsp_sink = True
+                        break
+                    elem = elem.get_parent()
+
+                if is_rtsp_sink:
+                    err_category = "publisher_failure"
+                    print(f"ERROR ({err_category}) from {src_name}: {err}", file=sys.stderr)
+                    if debug:
+                        print(f"DEBUG INFO: {debug}", file=sys.stderr)
+
+                    # Attempt bounded in-place reconnect on the rtspclientsink element
+                    sink_elem = pipeline.get_by_name("rtsp_push_sink")
+                    if sink_elem is None and message.src is not None:
+                        curr = message.src
+                        while curr is not None:
+                            cfact = curr.get_factory()
+                            if curr.get_name() == "rtsp_push_sink" or (cfact and cfact.get_name() == "rtspclientsink"):
+                                sink_elem = curr
+                                break
+                            curr = curr.get_parent()
+
+                    if sink_elem is not None and _sink_reconnect_attempts[0] < _MAX_SINK_RETRIES:
+                        _sink_reconnect_attempts[0] += 1
+                        print(
+                            f"[RTSP Push] In-place reconnect attempt {_sink_reconnect_attempts[0]}/{_MAX_SINK_RETRIES} for {sink_elem.get_name()}...",
+                            file=sys.stderr,
+                        )
+                        try:
+                            sink_elem.set_state(Gst.State.NULL)
+                            sink_elem.get_state(1 * Gst.SECOND)
+                            if _SINK_RETRY_DELAY_S > 0:
+                                time.sleep(_SINK_RETRY_DELAY_S)
+                            sink_elem.set_state(Gst.State.READY)
+                            sink_elem.get_state(1 * Gst.SECOND)
+                            sret = sink_elem.set_state(Gst.State.PLAYING)
+                            if sret != Gst.StateChangeReturn.FAILURE:
+                                print(f"[RTSP Push] In-place reconnect initiated successfully (state_return={sret.value_nick})")
+                                return
+                        except Exception as exc:
+                            print(f"[RTSP Push] In-place reconnect exception: {exc}", file=sys.stderr)
+
+                    _error_reason[0] = f"{err_category}:{src_name}:{err}"
+                    _error_flag[0] = True
+                    loop.quit()
+                    return
+
+                # Non-RTSP errors (source/decoder/pipeline) trigger full pipeline restart
+                err_category = "pipeline"
+                _error_reason[0] = f"{err_category}:{src_name}:{err}"
                 print(f"ERROR ({err_category}) from {src_name}: {err}", file=sys.stderr)
                 if debug:
                     print(f"DEBUG INFO: {debug}", file=sys.stderr)

@@ -1497,6 +1497,27 @@ class PeerOrchestrator:
                         self._reclaim_retry_count.pop(camera_id, None)
                     continue
 
+                # Inspect latest fresh peer heartbeats for another alive peer reporting camera_id
+                other_holder = None
+                with self._lock:
+                    for pid, p in self._peers.items():
+                        if pid != holder_node and (now - p.last_seen <= heartbeat_timeout) and (camera_id in p.active_cameras):
+                            other_holder = pid
+                            break
+                    if other_holder is not None:
+                        # Found another alive peer reporting this camera; update mapping atomically & skip local ADD
+                        self._migrated_out[camera_id] = other_holder
+                        self._reclaim_in_progress.discard(camera_id)
+                        self._reclaim_retry_at.pop(camera_id, None)
+                        self._reclaim_retry_count.pop(camera_id, None)
+
+                if other_holder is not None:
+                    logger.info(
+                        "[PeerOrch][Reclaim] Camera '%s' found active on alive peer '%s' (reassigned from '%s'). Skipping local ADD.",
+                        camera_id, other_holder, holder_node,
+                    )
+                    continue
+
                 logger.warning(
                     "[PeerOrch][Reclaim] Camera '%s' missing from active_cameras of alive holder '%s'! Initiating recovery...",
                     camera_id, holder_node,
@@ -2712,12 +2733,12 @@ class PeerOrchestrator:
             )
             return
 
-        # Success — REMOVE from self
+        # Success — REMOVE from self.
         # Final atomic ownership guard: the decision-time check in
         # _pick_camera_to_offload ran against a snapshot that may now be
-        # stale.  A concurrent migration / reclaim / rebalance can have
+        # stale. A concurrent migration / reclaim / rebalance can have
         # removed every other owned camera while we were waiting for this
-        # ACK, turning `camera_id` into the last owned stream.  Block the
+        # ACK, turning camera_id into the last owned stream. Block the
         # REMOVE rather than strip the node down to foreign-only streams.
         if not self._l1_remove_ownership_guard(camera_id):
             logger.error(
@@ -2726,10 +2747,6 @@ class PeerOrchestrator:
                 "sending REMOVE to self.",
                 camera_id, winner_node,
             )
-            # Clean pending reservation/state: the ACK handler normally pops
-            # _pending_winner, but on a blocked path we defensively release it
-            # here so a stale winner mapping can never leak into a later vote
-            # or double-release a slot belonging to another camera.
             with self._lock:
                 stale_winner = self._pending_winner.pop(camera_id, None)
                 self._pending_started_at.pop(camera_id, None)
@@ -2747,8 +2764,6 @@ class PeerOrchestrator:
                 "overload", trigger_load, trigger_fps,
                 time.time() * 1000 - start_ms, "OWNERSHIP_GUARD_BLOCK",
             )
-            # Suppress immediate re-escalation for this camera so the same
-            # stale decision is not retried in the next tick.
             self._cam_cooldown[camera_id] = time.time()
             return
 
@@ -2759,15 +2774,14 @@ class PeerOrchestrator:
             camera_id,
         )
 
-        # Update cooldown and track migration for future reclaim
+        # Commit reclaimable ownership only after ACK and REMOVE are sent.
         self._cam_cooldown[camera_id] = time.time()
-        self._migrated_out[camera_id] = winner_node
-        self.set_offload_level(camera_id, 0)
-
         with self._lock:
+            self._migrated_out[camera_id] = winner_node
             if camera_id not in self._cam_migration_history:
                 self._cam_migration_history[camera_id] = []
             self._cam_migration_history[camera_id].append(time.time())
+        self.set_offload_level(camera_id, 0)
 
         elapsed_ms = time.time() * 1000 - start_ms
         # Δτ: time from migration complete to first valid speed on the new node.
