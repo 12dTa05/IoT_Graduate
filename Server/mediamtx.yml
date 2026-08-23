@@ -19,6 +19,8 @@ readBufferCount: 2048
 # ── WebRTC server (serves to browser via WHEP) ──────────────
 webrtc: yes
 webrtcAddress: :8889
+# Static UDP port for ICE traffic to simplify firewall rules and routing
+webrtcICEUDPMuxAddress: :8189
 # CRITICAL: tells MediaMTX to include the public IP in ICE candidates
 # Without this, ICE candidates only contain Docker/private IPs and
 # external browsers cannot connect via WebRTC.

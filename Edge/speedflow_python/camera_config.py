@@ -175,6 +175,8 @@ class CameraManager:
         self._configs: Dict[str, CameraConfig] = {}
         # Fast lookup by source_id (immutable view, rebuild on reload)
         self._by_source_id: Dict[int, CameraConfig] = {}
+        # Set by the first decoded buffer, not by config registration.
+        self._stream_ready: Dict[int, threading.Event] = {}
         self._lock = threading.RLock()
 
         # Delta queue: [StreamDelta, ...] — thread-safe
@@ -345,6 +347,7 @@ class CameraManager:
         with self._lock:
             self._configs[cam_id] = cam_cfg
             self._rebuild_lookup()
+            self._stream_ready[source_id] = threading.Event()
 
         self._delta_q.put(StreamDelta(to_add=[cam_cfg]))
         logger.info(
@@ -613,11 +616,23 @@ class CameraManager:
             for cam_cfg in delta.to_add:
                 cfg = cam_cfg  # capture for lambda
                 if self._glib_idle_add and self._on_add:
+                    with self._lock:
+                        self._stream_ready[cfg.source_id] = threading.Event()
                     self._glib_idle_add(self._on_add, cfg)
                     logger.info(
                         "[CameraManager] Scheduled ADD camera=%s source_id=%d on GLib loop",
                         cfg.camera_id, cfg.source_id,
                     )
+
+    def stream_ready_event(self, source_id: int) -> Optional[threading.Event]:
+        """Return the readiness event for a pending dynamic stream."""
+        with self._lock:
+            return self._stream_ready.get(source_id)
+
+    def cleanup_stream_ready(self, source_id: int) -> None:
+        """Remove readiness event on stream removal to prevent leaks and stale reuse."""
+        with self._lock:
+            self._stream_ready.pop(source_id, None)
 
     # ------------------------------------------------------------------
     # REST API (optional — Phase 3)

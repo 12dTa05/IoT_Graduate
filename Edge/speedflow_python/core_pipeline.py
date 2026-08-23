@@ -61,6 +61,7 @@ def _make_source_bin(
     pipeline: Gst.Pipeline,
     streammux: Gst.Element,
     cam_cfg: CameraConfig,
+    ready_event: Optional[threading.Event] = None,
 ) -> Gst.Element:
     """
     Create a source bin for one camera and connect it to streammux.
@@ -78,7 +79,13 @@ def _make_source_bin(
 
     def on_source_setup(decodebin, src):
         if not is_file:
-            for prop, val in [("latency", 200), ("drop-on-latency", True)]:
+            for prop, val in [
+                ("latency", 200),
+                ("drop-on-latency", True),
+                ("protocols", 0x1),  # rtspsrc TCP transport (GST_RTSP_LOWER_TRANS_TCP)
+                ("retry", 5),
+                ("timeout", 5_000_000),  # 5s in microseconds
+            ]:
                 try:
                     src.set_property(prop, val)
                 except (TypeError, Exception):
@@ -110,6 +117,11 @@ def _make_source_bin(
             pad.link(q.get_static_pad("sink"))
             gst_link(q, conv)
             conv_src_pad = conv.get_static_pad("src")
+            if ready_event is not None:
+                def _first_buffer(pad, info, event=ready_event):
+                    event.set()
+                    return Gst.PadProbeReturn.REMOVE
+                conv_src_pad.add_probe(Gst.PadProbeType.BUFFER, _first_buffer)
             conv_src_pad.link(sinkpad)
 
             logger.info(
@@ -407,6 +419,7 @@ def dynamic_add_stream(
     cam_cfg: CameraConfig,
     tiler: Gst.Element,
     source_bins: dict,
+    ready_event: Optional[threading.Event] = None,
 ) -> Gst.Element:
     # 1. Read current batch-size from the live streammux rather than trusting
     #    a caller-supplied value that may have been stale before GLib idle_add
@@ -428,7 +441,7 @@ def dynamic_add_stream(
             recording_added = True
 
         # 3. Add and start the new source
-        src = _make_source_bin(pipeline, streammux, cam_cfg)
+        src = _make_source_bin(pipeline, streammux, cam_cfg, ready_event=ready_event)
         src.sync_state_with_parent()
     except Exception:
         # Rollback: restore batch-size and tear down any partially-created
@@ -486,7 +499,6 @@ def dynamic_remove_stream(
                 return False
             cleanup_started = True
 
-        was_playing = False
         probe_removed = False
         try:
             # Capture elements and pads before state changes / unlink
@@ -495,20 +507,6 @@ def dynamic_remove_stream(
             conv_elem = pipeline.get_by_name(f"conv_{camera_id}")
             conv_pad = conv_src_pad or (conv_elem.get_static_pad("src") if conv_elem else None)
             mux_sinkpad = streammux.get_static_pad(f"sink_{source_id}")
-
-            # Determine initial pipeline state
-            _, current_state, _ = pipeline.get_state(0)
-            was_playing = (current_state == Gst.State.PLAYING)
-
-            # Pause pipeline and wait for transition before pad operations
-            if was_playing:
-                pipeline.set_state(Gst.State.PAUSED)
-                state_ret, current_state, _ = pipeline.get_state(5 * Gst.SECOND)
-                if state_ret == Gst.StateChangeReturn.FAILURE or current_state != Gst.State.PAUSED:
-                    raise RuntimeError(
-                        f"Pipeline did not reach PAUSED before removing {camera_id}: "
-                        f"state={current_state.value_nick} result={state_ret.value_nick}"
-                    )
 
             # Transition source branch elements sequentially PLAYING -> PAUSED -> READY -> NULL
             branch_elements = [el for el in [source_elem, q_elem, conv_elem] if el is not None]
@@ -565,10 +563,6 @@ def dynamic_remove_stream(
                     pad.remove_probe(probe_id)
                 except Exception:
                     pass
-            # Restore pipeline state if it was originally PLAYING
-            if was_playing:
-                pipeline.set_state(Gst.State.PLAYING)
-                pipeline.get_state(5 * Gst.SECOND)
             if done_event is not None:
                 done_event.set()
 

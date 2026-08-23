@@ -187,27 +187,29 @@ class ZenohCommandSubscriber:
                 deadline = _time.monotonic() + _ack_timeout
                 playing  = False
 
-                # Poll until the source_id appears in the live lookup table
-                # (populated by on_add on the GLib main loop thread after
-                # dynamic_add_stream completes) or until timeout.
-                # FIX: Lock is acquired ONLY for the dict lookup and released BEFORE sleeping.
-                while _time.monotonic() < deadline:
-                    _time.sleep(0.25)
-                    try:
-                        live_cfg = None
-                        with _cam_manager._lock:
-                            live_cfg = _cam_manager._by_source_id.get(_source_id)
-                        if live_cfg is not None and live_cfg.camera_id == _cam_id and live_cfg.enabled:
-                            playing = True
-                            break
-                    except Exception:
-                        pass
+                # Config registration is synchronous and is not stream readiness.
+                # Wait for the first decoded buffer from this source instead.
+                ready_event = _cam_manager.stream_ready_event(_source_id)
+                if ready_event is not None:
+                    playing = ready_event.wait(timeout=max(0.0, deadline - _time.monotonic()))
 
                 if not playing:
                     logger.warning(
                         "[Zenoh C2] ADD ack NOT sent for '%s': stream did not reach "
                         "PLAYING within %.0fs.", _cam_id, _ack_timeout,
                     )
+                    # Local cleanup of unacknowledged stream to avoid duplicate orphan processing
+                    try:
+                        if hasattr(_cam_manager, "cleanup_stream_ready"):
+                            _cam_manager.cleanup_stream_ready(_source_id)
+                        with _cam_manager._lock:
+                            cfg = _cam_manager._configs.get(_cam_id)
+                            if cfg and cfg.enabled:
+                                cfg.enabled = False
+                                _cam_manager._rebuild_lookup()
+                        logger.info("[Zenoh C2] Disabled timed-out config for stream '%s'", _cam_id)
+                    except Exception as exc:
+                        logger.error("[Zenoh C2] Failed local cleanup after ADD timeout for '%s': %s", _cam_id, exc)
                     return
 
                 try:
@@ -289,6 +291,8 @@ class ZenohCommandSubscriber:
                 source_id = cfg.source_id
                 cfg.enabled = False
                 self._camera_manager._rebuild_lookup()
+                if hasattr(self._camera_manager, "cleanup_stream_ready"):
+                    self._camera_manager.cleanup_stream_ready(source_id)
 
             delta = StreamDelta(to_remove=[source_id])
             self._camera_manager._delta_q.put(delta)
