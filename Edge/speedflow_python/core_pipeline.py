@@ -82,7 +82,11 @@ def _make_source_bin(
             for prop, val in [
                 ("latency", 200),
                 ("drop-on-latency", True),
+<<<<<<< HEAD
                 ("protocols", 0x1),  # rtspsrc TCP transport (GST_RTSP_LOWER_TRANS_TCP)
+=======
+                ("protocols", 0x4),  # rtspsrc TCP transport (GST_RTSP_LOWER_TRANS_TCP)
+>>>>>>> 8e5e1484d3166c1922f1a5b8540c89930e87f147
                 ("retry", 5),
                 ("timeout", 5_000_000),  # 5s in microseconds
             ]:
