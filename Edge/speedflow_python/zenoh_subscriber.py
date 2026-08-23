@@ -182,8 +182,8 @@ class ZenohCommandSubscriber:
             _source_id   = source_id
             _node_id     = self._node_id
             _cam_manager = self._camera_manager
-            # Coordinate with migration_timeout_s: default 10.0s allows migration_timeout_s (12.0s) a 2.0s safety margin
-            _ack_timeout = float(self._ack_timeout_s) if self._ack_timeout_s is not None else 10.0
+            # Coordinate with migration_timeout_s: default 12.0s allows migration_timeout_s (15.0s) a 3.0s safety margin
+            _ack_timeout = float(self._ack_timeout_s) if self._ack_timeout_s is not None else 12.0
 
             def _send_ack() -> None:
                 import time as _time

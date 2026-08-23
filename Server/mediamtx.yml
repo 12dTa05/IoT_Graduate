@@ -9,7 +9,7 @@ logDestinations: [stdout]
 
 # ── RTSP server (receives push from Edge nodes) ─────────────
 rtsp: yes
-rtspAddress: :8554
+rtspAddress: 0.0.0.0:8554
 # TCP only — avoids UDP packet loss on the WAN link from Jetson→VPS
 protocols: [tcp]
 # Larger read buffer absorbs WAN jitter without dropping frames.
@@ -18,9 +18,9 @@ readBufferCount: 2048
 
 # ── WebRTC server (serves to browser via WHEP) ──────────────
 webrtc: yes
-webrtcAddress: :8889
+webrtcAddress: 0.0.0.0:8889
 # Static UDP port for ICE traffic to simplify firewall rules and routing
-webrtcICEUDPMuxAddress: :8189
+webrtcICEUDPMuxAddress: 0.0.0.0:8189
 # CRITICAL: tells MediaMTX to include the public IP in ICE candidates
 # Without this, ICE candidates only contain Docker/private IPs and
 # external browsers cannot connect via WebRTC.
@@ -28,11 +28,11 @@ webrtcICEHostNAT1To1IPs: ["116.118.9.125"]
 
 # ── API server (query active streams) ───────────────────────
 api: yes
-apiAddress: :9997
+apiAddress: 0.0.0.0:9997
 
 # ── HLS (low-latency fallback for browsers where WebRTC fails)
 hls: yes
-hlsAddress: :8888
+hlsAddress: 0.0.0.0:8888
 # 3 segments × 500ms = 1.5s DVR window — minimal latency
 hlsSegmentCount: 3
 hlsSegmentDuration: 500ms

@@ -407,8 +407,10 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
     _RESTART_DELAYS = [5, 10, 20, 30]
     restart_idx = 0
     _last_probe = None
+    _last_restart_cause = "initial_start"
 
     while True:
+        print(f"[RTSP Push] Building pipeline (cause: {_last_restart_cause})...")
         ret_build = build_pipeline(
             camera_configs=camera_manager.get_enabled_configs(),
             sink_type="rtsp_push",
@@ -441,6 +443,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         bus = pipeline.get_bus()
         bus.add_signal_watch()
         _error_flag = [False]
+        _error_reason = ["unknown"]
         _removing = set()  # guard against double-remove from multiple error msgs
 
         def on_message(bus, message):
@@ -486,6 +489,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
                     elem_name := (src_name or "")
                 ) and ("rtsp_push_sink" in elem_name or "sink" in elem_name or "rtsp" in elem_name)
                 err_category = "sink" if is_rtsp_sink else "pipeline"
+                _error_reason[0] = f"{err_category}_error:{src_name}:{err}"
                 print(f"ERROR ({err_category}) from {src_name}: {err}", file=sys.stderr)
                 if debug:
                     print(f"DEBUG INFO: {debug}", file=sys.stderr)
@@ -521,11 +525,13 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
 
         if _error_flag[0]:
             delay = _RESTART_DELAYS[min(restart_idx, len(_RESTART_DELAYS) - 1)]
-            print(f"[RTSP Push] RTSP error — reconnecting in {delay}s...", file=sys.stderr)
+            _last_restart_cause = _error_reason[0]
+            print(f"[RTSP Push] {_last_restart_cause} — reconnecting in {delay}s...", file=sys.stderr)
             restart_idx += 1
             import time as _time; _time.sleep(delay)
         else:
             # Clean EOS or intentional stop — do not restart
+            _last_restart_cause = "clean_stop"
             break
 
     # BUG-11 fix: stop the camera manager once, after the restart loop exits.
@@ -575,7 +581,8 @@ def run_python_mode(args) -> None:
     try:
         from .zenoh_subscriber import ZenohCommandSubscriber
         shared_session = peer_orch._session if peer_orch else None
-        ack_timeout = p2p_cfg.get("add_ack_timeout_s", max(1.0, float(p2p_cfg.get("migration_timeout_s", 12.0)) - 2.0))
+        # Pass configured add_ack_timeout_s from edge_node.yml (falls back to migration_timeout_s - 3.0s margin, or 12.0s default)
+        ack_timeout = p2p_cfg.get("add_ack_timeout_s", max(1.0, float(p2p_cfg.get("migration_timeout_s", 15.0)) - 3.0))
         zenoh_sub = ZenohCommandSubscriber(
             camera_manager=camera_manager,
             node_id=NODE_ID,

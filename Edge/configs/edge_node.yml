@@ -16,11 +16,13 @@ p2p:
   cooldown_s: 15.0              # per-camera cooldown between migrations
                                    # prevents ping-pong while allowing rebalancing
                                    # after migration effect is observable
-  migration_timeout_s: 12.0    # wait for ADD ack before rollback (restored to safe default;
+  migration_timeout_s: 15.0    # wait for ADD ack before rollback (restored to safe default;
                                  # 2 s was too tight for slow RTSP sources across LAN)
-  add_ack_timeout_s: 10.0      # max wait on receiver for ADD stream to reach PLAYING (must be < migration_timeout_s)
+  add_ack_timeout_s: 12.0      # max wait on receiver for ADD stream to reach PLAYING (must be < migration_timeout_s)
   heartbeat_timeout_s: 5.0      # peer declared OFFLINE after this silence
   failover_convergence_grace_s: 15.0 # suppress mutual false-offline cascade during failover convergence
+  rescue_claim_window_s: 1.0    # claim window to collect peer rescue claims before ADD
+  rescue_claim_lease_s: 15.0   # duration during which an active peer claim suppresses local ADD
   failover_rescue_hold_s: 60.0  # max hold time (s) before force-releasing rescued camera if original owner remains dead
   recovery_wait_s: 300.0        # wait 5 minutes in recovery before re-adding locally-owned cameras
   vote_window_s: 5.0            # proposal collection duration

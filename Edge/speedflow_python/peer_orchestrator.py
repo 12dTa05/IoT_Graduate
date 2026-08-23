@@ -2585,17 +2585,22 @@ class PeerOrchestrator:
             )
             owned = set()
 
+        # Removing a foreign (rescued/migrated-in) camera never reduces the
+        # locally-owned-active count, so it may always proceed.
+        if owned and camera_id not in owned:
+            return True
+
         with self._self_lock:
             active = set(self._self_state.active_cameras)
 
         if not owned:
+            # Foreign camera check when owned is empty: if camera_id is recorded
+            # as rescued or migrated-in, it is definitely foreign.
+            with self._lock:
+                if camera_id in self._rescued_cameras:
+                    return True
             # Fail closed: cannot prove another owned camera would remain.
             return False
-
-        # Removing a foreign (rescued/migrated-in) camera never reduces the
-        # locally-owned-active count, so it may always proceed.
-        if camera_id not in owned:
-            return True
 
         # Owned camera: proceed only if some OTHER owned camera stays active.
         owned_active = owned & active
@@ -2775,6 +2780,27 @@ class PeerOrchestrator:
         Reuses the same _pending_acks event mechanism as _wait_and_remove.
         If timeout, log error and schedule a bounded exponential retry.
         """
+        # Reclaim retry: re-validate holder state from latest heartbeat
+        # before each retry. If holder dropped camera, clear stale state safely.
+        now = time.time()
+        heartbeat_timeout = float(self._cfg.get("heartbeat_timeout_s", 5.0))
+        with self._lock:
+            holder_peer = self._peers.get(holder_node)
+            if holder_peer is not None and (now - holder_peer.last_seen <= heartbeat_timeout):
+                if camera_id not in holder_peer.active_cameras:
+                    with self._self_lock:
+                        is_active_local = camera_id in self._self_state.active_cameras
+                    if is_active_local:
+                        logger.info(
+                            "[PeerOrch][Reclaim] Holder '%s' no longer has '%s' and stream active locally; clearing reclaim mapping.",
+                            holder_node, camera_id,
+                        )
+                        self._migrated_out.pop(camera_id, None)
+                        self._reclaim_in_progress.discard(camera_id)
+                        self._reclaim_retry_at.pop(camera_id, None)
+                        self._reclaim_retry_count.pop(camera_id, None)
+                        return
+
         with self._lock:
             event = self._pending_acks.get(camera_id)
             if event is None:
@@ -3177,10 +3203,10 @@ class PeerOrchestrator:
                 return
 
         with self._claims_lock:
-            # Claims are only needed during the short contention window.  Bound
-            # this cache even when a failover exits early or the cluster churns.
-            claim_ttl_s = max(2.0, float(self._cfg.get("rescue_claim_window_s", 0.5)) * 4.0)
-            cutoff = time.time() - claim_ttl_s
+            # Claims are only needed during the claim window / lease period. Bound
+            # this cache using configured rescue_claim_lease_s (default 15s) or 4x window.
+            claim_lease_s = float(self._cfg.get("rescue_claim_lease_s", max(15.0, float(self._cfg.get("rescue_claim_window_s", 0.5)) * 4.0)))
+            cutoff = time.time() - claim_lease_s
             self._failover_claims = {
                 key: claim for key, claim in self._failover_claims.items()
                 if claim[1] >= cutoff
@@ -3446,6 +3472,19 @@ class PeerOrchestrator:
                     continue
 
                 # Fix E: Broadcast rescue claim to resolve membership-divergence split-brain
+                # Check if a fresh higher-priority claim lease already exists before publishing/claiming
+                claim_lease_s = float(cfg.get("rescue_claim_lease_s", 15.0))
+                with self._claims_lock:
+                    existing_claim = self._failover_claims.get((dead_node_id, camera_id))
+                    if (existing_claim is not None
+                            and existing_claim[0] != self._node_id
+                            and (time.time() - existing_claim[1]) < claim_lease_s):
+                        logger.info(
+                            "[Failover] Active rescue claim lease exists for '%s' by '%s' (age=%.1fs); skipping local claim.",
+                            camera_id, existing_claim[0], time.time() - existing_claim[1],
+                        )
+                        continue
+
                 # ponytail: mask to 63-bit int so msgpack integer serialization never overflows
                 my_weight = int(hashlib.sha256(f"{camera_id}:{self._node_id}".encode()).hexdigest()[:15], 16)
                 claim_payload = {
@@ -3465,8 +3504,8 @@ class PeerOrchestrator:
                 with self._claims_lock:
                     self._failover_claims[(dead_node_id, camera_id)] = (self._node_id, time.time(), my_weight)
 
-                # Wait short claim window to detect contention from other surviving nodes
-                claim_window_s = cfg.get("rescue_claim_window_s", 0.5)
+                # Wait configured claim window to collect peer rescue claims
+                claim_window_s = float(cfg.get("rescue_claim_window_s", 0.5))
                 if claim_window_s > 0:
                     time.sleep(claim_window_s)
 
@@ -3477,6 +3516,21 @@ class PeerOrchestrator:
                         logger.info(
                             "[Failover] Yielding rescue of '%s' to '%s' (higher weight %d > %d)",
                             camera_id, best_claim[0], best_claim[2], my_weight,
+                        )
+                        continue
+
+                # Stale holder guard before rescue ADD: verify dead holder is still stale
+                # under current freshness rules (heartbeat timeout + grace) to avoid acting on transient missed heartbeat
+                now_check = time.time()
+                timeout = float(self._cfg.get("heartbeat_timeout_s", 5.0))
+                grace_s = float(self._cfg.get("failover_grace_s", timeout))
+                offline_threshold = timeout + grace_s
+                with self._lock:
+                    dead_peer_state = self._peers.get(dead_node_id)
+                    if dead_peer_state is not None and (now_check - dead_peer_state.last_seen) <= offline_threshold:
+                        logger.warning(
+                            "[Failover] Aborted rescue ADD of '%s': dead holder '%s' is no longer stale (last_seen %.1fs ago <= %.1fs threshold).",
+                            camera_id, dead_node_id, now_check - dead_peer_state.last_seen, offline_threshold,
                         )
                         continue
 
