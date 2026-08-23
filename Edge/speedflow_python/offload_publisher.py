@@ -160,6 +160,7 @@ class OffloadPublisher:
         if jpeg is None:
             return
         self._encoded += 1
+        now = time.time()
         self._enqueue({
             "schema_version": OFFLOAD_PAYLOAD_SCHEMA_VERSION,
             "version":     OFFLOAD_PAYLOAD_SCHEMA_VERSION,
@@ -172,8 +173,8 @@ class OffloadPublisher:
             "frame_no":    frame_no,
             "jpeg":        jpeg,             # raw bytes (not base64)
             "confidence":  float(confidence),
-            "timestamp":   time.time(),
-            "ts":          time.time(),
+            "timestamp":   now,
+            "ts":          now,
         })
 
     def put_vehicle(
@@ -194,6 +195,7 @@ class OffloadPublisher:
         if jpeg is None:
             return
         self._encoded += 1
+        now = time.time()
         self._enqueue({
             "schema_version": OFFLOAD_PAYLOAD_SCHEMA_VERSION,
             "version":      OFFLOAD_PAYLOAD_SCHEMA_VERSION,
@@ -206,8 +208,8 @@ class OffloadPublisher:
             "frame_no":     frame_no,
             "jpeg":         jpeg,
             "bbox_world_y": float(bbox_world_y),
-            "timestamp":    time.time(),
-            "ts":           time.time(),
+            "timestamp":    now,
+            "ts":           now,
         })
 
     # ------------------------------------------------------------------

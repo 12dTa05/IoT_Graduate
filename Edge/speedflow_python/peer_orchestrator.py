@@ -392,8 +392,8 @@ class PeerOrchestrator:
         # with _check_rebalance reading it to detect camera returns).
         self._failover_triggered: Dict[str, float] = {}
 
-        # Rescue claims received from other nodes: (dead_node_id, camera_id) → (node_id, timestamp, priority_weight)
-        self._failover_claims: Dict[Tuple[str, str], Tuple[str, float, int]] = {}
+        # Rescue claims received from other nodes: (dead_node_id, camera_id) → (node_id, local_received_ts, priority_weight, remote_ts)
+        self._failover_claims: Dict[Tuple[str, str], Tuple[str, float, int, float]] = {}
         self._claims_lock = threading.Lock()
 
         # Cameras rescued via failover: camera_id → original_owner_node_id
@@ -2129,6 +2129,7 @@ class PeerOrchestrator:
             if camera_id not in self._rfo_snapshots:
                 self._rfo_snapshots[camera_id] = (_rfo_load, _rfo_fps)
 
+        now_ts = time.time()
         payload = {
             "requester":      self._node_id,
             "camera_id":      camera_id,
@@ -2138,7 +2139,8 @@ class PeerOrchestrator:
             "eps_fps":        eps_fps,
             "eps_network_ms": eps_net,
             "tier":           relaxation_tier,
-            "ts":             time.time(),
+            "timestamp":      now_ts,
+            "ts":             now_ts,
         }
 
         with self._lock:
@@ -2210,12 +2212,14 @@ class PeerOrchestrator:
             logger.error("[PeerOrch] Cannot get config for camera '%s'. Aborting election.", camera_id)
             return
 
+        now_ts = time.time()
         decision = {
             "winner":     winner["bidder"],
             "camera_id":  camera_id,
             "from_node":  self._node_id,
             "cam_config": cam_config,
-            "ts":         time.time(),
+            "timestamp":  now_ts,
+            "ts":         now_ts,
         }
         winner_id = winner["bidder"]
 
@@ -2458,13 +2462,15 @@ class PeerOrchestrator:
                 + w_therm * therm_ratio
             ) * 100.0
 
+            now_ts = time.time()
             proposal = {
                 "bidder":        self._node_id,
                 "camera_id":     camera_id,
                 "score":         round(f_x, 2),
                 "fps_predicted": predicted_fps,
                 "rtt_ms":        round(rtt_ms, 1),
-                "ts":            time.time(),
+                "timestamp":     now_ts,
+                "ts":            now_ts,
             }
 
             self._pubs["vote_proposal"].put(msgpack.packb(proposal, use_bin_type=True))
@@ -3221,11 +3227,13 @@ class PeerOrchestrator:
                 )
                 return
 
+        local_now = time.time()
         with self._claims_lock:
             # Claims are only needed during the claim window / lease period. Bound
             # this cache using configured rescue_claim_lease_s (default 15s) or 4x window.
+            # Local receipt time is used for lease freshness to prevent cross-node clock skew.
             claim_lease_s = float(self._cfg.get("rescue_claim_lease_s", max(15.0, float(self._cfg.get("rescue_claim_window_s", 0.5)) * 4.0)))
-            cutoff = time.time() - claim_lease_s
+            cutoff = local_now - claim_lease_s
             self._failover_claims = {
                 key: claim for key, claim in self._failover_claims.items()
                 if claim[1] >= cutoff
@@ -3233,10 +3241,10 @@ class PeerOrchestrator:
             key = (dead_node_id, camera_id)
             existing = self._failover_claims.get(key)
             if existing is None or priority_weight > existing[2]:
-                self._failover_claims[key] = (claimer_node_id, ts, priority_weight)
+                self._failover_claims[key] = (claimer_node_id, local_now, priority_weight, float(ts))
                 logger.info(
-                    "[Failover] Recorded rescue claim for '%s' (dead='%s') by '%s' (weight=%d)",
-                    camera_id, dead_node_id, claimer_node_id, priority_weight,
+                    "[Failover] Recorded rescue claim for '%s' (dead='%s') by '%s' (weight=%d, remote_ts=%.3f)",
+                    camera_id, dead_node_id, claimer_node_id, priority_weight, float(ts),
                 )
 
     def _publish_startup_announcement(self) -> None:
@@ -3245,12 +3253,14 @@ class PeerOrchestrator:
             owned = list(self._get_owned_camera_ids())
             if not owned:
                 return
+            now_ts = time.time()
             claim_payload = {
                 "type": "startup_claim",
                 "action": "startup_preempt",
                 "claimer_node_id": self._node_id,
                 "cameras": owned,
-                "ts": time.time(),
+                "timestamp": now_ts,
+                "ts": now_ts,
             }
             if "failover_claim" in self._pubs and self._pubs["failover_claim"] is not None:
                 self._pubs["failover_claim"].put(msgpack.packb(claim_payload, use_bin_type=True))
@@ -3506,12 +3516,14 @@ class PeerOrchestrator:
 
                 # ponytail: mask to 63-bit int so msgpack integer serialization never overflows
                 my_weight = int(hashlib.sha256(f"{camera_id}:{self._node_id}".encode()).hexdigest()[:15], 16)
+                claim_now = time.time()
                 claim_payload = {
                     "dead_node_id": dead_node_id,
                     "camera_id": camera_id,
                     "claimer_node_id": self._node_id,
                     "priority_weight": my_weight,
-                    "ts": time.time(),
+                    "timestamp": claim_now,
+                    "ts": claim_now,
                 }
                 if "failover_claim" in self._pubs:
                     try:
@@ -3521,7 +3533,7 @@ class PeerOrchestrator:
 
                 # Record own claim locally
                 with self._claims_lock:
-                    self._failover_claims[(dead_node_id, camera_id)] = (self._node_id, time.time(), my_weight)
+                    self._failover_claims[(dead_node_id, camera_id)] = (self._node_id, claim_now, my_weight, claim_now)
 
                 # Wait configured claim window to collect peer rescue claims
                 claim_window_s = float(cfg.get("rescue_claim_window_s", 0.5))

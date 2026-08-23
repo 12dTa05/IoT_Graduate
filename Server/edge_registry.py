@@ -18,9 +18,10 @@ class EdgeInfo:
         self.node_id = node_id
         self.ip = ip
         self.online = True
-        self.last_heartbeat = time.time()
+        self.received_at = time.time()
+        self.last_heartbeat = self.received_at
         self.health: Dict[str, Any] = {}
-        self.registered_at = time.time()
+        self.registered_at = self.received_at
 
     @property
     def cluster_id(self) -> str:
@@ -38,6 +39,7 @@ class EdgeInfo:
             "ip": self.ip,
             "online": self.online,
             "registered_at": self.registered_at,
+            "received_at": self.received_at,
             "last_heartbeat": self.last_heartbeat,
             "health": self.health,
             "cluster_id": self.cluster_id,
@@ -51,13 +53,15 @@ class EdgeRegistry:
         self._lock = threading.Lock()
 
     def register(self, node_id: str, ip: str) -> bool:
+        now = time.time()
         with self._lock:
             existing = self._edges.get(node_id)
             if existing:
                 if ip:
                     existing.ip = ip
                 existing.online = True
-                existing.last_heartbeat = time.time()
+                existing.received_at = now
+                existing.last_heartbeat = now
                 logger.info("[Registry] Edge '%s' re-registered at %s", node_id, existing.ip)
                 return False
             self._edges[node_id] = EdgeInfo(node_id, ip)
@@ -66,6 +70,7 @@ class EdgeRegistry:
         return True
 
     def update_health(self, node_id: str, payload: Dict[str, Any]) -> None:
+        now = time.time()
         with self._lock:
             info = self._edges.get(node_id)
             if not info:
@@ -75,7 +80,8 @@ class EdgeRegistry:
                 info = self._edges[node_id]
                 logger.info("[Registry] Edge '%s' auto-registered via status", node_id)
             info.online = True
-            info.last_heartbeat = time.time()
+            info.received_at = now
+            info.last_heartbeat = now
             if payload.get("advertise_ip"):
                 info.ip = payload["advertise_ip"]
             health = {k: v for k, v in payload.items() if k not in ("type", "node_id")}
