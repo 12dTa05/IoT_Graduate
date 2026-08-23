@@ -553,10 +553,10 @@ def run_python_mode(args) -> None:
         print(f"[P2P] Failed to load edge_node.yml: {exc}", file=sys.stderr)
 
     # --- P2P Peer Orchestrator (single Zenoh session for ALL P2P traffic) ---
+    p2p_cfg = edge_cfg.get("p2p", {})
     peer_orch = None
     try:
         from .peer_orchestrator import PeerOrchestrator
-        p2p_cfg = edge_cfg.get("p2p", {})
         peer_orch = PeerOrchestrator(
             node_id=NODE_ID,
             cfg=p2p_cfg,
@@ -575,10 +575,12 @@ def run_python_mode(args) -> None:
     try:
         from .zenoh_subscriber import ZenohCommandSubscriber
         shared_session = peer_orch._session if peer_orch else None
+        ack_timeout = p2p_cfg.get("add_ack_timeout_s", max(1.0, float(p2p_cfg.get("migration_timeout_s", 12.0)) - 2.0))
         zenoh_sub = ZenohCommandSubscriber(
             camera_manager=camera_manager,
             node_id=NODE_ID,
             session=shared_session,
+            ack_timeout_s=ack_timeout,
         )
         zenoh_sub.start()
         print(f"[Zenoh C2] Subscriber active. Node='{NODE_ID}', Key=peers/control/{NODE_ID}")
