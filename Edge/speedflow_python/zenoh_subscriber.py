@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Optional
 
 import msgpack
@@ -81,13 +82,18 @@ class ZenohCommandSubscriber:
         )
 
         # Signal that this node is online
+        now = time.time()
         self.publish_status({
+            "schema_version": 1,
+            "version": 1,
             "node_id": self._node_id,
             "event": "NODE_ONLINE",
             "active_cameras": [
                 c.camera_id
                 for c in self._camera_manager.get_enabled_configs()
             ],
+            "timestamp": now,
+            "ts": now,
         })
 
     def stop(self) -> None:
@@ -106,7 +112,23 @@ class ZenohCommandSubscriber:
         """Publish status/event from this node."""
         if self._session:
             try:
-                data = msgpack.packb(payload, use_bin_type=True)
+                p = dict(payload)
+                now = time.time()
+                if "timestamp" not in p and "ts" not in p:
+                    p["timestamp"] = now
+                    p["ts"] = now
+                elif "timestamp" not in p and "ts" in p:
+                    p["timestamp"] = p["ts"]
+                elif "ts" not in p and "timestamp" in p:
+                    p["ts"] = p["timestamp"]
+                if "schema_version" not in p and "version" not in p:
+                    p["schema_version"] = 1
+                    p["version"] = 1
+                elif "schema_version" not in p and "version" in p:
+                    p["schema_version"] = p["version"]
+                elif "version" not in p and "schema_version" in p:
+                    p["version"] = p["schema_version"]
+                data = msgpack.packb(p, use_bin_type=True)
                 self._session.put(self._status_key, data)
             except Exception as exc:
                 logger.warning("[Zenoh C2] Failed to publish status: %s", exc)
@@ -216,10 +238,15 @@ class ZenohCommandSubscriber:
                     return
 
                 try:
+                    now = _time.time()
                     ack_payload = msgpack.packb({
+                        "schema_version": 1,
+                        "version":   1,
                         "node_id":   _node_id,
                         "camera_id": _cam_id,
                         "event":     "PLAYING",
+                        "timestamp": now,
+                        "ts":        now,
                     }, use_bin_type=True)
                     _session.put(f"peers/vote/ack/{_cam_id}", ack_payload)
                     logger.info("[Zenoh C2] ADD ack sent for '%s' (stream PLAYING).", _cam_id)

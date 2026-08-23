@@ -147,6 +147,22 @@ class ZenohPublisher:
         """Msgpack-serialize and publish one event."""
         camera_id = data.get("camera_id", "unknown")
         key = f"traffic/events/{self._node_id}/{camera_id}"
+        # Ensure timestamp and schema metadata are attached to traffic events
+        if isinstance(data, dict):
+            if "timestamp" not in data and "ts" not in data:
+                data["timestamp"] = time.time()
+                data["ts"] = data["timestamp"]
+            elif "timestamp" not in data and "ts" in data:
+                data["timestamp"] = data["ts"]
+            elif "ts" not in data and "timestamp" in data:
+                data["ts"] = data["timestamp"]
+            if "schema_version" not in data and "version" not in data:
+                data["schema_version"] = 1
+                data["version"] = 1
+            elif "schema_version" not in data and "version" in data:
+                data["schema_version"] = data["version"]
+            elif "version" not in data and "schema_version" in data:
+                data["version"] = data["schema_version"]
         payload = msgpack.packb(data, use_bin_type=True)
         if self._session:
             # Reuse declared publishers to avoid resource leak

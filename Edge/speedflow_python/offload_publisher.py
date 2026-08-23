@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 TYPE_PLATE   = "plate"    # Level 3
 TYPE_VEHICLE = "vehicle"  # Level 2
 
+OFFLOAD_PAYLOAD_SCHEMA_VERSION = 1
+
 _QUEUE_MAXSIZE = 64  # ~2 s of bursts at 30 fps × 1 cam; older entries dropped
 
 
@@ -159,6 +161,9 @@ class OffloadPublisher:
             return
         self._encoded += 1
         self._enqueue({
+            "schema_version": OFFLOAD_PAYLOAD_SCHEMA_VERSION,
+            "version":     OFFLOAD_PAYLOAD_SCHEMA_VERSION,
+            "level":       3,
             "type":        TYPE_PLATE,
             "src":         self._node_id,
             "dst":         target_node,
@@ -167,6 +172,7 @@ class OffloadPublisher:
             "frame_no":    frame_no,
             "jpeg":        jpeg,             # raw bytes (not base64)
             "confidence":  float(confidence),
+            "timestamp":   time.time(),
             "ts":          time.time(),
         })
 
@@ -189,6 +195,9 @@ class OffloadPublisher:
             return
         self._encoded += 1
         self._enqueue({
+            "schema_version": OFFLOAD_PAYLOAD_SCHEMA_VERSION,
+            "version":      OFFLOAD_PAYLOAD_SCHEMA_VERSION,
+            "level":        2,
             "type":         TYPE_VEHICLE,
             "src":          self._node_id,
             "dst":          target_node,
@@ -197,6 +206,7 @@ class OffloadPublisher:
             "frame_no":     frame_no,
             "jpeg":         jpeg,
             "bbox_world_y": float(bbox_world_y),
+            "timestamp":    time.time(),
             "ts":           time.time(),
         })
 

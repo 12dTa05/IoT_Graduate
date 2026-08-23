@@ -86,6 +86,7 @@ class PeerState:
     avg_fps: Optional[float] = None
     fps_per_camera: Dict[str, float] = field(default_factory=dict)
     active_cameras: List[str] = field(default_factory=list)
+    streaming_cameras: List[str] = field(default_factory=list)
     camera_configs: Dict[str, dict] = field(default_factory=dict)
     max_streams: int = 8
     last_seen: float = field(default_factory=time.time)
@@ -332,6 +333,16 @@ class PeerOrchestrator:
         self._node_id = node_id
         self._cfg = cfg
         self._camera_manager = camera_manager
+
+        # Startup validation: add_ack_timeout_s must be strictly less than migration_timeout_s
+        migration_timeout = float(self._cfg.get("migration_timeout_s", 15.0))
+        if "add_ack_timeout_s" in self._cfg and self._cfg["add_ack_timeout_s"] is not None:
+            ack_timeout = float(self._cfg["add_ack_timeout_s"])
+            if ack_timeout >= migration_timeout:
+                raise ValueError(
+                    f"add_ack_timeout_s ({ack_timeout:.1f}s) must be strictly less than "
+                    f"migration_timeout_s ({migration_timeout:.1f}s) to ensure sender timeout safety"
+                )
 
         # Peer state
         self._peers: Dict[str, PeerState] = {}
@@ -687,6 +698,10 @@ class PeerOrchestrator:
                 self._self_state.fps_per_camera = _pick_fps_dict(pipeline)
                 if isinstance(pipeline.get("active_cameras"), (list, tuple, set)):
                     self._self_state.active_cameras = [str(c) for c in pipeline["active_cameras"] if isinstance(c, (str, int))]
+                if isinstance(pipeline.get("streaming_cameras"), (list, tuple, set)):
+                    self._self_state.streaming_cameras = [str(c) for c in pipeline["streaming_cameras"] if isinstance(c, (str, int))]
+                else:
+                    self._self_state.streaming_cameras = list(self._self_state.active_cameras)
                 raw_configs = pipeline.get("camera_configs")
                 if isinstance(raw_configs, dict) and raw_configs:
                     self._self_state.camera_configs = raw_configs
@@ -796,6 +811,10 @@ class PeerOrchestrator:
                     peer.fps_per_camera = {str(c): float(peer.avg_fps) for c in pipeline["active_cameras"] if isinstance(c, (str, int))}
             if isinstance(pipeline.get("active_cameras"), (list, tuple, set)):
                 peer.active_cameras = [str(c) for c in pipeline["active_cameras"] if isinstance(c, (str, int))]
+            if isinstance(pipeline.get("streaming_cameras"), (list, tuple, set)):
+                peer.streaming_cameras = [str(c) for c in pipeline["streaming_cameras"] if isinstance(c, (str, int))]
+            else:
+                peer.streaming_cameras = list(peer.active_cameras)
             # Preserve valid prior camera_configs when payload field is missing/malformed
             raw_configs = pipeline.get("camera_configs")
             if isinstance(raw_configs, dict) and raw_configs:

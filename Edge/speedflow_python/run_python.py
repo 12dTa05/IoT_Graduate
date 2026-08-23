@@ -39,6 +39,16 @@ logger = logging.getLogger(__name__)
 # created (rtsp_push restarts create a fresh probe per iteration).
 ACTIVE_SPEED_PROBE: list = []
 
+
+def _stop_active_speed_probes() -> None:
+    """Stop/join FPS writer on all probes in ACTIVE_SPEED_PROBE and clear the list."""
+    for p in ACTIVE_SPEED_PROBE:
+        try:
+            p.stop_fps_writer()
+        except Exception:
+            pass
+    ACTIVE_SPEED_PROBE.clear()
+
 # ---------------------------------------------------------------------------
 # Shared probe setup
 # ---------------------------------------------------------------------------
@@ -324,21 +334,27 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
     pipeline, nvdsosd, streammux, source_bins = ret_build
     tiler = pipeline.get_by_name("tiler")
 
+    # Stop any previous active probe's FPS writer before creating a new one
+    _stop_active_speed_probes()
+
     probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
-    ACTIVE_SPEED_PROBE.clear()
     ACTIVE_SPEED_PROBE.append(probe)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
     t0_playing = time.monotonic()
     ret = pipeline.set_state(Gst.State.PLAYING)
     if ret == Gst.StateChangeReturn.FAILURE:
+        _stop_active_speed_probes()
         _graceful_stop_pipeline(pipeline)
         raise RuntimeError("Unable to set display pipeline to PLAYING state")
     warmup_ms = (time.monotonic() - t0_playing) * 1000.0
     probe.record_warmup_ms(warmup_ms)
     logger.info("[Display] Pipeline PLAYING after %.0f ms (warmup)", warmup_ms)
 
-    _run_loop_until_eos_or_error(pipeline, camera_manager)
+    try:
+        _run_loop_until_eos_or_error(pipeline, camera_manager)
+    finally:
+        _stop_active_speed_probes()
     return probe
 
 
@@ -354,18 +370,24 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
     )
     pipeline, nvdsosd, streammux, source_bins = ret_build
 
+    # Stop any previous active probe's FPS writer before creating a new one
+    _stop_active_speed_probes()
+
     probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
-    ACTIVE_SPEED_PROBE.clear()
     ACTIVE_SPEED_PROBE.append(probe)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, None)
 
     print(f"[Python File Mode] Processing multi-streams to output files...")
     ret = pipeline.set_state(Gst.State.PLAYING)
     if ret == Gst.StateChangeReturn.FAILURE:
+        _stop_active_speed_probes()
         _graceful_stop_pipeline(pipeline)
         raise RuntimeError("Unable to set file pipeline to PLAYING state")
 
-    _run_loop_until_eos_or_error(pipeline, camera_manager)
+    try:
+        _run_loop_until_eos_or_error(pipeline, camera_manager)
+    finally:
+        _stop_active_speed_probes()
     return probe
 
 
@@ -410,6 +432,9 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
     _last_restart_cause = "initial_start"
 
     while True:
+        # Stop any previous active probe's FPS writer before creating a new one / rebuilding RTSP
+        _stop_active_speed_probes()
+
         print(f"[RTSP Push] Building pipeline (cause: {_last_restart_cause})...")
         ret_build = build_pipeline(
             camera_configs=camera_manager.get_enabled_configs(),
@@ -423,18 +448,35 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         tiler = pipeline.get_by_name("tiler")
 
         _last_probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
-        ACTIVE_SPEED_PROBE.clear()
         ACTIVE_SPEED_PROBE.append(_last_probe)
         _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
         ret = pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
             print("ERROR: Unable to set pipeline to PLAYING state", file=sys.stderr)
+            _stop_active_speed_probes()
+            _graceful_stop_pipeline(pipeline)
             delay = _RESTART_DELAYS[min(restart_idx, len(_RESTART_DELAYS) - 1)]
             print(f"[RTSP Push] Retrying in {delay}s...")
             restart_idx += 1
             import time as _time; _time.sleep(delay)
             continue
+        elif ret == Gst.StateChangeReturn.ASYNC:
+            state_ret, current_state, pending_state = pipeline.get_state(5 * Gst.SECOND)
+            print(f"[RTSP Push] State change ASYNC resolved: return={state_ret.value_nick}, current={current_state.value_nick}, pending={pending_state.value_nick}")
+            if state_ret == Gst.StateChangeReturn.FAILURE:
+                print("ERROR: Unable to complete pipeline transition to PLAYING state (ASYNC timeout/failure)", file=sys.stderr)
+                _stop_active_speed_probes()
+                _graceful_stop_pipeline(pipeline)
+                delay = _RESTART_DELAYS[min(restart_idx, len(_RESTART_DELAYS) - 1)]
+                print(f"[RTSP Push] Retrying in {delay}s...")
+                restart_idx += 1
+                import time as _time; _time.sleep(delay)
+                continue
+        elif ret == Gst.StateChangeReturn.NO_PREROLL:
+            print("[RTSP Push] State change NO_PREROLL: live pipeline running (preroll not required)")
+        elif ret == Gst.StateChangeReturn.SUCCESS:
+            print("[RTSP Push] State change SUCCESS: pipeline is PLAYING")
 
         restart_idx = 0  # reset backoff on successful start
         print(f"[RTSP Push] Streaming to {rtsp_url}")
@@ -508,6 +550,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             print("\nInterrupted by user")
             # BUG-11 fix: stop the manager on intentional exit only (see below)
             camera_manager.stop()
+            _stop_active_speed_probes()
             _graceful_stop_pipeline(pipeline)
             print("Pipeline stopped")
             return _last_probe
@@ -516,6 +559,8 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             # iteration — that kills the watchdog observer and processor thread
             # permanently.  On a restart those threads must stay alive so that
             # hot-reload and dynamic ADD/REMOVE keep working.
+            # Stop the probe FPS writer and clear active probe for this iteration
+            _stop_active_speed_probes()
             # We gracefully stop the pipeline state; _attach_camera_manager() at the
             # top of the next iteration re-registers on_add/on_remove callbacks
             # and calls camera_manager.start() again (which is idempotent for
@@ -582,7 +627,16 @@ def run_python_mode(args) -> None:
         from .zenoh_subscriber import ZenohCommandSubscriber
         shared_session = peer_orch._session if peer_orch else None
         # Pass configured add_ack_timeout_s from edge_node.yml (falls back to migration_timeout_s - 3.0s margin, or 12.0s default)
-        ack_timeout = p2p_cfg.get("add_ack_timeout_s", max(1.0, float(p2p_cfg.get("migration_timeout_s", 15.0)) - 3.0))
+        migration_timeout = float(p2p_cfg.get("migration_timeout_s", 15.0))
+        if "add_ack_timeout_s" in p2p_cfg and p2p_cfg["add_ack_timeout_s"] is not None:
+            ack_timeout = float(p2p_cfg["add_ack_timeout_s"])
+        else:
+            ack_timeout = max(1.0, migration_timeout - 3.0)
+        if ack_timeout >= migration_timeout:
+            raise ValueError(
+                f"add_ack_timeout_s ({ack_timeout:.1f}s) must be strictly less than "
+                f"migration_timeout_s ({migration_timeout:.1f}s) to ensure sender timeout safety"
+            )
         zenoh_sub = ZenohCommandSubscriber(
             camera_manager=camera_manager,
             node_id=NODE_ID,
@@ -706,7 +760,10 @@ def run_python_mode(args) -> None:
     # Fix #1 / #7: stop the FPS writer thread cleanly now that the pipeline
     # has exited, regardless of which mode was used.
     if probe is not None:
-        probe.stop_fps_writer()
+        try:
+            probe.stop_fps_writer()
+        except Exception:
+            pass
 
     # Clear the active probe reference so health loop doesn't push to stale probe
     ACTIVE_SPEED_PROBE.clear()

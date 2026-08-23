@@ -854,6 +854,7 @@ class OffloadReceiver:
             # else: no plate bbox — valid empty observation, still publish.
 
         # Publish result back to sender (only reached on successful inference)
+        level = 3 if crop_type == "plate" else (2 if crop_type == "vehicle" else item.get("level"))
         self._publish_result(
             dst_node  = src_node,
             camera_id = camera_id,
@@ -862,6 +863,7 @@ class OffloadReceiver:
             plate_text= plate_text,
             confidence= confidence,
             inference_ok = inference_ok,
+            level     = level,
         )
 
     def _record_inference_error(self, stage: str, reason: str, *,
@@ -924,6 +926,7 @@ class OffloadReceiver:
         self, dst_node: str, camera_id: str, stid: tuple,
         frame_no: int, plate_text: str, confidence: float,
         inference_ok: bool = True,
+        level: Optional[int] = None,
     ) -> None:
         key = f"offload/results/{self._node_id}/{dst_node}"
         pub = self._result_pubs.get(key)
@@ -931,7 +934,10 @@ class OffloadReceiver:
             pub = self._session.declare_publisher(key)
             self._result_pubs[key] = pub
 
+        now = time.time()
         payload = {
+            "schema_version": 1,
+            "version":     1,
             "src":         self._node_id,
             "dst":         dst_node,
             "camera_id":   camera_id,
@@ -940,7 +946,10 @@ class OffloadReceiver:
             "plate_text":  plate_text,
             "confidence":  float(confidence),
             "inference_ok": bool(inference_ok),
-            "ts":          time.time(),
+            "timestamp":   now,
+            "ts":          now,
         }
+        if level is not None:
+            payload["level"] = int(level)
         pub.put(msgpack.packb(payload, use_bin_type=True))
         self._results_sent += 1

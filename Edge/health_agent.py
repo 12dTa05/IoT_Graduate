@@ -1353,6 +1353,7 @@ class HealthAgent:
                             "input_fps_per_camera":  input_fps if snapshot_valid else {},
                             "avg_fps":        avg_fps,
                             "active_cameras": active_cameras,
+                            "streaming_cameras": active_cameras,
                             "source_starved_cameras": sorted(starved_cams),
                             "camera_workload": camera_workload,
                             "camera_features": feature_stats if snapshot_valid else {},
