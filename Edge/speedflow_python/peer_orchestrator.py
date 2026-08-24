@@ -1571,6 +1571,12 @@ class PeerOrchestrator:
                     "[PeerOrch][Reclaim] Exceeded max reclaim attempts (5) for camera '%s'. Giving up.",
                     camera_id,
                 )
+                self._migrated_out.pop(camera_id, None)
+                self._reclaim_attempts.pop(camera_id, None)
+                self._reclaim_retry_count.pop(camera_id, None)
+                self._reclaim_retry_at.pop(camera_id, None)
+                self._reclaim_in_progress.discard(camera_id)
+                self._reclaim_pending_remove.pop(camera_id, None)
                 continue
 
             # Make-before-Break: send ADD to self FIRST (do not REMOVE holder until stream PLAYING).
@@ -4068,9 +4074,15 @@ class PeerOrchestrator:
                 )
                 return None
 
-            # For L1, pick foreign MIN workload first
+            # ponytail: foreign cameras MUST NOT be L1-migrated — they can only
+            # return to their original owner via the owner's reclaim path.
+            # Forwarding a foreign camera to a third node via RFO creates
+            # chain migration (B→A→C) that breaks owner reclaim.
             if foreign_l1:
-                return min(foreign_l1, key=lambda c: foreign_l1[c])
+                logger.info(
+                    "[PeerOrch] L1: skipping %d foreign camera(s) — only owner can reclaim.",
+                    len(foreign_l1),
+                )
 
             # If owned active <= 1, guard against offloading owned camera
             if len(owned_active) <= 1:

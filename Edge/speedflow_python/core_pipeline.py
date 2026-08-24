@@ -424,7 +424,7 @@ def _remove_fake_black_source(pipeline: Gst.Pipeline, streammux: Gst.Element, so
         el.set_state(Gst.State.NULL)
     if fake_conv:
         conv_pad = fake_conv.get_static_pad("src")
-        mux_pad = streammux.get_static_pad(f"sink_{source_id}")
+        mux_pad = conv_pad.get_peer() if conv_pad and conv_pad.is_linked() else None
         if conv_pad and mux_pad and conv_pad.is_linked():
             conv_pad.unlink(mux_pad)
         if mux_pad:
@@ -586,7 +586,9 @@ def dynamic_remove_stream(
             q_elem = pipeline.get_by_name(f"q_{camera_id}")
             conv_elem = pipeline.get_by_name(f"conv_{camera_id}")
             conv_pad = conv_src_pad or (conv_elem.get_static_pad("src") if conv_elem else None)
-            mux_sinkpad = streammux.get_static_pad(f"sink_{source_id}")
+            # sink_N is a request pad — get_static_pad returns None for it.
+            # Use the conv src pad's peer (the mux sink it's linked to).
+            mux_sinkpad = conv_pad.get_peer() if conv_pad and conv_pad.is_linked() else None
 
             # Transition source branch elements sequentially PLAYING -> PAUSED -> READY -> NULL
             branch_elements = [el for el in [source_elem, q_elem, conv_elem] if el is not None]
