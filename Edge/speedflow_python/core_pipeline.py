@@ -467,6 +467,40 @@ def dynamic_add_stream(
     # Remove fake black source if it was occupying this source_id slot
     _remove_fake_black_source(pipeline, streammux, cam_cfg.source_id)
 
+    # Cleanup stale source_bin from a previous failed ADD attempt.
+    # If the prior _send_ack timed out without calling dynamic_remove_stream,
+    # the old uridecodebin may still occupy sink_N (sinkpad.is_linked()==True),
+    # causing on_pad_added to skip linking → ready_event never fires → retry TIMEOUT.
+    # ponytail: tear down stale bin here so retry gets a clean pad.
+    stale_src = source_bins.get(cam_cfg.camera_id)
+    if stale_src is not None and stale_src.get_parent() is not None:
+        # Unlink the queue/conv chain from streammux sink pad
+        stale_conv = pipeline.get_by_name(f"conv_{cam_cfg.camera_id}")
+        if stale_conv is not None:
+            conv_src = stale_conv.get_static_pad("src")
+            if conv_src and conv_src.is_linked():
+                mux_sinkpad = conv_src.get_peer()
+                conv_src.unlink(mux_sinkpad)
+                if mux_sinkpad:
+                    streammux.release_request_pad(mux_sinkpad)
+            stale_conv.set_state(Gst.State.NULL)
+            pipeline.remove(stale_conv)
+        stale_q = pipeline.get_by_name(f"q_{cam_cfg.camera_id}")
+        if stale_q is not None:
+            stale_q.set_state(Gst.State.NULL)
+            pipeline.remove(stale_q)
+        stale_src.set_state(Gst.State.NULL)
+        pipeline.remove(stale_src)
+        source_bins.pop(cam_cfg.camera_id, None)
+        # Restore batch-size incremented by the prior failed ADD
+        _bs = streammux.get_property("batch-size")
+        if _bs > 1:
+            streammux.set_property("batch-size", _bs - 1)
+        logger.info(
+            "[Pipeline] Removed stale source_bin for '%s' (source_id=%d) before retry ADD.",
+            cam_cfg.camera_id, cam_cfg.source_id,
+        )
+
     # 1. Read current batch-size from the live streammux rather than trusting
     #    a caller-supplied value that may have been stale before GLib idle_add
     #    dispatched this callback.

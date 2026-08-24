@@ -1573,27 +1573,8 @@ class PeerOrchestrator:
                 )
                 continue
 
-            # Before sending ADD to self, check if holder still has camera in active_cameras.
-            # If yes, send preliminary REMOVE first and wait for next heartbeat.
-            if holder_alive and holder_peer is not None and camera_id in holder_peer.active_cameras:
-                if self._reclaim_pending_remove.get(camera_id) == holder_node:
-                    # Still waiting for holder to remove it in next heartbeat
-                    continue
-                # Send preliminary REMOVE to holder and track in _reclaim_pending_remove
-                rem_key = f"peers/control/{holder_node}"
-                rem_payload = msgpack.packb({"cmd": "REMOVE", "camera_id": camera_id}, use_bin_type=True)
-                try:
-                    if self._session:
-                        self._session.put(rem_key, rem_payload)
-                    elif self._pubs.get("control") is not None:
-                        self._pubs["control"].put(rem_payload)
-                except Exception as exc:
-                    logger.warning("[PeerOrch][Reclaim] Failed to send preliminary REMOVE to '%s': %s", holder_node, exc)
-                self._reclaim_pending_remove[camera_id] = holder_node
-                continue
-            else:
-                # Holder no longer has it in active_cameras (or holder was dropped)
-                self._reclaim_pending_remove.pop(camera_id, None)
+            # Make-before-Break: send ADD to self FIRST (do not REMOVE holder until stream PLAYING).
+            # _wait_and_remove_reclaim() will send REMOVE to holder only after local ADD is confirmed.
 
             # Send ADD to self (reclaim)
             cam_config = self._get_camera_config(camera_id)
@@ -1632,7 +1613,9 @@ class PeerOrchestrator:
             self._reclaim_completed_at[camera_id] = now
             with self._lock:
                 self._reclaim_retry_count[camera_id] = 0
-                self._reclaim_attempts[camera_id] = 0
+                # ponytail: do NOT reset _reclaim_attempts here — it accumulates across
+                # all retry cycles and is the give-up gate; resetting it here caused
+                # infinite reclaim loops (always appeared as attempt 1).
                 self._reclaim_pending_remove.pop(camera_id, None)
 
             # Suppress overload decisions for the settle window once reclaim
