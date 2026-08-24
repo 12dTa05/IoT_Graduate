@@ -459,6 +459,8 @@ class PeerOrchestrator:
         # Reclaim retry tracking: camera_id → timestamp when reclaim can be retried
         self._reclaim_retry_at: Dict[str, float] = {}
         self._reclaim_retry_count: Dict[str, int] = {}
+        self._reclaim_attempts: Dict[str, int] = {}
+        self._reclaim_pending_remove: Dict[str, str] = {}
         # Cameras currently undergoing reclaim Make-before-Break
         self._reclaim_in_progress: set = set()
 
@@ -518,6 +520,9 @@ class PeerOrchestrator:
 
         # Target peer for each camera's offload (camera_id → node_id or "")
         self._offload_targets: Dict[str, str] = {}
+
+        # Per-camera timestamp when offload (L2/L3) was started
+        self._offload_started_at: Dict[str, float] = {}
 
         # Step-7: migration-complete timestamps for Δτ computation
         # camera_id → unix timestamp when REMOVE was confirmed sent
@@ -638,7 +643,10 @@ class PeerOrchestrator:
             old = self._offload_table.get(camera_id, 0)
             self._offload_table[camera_id] = level
             self._offload_targets[camera_id] = target_node
-            self._offload_level_changed_at[camera_id] = time.time()
+            now = time.time()
+            self._offload_level_changed_at[camera_id] = now
+            if level > 0 and old == 0:
+                self._offload_started_at[camera_id] = now
         if old != level:
             logger.info(
                 "[PeerOrch] Offload level %d→%d for '%s' (target='%s')",
@@ -1150,6 +1158,9 @@ class PeerOrchestrator:
                 self._offload_table[camera_id] = 0
                 self._offload_targets[camera_id] = ""
                 self._offload_level_changed_at[camera_id] = time.time()
+                start_ts = self._offload_started_at.pop(camera_id, 0.0)
+                dur = f" (duration: {time.time() - start_ts:.1f}s)" if start_ts > 0 else ""
+                logger.info("[PeerOrch] L%d offload ENDED for '%s': peer_offline%s", old_level, camera_id, dur)
                 logger.warning(
                     "[PeerOrch] Offload target '%s' offline — clearing L%d for '%s'",
                     node_id, old_level, camera_id,
@@ -1517,6 +1528,8 @@ class PeerOrchestrator:
                         self._reclaim_in_progress.discard(camera_id)
                         self._reclaim_retry_at.pop(camera_id, None)
                         self._reclaim_retry_count.pop(camera_id, None)
+                        self._reclaim_attempts.pop(camera_id, None)
+                        self._reclaim_pending_remove.pop(camera_id, None)
                     continue
 
                 # Inspect latest fresh peer heartbeats for another alive peer reporting camera_id
@@ -1532,6 +1545,8 @@ class PeerOrchestrator:
                         self._reclaim_in_progress.discard(camera_id)
                         self._reclaim_retry_at.pop(camera_id, None)
                         self._reclaim_retry_count.pop(camera_id, None)
+                        self._reclaim_attempts.pop(camera_id, None)
+                        self._reclaim_pending_remove.pop(camera_id, None)
 
                 if other_holder is not None:
                     logger.info(
@@ -1547,6 +1562,38 @@ class PeerOrchestrator:
             else:
                 # Holder offline or unknown — let dead-peer recovery / offline check handle it, but do not drop tracking
                 continue
+
+            # Increment _reclaim_attempts[camera_id], give up after > 5 attempts
+            attempts = self._reclaim_attempts.get(camera_id, 0) + 1
+            self._reclaim_attempts[camera_id] = attempts
+            if attempts > 5:
+                logger.error(
+                    "[PeerOrch][Reclaim] Exceeded max reclaim attempts (5) for camera '%s'. Giving up.",
+                    camera_id,
+                )
+                continue
+
+            # Before sending ADD to self, check if holder still has camera in active_cameras.
+            # If yes, send preliminary REMOVE first and wait for next heartbeat.
+            if holder_alive and holder_peer is not None and camera_id in holder_peer.active_cameras:
+                if self._reclaim_pending_remove.get(camera_id) == holder_node:
+                    # Still waiting for holder to remove it in next heartbeat
+                    continue
+                # Send preliminary REMOVE to holder and track in _reclaim_pending_remove
+                rem_key = f"peers/control/{holder_node}"
+                rem_payload = msgpack.packb({"cmd": "REMOVE", "camera_id": camera_id}, use_bin_type=True)
+                try:
+                    if self._session:
+                        self._session.put(rem_key, rem_payload)
+                    elif self._pubs.get("control") is not None:
+                        self._pubs["control"].put(rem_payload)
+                except Exception as exc:
+                    logger.warning("[PeerOrch][Reclaim] Failed to send preliminary REMOVE to '%s': %s", holder_node, exc)
+                self._reclaim_pending_remove[camera_id] = holder_node
+                continue
+            else:
+                # Holder no longer has it in active_cameras (or holder was dropped)
+                self._reclaim_pending_remove.pop(camera_id, None)
 
             # Send ADD to self (reclaim)
             cam_config = self._get_camera_config(camera_id)
@@ -1585,6 +1632,8 @@ class PeerOrchestrator:
             self._reclaim_completed_at[camera_id] = now
             with self._lock:
                 self._reclaim_retry_count[camera_id] = 0
+                self._reclaim_attempts[camera_id] = 0
+                self._reclaim_pending_remove.pop(camera_id, None)
 
             # Suppress overload decisions for the settle window once reclaim
             # ADD is initiated: incoming stream warm-up FPS can look like a
@@ -1784,7 +1833,10 @@ class PeerOrchestrator:
             for cam_id in list(state.active_cameras):
                 cl = self.get_offload_level(cam_id)
                 if cl in (2, 3):
+                    start_ts = self._offload_started_at.pop(cam_id, 0.0)
+                    dur = f" (duration: {now - start_ts:.1f}s)" if start_ts > 0 else ""
                     self.set_offload_level(cam_id, 0)
+                    logger.info("[PeerOrch] L%d offload ENDED for '%s': load_normalized%s", cl, cam_id, dur)
             return
 
         raw_intended_level = intended_level
@@ -1861,7 +1913,7 @@ class PeerOrchestrator:
                     intended_level = _clamp_intended_level(current_level, raw_intended_level, global_offload)
 
         # Runtime diagnostic log immediately before overload action
-        logger.info(
+        logger.debug(
             "[PeerOrch] Overload decision check: load=%.1f (thr1=%.1f, thr2=%.1f, thr3=%.1f), "
             "risk_index=%.2f, fps_valid=%s, active_cameras=%d, camera='%s', current_level=%d, target_level=%d, fuse=%s",
             load, thr1, thr2, thr3, state.risk_index, _has_valid_positive_fps(state.fps_per_camera),
@@ -1952,8 +2004,12 @@ class PeerOrchestrator:
                 return
             # Actually going to trigger L1 — clear fine-grained offload first
             if self.get_offload_level(cam_to_offload) in (2, 3):
+                cl = self.get_offload_level(cam_to_offload)
+                start_ts = self._offload_started_at.pop(cam_to_offload, 0.0)
+                dur = f" (duration: {now - start_ts:.1f}s)" if start_ts > 0 else ""
                 self.set_offload_level(cam_to_offload, 0)
-            logger.warning(
+                logger.info("[PeerOrch] L%d offload ENDED for '%s': escalated_to_l1%s", cl, cam_to_offload, dur)
+            logger.info(
                 "[PeerOrch] Load=%.1f ≥ L1 threshold=%.1f. Escalating to "
                 "Level 1 stream migration for '%s'.",
                 load, thr1, cam_to_offload,
@@ -1961,7 +2017,7 @@ class PeerOrchestrator:
             trigger = "fps_drop" if (state.avg_fps and
                                      state.avg_fps < cfg.get("eps_fps_strict", 18.0)
                                      ) else "load_score"
-            logger.warning("[PeerOrch] RFO trigger: %s reason=%s", cam_to_offload, trigger)
+            logger.info("[PeerOrch] RFO trigger: %s reason=%s", cam_to_offload, trigger)
             self._trigger_rfo(cam_to_offload, relaxation_tier=0)
 
         elif intended_level == 2:
@@ -1990,7 +2046,7 @@ class PeerOrchestrator:
                     )
                 return
             if current_level != 2:
-                logger.warning(
+                logger.info(
                     "[PeerOrch] Load=%.1f ≥ L2 threshold=%.1f. "
                     "Level 2 vehicle-crop offload for '%s' → '%s'.",
                     load, thr2, cam_to_offload, best_peer,
@@ -2008,7 +2064,7 @@ class PeerOrchestrator:
                     )
                 return
             if current_level != 3:
-                logger.warning(
+                logger.info(
                     "[PeerOrch] Load=%.1f ≥ L3 threshold=%.1f. "
                     "Level 3 plate-crop offload for '%s' → '%s'.",
                     load, thr3, cam_to_offload, best_peer,
@@ -2044,7 +2100,7 @@ class PeerOrchestrator:
             if (state.avg_fps and state.avg_fps < cfg.get("eps_fps_strict", 18.0))
             else "load_score"
         )
-        logger.warning(
+        logger.info(
             "[PeerOrch] OVERLOADED (%.1f%%, FPS=%s). Triggering RFO for '%s' (reason: %s)",
             state.load_score, state.avg_fps, cam_to_offload, trigger_reason,
         )
@@ -2096,6 +2152,8 @@ class PeerOrchestrator:
                 if nid == self._node_id:
                     continue
                 if now - peer.last_seen > timeout:
+                    continue
+                if peer.load_score >= 60.0:
                     continue
                 if self._peer_consecutive_timeouts.get(nid, 0) >= zombie_timeout_count:
                     continue
@@ -2220,7 +2278,7 @@ class PeerOrchestrator:
 
         if not proposals:
             if relaxation_tier < 2:
-                logger.warning(
+                logger.info(
                     "[PeerOrch] Zero bids for '%s' (tier=%d). Relaxing ε...",
                     camera_id, relaxation_tier,
                 )
@@ -2580,17 +2638,17 @@ class PeerOrchestrator:
                         or camera_id in self._rescued_cameras
                         or camera_id in self._migrated_out
                         or camera_id in self._reclaim_in_progress):
-                    logger.warning("[PeerOrch] Decision ignored: camera '%s' is in-flight/uncommitted or held.", camera_id)
+                    logger.info("[PeerOrch] Decision ignored: camera '%s' is in-flight/uncommitted or held.", camera_id)
                     return
 
                 # Reject/abort if an alive peer already reports this camera active
                 for pid, p in self._peers.items():
                     if pid != from_node and (now - p.last_seen <= heartbeat_timeout) and (camera_id in p.active_cameras):
-                        logger.warning("[PeerOrch] Decision ignored: camera '%s' is already active on alive peer '%s'.", camera_id, pid)
+                        logger.info("[PeerOrch] Decision ignored: camera '%s' is already active on alive peer '%s'.", camera_id, pid)
                         return
             with self._self_lock:
                 if camera_id in self._self_state.active_cameras:
-                    logger.warning("[PeerOrch] Decision ignored: camera '%s' is already active locally.", camera_id)
+                    logger.info("[PeerOrch] Decision ignored: camera '%s' is already active locally.", camera_id)
                     return
 
             # --- I WON: ADD camera to pipeline ---
@@ -2933,6 +2991,8 @@ class PeerOrchestrator:
                 self._reclaim_in_progress.discard(camera_id)
                 self._reclaim_retry_at.pop(camera_id, None)
                 self._reclaim_retry_count.pop(camera_id, None)
+                self._reclaim_attempts.pop(camera_id, None)
+                self._reclaim_pending_remove.pop(camera_id, None)
             logger.info(
                 "[PeerOrch] Reclaim: stream PLAYING on self — skipped REMOVE to '%s' (holder dead/offline). Reclaim complete.",
                 holder_node,
@@ -2957,6 +3017,8 @@ class PeerOrchestrator:
                 self._reclaim_in_progress.discard(camera_id)
                 self._reclaim_retry_at.pop(camera_id, None)
                 self._reclaim_retry_count.pop(camera_id, None)
+                self._reclaim_attempts.pop(camera_id, None)
+                self._reclaim_pending_remove.pop(camera_id, None)
             logger.info(
                 "[PeerOrch] Reclaim: holder '%s' no longer owns '%s'; skipped REMOVE.",
                 holder_node, camera_id,
@@ -3209,7 +3271,7 @@ class PeerOrchestrator:
                         continue
 
                     if not self._l1_remove_ownership_guard(cam):
-                        logger.warning(
+                        logger.info(
                             "[Failover] Aborted yield of '%s' on startup claim from '%s': last owned camera guard.",
                             cam, claimer_node_id,
                         )
@@ -3235,7 +3297,7 @@ class PeerOrchestrator:
                 # Validate static ownership
                 claimer_owned = self._get_node_owned_cameras(claimer_node_id)
                 if claimer_owned is not None and camera_id not in claimer_owned:
-                    logger.warning(
+                    logger.info(
                         "[Failover] Rejected claim from '%s' for '%s': not statically owned by claimer.",
                         claimer_node_id, camera_id,
                     )
@@ -3436,13 +3498,13 @@ class PeerOrchestrator:
             before_ex = len(orphaned_cameras)
             orphaned_cameras = [c for c in orphaned_cameras if c not in excluded_cams]
             if len(orphaned_cameras) < before_ex:
-                logger.warning(
+                logger.info(
                     "[Failover] Excluded %d cameras belonging to self or alive peers from '%s' rescue.",
                     before_ex - len(orphaned_cameras), dead_node_id,
                 )
 
         if not orphaned_cameras:
-            logger.warning(
+            logger.info(
                 "[Failover] No valid owned orphans from '%s' to rescue. Skipping.",
                 dead_node_id,
             )
@@ -3590,7 +3652,7 @@ class PeerOrchestrator:
                 with self._lock:
                     dead_peer_state = self._peers.get(dead_node_id)
                     if dead_peer_state is not None and (now_check - dead_peer_state.last_seen) <= offline_threshold:
-                        logger.warning(
+                        logger.info(
                             "[Failover] Aborted rescue ADD of '%s': dead holder '%s' is no longer stale (last_seen %.1fs ago <= %.1fs threshold).",
                             camera_id, dead_node_id, now_check - dead_peer_state.last_seen, offline_threshold,
                         )
@@ -3601,7 +3663,7 @@ class PeerOrchestrator:
                 cam_uri = cam_config.get("uri", "")
                 rtt = self._measure_rtt(cam_uri)
                 if rtt is None:
-                    logger.warning(
+                    logger.info(
                         "[Failover] Camera '%s' source unreachable (%s). Skipping.",
                         camera_id, cam_uri,
                     )
@@ -3675,7 +3737,7 @@ class PeerOrchestrator:
         if sid is not None:
             cmd["source_id"] = sid
         else:
-            logger.warning(
+            logger.info(
                 "[PeerOrch] REMOVE for '%s' (%s) emitted without source_id: could not resolve active source_id.",
                 camera_id, context or "unknown",
             )
@@ -4002,45 +4064,49 @@ class PeerOrchestrator:
         if not eligible:
             return None
 
+        # Split eligible cameras into foreign (not in cameras.yml) and owned
+        owned_cam_ids = self._get_owned_camera_ids()
+        foreign_eligible = {c: w for c, w in eligible.items() if c not in owned_cam_ids}
+        owned_eligible = {c: w for c, w in eligible.items() if c in owned_cam_ids}
+
         if level == 1:
             # Bounce dampening: filter out bounced cameras from L1 candidates
-            eligible_l1 = {c: w for c, w in eligible.items() if c not in bounced_cameras}
-            if not eligible_l1:
-                return None
+            foreign_l1 = {c: w for c, w in foreign_eligible.items() if c not in bounced_cameras}
+            owned_l1 = {c: w for c, w in owned_eligible.items() if c not in bounced_cameras}
 
             # L1 ownership guard: never migrate away the last owned camera.
             # Explicit L1 guard: never select an L1 candidate when <=1 locally-owned active camera.
-            owned_active = self._get_owned_camera_ids() & set(state.active_cameras)
+            owned_active = owned_cam_ids & set(state.active_cameras)
             if len(owned_active) == 0:
-                logger.warning(
+                logger.info(
                     "[PeerOrch] L1 fail-safe: no locally-owned camera is active "
                     "(active=%d). Skipping migration to preserve ownership.",
                     len(state.active_cameras),
                 )
                 return None
-            elif len(owned_active) == 1:
-                # If <= 1 owned camera is active (exactly 1 here), we can NEVER pick that owned camera.
-                # We may only pick a foreign candidate if one exists and preserves >= 1 owned camera.
-                # Filter out all owned cameras from eligible_l1.
-                eligible_l1 = {c: w for c, w in eligible_l1.items() if c not in owned_active}
-                if not eligible_l1:
-                    logger.warning(
-                        "[PeerOrch] L1 guard: <= 1 locally-owned camera active (owned_active=%d, active=%d) and no foreign candidates. Skipping L1 migration.",
-                        len(owned_active), len(state.active_cameras),
-                    )
-                    return None
 
-            # Walk candidates lightest-first; skip any whose migration would
-            # leave zero owned cameras active. The first one that preserves
-            # ≥1 owned camera wins.
-            for c in sorted(eligible_l1, key=lambda cam: eligible_l1[cam]):
-                if c not in owned_active or (owned_active - {c}):
-                    return c
-            # Every eligible candidate would zero out owned cameras — fail safe.
-            logger.warning(
+            # For L1, pick foreign MIN workload first
+            if foreign_l1:
+                return min(foreign_l1, key=lambda c: foreign_l1[c])
+
+            # If owned active <= 1, guard against offloading owned camera
+            if len(owned_active) <= 1:
+                logger.info(
+                    "[PeerOrch] L1 guard: <= 1 locally-owned camera active (owned_active=%d, active=%d) and no foreign candidates. Skipping L1 migration.",
+                    len(owned_active), len(state.active_cameras),
+                )
+                return None
+
+            # Then owned MIN workload (guard <=1 owned)
+            if owned_l1:
+                for c in sorted(owned_l1, key=lambda cam: owned_l1[cam]):
+                    if (owned_active - {c}):
+                        return c
+
+            logger.info(
                 "[PeerOrch] L1 fail-safe: every eligible candidate would leave "
-                "zero owned cameras active (eligible=%d, owned_active=%d).",
-                len(eligible_l1), len(owned_active),
+                "zero owned cameras active (owned_active=%d).",
+                len(owned_active),
             )
             return None
 

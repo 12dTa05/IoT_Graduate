@@ -413,6 +413,49 @@ def build_pipeline(
 # Dynamic stream add/remove helpers (Phase 3)
 # ---------------------------------------------------------------------------
 
+def _remove_fake_black_source(pipeline: Gst.Pipeline, streammux: Gst.Element, source_id: int) -> None:
+    """Remove videotestsrc pattern=2 black placeholder for source_id if present."""
+    fake_src = pipeline.get_by_name(f"fake_src_{source_id}")
+    if not fake_src:
+        return
+    fake_conv = pipeline.get_by_name(f"fake_conv_{source_id}")
+    fake_elements = [el for el in [fake_src, fake_conv] if el is not None]
+    for el in fake_elements:
+        el.set_state(Gst.State.NULL)
+    if fake_conv:
+        conv_pad = fake_conv.get_static_pad("src")
+        mux_pad = streammux.get_static_pad(f"sink_{source_id}")
+        if conv_pad and mux_pad and conv_pad.is_linked():
+            conv_pad.unlink(mux_pad)
+        if mux_pad:
+            streammux.release_request_pad(mux_pad)
+    for el in fake_elements:
+        pipeline.remove(el)
+    logger.info("[Pipeline] Removed fake black source for slot source_id=%d", source_id)
+
+
+def _add_fake_black_source(pipeline: Gst.Pipeline, streammux: Gst.Element, source_id: int) -> None:
+    """Add videotestsrc pattern=2 (black) to keep tiler slot black."""
+    try:
+        sinkpad = streammux.get_request_pad(f"sink_{source_id}")
+        if not sinkpad:
+            return
+        fake_src = make_element(f"fake_src_{source_id}", "videotestsrc")
+        fake_src.set_property("pattern", 2)  # 2 = black
+        fake_conv = make_element(f"fake_conv_{source_id}", "nvvideoconvert")
+        pipeline.add(fake_src)
+        pipeline.add(fake_conv)
+        gst_link(fake_src, fake_conv)
+        conv_pad = fake_conv.get_static_pad("src")
+        if conv_pad and sinkpad:
+            conv_pad.link(sinkpad)
+        fake_src.sync_state_with_parent()
+        fake_conv.sync_state_with_parent()
+        logger.info("[Pipeline] Added fake black source for freed slot source_id=%d", source_id)
+    except Exception as exc:
+        logger.warning("[Pipeline] Could not add fake black source for slot source_id=%d: %s", source_id, exc)
+
+
 def dynamic_add_stream(
     pipeline: Gst.Pipeline,
     streammux: Gst.Element,
@@ -421,6 +464,9 @@ def dynamic_add_stream(
     source_bins: dict,
     ready_event: Optional[threading.Event] = None,
 ) -> Gst.Element:
+    # Remove fake black source if it was occupying this source_id slot
+    _remove_fake_black_source(pipeline, streammux, cam_cfg.source_id)
+
     # 1. Read current batch-size from the live streammux rather than trusting
     #    a caller-supplied value that may have been stale before GLib idle_add
     #    dispatched this callback.
@@ -552,6 +598,10 @@ def dynamic_remove_stream(
             old_n = streammux.get_property("batch-size")
             new_n = max(1, old_n - 1)
             streammux.set_property("batch-size", new_n)
+
+            # Display fix: add fake black source to keep slot black in tiler if tiler is present
+            if tiler is not None:
+                _add_fake_black_source(pipeline, streammux, source_id)
 
             logger.info(f"[Pipeline] Cleaned up resources for camera {camera_id}")
         except Exception as exc:

@@ -644,6 +644,28 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
 
 def run_python_mode(args) -> None:
     """Entry point called by main.py for the Python backend."""
+    # Dual logging handler: terminal WARNING+ only, file /tmp/edge_debug.log DEBUG+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    # Clear existing root handlers to avoid duplicate logs
+    for h in list(root_logger.handlers):
+        root_logger.removeHandler(h)
+
+    formatter = logging.Formatter("[%(asctime)s] %(levelname)s %(name)s — %(message)s", datefmt="%H:%M:%S")
+
+    term_handler = logging.StreamHandler(sys.stderr)
+    term_handler.setLevel(logging.WARNING)
+    term_handler.setFormatter(formatter)
+    root_logger.addHandler(term_handler)
+
+    try:
+        file_handler = logging.FileHandler("/tmp/edge_debug.log", mode="a", encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+    except Exception as exc:
+        print(f"[Logging] Failed to attach /tmp/edge_debug.log handler: {exc}", file=sys.stderr)
+
     camera_manager = CameraManager(CAMERAS_YML)
 
     # --- P2P config (edge_node.yml) ---
