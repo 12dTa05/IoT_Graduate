@@ -20,7 +20,7 @@ from typing import Optional
 
 import gi
 gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GLib
+from gi.repository import Gst
 
 from .common import make_element, gst_link
 from .settings import (
@@ -557,119 +557,68 @@ def dynamic_remove_stream(
             done_event.set()
         return
 
-    # Jetson removal risk (known limitation):
-    # The BLOCK_DOWNSTREAM + idle_add pattern is the documented GStreamer-safe
-    # way to remove a src pad from a running nvstreammux.  However, DeepStream
-    # 6.x on Jetson may still log harmless pad-spurious warnings or, in rare
-    # cases, trigger a short-lived mux hiccup on the remaining streams because
-    # nvstreammux doesn't entirely isolate per-sink-pad internal state.  No
-    # async retry or pad-blocking refinements are added here — those belong
-    # to a separate runtime/native/probes change by other writers.
+    logger.info(
+        "[Pipeline] Removing stream '%s' (source_id=%d) synchronously",
+        camera_id,
+        source_id,
+    )
 
-    conv = pipeline.get_by_name(f"conv_{camera_id}")
-    conv_src_pad = conv.get_static_pad("src") if conv else None
-    cleanup_lock = threading.Lock()
-    cleanup_scheduled = False
-    cleanup_started = False
+    # Synchronous teardown on the GLib main thread: avoids BLOCK_DOWNSTREAM pad
+    # probe deadlocks when RTSP streams are stalled and buffers stop flowing.
+    try:
+        # Capture elements and pads before state changes / unlink
+        source_elem = src
+        q_elem = pipeline.get_by_name(f"q_{camera_id}")
+        conv_elem = pipeline.get_by_name(f"conv_{camera_id}")
+        conv_pad = conv_elem.get_static_pad("src") if conv_elem else None
+        # sink_N is a request pad — get_static_pad returns None for it.
+        # Use the conv src pad's peer (the mux sink it's linked to).
+        mux_sinkpad = conv_pad.get_peer() if conv_pad and conv_pad.is_linked() else None
 
-    def _cleanup_bin(pad, probe_id):
-        nonlocal cleanup_started
-        with cleanup_lock:
-            if cleanup_started:
-                return False
-            cleanup_started = True
-
-        probe_removed = False
-        try:
-            # Capture elements and pads before state changes / unlink
-            source_elem = src
-            q_elem = pipeline.get_by_name(f"q_{camera_id}")
-            conv_elem = pipeline.get_by_name(f"conv_{camera_id}")
-            conv_pad = conv_src_pad or (conv_elem.get_static_pad("src") if conv_elem else None)
-            # sink_N is a request pad — get_static_pad returns None for it.
-            # Use the conv src pad's peer (the mux sink it's linked to).
-            mux_sinkpad = conv_pad.get_peer() if conv_pad and conv_pad.is_linked() else None
-
-            # Transition source branch elements sequentially PLAYING -> PAUSED -> READY -> NULL
-            branch_elements = [el for el in [source_elem, q_elem, conv_elem] if el is not None]
-            for target_state in (Gst.State.PAUSED, Gst.State.READY, Gst.State.NULL):
-                for el in branch_elements:
-                    el.set_state(target_state)
-                for el in branch_elements:
-                    state_ret, current_state, _ = el.get_state(5 * Gst.SECOND)
-                    if state_ret == Gst.StateChangeReturn.FAILURE:
-                        raise RuntimeError(
-                            f"Element {el.get_name()} failed to reach "
-                            f"{target_state.value_nick}: state={current_state.value_nick}"
-                        )
-
-            # Unlink conv src from mux sink
-            if conv_pad and mux_sinkpad and conv_pad.is_linked():
-                conv_pad.unlink(mux_sinkpad)
-
-            # Release mux request pad only after source is safely in NULL state
-            if mux_sinkpad:
-                streammux.release_request_pad(mux_sinkpad)
-
-            # Remove blocking probe
-            if pad and probe_id:
-                try:
-                    pad.remove_probe(probe_id)
-                    probe_removed = True
-                except Exception:
-                    pass
-
-            # Remove elements from pipeline
+        # Transition source branch elements sequentially PLAYING -> PAUSED -> READY -> NULL
+        branch_elements = [el for el in [source_elem, q_elem, conv_elem] if el is not None]
+        for target_state in (Gst.State.PAUSED, Gst.State.READY, Gst.State.NULL):
             for el in branch_elements:
-                pipeline.remove(el)
+                el.set_state(target_state)
+            for el in branch_elements:
+                state_ret, current_state, _ = el.get_state(5 * Gst.SECOND)
+                if state_ret == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError(
+                        f"Element {el.get_name()} failed to reach "
+                        f"{target_state.value_nick}: state={current_state.value_nick}"
+                    )
 
-            # Clean up recording branch
-            _remove_file_recording_branch(pipeline, source_id)
+        # Unlink conv src from mux sink
+        if conv_pad and mux_sinkpad and conv_pad.is_linked():
+            conv_pad.unlink(mux_sinkpad)
 
-            # Bookkeeping
-            if camera_id in source_bins:
-                del source_bins[camera_id]
+        # Release mux request pad only after source is safely in NULL state
+        if mux_sinkpad:
+            streammux.release_request_pad(mux_sinkpad)
 
-            # Decrease batch size
-            old_n = streammux.get_property("batch-size")
-            new_n = max(1, old_n - 1)
-            streammux.set_property("batch-size", new_n)
+        # Remove elements from pipeline
+        for el in branch_elements:
+            pipeline.remove(el)
 
-            # Display fix: add fake black source to keep slot black in tiler if tiler is present
-            if tiler is not None:
-                _add_fake_black_source(pipeline, streammux, source_id)
+        # Clean up recording branch
+        _remove_file_recording_branch(pipeline, source_id)
 
-            logger.info(f"[Pipeline] Cleaned up resources for camera {camera_id}")
-        except Exception as exc:
-            logger.error(f"[Pipeline] Error during cleanup of camera {camera_id}: {exc}")
-            return False
-        finally:
-            if pad and probe_id and not probe_removed:
-                try:
-                    pad.remove_probe(probe_id)
-                except Exception:
-                    pass
-            if done_event is not None:
-                done_event.set()
+        # Bookkeeping
+        if camera_id in source_bins:
+            del source_bins[camera_id]
 
-        return False
+        # Decrease batch size
+        old_n = streammux.get_property("batch-size")
+        new_n = max(1, old_n - 1)
+        streammux.set_property("batch-size", new_n)
 
-    def _blocking_probe(pad, info, _user_data):
-        nonlocal cleanup_scheduled
-        with cleanup_lock:
-            if cleanup_scheduled:
-                return Gst.PadProbeReturn.OK
-            cleanup_scheduled = True
+        # Display fix: add fake black source to keep slot black in tiler if tiler is present
+        if tiler is not None:
+            _add_fake_black_source(pipeline, streammux, source_id)
 
-        # Keep probe active to maintain blocking state, schedule cleanup on GLib idle.
-        GLib.idle_add(_cleanup_bin, pad, info.id)
-        # Keep the pad blocked until cleanup removes this probe.
-        return Gst.PadProbeReturn.OK
-
-    if conv_src_pad:
-        conv_src_pad.add_probe(
-            Gst.PadProbeType.BLOCK_DOWNSTREAM, _blocking_probe, None
-        )
-    else:
-        # If no pad exists, clean up immediately
-        GLib.idle_add(_cleanup_bin, None, None)
+        logger.info(f"[Pipeline] Cleaned up resources for camera {camera_id}")
+    except Exception as exc:
+        logger.error(f"[Pipeline] Error during cleanup of camera {camera_id}: {exc}")
+    finally:
+        if done_event is not None:
+            done_event.set()

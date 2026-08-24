@@ -1948,6 +1948,25 @@ class PeerOrchestrator:
         l2_dwell = _dwell_s(cfg, "l2_dwell_s", 7.0)
 
         if intended_level == 1:
+            # Ownership guard: only cameras this node owns (cameras.yml) may be
+            # migrated away. Escalation ladders lock onto the L2/L3-picked camera,
+            # which can be foreign — swap to an owned camera for the actual migration.
+            owned_cam_ids = self._get_owned_camera_ids()
+            if cam_to_offload not in owned_cam_ids:
+                new_cam = self._pick_camera_to_offload(state, level=1)
+                if not new_cam:
+                    logger.info(
+                        "[PeerOrch] L1 escalation blocked: '%s' is foreign and no owned camera is eligible — retaining Level %d offload",
+                        cam_to_offload, current_level,
+                    )
+                    return
+                logger.info(
+                    "[PeerOrch] L1 target swapped: foreign '%s' retained (crop offload continues); migrating owned '%s' instead",
+                    cam_to_offload, new_cam,
+                )
+                cam_to_offload = new_cam
+                current_level = self.get_offload_level(cam_to_offload)
+
             # Full stream migration (Level 1) — existing RFO path.
             # Dwell gate: if this camera currently has L2 active, require L2
             # to have been active for l2_dwell seconds before escalating to L1.
@@ -2953,9 +2972,9 @@ class PeerOrchestrator:
             else:
                 logger.error(
                     "[PeerOrch] Reclaim: TIMEOUT (%ds) waiting for local ADD ack of '%s' from holder '%s' "
-                    "(active=%d, retry=%d/%d) — scheduling retry in %.1fs",
+                    "(active=%d, attempt=%d/5) — scheduling retry in %.1fs",
                     int(timeout), camera_id, holder_node,
-                    len(self._self_state.active_cameras), current_retries, max_retries, backoff_s,
+                    len(self._self_state.active_cameras), self._reclaim_attempts.get(camera_id, 0), backoff_s,
                 )
             return
 
