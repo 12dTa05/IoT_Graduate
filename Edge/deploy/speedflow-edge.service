@@ -1,0 +1,21 @@
+# speedflow-edge.service — keep the edge stack alive across SSH disconnects
+# and host reboots. Deploy per node:
+#   sudo cp Edge/deploy/speedflow-edge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now speedflow-edge
+# Edit User= and WorkingDirectory= to match the node's checkout path.
+[Unit]
+Description=SpeedFlow Edge pipeline (run_edge.sh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mta
+WorkingDirectory=/home/mta/IoT_Graduate/Edge
+ExecStart=/bin/bash run_edge.sh
+Restart=always
+RestartSec=10
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

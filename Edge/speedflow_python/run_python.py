@@ -644,7 +644,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
 
 def run_python_mode(args) -> None:
     """Entry point called by main.py for the Python backend."""
-    # Dual logging handler: terminal WARNING+ only, file /tmp/edge_debug.log DEBUG+
+    # Dual logging handler: terminal INFO+, file /tmp/edge_debug.log DEBUG+
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
     # Clear existing root handlers to avoid duplicate logs
@@ -654,7 +654,7 @@ def run_python_mode(args) -> None:
     formatter = logging.Formatter("[%(asctime)s] %(levelname)s %(name)s — %(message)s", datefmt="%H:%M:%S")
 
     term_handler = logging.StreamHandler(sys.stderr)
-    term_handler.setLevel(logging.WARNING)
+    term_handler.setLevel(logging.INFO)
     term_handler.setFormatter(formatter)
     root_logger.addHandler(term_handler)
 

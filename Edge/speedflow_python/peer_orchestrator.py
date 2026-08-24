@@ -1121,8 +1121,14 @@ class PeerOrchestrator:
                             seen_candidates.add(c)
 
                 if candidate_orphans:
+                    # Time-based re-arm: a failed attempt (e.g. RTSP sources
+                    # unreachable while the dead host is down) must retry once
+                    # sources come back, instead of latching until the peer's
+                    # heartbeat revives.
+                    retry_interval_s = float(self._cfg.get("failover_retry_interval_s", 30.0))
                     with self._lock:
-                        should_trigger = node_id not in self._failover_triggered
+                        last_attempt = self._failover_triggered.get(node_id, 0.0)
+                        should_trigger = (now - last_attempt) >= retry_interval_s
                         if should_trigger:
                             self._failover_triggered[node_id] = now
                     if should_trigger:
@@ -1290,32 +1296,10 @@ class PeerOrchestrator:
             owned_ids = set()
         owned_active_snapshot = owned_ids & self_active_snapshot
 
-        # Release rescues whose owner remains dead beyond the bounded hold
-        # window.  This check must run before the owned-camera guard: a node
-        # with healthy local streams can still be overloaded by a stale rescue.
-        rescue_hold_s = float(self._cfg.get("failover_rescue_hold_s", 60.0))
-        expired_rescues = []
-        with self._lock:
-            for cam_id, orig_owner in list(self._rescued_cameras.items()):
-                rescued_t = self._rescued_at.get(cam_id, now)
-                peer = self._peers.get(orig_owner)
-                is_dead = peer is None or (now - peer.last_seen > timeout)
-                if is_dead and (now - rescued_t) >= rescue_hold_s:
-                    expired_rescues.append((cam_id, orig_owner))
-
-        for cam_id, orig_owner in expired_rescues:
-            with self._lock:
-                self._rescued_cameras.pop(cam_id, None)
-                self._rescued_at.pop(cam_id, None)
-            remove_cmd = self._build_remove_cmd(cam_id, context="rescue_hold_timeout")
-            pub = self._pubs.get("control")
-            if pub:
-                pub.put(msgpack.packb(remove_cmd, use_bin_type=True))
-            logger.warning(
-                "[PeerOrch][Rebalance] Rescue hold timeout (%.1fs) expired for camera '%s' "
-                "(owner '%s' remains dead). Force-releasing camera.",
-                rescue_hold_s, cam_id, orig_owner,
-            )
+        # ponytail: no rescue-hold expiry DROP. Rescued cameras stay on the
+        # rescuer until the original owner revives and resumes them (normal
+        # return path below). The old force-REMOVE left the camera owned by
+        # nobody cluster-wide when the owner stayed dead.
 
         # Aggregate owned-camera guard: zero locally-owned active cameras
         # means the node cannot satisfy the L1 ownership invariant for
@@ -3674,6 +3658,26 @@ class PeerOrchestrator:
                     logger.info(
                         "[Failover] Camera '%s' source unreachable (%s). Skipping.",
                         camera_id, cam_uri,
+                    )
+                    continue
+
+                # Alive-peer ownership guard: another surviving node may have
+                # rescued this camera in an earlier round whose claim lease has
+                # since expired. Never ADD a camera an alive peer currently
+                # reports owning.
+                alive_owner = None
+                with self._lock:
+                    for other_id, other_state in self._peers.items():
+                        if other_id == dead_node_id:
+                            continue
+                        if ((time.time() - other_state.last_seen) <= timeout
+                                and camera_id in other_state.active_cameras):
+                            alive_owner = other_id
+                            break
+                if alive_owner is not None:
+                    logger.info(
+                        "[Failover] Camera '%s' already handled by alive peer '%s'. Skipping.",
+                        camera_id, alive_owner,
                     )
                     continue
 
