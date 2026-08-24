@@ -262,25 +262,11 @@ if [[ "$CALIBRATE" -eq 1 ]]; then
 fi
 
 # ===========================================================================
-# STEP 2: Start health_agent (WebSocket + Zenoh + metrics)
+# STEP 2: Start main.py pipeline (starts internal HealthAgent + PeerOrch)
 # ===========================================================================
 _STEP2_LABEL="STEP 2"
-[[ "$CALIBRATE" -eq 1 ]] && _STEP2_LABEL="STEP 2/6"
-echo ""
-echo "[run_edge] ── ${_STEP2_LABEL}: Starting health_agent.py ──"
-"$PYTHON" health_agent.py &
-_pids+=("$!")
-HEALTH_PID=${_pids[-1]}
-
-# Give health_agent time to connect to Zenoh and the monitoring server
-sleep 2
-
-# ===========================================================================
-# STEP 3: Start main.py pipeline
-# ===========================================================================
-_STEP3_LABEL="STEP 3"
-[[ "$CALIBRATE" -eq 1 ]] && _STEP3_LABEL="STEP 3/6"
-echo "[run_edge] ── ${_STEP3_LABEL}: Starting pipeline (mode=$MODE) ──"
+[[ "$CALIBRATE" -eq 1 ]] && _STEP2_LABEL="STEP 2/5"
+echo "[run_edge] ── ${_STEP2_LABEL}: Starting pipeline (mode=$MODE) ──"
 if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
     "$PYTHON" main.py --mode "$MODE" &
 else
@@ -288,17 +274,17 @@ else
 fi
 _pids+=("$!")
 PIPELINE_PID=${_pids[-1]}
-echo "[run_edge] health_agent PID=$HEALTH_PID  |  pipeline PID=$PIPELINE_PID"
+echo "[run_edge] pipeline PID=$PIPELINE_PID"
 
 # ===========================================================================
-# STEP 4 (--collect / --calibrate): Run profile_collect.py alongside pipeline
+# STEP 3 (--collect / --calibrate): Run profile_collect.py alongside pipeline
 # ===========================================================================
 COLLECT_PID=""
 if [[ "$COLLECT" -eq 1 ]]; then
-    _STEP4_LABEL="STEP 4"
-    [[ "$CALIBRATE" -eq 1 ]] && _STEP4_LABEL="STEP 4/6"
+    _STEP3_LABEL="STEP 3"
+    [[ "$CALIBRATE" -eq 1 ]] && _STEP3_LABEL="STEP 3/5"
     echo ""
-    echo "[run_edge] ── ${_STEP4_LABEL}: Waiting for pipeline FPS stats before collecting... ──"
+    echo "[run_edge] ── ${_STEP3_LABEL}: Waiting for pipeline FPS stats before collecting... ──"
 
     WAIT_S=0
     until [[ -f /dev/shm/speedflow_fps.json ]] || [[ $WAIT_S -ge 30 ]]; do
@@ -332,36 +318,12 @@ fi
 # ---------------------------------------------------------------------------
 # Watch loop — exits when collector finishes (collect/calibrate), or supervises indefinitely
 # ---------------------------------------------------------------------------
-MAX_HEALTH_RESTARTS=5
-HEALTH_RESTART_COUNT=0
-HEALTH_BACKOFF=3
-
 MAX_PIPELINE_RESTARTS=5
 PIPELINE_RESTART_COUNT=0
 PIPELINE_BACKOFF=3
 
 while true; do
     sleep 2
-
-    if ! kill -0 "$HEALTH_PID" 2>/dev/null; then
-        echo "[run_edge] WARNING: health_agent exited. Restart attempt $((HEALTH_RESTART_COUNT + 1))/$MAX_HEALTH_RESTARTS..." >&2
-        if [[ $HEALTH_RESTART_COUNT -ge $MAX_HEALTH_RESTARTS ]]; then
-            echo "[run_edge] Max health_agent restarts reached ($MAX_HEALTH_RESTARTS). Sleeping 60s before reset..." >&2
-            sleep 60
-            HEALTH_RESTART_COUNT=0
-            HEALTH_BACKOFF=3
-        else
-            sleep $HEALTH_BACKOFF
-            ((HEALTH_RESTART_COUNT++)) || true
-            HEALTH_BACKOFF=$((HEALTH_BACKOFF * 2))
-            [[ $HEALTH_BACKOFF -gt 30 ]] && HEALTH_BACKOFF=30
-        fi
-        "$PYTHON" health_agent.py &
-        HEALTH_PID=$!
-        _pids+=("$HEALTH_PID")
-        echo "[run_edge] health_agent restarted with PID=$HEALTH_PID (restart count: $HEALTH_RESTART_COUNT)"
-        continue
-    fi
 
     if ! kill -0 "$PIPELINE_PID" 2>/dev/null; then
         echo "[run_edge] WARNING: pipeline exited unexpectedly. Restart attempt $((PIPELINE_RESTART_COUNT + 1))/$MAX_PIPELINE_RESTARTS..." >&2
@@ -390,11 +352,9 @@ while true; do
 
     if [[ -n "$COLLECT_PID" ]] && ! kill -0 "$COLLECT_PID" 2>/dev/null; then
         echo "[run_edge] Collection complete → $COLLECT_OUTPUT"
-        echo "[run_edge] Stopping pipeline and health_agent..."
+        echo "[run_edge] Stopping pipeline..."
         kill "$PIPELINE_PID" 2>/dev/null || true
-        kill "$HEALTH_PID"   2>/dev/null || true
         wait "$PIPELINE_PID" 2>/dev/null || true
-        wait "$HEALTH_PID"   2>/dev/null || true
         # Remove from _pids so _cleanup doesn't double-kill
         _pids=()
         break

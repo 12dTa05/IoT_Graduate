@@ -20,6 +20,7 @@ p2p:
                                  # 2 s was too tight for slow RTSP sources across LAN)
   add_ack_timeout_s: 12.0      # max wait on receiver for ADD stream to reach PLAYING (must be < migration_timeout_s)
   heartbeat_timeout_s: 5.0      # peer declared OFFLINE after this silence
+  failover_grace_s: 10.0        # grace period between heartbeat timeout and offline declaration; allows Zenoh mesh reconvergence after container restart without triggering false-offline cascades
   failover_convergence_grace_s: 15.0 # suppress mutual false-offline cascade during failover convergence
   rescue_claim_window_s: 1.0    # claim window to collect peer rescue claims before ADD
   rescue_claim_lease_s: 15.0   # duration during which an active peer claim suppresses local ADD

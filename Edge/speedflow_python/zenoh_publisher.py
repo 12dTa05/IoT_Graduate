@@ -57,6 +57,9 @@ class ZenohPublisher:
         self._running = False
         self._sent_count = 0
         self._drop_count = 0
+        self._error_count = 0
+        self._last_send_time: Optional[float] = None
+        self._last_error_time: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -96,8 +99,8 @@ class ZenohPublisher:
                 self._session.close()
         self._publishers.clear()
         logger.info(
-            "[ZenohPub] Stopped. Sent=%d, Dropped=%d",
-            self._sent_count, self._drop_count,
+            "[ZenohPub] Stopped. Sent=%d, Dropped=%d, Errors=%d",
+            self._sent_count, self._drop_count, self._error_count,
         )
 
     def put(self, data: Dict[str, Any]) -> None:
@@ -130,6 +133,7 @@ class ZenohPublisher:
     def _publish_loop(self) -> None:
         """Consume queue and publish via Zenoh."""
         import zenoh
+        consecutive_errors = 0
         while self._running:
             try:
                 item = self._queue.get(timeout=2.0)
@@ -139,8 +143,17 @@ class ZenohPublisher:
                 break
             try:
                 self._send(item)
+                self._last_send_time = time.time()
+                consecutive_errors = 0
             except Exception as exc:
-                logger.warning("[ZenohPub] Send error: %s", exc)
+                self._error_count += 1
+                consecutive_errors += 1
+                self._last_error_time = time.time()
+                if consecutive_errors == 1 or consecutive_errors % 20 == 0:
+                    logger.warning(
+                        "[ZenohPub] Send error (consecutive=%d, total=%d): %s",
+                        consecutive_errors, self._error_count, exc,
+                    )
             # Zenoh peer mode has no "reconnect" — session stays valid
 
     def _send(self, data: Dict[str, Any]) -> None:

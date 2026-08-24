@@ -58,6 +58,9 @@ class ZenohCommandSubscriber:
         self._subscriber = None
         self._running = False
 
+        from concurrent.futures import ThreadPoolExecutor
+        self._ack_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ZenohC2-ACK")
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -98,6 +101,8 @@ class ZenohCommandSubscriber:
 
     def stop(self) -> None:
         """Unsubscribe and close Zenoh session."""
+        if hasattr(self, '_ack_pool'):
+            self._ack_pool.shutdown(wait=True, timeout=5)
         self._running = False
         if self._subscriber:
             self._subscriber.undeclare()
@@ -253,7 +258,7 @@ class ZenohCommandSubscriber:
                 except Exception as exc:
                     logger.warning("[Zenoh C2] Failed to send ack for '%s': %s", _cam_id, exc)
 
-            threading.Thread(target=_send_ack, daemon=True).start()
+            self._ack_pool.submit(_send_ack)
 
         except KeyError as exc:
             logger.error("[Zenoh C2] ADD command missing required field: %s", exc)
@@ -321,11 +326,11 @@ class ZenohCommandSubscriber:
                 source_id = cfg.source_id
                 cfg.enabled = False
                 self._camera_manager._rebuild_lookup()
-                if hasattr(self._camera_manager, "cleanup_stream_ready"):
-                    self._camera_manager.cleanup_stream_ready(source_id)
 
             delta = StreamDelta(to_remove=[source_id])
             self._camera_manager._delta_q.put(delta)
+            if hasattr(self._camera_manager, "cleanup_stream_ready"):
+                self._camera_manager.cleanup_stream_ready(source_id)
 
             logger.info(
                 "[Zenoh C2] REMOVE queued: camera_id='%s', source_id=%d", cam_id, source_id

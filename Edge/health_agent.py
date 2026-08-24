@@ -902,11 +902,13 @@ class HealthAgent:
     WebSocket to push health payloads to the Central Monitor Server.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, external_session=None) -> None:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._session = None
         self._pub = None
+        self._external_session = external_session
+        self._ready_event = threading.Event()
         self._jtop = None          # persistent jtop session
         self._monitor_client = None  # own WS client when run standalone
         # One-shot warmup_ms set by run_python.py after pipeline PLAYING
@@ -920,6 +922,12 @@ class HealthAgent:
         # EMA state for workload-primary + FPS-confirmation policy
         self._workload_ema: Optional[float] = None
         self._fps_ema: Optional[float] = None
+        # Heartbeat telemetry / watchdog metrics
+        self._heartbeat_sent_count = 0
+        self._heartbeat_error_count = 0
+        self._heartbeat_consecutive_errors = 0
+        self._last_heartbeat_sent_time: Optional[float] = None
+        self._last_heartbeat_error_time: Optional[float] = None
 
     def _reload_cam_configs(self) -> Dict[str, dict]:
         """Read cameras.yml for peer failover metadata in health payloads."""
@@ -956,6 +964,11 @@ class HealthAgent:
             logger.warning("[HealthAgent] Failed to reload camera configs: %s", exc)
             return self._cam_configs_cache
 
+    def run(self) -> None:
+        """Run the health agent loop directly (blocking or thread target)."""
+        self._running = True
+        self._run()
+
     def start(self) -> None:
         """Start agent in daemon thread."""
         self._running = True
@@ -978,19 +991,39 @@ class HealthAgent:
             except Exception:
                 pass
             self._jtop = None
-        if self._session:
+        self._close_zenoh()
+
+    def _close_zenoh(self) -> None:
+        """Safely close and invalidate HealthAgent-owned Zenoh publisher and session."""
+        if self._pub is not None:
+            try:
+                self._pub.undeclare()
+            except Exception as exc:
+                logger.debug("[HealthAgent] _close_zenoh undeclare error: %s", exc)
+            self._pub = None
+        if self._session is not None and self._external_session is None:
             try:
                 self._session.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("[HealthAgent] _close_zenoh session.close() error: %s", exc)
+            self._session = None
+        elif self._session is not None:
+            self._session = None
 
-    def _connect_zenoh(self):
-        """Open Zenoh session and declare status publisher."""
+    def _connect_zenoh(self, external_session=None):
+        """Open Zenoh session and declare status publisher, or reuse external_session."""
         import zenoh
+        target_session = external_session if external_session is not None else self._external_session
         try:
-            session = make_session()
+            if target_session is not None:
+                self._external_session = target_session
+                session = target_session
+                logger.info("[HealthAgent] Using shared Zenoh session.")
+            else:
+                self._external_session = None
+                session = make_session()
+                logger.info("[HealthAgent] Zenoh session opened (peer mode).")
             pub = session.declare_publisher(f"peers/status/{NODE_ID}")
-            logger.info("[HealthAgent] Zenoh session opened (peer mode).")
             return session, pub
         except Exception as exc:
             logger.error("[HealthAgent] Cannot open Zenoh session: %s", exc)
@@ -1156,6 +1189,8 @@ class HealthAgent:
             self._session, self._pub = self._connect_zenoh()
             if not self._session:
                 logger.error("[HealthAgent] Zenoh unavailable. Running in log-only mode.")
+
+            self._ready_event.set()
 
             self._jtop = self._open_jtop()
 
@@ -1383,7 +1418,22 @@ class HealthAgent:
                         payload.update(proactive_result)
 
                     if self._pub:
-                        self._pub.put(msgpack.packb(payload, use_bin_type=True))
+                        try:
+                            self._pub.put(msgpack.packb(payload, use_bin_type=True))
+                            self._heartbeat_sent_count += 1
+                            self._heartbeat_consecutive_errors = 0
+                            self._last_heartbeat_sent_time = time.time()
+                        except Exception as pub_exc:
+                            self._heartbeat_error_count += 1
+                            self._heartbeat_consecutive_errors += 1
+                            self._last_heartbeat_error_time = time.time()
+                            if self._heartbeat_consecutive_errors == 1 or self._heartbeat_consecutive_errors % 10 == 0:
+                                logger.warning(
+                                    "[HealthAgent] Heartbeat publish failed (consecutive=%d, total=%d): %s",
+                                    self._heartbeat_consecutive_errors, self._heartbeat_error_count, pub_exc,
+                                )
+                            self._close_zenoh()
+                            _last_zenoh_attempt = 0  # force immediate reconnect on next loop iteration
 
                     _log_cycle += 1
                     if _log_cycle % HEALTH_LOG_EVERY == 1:
@@ -1428,11 +1478,8 @@ class HealthAgent:
                     self._jtop.close()
                 except Exception:
                     pass
-            if self._session:
-                try:
-                    self._session.close()
-                except Exception:
-                    pass
+                self._jtop = None
+            self._close_zenoh()
             logger.info("[HealthAgent] Stopped.")
 
 

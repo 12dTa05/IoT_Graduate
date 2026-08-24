@@ -675,6 +675,19 @@ def run_python_mode(args) -> None:
         print(f"[PeerOrch] Failed to start: {exc}", file=sys.stderr)
         peer_orch = None
 
+    # --- Health Agent (shares PeerOrchestrator's Zenoh session) ---
+    health_agent = None
+    try:
+        from health_agent import HealthAgent
+        health_agent = HealthAgent(external_session=peer_orch._session if peer_orch else None)
+        ha_thread = threading.Thread(target=health_agent.run, daemon=True, name="HealthAgent")
+        ha_thread.start()
+        health_agent._ready_event.wait(timeout=5)
+        print(f"[HealthAgent] Started. Node='{NODE_ID}', Interval={S.HEALTH_INTERVAL}s")
+    except Exception as exc:
+        print(f"[HealthAgent] Failed to start: {exc}", file=sys.stderr)
+        health_agent = None
+
     # --- Zenoh Command & Control (shares PeerOrchestrator's Zenoh session) ---
     zenoh_sub = None
     try:

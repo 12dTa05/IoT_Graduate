@@ -364,6 +364,13 @@ class PeerOrchestrator:
         # Vote windows: camera_id → list[proposal]
         self._vote_windows: Dict[str, List[dict]] = {}
         self._vote_timers: Dict[str, threading.Timer] = {}
+
+        # Status/heartbeat publish failure tracking
+        self._status_sent_count = 0
+        self._status_error_count = 0
+        self._status_consecutive_errors = 0
+        self._last_status_sent_time: Optional[float] = None
+        self._last_status_error_time: Optional[float] = None
         # Cameras with RFO sent but vote window still open (prevent re-trigger)
         self._vote_in_progress: set = set()
         # RFO trigger snapshots: camera_id -> (trigger_load, trigger_fps)
@@ -577,7 +584,20 @@ class PeerOrchestrator:
         """Publish health status on peers/status/<node_id> (called by health push loop)."""
         pub = self._pubs.get("status")
         if pub:
-            pub.put(payload)
+            try:
+                pub.put(payload)
+                self._status_sent_count += 1
+                self._status_consecutive_errors = 0
+                self._last_status_sent_time = time.time()
+            except Exception as exc:
+                self._status_error_count += 1
+                self._status_consecutive_errors += 1
+                self._last_status_error_time = time.time()
+                if self._status_consecutive_errors == 1 or self._status_consecutive_errors % 10 == 0:
+                    logger.warning(
+                        "[PeerOrch] Status publish failed (consecutive=%d, total=%d): %s",
+                        self._status_consecutive_errors, self._status_error_count, exc,
+                    )
 
     def update_self_state(self, payload: dict) -> None:
         """Update this node's local state without publishing a Zenoh heartbeat.
@@ -1016,10 +1036,20 @@ class PeerOrchestrator:
         the grace window expires.
         """
         now = time.time()
-        timeout = self._cfg.get("heartbeat_timeout_s", 5.0)
-        grace_s = self._cfg.get("failover_grace_s", timeout)
+        timeout = float(self._cfg.get("heartbeat_timeout_s", 5.0))
+        grace_s = float(self._cfg.get("failover_grace_s", timeout))
         offline_threshold = timeout + grace_s
         convergence_grace_s = float(self._cfg.get("failover_convergence_grace_s", 15.0))
+
+        with self._self_lock:
+            if self._self_state.last_seen == 0.0 or (now - self._self_state.last_seen > offline_threshold):
+                logger.debug(
+                    "[PeerOrch] Self heartbeat stale or missing (age=%.1fs > %.1fs). "
+                    "Suppressing peer-offline detection.",
+                    now - self._self_state.last_seen,
+                    offline_threshold,
+                )
+                return
 
         with self._lock:
             # Per-dead-node / per-peer suppression:
@@ -1095,11 +1125,7 @@ class PeerOrchestrator:
                             node_id, silent_s, offline_threshold, len(orphans),
                         )
                         self._notified_offline.discard(node_id)
-                        threading.Thread(
-                            target=self._leaderless_failover,
-                            args=(node_id, orphans),
-                            daemon=True,
-                        ).start()
+                        self._executor.submit(self._leaderless_failover, node_id, orphans)
                 else:
                     if node_id not in self._notified_offline:
                         logger.warning("[PeerOrch] Peer '%s' OFFLINE (no cameras).", node_id)
@@ -1188,11 +1214,7 @@ class PeerOrchestrator:
                 self._reclaim_retry_count[camera_id] = 0
             self._transition_settle_until = now + self._cfg.get("transition_settle_s", 5.0)
 
-            threading.Thread(
-                target=self._wait_and_remove_reclaim,
-                args=(camera_id, dead_node_id),
-                daemon=True,
-            ).start()
+            self._executor.submit(self._wait_and_remove_reclaim, camera_id, dead_node_id)
 
     def _check_rebalance(self) -> None:
         """
@@ -1570,11 +1592,7 @@ class PeerOrchestrator:
             self._transition_settle_until = now + cfg.get("transition_settle_s", 5.0)
 
             # Spin up a thread that waits for the local ADD ack then removes holder
-            threading.Thread(
-                target=self._wait_and_remove_reclaim,
-                args=(camera_id, holder_node),
-                daemon=True,
-            ).start()
+            self._executor.submit(self._wait_and_remove_reclaim, camera_id, holder_node)
 
             self._cam_cooldown[camera_id] = now
             # Reset eligible timer to avoid immediately reclaiming next camera
@@ -1655,9 +1673,12 @@ class PeerOrchestrator:
             self_last_seen = self._self_state.last_seen
 
         # Stale self-heartbeat guard: if self state has never been received or
-        # is stale (last_seen > heartbeat_timeout_s), skip overload checks.
+        # is stale (last_seen > offline_threshold), skip overload checks.
+        # Use same threshold as _check_offline_peers to avoid inconsistent suppression.
         timeout = self._cfg.get("heartbeat_timeout_s", 5.0)
-        if self_last_seen == 0.0 or (now - self_last_seen > timeout):
+        grace_s = self._cfg.get("failover_grace_s", timeout)
+        offline_threshold = timeout + grace_s
+        if self_last_seen == 0.0 or (now - self_last_seen > offline_threshold):
             if self._maybe_log_block("stale_self_heartbeat", now):
                 logger.warning(
                     "[PeerOrch] Self heartbeat stale or missing (age=%.1fs > %.1fs). "
@@ -2597,11 +2618,7 @@ class PeerOrchestrator:
 
         elif from_node == self._node_id:
             # --- I AM REQUESTER: wait for ack then REMOVE ---
-            threading.Thread(
-                target=self._wait_and_remove,
-                args=(camera_id, winner),
-                daemon=True,
-            ).start()
+            self._executor.submit(self._wait_and_remove, camera_id, winner)
 
     def _l1_remove_ownership_guard(self, camera_id: str) -> bool:
         """
