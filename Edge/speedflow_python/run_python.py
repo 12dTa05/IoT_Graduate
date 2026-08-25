@@ -329,9 +329,8 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
         camera_configs=configs,
         sink_type="display",
         mux_width=args.width,
-        mux_height=args.height,
-        slot_capacity=max(camera_manager.get_max_streams(), len(configs)),
-    )
+            mux_height=args.height,
+        )
     pipeline, nvdsosd, streammux, source_bins = ret_build
     tiler = pipeline.get_by_name("tiler")
 
@@ -368,8 +367,7 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
         sink_type="file",
         mux_width=args.width,
         mux_height=args.height,
-        slot_capacity=max(camera_manager.get_max_streams(), len(configs)),
-    )
+        )
     pipeline, nvdsosd, streammux, source_bins = ret_build
 
     # Stop any previous active probe's FPS writer before creating a new one
@@ -445,10 +443,6 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             mux_height=args.height,
             rtsp_push_url=rtsp_url,
             bitrate=S.RTSP_PUSH_BITRATE,
-            slot_capacity=max(
-                camera_manager.get_max_streams(),
-                len(camera_manager.get_enabled_configs()),
-            ),
         )
         pipeline, nvdsosd, streammux, source_bins = ret_build
         tiler = pipeline.get_by_name("tiler")

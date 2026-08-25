@@ -276,7 +276,12 @@ def build_pipeline(
     # churn is eliminated by construction. batch-size still tracks the number
     # of active branches exactly as before (unchanged GPU economics).
     if slot_capacity is None:
-        slot_capacity = n_cameras
+        # Deployment-wide source_id universe, NOT this node's own camera
+        # count: any camera may arrive here via migration/failover carrying
+        # its original source_id (e.g. sids 4-5 landing on a 2-camera node).
+        # Idle request pads are inert (no branch linked, batch-size excludes
+        # them), so a generous bound costs nothing at runtime.
+        slot_capacity = int(os.environ.get("SPEEDFLOW_SLOT_CAPACITY", "16"))
     slot_capacity = max(int(slot_capacity), n_cameras)
     for sid in range(slot_capacity):
         streammux.get_request_pad(f"sink_{sid}")
