@@ -238,6 +238,15 @@ class ZenohCommandSubscriber:
                                 cfg.enabled = False
                                 _cam_manager._rebuild_lookup()
                         logger.info("[Zenoh C2] Disabled timed-out config for stream '%s'", _cam_id)
+                        # Release the half-added source for real (#774/#598):
+                        # leaving the uridecodebin in the pipeline leaks its
+                        # NVDEC session until some future ADD reclaims it.
+                        delta = StreamDelta(to_remove=[_source_id])
+                        _cam_manager._delta_q.put(delta)
+                        logger.info(
+                            "[Zenoh C2] Queued REMOVE for timed-out ADD stream '%s' "
+                            "(source_id=%d)", _cam_id, _source_id,
+                        )
                     except Exception as exc:
                         logger.error("[Zenoh C2] Failed local cleanup after ADD timeout for '%s': %s", _cam_id, exc)
                     return

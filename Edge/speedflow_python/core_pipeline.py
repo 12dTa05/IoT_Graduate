@@ -99,8 +99,20 @@ def _make_source_bin(
         if not caps or not caps.to_string().startswith("video/"):
             return
         pad_name = f"sink_{source_id}"
-        sinkpad = streammux.get_request_pad(pad_name)
-        if sinkpad and not sinkpad.is_linked():
+        # Mux sink pads are pre-created once at build time and are NEVER
+        # requested/released post-init (#596 crash class). A pad still linked
+        # here can only be owned by our own black filler left by a previous
+        # REMOVE — detach it, then link the real branch into the same pad.
+        sinkpad = streammux.get_static_pad(pad_name)
+        if sinkpad is None:
+            logger.error(
+                "[Pipeline] No permanent mux pad '%s' for camera '%s' "
+                "(source_id=%d beyond slot capacity); ADD aborted.",
+                pad_name, cam_cfg.camera_id, source_id,
+            )
+            return
+        _detach_filler_from_pad(pipeline, streammux, source_id)
+        if not sinkpad.is_linked():
             q = make_element(f"q_{cam_cfg.camera_id}", "queue")
             q.set_property("max-size-buffers", 4)
             q.set_property("leaky", 2)          # leaky downstream
@@ -219,6 +231,7 @@ def build_pipeline(
     mux_width: int = 1920,
     mux_height: int = 1080,
     analytics_config: str = None,
+    slot_capacity: int = None,
     **kwargs,
 ):
     """
@@ -253,6 +266,24 @@ def build_pipeline(
     )
     streammux.set_property("live-source", live_source)
     streammux.set_property("attach-sys-ts", True)
+
+    # ── Permanent mux sink pads (crash-class fix) ─────────────────────────────
+    # Every possible slot's request pad is created ONCE here, before the
+    # pipeline ever runs, and is never released while the process lives.
+    # Dynamic ADD/REMOVE only swaps the upstream branch linked into an
+    # existing pad. Pad request/release on a PLAYING nvstreammux can corrupt
+    # NvBufSurfacePool and wedge the Tegra kernel (#596), so post-init pad
+    # churn is eliminated by construction. batch-size still tracks the number
+    # of active branches exactly as before (unchanged GPU economics).
+    if slot_capacity is None:
+        slot_capacity = n_cameras
+    slot_capacity = max(int(slot_capacity), n_cameras)
+    for sid in range(slot_capacity):
+        streammux.get_request_pad(f"sink_{sid}")
+    logger.info(
+        "[Pipeline] Pre-created %d permanent mux sink pads (slot_capacity=%d)",
+        slot_capacity, slot_capacity,
+    )
 
     # ── Core AI processing ───────────────────────────────────────────────────
     pgie = make_element("primary-infer", "nvinfer")
@@ -413,8 +444,55 @@ def build_pipeline(
 # Dynamic stream add/remove helpers (Phase 3)
 # ---------------------------------------------------------------------------
 
-def _remove_fake_black_source(pipeline: Gst.Pipeline, streammux: Gst.Element, source_id: int) -> None:
-    """Remove videotestsrc pattern=2 black placeholder for source_id if present."""
+# Orin NVDEC hardware decode-session ceiling is ~16-32 (#598); exceeding it
+# yields unrecoverable OutputBufferUnavailable (reboot required). Gate ADDs at
+# a conservative default well below the documented floor until device data
+# justifies raising it. ponytail: single env knob instead of settings plumbing;
+# raise SPEEDFLOW_NVDEC_SESSION_LIMIT once workload-swap data arrives.
+NVDEC_SESSION_LIMIT = int(os.environ.get("SPEEDFLOW_NVDEC_SESSION_LIMIT", "14"))
+
+
+def _iter_elements_deep(root: Gst.Element):
+    """Yield every GstElement under root, recursing into bins."""
+    if not isinstance(root, Gst.Bin):
+        return
+    it = root.iterate_recurse()
+    while True:
+        ret, el = it.next()
+        if ret != Gst.IteratorResult.OK:
+            return
+        yield el
+
+
+def _count_nvdec_decoders(pipeline: Gst.Pipeline) -> int:
+    """Count live nvv4l2decoder elements ≈ active NVDEC hardware sessions."""
+    n = 0
+    for el in _iter_elements_deep(pipeline):
+        factory = el.get_factory()
+        if factory and factory.get_name() == "nvv4l2decoder":
+            n += 1
+    return n
+
+
+def _proc_rss_mb() -> int:
+    """Process RSS in MB (-1 if unreadable) for teardown-leak auditing."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return -1
+
+
+def _detach_filler_from_pad(pipeline: Gst.Pipeline, streammux: Gst.Element, source_id: int) -> None:
+    """Stop and remove a black filler occupying a permanent mux sink pad.
+
+    The mux pad itself is NEVER released (#596 crash class): only the
+    upstream filler branch is torn down so the permanent pad becomes free
+    for the real source branch.
+    """
     fake_src = pipeline.get_by_name(f"fake_src_{source_id}")
     if not fake_src:
         return
@@ -427,18 +505,24 @@ def _remove_fake_black_source(pipeline: Gst.Pipeline, streammux: Gst.Element, so
         mux_pad = conv_pad.get_peer() if conv_pad and conv_pad.is_linked() else None
         if conv_pad and mux_pad and conv_pad.is_linked():
             conv_pad.unlink(mux_pad)
-        if mux_pad:
-            streammux.release_request_pad(mux_pad)
     for el in fake_elements:
         pipeline.remove(el)
-    logger.info("[Pipeline] Removed fake black source for slot source_id=%d", source_id)
+    logger.info("[Pipeline] Detached black filler from permanent pad sink_%d", source_id)
 
 
 def _add_fake_black_source(pipeline: Gst.Pipeline, streammux: Gst.Element, source_id: int) -> None:
     """Add videotestsrc pattern=2 (black) to keep tiler slot black."""
     try:
-        sinkpad = streammux.get_request_pad(f"sink_{source_id}")
-        if not sinkpad:
+        # ponytail: never get_request_pad post-init (#596 crash class) — the
+        # permanent pad was pre-created at build time via slot_capacity.
+        sinkpad = streammux.get_static_pad(f"sink_{source_id}")
+        if sinkpad is None:
+            logger.warning(
+                "[Pipeline] No permanent mux pad sink_%d; cannot attach black filler.",
+                source_id,
+            )
+            return
+        if sinkpad.is_linked():
             return
         fake_src = make_element(f"fake_src_{source_id}", "videotestsrc")
         fake_src.set_property("pattern", 2)  # 2 = black
@@ -464,41 +548,33 @@ def dynamic_add_stream(
     source_bins: dict,
     ready_event: Optional[threading.Event] = None,
 ) -> Gst.Element:
-    # Remove fake black source if it was occupying this source_id slot
-    _remove_fake_black_source(pipeline, streammux, cam_cfg.source_id)
-
     # Cleanup stale source_bin from a previous failed ADD attempt.
-    # If the prior _send_ack timed out without calling dynamic_remove_stream,
-    # the old uridecodebin may still occupy sink_N (sinkpad.is_linked()==True),
-    # causing on_pad_added to skip linking → ready_event never fires → retry TIMEOUT.
-    # ponytail: tear down stale bin here so retry gets a clean pad.
+    # If the prior _send_ack timed out without a REMOVE completing, the old
+    # uridecodebin may still occupy this slot (its mux pad stays linked).
+    # Route through the SAME sequential teardown as dynamic_remove_stream:
+    # direct-to-NULL slams leave Tegra nvv4l2decoder registers undefined
+    # (#597 kernel v4l2 deadlock), and pad release is forbidden post-init (#596).
     stale_src = source_bins.get(cam_cfg.camera_id)
     if stale_src is not None and stale_src.get_parent() is not None:
-        # Unlink the queue/conv chain from streammux sink pad
-        stale_conv = pipeline.get_by_name(f"conv_{cam_cfg.camera_id}")
-        if stale_conv is not None:
-            conv_src = stale_conv.get_static_pad("src")
-            if conv_src and conv_src.is_linked():
-                mux_sinkpad = conv_src.get_peer()
-                conv_src.unlink(mux_sinkpad)
-                if mux_sinkpad:
-                    streammux.release_request_pad(mux_sinkpad)
-            stale_conv.set_state(Gst.State.NULL)
-            pipeline.remove(stale_conv)
-        stale_q = pipeline.get_by_name(f"q_{cam_cfg.camera_id}")
-        if stale_q is not None:
-            stale_q.set_state(Gst.State.NULL)
-            pipeline.remove(stale_q)
-        stale_src.set_state(Gst.State.NULL)
-        pipeline.remove(stale_src)
-        source_bins.pop(cam_cfg.camera_id, None)
-        # Restore batch-size incremented by the prior failed ADD
-        _bs = streammux.get_property("batch-size")
-        if _bs > 1:
-            streammux.set_property("batch-size", _bs - 1)
         logger.info(
-            "[Pipeline] Removed stale source_bin for '%s' (source_id=%d) before retry ADD.",
+            "[Pipeline] Removing stale source_bin for '%s' (source_id=%d) before retry ADD.",
             cam_cfg.camera_id, cam_cfg.source_id,
+        )
+        _teardown_source_branch(
+            pipeline, streammux, cam_cfg.camera_id, cam_cfg.source_id,
+            tiler, source_bins,
+        )
+
+    # NVDEC session gate (#598): exceeding the Orin decode-session ceiling is
+    # unrecoverable (reboot required). Refuse BEFORE mutating anything; the
+    # caller's exception path disables the config and a later REMOVE becomes
+    # a clean no-op.
+    nvdec_count = _count_nvdec_decoders(pipeline)
+    if nvdec_count >= NVDEC_SESSION_LIMIT:
+        raise RuntimeError(
+            f"NVDEC session limit reached ({nvdec_count} >= "
+            f"{NVDEC_SESSION_LIMIT}); refusing ADD '{cam_cfg.camera_id}' "
+            f"(source_id={cam_cfg.source_id})"
         )
 
     # 1. Read current batch-size from the live streammux rather than trusting
@@ -542,6 +618,102 @@ def dynamic_add_stream(
 
 
 
+def _teardown_source_branch(
+    pipeline: Gst.Pipeline,
+    streammux: Gst.Element,
+    camera_id: str,
+    source_id: int,
+    tiler: Optional[Gst.Element],
+    source_bins: dict,
+) -> None:
+    """Single sequential teardown path for a live source branch.
+
+    Used by dynamic_remove_stream AND the stale-bin cleanup in
+    dynamic_add_stream so there is exactly one correct teardown
+    implementation (#597): PLAYING→PAUSED→READY→NULL with get_state waits.
+    The mux sink pad is NEVER released (#596 crash class); after the branch
+    is gone the permanent pad is re-armed with a black filler (tiled sinks).
+    """
+    src = source_bins.get(camera_id)
+    if not src:
+        return
+
+    pre_nvdec = _count_nvdec_decoders(pipeline)
+    pre_rss = _proc_rss_mb()
+
+    try:
+        q_elem = pipeline.get_by_name(f"q_{camera_id}")
+        conv_elem = pipeline.get_by_name(f"conv_{camera_id}")
+        conv_pad = conv_elem.get_static_pad("src") if conv_elem else None
+        mux_sinkpad = conv_pad.get_peer() if conv_pad and conv_pad.is_linked() else None
+
+        # Transition source branch elements sequentially PLAYING -> PAUSED -> READY -> NULL
+        branch_elements = [el for el in [src, q_elem, conv_elem] if el is not None]
+        for target_state in (Gst.State.PAUSED, Gst.State.READY, Gst.State.NULL):
+            for el in branch_elements:
+                el.set_state(target_state)
+            for el in branch_elements:
+                state_ret, current_state, _ = el.get_state(5 * Gst.SECOND)
+                if state_ret == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError(
+                        f"Element {el.get_name()} failed to reach "
+                        f"{target_state.value_nick}: state={current_state.value_nick}"
+                    )
+
+        # Verify hardware decoder(s) really reached NULL — a bin can report
+        # NULL while an inner nvv4l2decoder is wedged mid-teardown, silently
+        # leaking its NVDEC session toward the #598 accumulation ceiling.
+        for dec_el in _iter_elements_deep(src):
+            factory = dec_el.get_factory()
+            fname = factory.get_name() if factory else ""
+            if fname.startswith("nvv4l2"):
+                _, dec_state, _ = dec_el.get_state(0)
+                if dec_state != Gst.State.NULL:
+                    logger.critical(
+                        "[Pipeline] '%s' (%s) stuck at %s after bin NULL for "
+                        "camera %s — NVDEC session leak risk!",
+                        dec_el.get_name(), fname, dec_state.value_nick, camera_id,
+                    )
+
+        # Unlink conv src from the mux sink pad.
+        # ponytail: release_request_pad deliberately omitted — pads are permanent (#596).
+        if conv_pad and mux_sinkpad and conv_pad.is_linked():
+            conv_pad.unlink(mux_sinkpad)
+
+        # Remove elements from pipeline
+        for el in branch_elements:
+            pipeline.remove(el)
+
+        # Clean up recording branch
+        _remove_file_recording_branch(pipeline, source_id)
+
+        # Bookkeeping
+        if camera_id in source_bins:
+            del source_bins[camera_id]
+
+        # Decrease batch size
+        old_n = streammux.get_property("batch-size")
+        new_n = max(1, old_n - 1)
+        streammux.set_property("batch-size", new_n)
+
+        # Display fix: re-arm the permanent pad with black filler for tiled sinks
+        if tiler is not None:
+            _add_fake_black_source(pipeline, streammux, source_id)
+
+        # Leak audit (on-device evidence): nvdec must drop by exactly the
+        # number of removed branches (-1 here); rss creep across many cycles
+        # flags Python/GObject ref leaks or unfreed NvBufSurface memory.
+        logger.info(
+            "[Pipeline] Teardown audit '%s': nvdec %d→%d, rss %dMB→%dMB",
+            camera_id,
+            pre_nvdec, _count_nvdec_decoders(pipeline),
+            pre_rss, _proc_rss_mb(),
+        )
+        logger.info("[Pipeline] Cleaned up resources for camera %s", camera_id)
+    except Exception as exc:
+        logger.error("[Pipeline] Error during cleanup of camera %s: %s", camera_id, exc)
+
+
 def dynamic_remove_stream(
     pipeline: Gst.Pipeline,
     streammux: Gst.Element,
@@ -562,63 +734,8 @@ def dynamic_remove_stream(
         camera_id,
         source_id,
     )
-
     # Synchronous teardown on the GLib main thread: avoids BLOCK_DOWNSTREAM pad
     # probe deadlocks when RTSP streams are stalled and buffers stop flowing.
-    try:
-        # Capture elements and pads before state changes / unlink
-        source_elem = src
-        q_elem = pipeline.get_by_name(f"q_{camera_id}")
-        conv_elem = pipeline.get_by_name(f"conv_{camera_id}")
-        conv_pad = conv_elem.get_static_pad("src") if conv_elem else None
-        # sink_N is a request pad — get_static_pad returns None for it.
-        # Use the conv src pad's peer (the mux sink it's linked to).
-        mux_sinkpad = conv_pad.get_peer() if conv_pad and conv_pad.is_linked() else None
-
-        # Transition source branch elements sequentially PLAYING -> PAUSED -> READY -> NULL
-        branch_elements = [el for el in [source_elem, q_elem, conv_elem] if el is not None]
-        for target_state in (Gst.State.PAUSED, Gst.State.READY, Gst.State.NULL):
-            for el in branch_elements:
-                el.set_state(target_state)
-            for el in branch_elements:
-                state_ret, current_state, _ = el.get_state(5 * Gst.SECOND)
-                if state_ret == Gst.StateChangeReturn.FAILURE:
-                    raise RuntimeError(
-                        f"Element {el.get_name()} failed to reach "
-                        f"{target_state.value_nick}: state={current_state.value_nick}"
-                    )
-
-        # Unlink conv src from mux sink
-        if conv_pad and mux_sinkpad and conv_pad.is_linked():
-            conv_pad.unlink(mux_sinkpad)
-
-        # Release mux request pad only after source is safely in NULL state
-        if mux_sinkpad:
-            streammux.release_request_pad(mux_sinkpad)
-
-        # Remove elements from pipeline
-        for el in branch_elements:
-            pipeline.remove(el)
-
-        # Clean up recording branch
-        _remove_file_recording_branch(pipeline, source_id)
-
-        # Bookkeeping
-        if camera_id in source_bins:
-            del source_bins[camera_id]
-
-        # Decrease batch size
-        old_n = streammux.get_property("batch-size")
-        new_n = max(1, old_n - 1)
-        streammux.set_property("batch-size", new_n)
-
-        # Display fix: add fake black source to keep slot black in tiler if tiler is present
-        if tiler is not None:
-            _add_fake_black_source(pipeline, streammux, source_id)
-
-        logger.info(f"[Pipeline] Cleaned up resources for camera {camera_id}")
-    except Exception as exc:
-        logger.error(f"[Pipeline] Error during cleanup of camera {camera_id}: {exc}")
-    finally:
-        if done_event is not None:
-            done_event.set()
+    _teardown_source_branch(pipeline, streammux, camera_id, source_id, tiler, source_bins)
+    if done_event is not None:
+        done_event.set()
