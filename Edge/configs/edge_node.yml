@@ -8,15 +8,15 @@
 # ============================================================
 
 p2p:
-  overload_threshold: 60.0      # load_score at or above this triggers RFO; L3 anchor
+  overload_threshold: 55.0      # load_score at or above this triggers RFO; L3 anchor
                                    # under Base + Bonus load_score (L3=60)
   overload_duration_s: 5.0     # must be overloaded this long before RFO
                                    # slightly exceeds one traffic-light cycle (6s)
                                    # to filter transient GPU bursts with healthy FPS
-  cooldown_s: 15.0              # per-camera cooldown between migrations
+  cooldown_s: 12.0              # per-camera cooldown between migrations
                                    # prevents ping-pong while allowing rebalancing
                                    # after migration effect is observable
-  migration_timeout_s: 15.0    # wait for ADD ack before rollback (restored to safe default;
+  migration_timeout_s: 12.0    # wait for ADD ack before rollback (restored to safe default;
                                  # 2 s was too tight for slow RTSP sources across LAN)
   add_ack_timeout_s: 12.0      # max wait on receiver for ADD stream to reach PLAYING (must be < migration_timeout_s)
   heartbeat_timeout_s: 5.0      # peer declared OFFLINE after this silence
@@ -28,12 +28,12 @@ p2p:
   recovery_wait_s: 300.0        # wait 5 minutes in recovery before re-adding locally-owned cameras
   vote_window_s: 5.0            # proposal collection duration
   failover_jitter_max_s: 5.0    # random delay before failover ADD (race prevention)
-  reclaim_margin: 15.0         # reclaim only when load < (overload_threshold - reclaim_margin)
-                                # 60 - 15 = 45; enables reclaim once score drops below 45
-  reclaim_stable_s: 30.0       # load must stay below reclaim threshold this long before
+  reclaim_margin: 12.0         # reclaim only when load < (overload_threshold - reclaim_margin)
+                                # 55 - 12 = 43; enables reclaim once score drops below 43
+  reclaim_stable_s: 15.0       # load must stay below reclaim threshold this long before
                                 # reclaiming — one full signal cycle to confirm genuine
                                 # capacity recovery rather than a momentary green phase
-  reclaim_stability_s: 30.0    # post-reclaim observation window (seconds): a just-returned
+  reclaim_stability_s: 15.0    # post-reclaim observation window (seconds): a just-returned
                                 # camera cannot be offloaded during this window; prevents oscillation
                                 # from transient FPS spikes during stream warm-up.
                                 # Same cadence as reclaim_stable_s; treat as a pair — change both together.
@@ -60,9 +60,9 @@ p2p:
     invalid_policy: conservative
 
   # epsilon-Constraint tiers (Pareto optimization)
-  eps_fps_strict: 15.0          # Tier 0 — strict FPS floor
-  eps_fps_tier1: 12.0           # Tier 1 relaxation
-  eps_fps_tier2: 10.0           # Tier 2 relaxation
+  eps_fps_strict: 25.0          # Tier 0 — strict FPS floor
+  eps_fps_tier1: 21.0           # Tier 1 relaxation
+  eps_fps_tier2: 18.0           # Tier 2 relaxation
   eps_network_ms_strict: 30.0   # Tier 0 — RTSP RTT ceiling
   eps_network_ms_tier1: 60.0    # Tier 1 relaxation
   eps_streams_max: 4            # Hard capacity ceiling
@@ -100,9 +100,9 @@ p2p:
   # Load thresholds that trigger each escalation step
   # Calibrated for the weighted multi-signal composite load_score:
   #   L3: 42.0 (plate crops) · L2: 50.0 (vehicle crops) · L1: 60.0 (stream migration)
-  offload_level3_threshold: 60.0   # L3: crop offload → plate-crop offload first
-  offload_level2_threshold: 67.0   # L2: vehicle-crop offload when load worsens
-  offload_level1_threshold: 76.0   # L1: fall-stream RTSP migration at critical load
+  offload_level3_threshold: 55.0   # L3: crop offload → plate-crop offload first
+  offload_level2_threshold: 64.0   # L2: vehicle-crop offload when load worsens
+  offload_level1_threshold: 72.0   # L1: fall-stream RTSP migration at critical load
 
   # Cooldown between level changes for the same camera (seconds)
   offload_level_cooldown_s: 12.0
@@ -111,8 +111,8 @@ p2p:
   # Prevents premature escalation while the lower-level offload takes effect.
   # Dwell starts when set_offload_level commits L3/L2 for that camera.
   # Bypassed if a hardware emergency fuse is explicitly active.
-  l3_dwell_s: 10.0    # L3 must remain active this long before L2
-  l2_dwell_s: 17.0     # L2 must remain active this long before L1
+  l3_dwell_s: 8.0    # L3 must remain active this long before L2
+  l2_dwell_s: 12.0     # L2 must remain active this long before L1
 
   # TensorRT engine paths used by the offload receiver (Level 2 + 3)
   lpr_engine_path: "models/lpr.engine"

@@ -377,6 +377,7 @@ services:
       - RTSP_URL=\${CAM${CAM_LOCAL_NUMS[0]}_RTSP_URL:-rtsp://rtsp_server:8554/cam${CAM_LOCAL_NUMS[0]}}
     volumes:
       - ./videos:/videos
+      - /mnt/data:/mnt/data
     restart: unless-stopped
 
   cam${CAM_LOCAL_NUMS[1]}:
@@ -389,6 +390,7 @@ services:
       - RTSP_URL=\${CAM${CAM_LOCAL_NUMS[1]}_RTSP_URL:-rtsp://rtsp_server:8554/cam${CAM_LOCAL_NUMS[1]}}
     volumes:
       - ./videos:/videos
+      - /mnt/data:/mnt/data
     restart: unless-stopped
 EOF
 ok "Camera/docker-compose.yml generated"
