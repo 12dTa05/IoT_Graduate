@@ -487,9 +487,6 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         _error_flag = [False]
         _error_reason = ["unknown"]
         _removing = set()  # guard against double-remove from multiple error msgs
-        _sink_reconnect_attempts = [0]
-        _MAX_SINK_RETRIES = int(os.environ.get("RTSP_PUSH_MAX_RETRIES", "3"))
-        _SINK_RETRY_DELAY_S = float(os.environ.get("RTSP_PUSH_RETRY_DELAY_S", "1.0"))
 
         def on_message(bus, message):
             t = message.type
@@ -547,37 +544,8 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
                     if debug:
                         print(f"DEBUG INFO: {debug}", file=sys.stderr)
 
-                    # Attempt bounded in-place reconnect on the rtspclientsink element
-                    sink_elem = pipeline.get_by_name("rtsp_push_sink")
-                    if sink_elem is None and message.src is not None:
-                        curr = message.src
-                        while curr is not None:
-                            cfact = curr.get_factory()
-                            if curr.get_name() == "rtsp_push_sink" or (cfact and cfact.get_name() == "rtspclientsink"):
-                                sink_elem = curr
-                                break
-                            curr = curr.get_parent()
-
-                    if sink_elem is not None and _sink_reconnect_attempts[0] < _MAX_SINK_RETRIES:
-                        _sink_reconnect_attempts[0] += 1
-                        print(
-                            f"[RTSP Push] In-place reconnect attempt {_sink_reconnect_attempts[0]}/{_MAX_SINK_RETRIES} for {sink_elem.get_name()}...",
-                            file=sys.stderr,
-                        )
-                        try:
-                            sink_elem.set_state(Gst.State.NULL)
-                            sink_elem.get_state(1 * Gst.SECOND)
-                            if _SINK_RETRY_DELAY_S > 0:
-                                time.sleep(_SINK_RETRY_DELAY_S)
-                            sink_elem.set_state(Gst.State.READY)
-                            sink_elem.get_state(1 * Gst.SECOND)
-                            sret = sink_elem.set_state(Gst.State.PLAYING)
-                            if sret != Gst.StateChangeReturn.FAILURE:
-                                print(f"[RTSP Push] In-place reconnect initiated successfully (state_return={sret.value_nick})")
-                                return
-                        except Exception as exc:
-                            print(f"[RTSP Push] In-place reconnect exception: {exc}", file=sys.stderr)
-
+                    # ponytail: in-place NULL->PLAYING on rtspclientsink sends empty SDP (400 Bad Request);
+                    # full pipeline rebuild below resets RTSP session cleanly with fresh caps.
                     _error_reason[0] = f"{err_category}:{src_name}:{err}"
                     _error_flag[0] = True
                     loop.quit()
