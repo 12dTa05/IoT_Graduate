@@ -545,7 +545,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
                         print(f"DEBUG INFO: {debug}", file=sys.stderr)
 
                     # ponytail: in-place NULL->PLAYING on rtspclientsink sends empty SDP (400 Bad Request);
-                    # full pipeline rebuild below resets RTSP session cleanly with fresh caps.
+                    # full pipeline rebuild below resets RTSP session cleanly with fresh caps
                     _error_reason[0] = f"{err_category}:{src_name}:{err}"
                     _error_flag[0] = True
                     loop.quit()

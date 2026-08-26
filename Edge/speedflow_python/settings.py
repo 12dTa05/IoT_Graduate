@@ -87,7 +87,7 @@ FPS_STATS_FILE   = _get("FPS_STATS_FILE")
 # -----------------------------------------------------------
 RTSP_PUSH_URL     = os.environ.get("RTSP_PUSH_URL", "").strip()
 # ponytail: 1Mbps default fits shared WAN uplink (3 nodes * 1Mbps < ~4.5Mbps measured capacity)
-RTSP_PUSH_BITRATE = int(os.environ.get("RTSP_PUSH_BITRATE", "1000000"))
+RTSP_PUSH_BITRATE = int(os.environ.get("RTSP_PUSH_BITRATE", "3000000"))
 
 # -----------------------------------------------------------
 # Network identity
