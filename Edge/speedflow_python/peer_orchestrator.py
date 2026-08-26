@@ -409,6 +409,10 @@ class PeerOrchestrator:
         # Timestamps when cameras were rescued: camera_id → timestamp
         self._rescued_at: Dict[str, float] = {}
 
+        # Duplicate camera observation counts for safe duplicate reconciliation:
+        # (peer_node_id, camera_id) -> count of consecutive heartbeat observations
+        self._duplicate_camera_seen: Dict[Tuple[str, str], int] = {}
+
         # Cameras migrated away due to overload: camera_id → winner_node_id
         # Used to reclaim cameras when this node's load drops below threshold.
         self._migrated_out: Dict[str, str] = {}
@@ -924,6 +928,84 @@ class PeerOrchestrator:
                 logger.info(
                     "[PeerOrch] Original owner '%s' resumed '%s' (fps_valid=%s, load=%.1f). Immediate yield: sent REMOVE.",
                     node_id, cam_id, peer_fps_valid, peer.load_score,
+                )
+
+            # Safe duplicate reconciliation defense-in-depth:
+            # If self and an alive peer both report the same active camera, static owner wins.
+            # Only non-static-owner self issues self REMOVE (never asks static owner to remove).
+            # Duplicate observation must be stable across at least 2 consecutive heartbeats.
+            # Skip if camera is in-flight across rescue/reclaim/migration/warmup.
+            to_remove_self_reconcile: List[str] = []
+            with self._self_lock:
+                self_active = set(self._self_state.active_cameras)
+
+            # Update duplicate observation trackers
+            peer_active = set(peer.active_cameras)
+            for cam_id in list(self_active & peer_active):
+                key = (node_id, cam_id)
+                self._duplicate_camera_seen[key] = self._duplicate_camera_seen.get(key, 0) + 1
+
+                # Clean up if not active or not in-flight
+                # Check in-flight and exclusion gates
+                if (
+                    cam_id in self._rescued_cameras
+                    or cam_id in self._reclaim_in_progress
+                    or cam_id in self._pending_acks
+                    or cam_id in self._pending_winner
+                    or cam_id in self._camera_added_at
+                ):
+                    continue
+
+                if self._duplicate_camera_seen.get(key, 0) < 2:
+                    continue
+
+                # Authoritative static ownership check via _get_node_owned_cameras / node_camera_map
+                peer_static = self._get_node_owned_cameras(node_id)
+                self_static = self._get_node_owned_cameras(self._node_id)
+
+                peer_is_static_owner = peer_static is not None and cam_id in peer_static
+                self_is_static_owner = self_static is not None and cam_id in self_static
+
+                # Fail closed on ambiguity
+                if peer_is_static_owner and self_is_static_owner:
+                    logger.warning(
+                        "[PeerOrch][Reconcile] Ambiguous ownership for duplicate camera '%s': both '%s' and self configured as static owner. Failing closed.",
+                        cam_id, node_id,
+                    )
+                    continue
+                if not peer_is_static_owner and not self_is_static_owner:
+                    logger.warning(
+                        "[PeerOrch][Reconcile] Unresolved ownership for duplicate camera '%s' between '%s' and self. Failing closed.",
+                        cam_id, node_id,
+                    )
+                    continue
+
+                # If self is static owner, do nothing (peer will yield or self keeps it)
+                if self_is_static_owner:
+                    continue
+
+                # Self is not static owner and peer is static owner -> self yields
+                if peer_is_static_owner:
+                    # Single-flight / cooldown tracking
+                    now_ts = time.time()
+                    if now_ts - self._cam_cooldown.get(cam_id, 0.0) < 5.0:
+                        continue
+                    to_remove_self_reconcile.append(cam_id)
+                    self._cam_cooldown[cam_id] = now_ts
+
+            # Clean tracking for non-duplicate cameras on this peer
+            for (p_node, p_cam) in list(self._duplicate_camera_seen.keys()):
+                if p_node == node_id and p_cam not in (self_active & peer_active):
+                    self._duplicate_camera_seen.pop((p_node, p_cam), None)
+
+            # Issue REMOVE outside _lock
+            for cam_id in to_remove_self_reconcile:
+                remove_cmd = self._build_remove_cmd(cam_id, context="duplicate_reconciliation")
+                if self._pubs.get("control") is not None:
+                    self._pubs["control"].put(msgpack.packb(remove_cmd, use_bin_type=True))
+                logger.info(
+                    "[PeerOrch][Reconcile] Duplicate camera '%s' active on both self and static owner '%s'. Non-owner self yielding: REMOVE sent.",
+                    cam_id, node_id,
                 )
 
             # Phase 6 / Reviewer Finding 2.4: compute migration blind-spot metric (Δτ)
@@ -2810,10 +2892,44 @@ class PeerOrchestrator:
         if not self._l1_remove_ownership_guard(camera_id):
             logger.error(
                 "[PeerOrch] L1 REMOVE ABORTED for '%s' (winner='%s'): it is now "
-                "the last locally-owned active camera. Keeping it local; not "
-                "sending REMOVE to self.",
+                "the last locally-owned active camera. Keeping it local; rolling back winner.",
                 camera_id, winner_node,
             )
+            # Send targeted rollback REMOVE to winner so it does not keep playing the stream
+            if winner_node and winner_node != self._node_id:
+                try:
+                    winner_sid: Optional[int] = None
+                    with self._lock:
+                        winner_p = self._peers.get(winner_node)
+                        if winner_p and isinstance(winner_p.camera_configs, dict):
+                            winner_c = winner_p.camera_configs.get(camera_id)
+                            if isinstance(winner_c, dict) and "source_id" in winner_c:
+                                try:
+                                    winner_sid = int(winner_c["source_id"])
+                                except (ValueError, TypeError):
+                                    pass
+                    rollback_cmd: dict = {"cmd": "REMOVE", "camera_id": camera_id}
+                    if winner_sid is not None:
+                        rollback_cmd["source_id"] = winner_sid
+                    else:
+                        rollback_cmd = self._build_remove_cmd(camera_id, context="l1_guard_abort_rollback")
+
+                    winner_control_key = f"peers/control/{winner_node}"
+                    if self._session is not None:
+                        self._session.put(
+                            winner_control_key,
+                            msgpack.packb(rollback_cmd, use_bin_type=True),
+                        )
+                    logger.info(
+                        "[PeerOrch] Rollback REMOVE sent to winner '%s' for '%s' following L1 ownership guard abort.",
+                        winner_node, camera_id,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "[PeerOrch] Failed to send rollback REMOVE to winner '%s' for '%s': %s",
+                        winner_node, camera_id, exc,
+                    )
+
             with self._lock:
                 stale_winner = self._pending_winner.pop(camera_id, None)
                 self._pending_started_at.pop(camera_id, None)
