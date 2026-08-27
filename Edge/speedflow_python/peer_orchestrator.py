@@ -88,6 +88,9 @@ class PeerState:
     active_cameras: List[str] = field(default_factory=list)
     streaming_cameras: List[str] = field(default_factory=list)
     camera_configs: Dict[str, dict] = field(default_factory=dict)
+    camera_owners: Dict[str, str] = field(default_factory=dict)
+    camera_holders: Dict[str, str] = field(default_factory=dict)
+    camera_epochs: Dict[str, int] = field(default_factory=dict)
     max_streams: int = 8
     last_seen: float = field(default_factory=time.time)
     overload_since: Optional[float] = None
@@ -467,6 +470,14 @@ class PeerOrchestrator:
         self._reclaim_pending_remove: Dict[str, str] = {}
         # Cameras currently undergoing reclaim Make-before-Break
         self._reclaim_in_progress: set = set()
+        # Tracking camera owner epochs and active migration IDs
+        self._camera_epochs: Dict[str, int] = {}
+        self._camera_migration_ids: Dict[str, str] = {}
+        self._pending_migration_ids: Dict[str, str] = {}
+        self._pending_epochs: Dict[str, int] = {}
+        self._reclaim_pending_remove_epoch: Dict[str, int] = {}
+        self._reclaim_pending_remove_mig_id: Dict[str, str] = {}
+        self._reclaim_remove_acks: Dict[str, threading.Event] = {}
 
         # ponytail: rate-limit blocked-decision diagnostics so they don't spew
         # every 1-second tick.  Keys are short reason strings; value is the Unix
@@ -570,8 +581,9 @@ class PeerOrchestrator:
         self._session.declare_subscriber("peers/vote/proposal",  self._on_sample)
         self._session.declare_subscriber("peers/vote/decision",  self._on_sample)
         self._session.declare_subscriber("peers/vote/ack/**",    self._on_sample)
+        self._session.declare_subscriber("peers/remove/ack/**",  self._on_sample)
         self._session.declare_subscriber("peers/failover/claim", self._on_sample)
-        logger.info("[PeerOrch] Subscribed to: peers/status/**, peers/vote/*, peers/vote/ack/**, peers/failover/claim")
+        logger.info("[PeerOrch] Subscribed to: peers/status/**, peers/vote/*, peers/vote/ack/**, peers/remove/ack/**, peers/failover/claim")
 
         self._running = True
         self._ready_event.set()
@@ -619,6 +631,44 @@ class PeerOrchestrator:
             payload = dict(payload)
             payload["node_id"] = self._node_id
         self._on_peer_status(payload)
+
+    def get_ownership_records(self) -> Dict[str, dict]:
+        """
+        Return thread-safe snapshot of locally active/owned camera ownership records.
+        Distinguishes static/original owner from current holder.
+        Maps camera_id -> {"owner": str, "holder": str, "epoch": int, "migration_id": Optional[str]}
+        """
+        records = {}
+        static_owned = self._get_owned_camera_ids()
+        with self._lock:
+            with self._self_lock:
+                active_cams = list(self._self_state.active_cameras)
+            for cam_id in active_cams:
+                epoch = self._camera_epochs.get(cam_id, 1)
+                mig_id = self._camera_migration_ids.get(cam_id)
+                # Static owner is this node if configured in cameras.yml;
+                # otherwise check rescued_cameras or fallback to static mapping.
+                orig_owner = self._rescued_cameras.get(cam_id)
+                if orig_owner is None:
+                    if cam_id in static_owned:
+                        orig_owner = self._node_id
+                    else:
+                        # Check configured mapping for any peer
+                        node_cam_map = self._cfg.get("node_camera_map")
+                        if isinstance(node_cam_map, dict):
+                            for nid, cams in node_cam_map.items():
+                                if isinstance(cams, (list, tuple, set)) and cam_id in cams:
+                                    orig_owner = nid
+                                    break
+                rec = {
+                    "owner": orig_owner,
+                    "holder": self._node_id,
+                    "epoch": epoch,
+                }
+                if mig_id is not None:
+                    rec["migration_id"] = mig_id
+                records[cam_id] = rec
+        return records
 
     def get_offload_level(self, camera_id: str) -> int:
         """
@@ -691,6 +741,8 @@ class PeerOrchestrator:
             self._on_vote_decision(payload)
         elif key.startswith("peers/vote/ack/"):
             self._on_vote_ack(payload)
+        elif key.startswith("peers/remove/ack/"):
+            self._on_remove_ack(payload)
         elif key == "peers/failover/claim":
             self._on_failover_claim(payload)
         else:
@@ -871,6 +923,9 @@ class PeerOrchestrator:
             peer.offload_crops_received_per_s = float(
                 pipeline.get("offload_crops_received_per_s", 0.0) or 0.0
             )
+            peer.camera_owners = payload.get("camera_owners", {}) or {}
+            peer.camera_holders = payload.get("camera_holders", {}) or {}
+            peer.camera_epochs = payload.get("camera_epochs", {}) or {}
             peer.last_seen = time.time()
             # max_streams from peer health payload; malformed values fall back to 8
             try:
@@ -931,9 +986,10 @@ class PeerOrchestrator:
                 )
 
             # Safe duplicate reconciliation defense-in-depth:
-            # If self and an alive peer both report the same active camera, static owner wins.
-            # Only non-static-owner self issues self REMOVE (never asks static owner to remove).
-            # Duplicate observation must be stable across at least 2 consecutive heartbeats.
+            # If self and an alive peer both report the same active camera, check monotonic epoch / identity:
+            # 1. Higher epoch wins. Lower epoch node yields/removes.
+            # 2. Equal epoch / absent identity: static owner is deterministic tie-breaker.
+            # 3. Duplicate observation must be stable across at least 2 consecutive heartbeats.
             # Skip if camera is in-flight across rescue/reclaim/migration/warmup.
             to_remove_self_reconcile: List[str] = []
             with self._self_lock:
@@ -959,34 +1015,53 @@ class PeerOrchestrator:
                 if self._duplicate_camera_seen.get(key, 0) < 2:
                     continue
 
-                # Authoritative static ownership check via _get_node_owned_cameras / node_camera_map
-                peer_static = self._get_node_owned_cameras(node_id)
-                self_static = self._get_node_owned_cameras(self._node_id)
+                # Monotonic epoch check
+                self_epoch = self._camera_epochs.get(cam_id, 1)
+                peer_epoch = peer.camera_epochs.get(cam_id, 1)
 
-                peer_is_static_owner = peer_static is not None and cam_id in peer_static
-                self_is_static_owner = self_static is not None and cam_id in self_static
-
-                # Fail closed on ambiguity
-                if peer_is_static_owner and self_is_static_owner:
-                    logger.warning(
-                        "[PeerOrch][Reconcile] Ambiguous ownership for duplicate camera '%s': both '%s' and self configured as static owner. Failing closed.",
-                        cam_id, node_id,
+                should_self_yield = False
+                if peer_epoch > self_epoch:
+                    logger.info(
+                        "[PeerOrch][Reconcile] Peer '%s' has higher epoch (%d > %d) for duplicate camera '%s'. Self yielding.",
+                        node_id, peer_epoch, self_epoch, cam_id,
                     )
-                    continue
-                if not peer_is_static_owner and not self_is_static_owner:
-                    logger.warning(
-                        "[PeerOrch][Reconcile] Unresolved ownership for duplicate camera '%s' between '%s' and self. Failing closed.",
-                        cam_id, node_id,
+                    should_self_yield = True
+                elif self_epoch > peer_epoch:
+                    logger.info(
+                        "[PeerOrch][Reconcile] Self has higher epoch (%d > %d) for duplicate camera '%s'. Peer '%s' expected to yield.",
+                        self_epoch, peer_epoch, cam_id, node_id,
                     )
-                    continue
+                    should_self_yield = False
+                else:
+                    # Equal epoch: use reported original owner vs current holder
+                    # Check peer.camera_owners first, fall back to static mapping
+                    peer_owner_claim = peer.camera_owners.get(cam_id)
+                    peer_is_owner = (peer_owner_claim == node_id)
 
-                # If self is static owner, do nothing (peer will yield or self keeps it)
-                if self_is_static_owner:
-                    continue
+                    static_owned = self._get_owned_camera_ids()
+                    self_is_owner = (cam_id in static_owned) or (self._rescued_cameras.get(cam_id) == self._node_id)
+                    if peer_owner_claim is None:
+                        peer_static = self._get_node_owned_cameras(node_id)
+                        peer_is_owner = peer_static is not None and cam_id in peer_static
 
-                # Self is not static owner and peer is static owner -> self yields
-                if peer_is_static_owner:
-                    # Single-flight / cooldown tracking
+                    # Fail closed on ambiguity
+                    if peer_is_owner and self_is_owner:
+                        logger.warning(
+                            "[PeerOrch][Reconcile] Ambiguous ownership for duplicate camera '%s': both '%s' and self configured/reporting as owner at epoch %d. Failing closed.",
+                            cam_id, node_id, self_epoch,
+                        )
+                        continue
+                    if not peer_is_owner and not self_is_owner:
+                        logger.warning(
+                            "[PeerOrch][Reconcile] Unresolved ownership for duplicate camera '%s' between '%s' and self at epoch %d. Failing closed.",
+                            cam_id, node_id, self_epoch,
+                        )
+                        continue
+
+                    if peer_is_owner and not self_is_owner:
+                        should_self_yield = True
+
+                if should_self_yield:
                     now_ts = time.time()
                     if now_ts - self._cam_cooldown.get(cam_id, 0.0) < 5.0:
                         continue
@@ -1291,7 +1366,21 @@ class PeerOrchestrator:
                 )
                 continue
 
-            add_cmd = {**cam_config, "cmd": "ADD"}
+            now_ts = time.time()
+            with self._lock:
+                cur_epoch = self._camera_epochs.get(camera_id, 1) + 1
+                self._camera_epochs[camera_id] = cur_epoch
+                mig_id = f"mig_{camera_id}_{int(now_ts * 1000)}"
+                self._camera_migration_ids[camera_id] = mig_id
+                self._pending_migration_ids[camera_id] = mig_id
+                self._pending_epochs[camera_id] = cur_epoch
+
+            add_cmd = {
+                **cam_config,
+                "cmd": "ADD",
+                "epoch": cur_epoch,
+                "migration_id": mig_id,
+            }
             event = threading.Event()
             with self._lock:
                 # Register before publishing ADD: the receiver can ACK
@@ -1629,20 +1718,18 @@ class PeerOrchestrator:
                 # Holder offline or unknown — let dead-peer recovery / offline check handle it, but do not drop tracking
                 continue
 
-            # Increment _reclaim_attempts[camera_id], give up after > 5 attempts
+            # Increment _reclaim_attempts[camera_id]; never permanently abandon/pop _migrated_out
             attempts = self._reclaim_attempts.get(camera_id, 0) + 1
             self._reclaim_attempts[camera_id] = attempts
+            # Apply backoff cooldown on repeat attempts without dropping camera tracking
             if attempts > 5:
-                logger.error(
-                    "[PeerOrch][Reclaim] Exceeded max reclaim attempts (5) for camera '%s'. Giving up.",
-                    camera_id,
+                backoff_s = min(30.0, 5.0 * (attempts - 5))
+                self._reclaim_retry_at[camera_id] = now + backoff_s
+                logger.warning(
+                    "[PeerOrch][Reclaim] Camera '%s' reclaim attempt %d > 5; backing off for %.1fs without dropping tracking.",
+                    camera_id, attempts, backoff_s,
                 )
-                self._migrated_out.pop(camera_id, None)
-                self._reclaim_attempts.pop(camera_id, None)
-                self._reclaim_retry_count.pop(camera_id, None)
-                self._reclaim_retry_at.pop(camera_id, None)
                 self._reclaim_in_progress.discard(camera_id)
-                self._reclaim_pending_remove.pop(camera_id, None)
                 continue
 
             # Make-before-Break: send ADD to self FIRST (do not REMOVE holder until stream PLAYING).
@@ -1656,7 +1743,21 @@ class PeerOrchestrator:
 
             # Make-before-Break: Step 1 — ADD to self first, wait for stream PLAYING ack
             # Step 2 — Only then REMOVE from holder
-            add_cmd = {**cam_config, "cmd": "ADD"}
+            now_ts = time.time()
+            with self._lock:
+                cur_epoch = self._camera_epochs.get(camera_id, 1) + 1
+                self._camera_epochs[camera_id] = cur_epoch
+                mig_id = f"mig_{camera_id}_{int(now_ts * 1000)}"
+                self._camera_migration_ids[camera_id] = mig_id
+                self._pending_migration_ids[camera_id] = mig_id
+                self._pending_epochs[camera_id] = cur_epoch
+
+            add_cmd = {
+                **cam_config,
+                "cmd": "ADD",
+                "epoch": cur_epoch,
+                "migration_id": mig_id,
+            }
             event = threading.Event()
             with self._lock:
                 # Register before publishing ADD: the receiver can ACK
@@ -2387,13 +2488,23 @@ class PeerOrchestrator:
             return
 
         now_ts = time.time()
+        with self._lock:
+            cur_epoch = self._camera_epochs.get(camera_id, 1) + 1
+            self._camera_epochs[camera_id] = cur_epoch
+            mig_id = f"mig_{camera_id}_{int(now_ts * 1000)}"
+            self._camera_migration_ids[camera_id] = mig_id
+            self._pending_migration_ids[camera_id] = mig_id
+            self._pending_epochs[camera_id] = cur_epoch
+
         decision = {
-            "winner":     winner["bidder"],
-            "camera_id":  camera_id,
-            "from_node":  self._node_id,
-            "cam_config": cam_config,
-            "timestamp":  now_ts,
-            "ts":         now_ts,
+            "winner":       winner["bidder"],
+            "camera_id":    camera_id,
+            "from_node":    self._node_id,
+            "cam_config":   cam_config,
+            "epoch":        cur_epoch,
+            "migration_id": mig_id,
+            "timestamp":    now_ts,
+            "ts":           now_ts,
         }
         winner_id = winner["bidder"]
 
@@ -2730,7 +2841,21 @@ class PeerOrchestrator:
             if not cam_config:
                 logger.error("[PeerOrch] Decision missing cam_config for '%s'", camera_id)
                 return
+
+            epoch = payload.get("epoch")
+            migration_id = payload.get("migration_id")
+            if epoch is not None or migration_id is not None:
+                with self._lock:
+                    if epoch is not None:
+                        self._camera_epochs[camera_id] = int(epoch)
+                    if migration_id is not None:
+                        self._camera_migration_ids[camera_id] = str(migration_id)
+
             add_cmd = {**cam_config, "cmd": "ADD"}
+            if epoch is not None:
+                add_cmd["epoch"] = epoch
+            if migration_id is not None:
+                add_cmd["migration_id"] = migration_id
             # ZenohCommandSubscriber is the single owner of ADD/ACK: it
             # processes the ADD, waits for the stream to reach PLAYING,
             # and publishes peers/vote/ack/{cam}.  Publishing directly to
@@ -3037,7 +3162,6 @@ class PeerOrchestrator:
 
         if not confirmed:
             base_retry_s = float(self._cfg.get("reclaim_retry_s", 5.0))
-            max_retries = int(self._cfg.get("reclaim_max_retries", 3))
             cooldown_s = float(self._cfg.get("cooldown_s", 45.0))
             if cooldown_s <= 0.0:
                 cooldown_s = float("inf")
@@ -3046,36 +3170,15 @@ class PeerOrchestrator:
                 current_retries = self._reclaim_retry_count.get(camera_id, 0) + 1
                 self._reclaim_retry_count[camera_id] = current_retries
                 self._reclaim_in_progress.discard(camera_id)
+                backoff_s = min(base_retry_s * (2 ** (current_retries - 1)), cooldown_s)
+                self._reclaim_retry_at[camera_id] = time.time() + backoff_s
 
-                if current_retries > max_retries:
-                    self._migrated_out.pop(camera_id, None)
-                    self._reclaim_retry_at.pop(camera_id, None)
-                    self._reclaim_retry_count.pop(camera_id, None)
-                    abandoned = True
-                    backoff_s = 0.0
-                else:
-                    backoff_s = min(base_retry_s * (2 ** (current_retries - 1)), cooldown_s)
-                    self._reclaim_retry_at[camera_id] = time.time() + backoff_s
-                    abandoned = False
-
-            if abandoned:
-                logger.error(
-                    "[PeerOrch] Reclaim: TIMEOUT (%ds) waiting for local ADD ack of '%s' from holder '%s' "
-                    "— max retries (%d) exceeded, RECLAIM_ABANDONED",
-                    int(timeout), camera_id, holder_node, max_retries,
-                )
-                self._migration_log.log(
-                    holder_node, self._node_id, camera_id,
-                    "reclaim", getattr(self._self_state, "load_score", 0.0), None,
-                    0.0, "RECLAIM_ABANDONED",
-                )
-            else:
-                logger.error(
-                    "[PeerOrch] Reclaim: TIMEOUT (%ds) waiting for local ADD ack of '%s' from holder '%s' "
-                    "(active=%d, attempt=%d/5) — scheduling retry in %.1fs",
-                    int(timeout), camera_id, holder_node,
-                    len(self._self_state.active_cameras), self._reclaim_attempts.get(camera_id, 0), backoff_s,
-                )
+            logger.error(
+                "[PeerOrch] Reclaim: TIMEOUT (%ds) waiting for local ADD ack of '%s' from holder '%s' "
+                "(active=%d, retry=%d) — scheduling retry in %.1fs",
+                int(timeout), camera_id, holder_node,
+                len(self._self_state.active_cameras), current_retries, backoff_s,
+            )
             return
 
         # Stream confirmed PLAYING on self
@@ -3141,6 +3244,8 @@ class PeerOrchestrator:
         # Holder is alive — safe to remove from holder
         # Note: on holder node, source_id cannot be locally resolved, so we query holder peer camera_configs
         holder_sid: Optional[int] = None
+        holder_epoch: Optional[int] = None
+        holder_mig_id: Optional[str] = None
         with self._lock:
             holder_p = self._peers.get(holder_node)
             if holder_p and isinstance(holder_p.camera_configs, dict):
@@ -3150,6 +3255,8 @@ class PeerOrchestrator:
                         holder_sid = int(holder_c["source_id"])
                     except (ValueError, TypeError):
                         pass
+            holder_epoch = self._camera_epochs.get(camera_id)
+            holder_mig_id = self._camera_migration_ids.get(camera_id)
 
         remove_cmd: dict = {"cmd": "REMOVE", "camera_id": camera_id}
         if holder_sid is not None:
@@ -3159,14 +3266,45 @@ class PeerOrchestrator:
                 "[PeerOrch] Reclaim REMOVE for '%s' to '%s' emitted without source_id (holder config not reporting source_id).",
                 camera_id, holder_node,
             )
+        if holder_epoch is not None:
+            remove_cmd["epoch"] = holder_epoch
+        if holder_mig_id is not None:
+            remove_cmd["migration_id"] = holder_mig_id
+
+        # Register dedicated remove ACK event before sending REMOVE
+        remove_ack_event = threading.Event()
+        with self._lock:
+            self._reclaim_remove_acks[camera_id] = remove_ack_event
+            self._reclaim_pending_remove[camera_id] = holder_node
+            if holder_epoch is not None:
+                self._reclaim_pending_remove_epoch[camera_id] = holder_epoch
+            if holder_mig_id is not None:
+                self._reclaim_pending_remove_mig_id[camera_id] = holder_mig_id
 
         holder_control_key = f"peers/control/{holder_node}"
+        remove_sent = False
         try:
             if self._session is not None:
                 self._session.put(
                     holder_control_key,
                     msgpack.packb(remove_cmd, use_bin_type=True),
                 )
+                remove_sent = True
+        except Exception as exc:
+            logger.error("[PeerOrch] Reclaim: failed to send REMOVE to '%s' for '%s': %s", holder_node, camera_id, exc)
+
+        remove_confirmed = False
+        if remove_sent:
+            remove_timeout = float(self._cfg.get("remove_ack_timeout_s", 10.0))
+            remove_confirmed = remove_ack_event.wait(timeout=remove_timeout)
+
+        with self._lock:
+            self._reclaim_remove_acks.pop(camera_id, None)
+            self._reclaim_pending_remove.pop(camera_id, None)
+            self._reclaim_pending_remove_epoch.pop(camera_id, None)
+            self._reclaim_pending_remove_mig_id.pop(camera_id, None)
+
+        if remove_confirmed:
             with self._lock:
                 self._migrated_out.pop(camera_id, None)
                 self._reclaim_in_progress.discard(camera_id)
@@ -3174,7 +3312,7 @@ class PeerOrchestrator:
                 self._reclaim_retry_count.pop(camera_id, None)
                 self._reclaim_attempts.pop(camera_id, None)
             logger.info(
-                "[PeerOrch] Reclaim: stream PLAYING on self — REMOVE sent to '%s' for '%s'. Reclaim complete.",
+                "[PeerOrch] Reclaim: stream PLAYING on self and REMOVE ACK confirmed from '%s' for '%s'. Reclaim complete.",
                 holder_node, camera_id,
             )
             self._migration_log.log(
@@ -3182,9 +3320,8 @@ class PeerOrchestrator:
                 "reclaim", getattr(self._self_state, "load_score", 0.0), None,
                 0.0, "RECLAIMED",
             )
-        except Exception as exc:
+        else:
             base_retry_s = float(self._cfg.get("reclaim_retry_s", 5.0))
-            max_retries = int(self._cfg.get("reclaim_max_retries", 3))
             cooldown_s = float(self._cfg.get("cooldown_s", 45.0))
             if cooldown_s <= 0.0:
                 cooldown_s = float("inf")
@@ -3192,32 +3329,13 @@ class PeerOrchestrator:
                 current_retries = self._reclaim_retry_count.get(camera_id, 0) + 1
                 self._reclaim_retry_count[camera_id] = current_retries
                 self._reclaim_in_progress.discard(camera_id)
-                if current_retries > max_retries:
-                    self._migrated_out.pop(camera_id, None)
-                    self._reclaim_retry_at.pop(camera_id, None)
-                    self._reclaim_retry_count.pop(camera_id, None)
-                    abandoned = True
-                    backoff_s = 0.0
-                else:
-                    backoff_s = min(base_retry_s * (2 ** (current_retries - 1)), cooldown_s)
-                    self._reclaim_retry_at[camera_id] = time.time() + backoff_s
-                    abandoned = False
+                backoff_s = min(base_retry_s * (2 ** (current_retries - 1)), cooldown_s)
+                self._reclaim_retry_at[camera_id] = time.time() + backoff_s
 
-            if abandoned:
-                logger.error(
-                    "[PeerOrch] Reclaim: failed to send REMOVE to '%s' for '%s': %s — max retries (%d) exceeded, RECLAIM_ABANDONED",
-                    holder_node, camera_id, exc, max_retries,
-                )
-                self._migration_log.log(
-                    holder_node, self._node_id, camera_id,
-                    "reclaim", getattr(self._self_state, "load_score", 0.0), None,
-                    0.0, "RECLAIM_ABANDONED",
-                )
-            else:
-                logger.error(
-                    "[PeerOrch] Reclaim: failed to send REMOVE to '%s' for '%s': %s — scheduling retry in %.1fs (retry=%d/%d)",
-                    holder_node, camera_id, exc, backoff_s, current_retries, max_retries,
-                )
+            logger.error(
+                "[PeerOrch] Reclaim: REMOVE unconfirmed (timeout or send failure) to '%s' for '%s' — scheduling retry in %.1fs (retry=%d)",
+                holder_node, camera_id, backoff_s, current_retries,
+            )
 
     # ------------------------------------------------------------------
     # Vote ack
@@ -3255,6 +3373,29 @@ class PeerOrchestrator:
             expected_winner = self._pending_winner.get(camera_id)
             event = self._pending_acks.get(camera_id)
 
+            ack_epoch = payload.get("epoch")
+            ack_mig_id = payload.get("migration_id")
+            pending_epoch = self._pending_epochs.get(camera_id)
+            pending_mig_id = self._pending_migration_ids.get(camera_id)
+
+            if pending_epoch is not None and ack_epoch is not None:
+                try:
+                    if int(ack_epoch) != int(pending_epoch):
+                        logger.warning(
+                            "[PeerOrch] Ignoring stale ACK for '%s': ack epoch=%r != pending epoch=%r",
+                            camera_id, ack_epoch, pending_epoch,
+                        )
+                        return
+                except (ValueError, TypeError):
+                    return
+            if pending_mig_id is not None and ack_mig_id is not None:
+                if str(ack_mig_id) != str(pending_mig_id):
+                    logger.warning(
+                        "[PeerOrch] Ignoring mismatched ACK for '%s': ack mig_id=%r != pending mig_id=%r",
+                        camera_id, ack_mig_id, pending_mig_id,
+                    )
+                    return
+
             if expected_winner is not None and ack_node not in ("", expected_winner):
                 # Wrong/forged/stale sender for an in-flight migration — fail closed.
                 logger.debug(
@@ -3274,6 +3415,8 @@ class PeerOrchestrator:
             # Authenticated — now atomically claim the reservation if we own it.
             winner_id = self._pending_winner.pop(camera_id, None)
             self._pending_started_at.pop(camera_id, None)
+            self._pending_epochs.pop(camera_id, None)
+            self._pending_migration_ids.pop(camera_id, None)
             if winner_id is not None:
                 self._peer_inflight[winner_id] = max(
                     0, self._peer_inflight.get(winner_id, 0) - 1
@@ -3292,6 +3435,63 @@ class PeerOrchestrator:
             )
         elif event is not None:
             logger.info("[PeerOrch] Ack received for '%s' — stream is PLAYING.", camera_id)
+
+    def _on_remove_ack(self, payload: dict) -> None:
+        """
+        Handle incoming REMOVE ACK on peers/remove/ack/{cam_id}.
+        Validates camera_id, source_id, epoch, and migration_id against in-flight reclaim/remove requests.
+        """
+        cam_id = payload.get("camera_id") or payload.get("cam_id")
+        if not cam_id:
+            return
+        ack_node = payload.get("node_id", "")
+        event_type = payload.get("event")
+        if event_type is not None and event_type != "REMOVED":
+            logger.warning(
+                "[PeerOrch] Ignoring remove ACK for '%s': event='%s' != 'REMOVED'.",
+                cam_id, event_type,
+            )
+            return
+
+        with self._lock:
+            pending_holder = self._reclaim_pending_remove.get(cam_id)
+            event = self._reclaim_remove_acks.get(cam_id)
+            if event is None:
+                logger.debug("[PeerOrch] No pending remove ACK event for '%s', ignoring.", cam_id)
+                return
+
+            if pending_holder is not None and ack_node not in ("", pending_holder):
+                logger.warning(
+                    "[PeerOrch] Ignoring remove ACK for '%s': sender='%s' != pending holder='%s'.",
+                    cam_id, ack_node, pending_holder,
+                )
+                return
+
+            ack_epoch = payload.get("epoch")
+            ack_mig_id = payload.get("migration_id")
+            pending_epoch = self._reclaim_pending_remove_epoch.get(cam_id)
+            pending_mig_id = self._reclaim_pending_remove_mig_id.get(cam_id)
+
+            if pending_epoch is not None and ack_epoch is not None:
+                try:
+                    if int(ack_epoch) != int(pending_epoch):
+                        logger.warning(
+                            "[PeerOrch] Ignoring stale remove ACK for '%s': ack epoch=%r != pending epoch=%r",
+                            cam_id, ack_epoch, pending_epoch,
+                        )
+                        return
+                except (ValueError, TypeError):
+                    return
+            if pending_mig_id is not None and ack_mig_id is not None:
+                if str(ack_mig_id) != str(pending_mig_id):
+                    logger.warning(
+                        "[PeerOrch] Ignoring mismatched remove ACK for '%s': ack mig_id=%r != pending mig_id=%r",
+                        cam_id, ack_mig_id, pending_mig_id,
+                    )
+                    return
+
+            event.set()
+            logger.info("[PeerOrch] Remove ACK confirmed for '%s' from '%s'", cam_id, ack_node)
 
     def _is_peer_ready_for_yield(self, peer: Optional[PeerState], camera_id: str) -> bool:
         """Predicate to check if the original owner is alive, ready, and running the camera.
@@ -3859,7 +4059,7 @@ class PeerOrchestrator:
 
     def _build_remove_cmd(self, camera_id: str, context: str = "") -> dict:
         """
-        Build a REMOVE command dict for camera_id, attaching resolved source_id if available.
+        Build a REMOVE command dict for camera_id, attaching resolved source_id, epoch, and migration_id if available.
         """
         cmd: dict = {"cmd": "REMOVE", "camera_id": camera_id}
         sid = self._resolve_local_source_id(camera_id)
@@ -3870,6 +4070,12 @@ class PeerOrchestrator:
                 "[PeerOrch] REMOVE for '%s' (%s) emitted without source_id: could not resolve active source_id.",
                 camera_id, context or "unknown",
             )
+        epoch = self._camera_epochs.get(camera_id)
+        if epoch is not None:
+            cmd["epoch"] = epoch
+        mig_id = self._camera_migration_ids.get(camera_id) if hasattr(self, "_camera_migration_ids") else None
+        if mig_id is not None:
+            cmd["migration_id"] = mig_id
         return cmd
 
     def _measure_rtt(self, rtsp_uri: str) -> Optional[float]:

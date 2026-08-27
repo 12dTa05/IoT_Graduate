@@ -669,7 +669,11 @@ def run_python_mode(args) -> None:
     health_agent = None
     try:
         from health_agent import HealthAgent
-        health_agent = HealthAgent(external_session=peer_orch._session if peer_orch else None)
+        ownership_cb = peer_orch.get_ownership_records if peer_orch else None
+        health_agent = HealthAgent(
+            external_session=peer_orch._session if peer_orch else None,
+            ownership_provider=ownership_cb,
+        )
         ha_thread = threading.Thread(target=health_agent.run, daemon=True, name="HealthAgent")
         ha_thread.start()
         health_agent._ready_event.wait(timeout=5)

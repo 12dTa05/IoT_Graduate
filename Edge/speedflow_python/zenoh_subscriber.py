@@ -102,7 +102,7 @@ class ZenohCommandSubscriber:
     def stop(self) -> None:
         """Unsubscribe and close Zenoh session."""
         if hasattr(self, '_ack_pool'):
-            self._ack_pool.shutdown(wait=True, timeout=5)
+            self._ack_pool.shutdown(wait=True)
         self._running = False
         if self._subscriber:
             self._subscriber.undeclare()
@@ -209,6 +209,8 @@ class ZenohCommandSubscriber:
             _source_id   = source_id
             _node_id     = self._node_id
             _cam_manager = self._camera_manager
+            _epoch       = payload.get("epoch")
+            _mig_id      = payload.get("migration_id")
             # Coordinate with migration_timeout_s: default 12.0s allows migration_timeout_s (15.0s) a 3.0s safety margin
             _ack_timeout = float(self._ack_timeout_s) if self._ack_timeout_s is not None else 12.0
 
@@ -253,7 +255,7 @@ class ZenohCommandSubscriber:
 
                 try:
                     now = _time.time()
-                    ack_payload = msgpack.packb({
+                    ack_p = {
                         "schema_version": 1,
                         "version":   1,
                         "node_id":   _node_id,
@@ -261,9 +263,15 @@ class ZenohCommandSubscriber:
                         "event":     "PLAYING",
                         "timestamp": now,
                         "ts":        now,
-                    }, use_bin_type=True)
-                    _session.put(f"peers/vote/ack/{_cam_id}", ack_payload)
-                    logger.info("[Zenoh C2] ADD ack sent for '%s' (stream PLAYING).", _cam_id)
+                    }
+                    if _epoch is not None:
+                        ack_p["epoch"] = _epoch
+                    if _mig_id is not None:
+                        ack_p["migration_id"] = _mig_id
+                    ack_payload = msgpack.packb(ack_p, use_bin_type=True)
+                    if _session:
+                        _session.put(f"peers/vote/ack/{_cam_id}", ack_payload)
+                    logger.info("[Zenoh C2] ADD ack sent for '%s' (stream PLAYING, epoch=%s, migration_id=%s).", _cam_id, _epoch, _mig_id)
                 except Exception as exc:
                     logger.warning("[Zenoh C2] Failed to send ack for '%s': %s", _cam_id, exc)
 
@@ -287,6 +295,8 @@ class ZenohCommandSubscriber:
     def _handle_remove(self, payload: dict) -> None:
         try:
             cam_id = payload["camera_id"]
+            epoch = payload.get("epoch")
+            migration_id = payload.get("migration_id")
 
             with self._camera_manager._lock:
                 cfg = self._camera_manager._configs.get(cam_id)
@@ -299,6 +309,8 @@ class ZenohCommandSubscriber:
                         "event": "REMOVE_REJECTED",
                         "camera_id": cam_id,
                         "reason": "not_active",
+                        "epoch": epoch,
+                        "migration_id": migration_id,
                     })
                     return
                 # If command specifies source_id, verify it matches current active source_id.
@@ -317,6 +329,8 @@ class ZenohCommandSubscriber:
                             "event": "REMOVE_REJECTED",
                             "camera_id": cam_id,
                             "reason": "malformed_source_id",
+                            "epoch": epoch,
+                            "migration_id": migration_id,
                         })
                         return
 
@@ -330,13 +344,47 @@ class ZenohCommandSubscriber:
                             "event": "REMOVE_REJECTED",
                             "camera_id": cam_id,
                             "reason": "stale_source_id",
+                            "epoch": epoch,
+                            "migration_id": migration_id,
                         })
                         return
                 source_id = cfg.source_id
                 cfg.enabled = False
                 self._camera_manager._rebuild_lookup()
 
-            delta = StreamDelta(to_remove=[source_id])
+            def _on_teardown_done():
+                try:
+                    now = time.time()
+                    ack_p = {
+                        "schema_version": 1,
+                        "version": 1,
+                        "node_id": self._node_id,
+                        "camera_id": cam_id,
+                        "source_id": source_id,
+                        "event": "REMOVED",
+                        "timestamp": now,
+                        "ts": now,
+                    }
+                    if epoch is not None:
+                        ack_p["epoch"] = epoch
+                    if migration_id is not None:
+                        ack_p["migration_id"] = migration_id
+
+                    if self._session:
+                        self._session.put(f"peers/remove/ack/{cam_id}", msgpack.packb(ack_p, use_bin_type=True))
+                    self.publish_status({
+                        "node_id": self._node_id,
+                        "event": "REMOVED",
+                        "camera_id": cam_id,
+                        "source_id": source_id,
+                        "epoch": epoch,
+                        "migration_id": migration_id,
+                    })
+                    logger.info("[Zenoh C2] REMOVED ack sent for '%s' (source_id=%d, epoch=%s, migration_id=%s)", cam_id, source_id, epoch, migration_id)
+                except Exception as ex:
+                    logger.error("[Zenoh C2] Failed to send REMOVED ack for '%s': %s", cam_id, ex)
+
+            delta = StreamDelta(to_remove=[(source_id, _on_teardown_done)])
             self._camera_manager._delta_q.put(delta)
             if hasattr(self._camera_manager, "cleanup_stream_ready"):
                 self._camera_manager.cleanup_stream_ready(source_id)
@@ -349,12 +397,24 @@ class ZenohCommandSubscriber:
                 "event": "REMOVE_PROCESSING",
                 "camera_id": cam_id,
                 "source_id": source_id,
+                "epoch": epoch,
+                "migration_id": migration_id,
             })
 
         except KeyError as exc:
             logger.error("[Zenoh C2] REMOVE command missing required field: %s", exc)
+            self.publish_status({
+                "node_id": self._node_id,
+                "event": "REMOVE_FAILED",
+                "reason": f"missing_field_{exc}",
+            })
         except Exception as exc:
             logger.error("[Zenoh C2] REMOVE command error: %s", exc)
+            self.publish_status({
+                "node_id": self._node_id,
+                "event": "REMOVE_FAILED",
+                "reason": str(exc),
+            })
 
     def _handle_status_request(self) -> None:
         active = self._camera_manager.get_enabled_configs()

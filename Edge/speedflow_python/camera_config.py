@@ -26,7 +26,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -75,7 +75,7 @@ class CameraConfig:
 class StreamDelta:
     """Changes detected between two config file reads."""
     to_add: List[CameraConfig] = field(default_factory=list)
-    to_remove: List[int] = field(default_factory=list)   # list of source_id
+    to_remove: List[Any] = field(default_factory=list)   # list of source_id (int) or tuple (source_id, callback)
 
 
 # ---------------------------------------------------------------------------
@@ -575,14 +575,26 @@ class CameraManager:
 
             # Remove first, add second (avoid source_id conflict)
             remove_events = []
-            for source_id in delta.to_remove:
-                sid = source_id  # capture for lambda
+            for item in delta.to_remove:
+                if isinstance(item, tuple):
+                    sid, on_complete_cb = item
+                else:
+                    sid, on_complete_cb = item, None
+
                 if self._glib_idle_add and self._on_remove:
                     done = threading.Event()
+                    on_rem = self._on_remove
 
-                    def _remove_with_ack(source_id=sid, event=done):
+                    def _remove_with_ack(source_id=sid, event=done, remove_fn=on_rem):
                         try:
-                            self._on_remove(source_id, done_event=event)
+                            if remove_fn is not None:
+                                try:
+                                    remove_fn(source_id, done_event=event)
+                                except TypeError:
+                                    remove_fn(source_id)
+                                    event.set()
+                            else:
+                                event.set()
                         except Exception as exc:
                             logger.error(
                                 "[CameraManager] Error in on_remove for source_id=%d: %s",
@@ -593,23 +605,46 @@ class CameraManager:
                         return False
 
                     self._glib_idle_add(_remove_with_ack)
-                    remove_events.append((sid, done))
+                    remove_events.append((sid, done, on_complete_cb))
                     logger.info(
                         "[CameraManager] Scheduled REMOVE source_id=%d on GLib loop", sid
                     )
+                else:
+                    if on_complete_cb is not None:
+                        try:
+                            on_complete_cb()
+                        except Exception as cb_exc:
+                            logger.error(
+                                "[CameraManager] Error in on_complete callback for source_id=%d: %s",
+                                sid,
+                                cb_exc,
+                            )
 
-            if delta.to_remove and delta.to_add:
-                all_removed_cleanly = True
-                for sid, done in remove_events:
-                    if not done.wait(timeout=8.0):
+            all_removed_cleanly = True
+            if remove_events:
+                for sid, done, cb in remove_events:
+                    # Wait for GLib MainLoop to finish teardown
+                    if not done.wait(timeout=10.0):
                         all_removed_cleanly = False
                         logger.warning(
-                            "[CameraManager] REMOVE source_id=%d did not ack within 8s before ADD",
-                            sid,
+                            "[CameraManager] Timeout waiting for REMOVE source_id=%d on GLib loop", sid
                         )
+                    else:
+                        if cb is not None:
+                            try:
+                                cb()
+                            except Exception as cb_exc:
+                                logger.error(
+                                    "[CameraManager] Error in on_complete callback for source_id=%d: %s",
+                                    sid,
+                                    cb_exc,
+                                )
+
+            if delta.to_remove and delta.to_add:
                 if not all_removed_cleanly:
                     logger.error(
-                        "[CameraManager] Skipping ADD queue because previous REMOVE did not complete safely within timeout."
+                        "[CameraManager] Aborting ADD in delta: one or more REMOVEs "
+                        "did not complete within timeout."
                     )
                     continue
 

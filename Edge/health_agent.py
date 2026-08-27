@@ -18,7 +18,7 @@ import time
 import threading
 import collections
 from pathlib import Path
-from typing import Dict, Optional, Deque, Tuple
+from typing import Callable, Deque, Dict, Optional, Tuple
 
 import os
 import msgpack
@@ -902,12 +902,13 @@ class HealthAgent:
     WebSocket to push health payloads to the Central Monitor Server.
     """
 
-    def __init__(self, external_session=None) -> None:
+    def __init__(self, external_session=None, ownership_provider: Optional[Callable[[], Dict[str, dict]]] = None) -> None:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._session = None
         self._pub = None
         self._external_session = external_session
+        self._ownership_provider = ownership_provider
         self._ready_event = threading.Event()
         self._jtop = None          # persistent jtop session
         self._monitor_client = None  # own WS client when run standalone
@@ -1354,6 +1355,25 @@ class HealthAgent:
                     pipeline_status = "waiting" if is_waiting else "running"
                     pipeline_idle = bool(snapshot_valid and not active_cameras)
 
+                    # Retrieve live camera ownership & epochs if provider is configured
+                    camera_owners = {}
+                    camera_holders = {}
+                    camera_epochs = {}
+                    if self._ownership_provider is not None:
+                        try:
+                            records = self._ownership_provider()
+                            if isinstance(records, dict):
+                                for cam_k, rec in records.items():
+                                    if isinstance(rec, dict):
+                                        if "owner" in rec:
+                                            camera_owners[cam_k] = rec["owner"]
+                                        if "holder" in rec:
+                                            camera_holders[cam_k] = rec["holder"]
+                                        if "epoch" in rec:
+                                            camera_epochs[cam_k] = rec["epoch"]
+                        except Exception as exc:
+                            logger.debug("[HealthAgent] Failed to retrieve live ownership records: %s", exc)
+
                     now_ts = time.time()
                     payload = {
                         "type":          "health",
@@ -1373,6 +1393,9 @@ class HealthAgent:
                         "gpu_temp_c":    metrics["gpu_temp_c"],
                         "power_mw":      metrics["power_mw"],
                         "source":        metrics.get("source", "jtop"),
+                        "camera_owners": camera_owners,
+                        "camera_holders": camera_holders,
+                        "camera_epochs": camera_epochs,
                         "pipeline": {
                             # pipeline_available distinguishes "pipeline not yet
                             # started / stale snapshot" (False, load_score=100)
@@ -1397,6 +1420,8 @@ class HealthAgent:
                             "camera_workload": camera_workload,
                             "camera_features": feature_stats if snapshot_valid else {},
                             "camera_configs": self._cam_configs_cache,
+                            "camera_owners":  camera_owners,
+                            "camera_epochs":  camera_epochs,
                             "max_streams":    int(self._max_streams or 8),
                             "offload_crops_received_per_s": float(offload_crops_received_per_s or 0.0),
                         },
