@@ -3172,6 +3172,7 @@ class PeerOrchestrator:
                 self._reclaim_in_progress.discard(camera_id)
                 self._reclaim_retry_at.pop(camera_id, None)
                 self._reclaim_retry_count.pop(camera_id, None)
+                self._reclaim_attempts.pop(camera_id, None)
             logger.info(
                 "[PeerOrch] Reclaim: stream PLAYING on self — REMOVE sent to '%s' for '%s'. Reclaim complete.",
                 holder_node, camera_id,
