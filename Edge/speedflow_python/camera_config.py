@@ -286,21 +286,33 @@ class CameraManager:
         source_id = int(cmd["source_id"])
         uri       = cmd["uri"]
 
-        existing_cam = self.get_config_by_camera_id(cam_id)
-        if existing_cam and existing_cam.enabled:
-            logger.warning(
-                "[CameraManager] ADD ignored: camera_id='%s' already active.",
-                cam_id,
-            )
-            return False
+        # Reject if camera_id or source_id is already in use (including disabled configs pending removal)
+        # to prevent source_id / lookup collisions between cameras.
+        with self._lock:
+            existing_cam = self._configs.get(cam_id)
+            if existing_cam and existing_cam.enabled:
+                logger.warning(
+                    "[CameraManager] ADD ignored: camera_id='%s' already active.",
+                    cam_id,
+                )
+                return False
 
-        existing = self.get_config(source_id)
-        if existing and existing.enabled:
-            logger.warning(
-                "[CameraManager] ADD ignored: source_id=%d ('%s') already active.",
-                source_id, existing.camera_id,
-            )
-            return False
+            existing_by_sid = self._by_source_id.get(source_id)
+            if existing_by_sid and existing_by_sid.enabled:
+                logger.warning(
+                    "[CameraManager] ADD ignored: source_id=%d ('%s') already active on camera_id='%s'.",
+                    source_id, existing_by_sid.camera_id, cam_id,
+                )
+                return False
+
+            # Check if any other config in _configs is using this source_id (even if not yet in _by_source_id)
+            for c in self._configs.values():
+                if c.source_id == source_id and c.camera_id != cam_id and c.enabled:
+                    logger.warning(
+                        "[CameraManager] ADD rejected: source_id=%d already assigned to enabled camera '%s'.",
+                        source_id, c.camera_id,
+                    )
+                    return False
 
         # Gate against max_streams: count currently enabled cameras.
         enabled_count = len(self.get_enabled_configs())
@@ -478,11 +490,20 @@ class CameraManager:
 
     def _rebuild_lookup(self) -> None:
         """Rebuild _by_source_id from _configs. Call while holding lock."""
-        self._by_source_id = {
-            c.source_id: c
-            for c in self._configs.values()
-            if c.enabled
-        }
+        new_by_sid = {}
+        for c in self._configs.values():
+            if not c.enabled:
+                continue
+            if c.source_id in new_by_sid:
+                existing = new_by_sid[c.source_id]
+                logger.critical(
+                    "[CameraManager] CRITICAL source_id collision: source_id=%d claimed by both '%s' and '%s'. "
+                    "Retaining earlier camera to prevent cross-camera draw mixup.",
+                    c.source_id, existing.camera_id, c.camera_id,
+                )
+                continue
+            new_by_sid[c.source_id] = c
+        self._by_source_id = new_by_sid
 
     def reload(self) -> Optional[StreamDelta]:
         """Public method to re-read YAML file and return StreamDelta if changed."""

@@ -10,8 +10,9 @@ so nodes on the same LAN switch discover each other automatically.
 
 from __future__ import annotations
 
-import os
 import zenoh
+
+from .settings import ZENOH_ROUTER
 
 
 def make_config() -> zenoh.Config:
@@ -20,9 +21,8 @@ def make_config() -> zenoh.Config:
     cfg.insert_json5("scouting/multicast/enabled", "true")
     
     # Cross-network router / server endpoint (e.g. "tcp/116.118.9.125:7447")
-    zenoh_router = os.environ.get("ZENOH_ROUTER", "").strip()
-    if zenoh_router:
-        cfg.insert_json5("connect/endpoints", f'["{zenoh_router}"]')
+    if ZENOH_ROUTER:
+        cfg.insert_json5("connect/endpoints", f'["{ZENOH_ROUTER}"]')
         
     return cfg
 

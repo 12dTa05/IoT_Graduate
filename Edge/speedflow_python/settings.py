@@ -13,6 +13,7 @@ Usage:
 
 import os
 from pathlib import Path
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 
@@ -33,9 +34,14 @@ def _require(key: str) -> str:
         )
     return val
 
-def _get(key: str, cast=str):
+def _get(key: str, cast: Any = str) -> Any:
     """Read env var with cast; raise if missing."""
     return cast(_require(key))
+
+# -----------------------------------------------------------
+# Logging
+# -----------------------------------------------------------
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
 
 # -----------------------------------------------------------
 # Central Monitoring Server / Zenoh Router
@@ -45,7 +51,7 @@ ZENOH_ROUTER = os.environ.get("ZENOH_ROUTER", "").strip()   # empty → multicas
 # -----------------------------------------------------------
 # Node identity
 # -----------------------------------------------------------
-NODE_ID        = _get("NODE_ID")
+NODE_ID = _get("NODE_ID")
 
 # -----------------------------------------------------------
 # Load balancing experiment mode
@@ -85,9 +91,17 @@ FPS_STATS_FILE   = _get("FPS_STATS_FILE")
 # -----------------------------------------------------------
 # RTSP Push (Centralized Streaming to Server)
 # -----------------------------------------------------------
-RTSP_PUSH_URL     = os.environ.get("RTSP_PUSH_URL", "").strip()
-# ponytail: 1Mbps default fits shared WAN uplink (3 nodes * 1Mbps < ~4.5Mbps measured capacity)
-RTSP_PUSH_BITRATE = int(os.environ.get("RTSP_PUSH_BITRATE", "3000000"))
+RTSP_PUSH_URL           = os.environ.get("RTSP_PUSH_URL", "").strip()
+# ponytail: 750kbps default fits shared WAN uplink (3 nodes * 2 cams * 750kbps = 4.5Mbps measured capacity)
+RTSP_PUSH_BITRATE       = int(os.environ.get("RTSP_PUSH_BITRATE", "750000"))
+RTSP_PUSH_MAX_RETRIES   = int(os.environ.get("RTSP_PUSH_MAX_RETRIES", "3"))
+RTSP_PUSH_RETRY_DELAY_S = float(os.environ.get("RTSP_PUSH_RETRY_DELAY_S", "1.0"))
+
+# -----------------------------------------------------------
+# DeepStream Pipeline Session & Slot Limits
+# -----------------------------------------------------------
+SPEEDFLOW_SLOT_CAPACITY       = int(os.environ.get("SPEEDFLOW_SLOT_CAPACITY", "16"))
+SPEEDFLOW_NVDEC_SESSION_LIMIT = int(os.environ.get("SPEEDFLOW_NVDEC_SESSION_LIMIT", "14"))
 
 # -----------------------------------------------------------
 # Network identity

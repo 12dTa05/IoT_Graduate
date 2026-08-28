@@ -26,6 +26,8 @@ from .common import make_element, gst_link
 from .settings import (
     INFER_CONFIG, TRACKER_CFG, ANALYTICS_CFG,
     SGIE_CONFIG, TRACKER_LIB, LPR_CONFIG,
+    SPEEDFLOW_SLOT_CAPACITY, SPEEDFLOW_NVDEC_SESSION_LIMIT,
+    RTSP_PUSH_BITRATE,
 )
 from .camera_config import CameraConfig, compute_tiler_layout
 
@@ -150,7 +152,7 @@ def _add_rtsp_push_branch(
     demux: Gst.Element,
     cam_cfg: CameraConfig,
     rtsp_push_base_url: str,
-    bitrate: int = 1_000_000,
+    bitrate: int = RTSP_PUSH_BITRATE,
     sync: bool = False,
 ) -> list[Gst.Element]:
     """Create one nvstreamdemux -> encoder -> rtspclientsink branch for cam_cfg."""
@@ -168,7 +170,7 @@ def _add_rtsp_push_branch(
         )
     )
     enc = make_element(f"enc_rtsp_push{suffix}", "nvv4l2h264enc")
-    enc.set_property("bitrate", bitrate)  # default 1 Mbps per camera
+    enc.set_property("bitrate", bitrate)  # default 750 kbps per camera
     enc.set_property("iframeinterval", 30)
     enc.set_property("insert-sps-pps", True)
     try:
@@ -236,11 +238,11 @@ def init_rtsp_push_branches(
     demux: Gst.Element,
     present_cameras: list[CameraConfig],
     rtsp_push_base_url: str,
-    bitrate: int = 1_000_000,
+    bitrate: int = 750_000,
 ) -> None:
     """Initialize RTSP push branches for all enabled initial cameras."""
     for cam_cfg in present_cameras:
-        if cam_cfg.enabled:
+        if getattr(cam_cfg, "enabled", True):
             _add_rtsp_push_branch(
                 pipeline, demux, cam_cfg, rtsp_push_base_url, bitrate=bitrate
             )
@@ -382,7 +384,7 @@ def build_pipeline(
         # its original source_id (e.g. sids 4-5 landing on a 2-camera node).
         # Idle request pads are inert (no branch linked, batch-size excludes
         # them), so a generous bound costs nothing at runtime.
-        slot_capacity = int(os.environ.get("SPEEDFLOW_SLOT_CAPACITY", "16"))
+        slot_capacity = SPEEDFLOW_SLOT_CAPACITY
     slot_capacity = max(int(slot_capacity), n_cameras)
     for sid in range(slot_capacity):
         streammux.get_request_pad(f"sink_{sid}")
@@ -466,7 +468,7 @@ def build_pipeline(
         demux = make_element("demux", "nvstreamdemux")
         pipeline.add(demux)
         rtsp_base_url = kwargs.get("rtsp_push_base_url") or kwargs.get("rtsp_push_url") or ""
-        rtsp_bitrate = kwargs.get("rtsp_push_bitrate") or kwargs.get("bitrate", 1_000_000)
+        rtsp_bitrate = kwargs.get("rtsp_push_bitrate") or kwargs.get("bitrate", 750_000)
         init_rtsp_push_branches(pipeline, demux, camera_configs, rtsp_base_url, bitrate=rtsp_bitrate)
 
     elif sink_type == "file":
@@ -624,9 +626,8 @@ def rebuild_rtsp_push_sink(
 # Orin NVDEC hardware decode-session ceiling is ~16-32 (#598); exceeding it
 # yields unrecoverable OutputBufferUnavailable (reboot required). Gate ADDs at
 # a conservative default well below the documented floor until device data
-# justifies raising it. ponytail: single env knob instead of settings plumbing;
-# raise SPEEDFLOW_NVDEC_SESSION_LIMIT once workload-swap data arrives.
-NVDEC_SESSION_LIMIT = int(os.environ.get("SPEEDFLOW_NVDEC_SESSION_LIMIT", "14"))
+# justifies raising it.
+NVDEC_SESSION_LIMIT = SPEEDFLOW_NVDEC_SESSION_LIMIT
 
 
 def _iter_elements_deep(root: Gst.Element):
@@ -774,7 +775,7 @@ def dynamic_add_stream(
     try:
         if demux is not None:
             if rtsp_push_base_url:
-                bitrate = rtsp_push_bitrate if rtsp_push_bitrate is not None else 1_000_000
+                bitrate = rtsp_push_bitrate if rtsp_push_bitrate is not None else 750_000
                 _add_rtsp_push_branch(
                     pipeline, demux, cam_cfg, rtsp_push_base_url, bitrate=bitrate, sync=True
                 )

@@ -196,8 +196,14 @@ ZENOH_ROUTER=tcp/$SERVER_IP:7447
 
 # --- RTSP Push (→ MediaMTX on Server) ---
 RTSP_PUSH_URL=rtsp://$SERVER_IP:8554/$NODE_ID
-# 2.5 Mbps is sufficient for 1280x720@25fps monitoring quality.
-RTSP_PUSH_BITRATE=2500000
+# Max 750 kbps per camera (750000 bps) to fit shared WAN uplink bandwidth
+RTSP_PUSH_BITRATE=750000
+RTSP_PUSH_MAX_RETRIES=3
+RTSP_PUSH_RETRY_DELAY_S=1.0
+
+# --- DeepStream Pipeline Session & Slot Limits ---
+SPEEDFLOW_SLOT_CAPACITY=16
+SPEEDFLOW_NVDEC_SESSION_LIMIT=14
 
 # --- Zenoh (P2P peer mode) ---
 ZENOH_QUEUE_MAXSIZE=1000

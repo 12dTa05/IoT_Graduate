@@ -49,6 +49,9 @@ Examples:
     if args.mode == "file" and not args.output:
         parser.error("--output is required when --mode is 'file'")
 
+    from speedflow_python.log_utils import install_crash_hooks
+    install_crash_hooks()
+
     from speedflow_python.run_python import run_python_mode
     run_python_mode(args)
 

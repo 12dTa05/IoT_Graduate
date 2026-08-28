@@ -41,10 +41,10 @@ import msgpack
 from .zenoh_session import make_session
 
 # Settings loaded from Edge/.env
-from .settings import ROOT as _ROOT
+from .settings import ROOT as _ROOT, LOG_LEVEL
 
 def _setup_logging() -> logging.Logger:
-    raw_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+    raw_level = LOG_LEVEL
     level = getattr(logging, raw_level, logging.INFO)
     root_level = logging.INFO if raw_level == "DEBUG" else level
 

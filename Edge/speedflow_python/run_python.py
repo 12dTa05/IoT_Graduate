@@ -34,6 +34,9 @@ from .settings import (
     FPS_STATS_FILE,
     TARGET_FPS,
     HEALTH_INTERVAL,
+    RTSP_PUSH_BITRATE,
+    RTSP_PUSH_MAX_RETRIES,
+    RTSP_PUSH_RETRY_DELAY_S,
 )
 
 import yaml
@@ -445,7 +448,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         _stop_active_speed_probes()
 
         print(f"[RTSP Push] Building pipeline (cause: {_last_restart_cause})...")
-        rtsp_push_bitrate = int(os.environ.get("RTSP_PUSH_PER_CAM_BITRATE", os.environ.get("RTSP_PUSH_BITRATE", "1000000")))
+        rtsp_push_bitrate = RTSP_PUSH_BITRATE
         ret_build = build_pipeline(
             camera_configs=camera_manager.get_enabled_configs(),
             sink_type="rtsp_push",
@@ -502,8 +505,8 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         _removing = set()  # guard against double-remove from multiple error msgs
 
         _sink_reconnect_attempts = [0]
-        _MAX_SINK_RETRIES = int(os.environ.get("RTSP_PUSH_MAX_RETRIES", "3"))
-        _SINK_RETRY_DELAY_S = float(os.environ.get("RTSP_PUSH_RETRY_DELAY_S", "1.0"))
+        _MAX_SINK_RETRIES = RTSP_PUSH_MAX_RETRIES
+        _SINK_RETRY_DELAY_S = RTSP_PUSH_RETRY_DELAY_S
 
         def on_message(bus, message):
             t = message.type
@@ -678,13 +681,19 @@ def run_python_mode(args) -> None:
     term_handler.setFormatter(formatter)
     root_logger.addHandler(term_handler)
 
+    from .log_utils import FlushRotatingFileHandler, install_crash_hooks
+    S.PATH_LOGS.mkdir(parents=True, exist_ok=True)
+    install_crash_hooks(S.PATH_LOGS)
+
+    debug_log_path = str(S.PATH_LOGS / "edge_debug.log")
+
     try:
-        file_handler = logging.FileHandler("/tmp/edge_debug.log", mode="a", encoding="utf-8")
+        file_handler = FlushRotatingFileHandler(debug_log_path, mode="a", encoding="utf-8")
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
     except Exception as exc:
-        print(f"[Logging] Failed to attach /tmp/edge_debug.log handler: {exc}", file=sys.stderr)
+        print(f"[Logging] Failed to attach {debug_log_path} handler: {exc}", file=sys.stderr)
 
     camera_manager = CameraManager(CAMERAS_YML)
 

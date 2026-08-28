@@ -357,7 +357,7 @@ const MODAL_IMG = $('modal-img');
 
 // ── State ────────────────────────────────────────────────────
 const edges = {};                // node_id -> edge dict (from server)
-const streamStates = {};         // camId -> { pc, video, cell, streamPath, connecting, reconnectTimer, statsTimer, bitrate, connected }
+const streamStates = {};         // camId -> { pc, mediaStream, video, cell, streamPath, connecting, reconnectTimer, statsTimer, bitrate, connected }
 const allKnownCameras = new Map(); // camId -> { camera_id, source_id, node_id, node_ip, stream_path }
 
 let clusters = [];               // [{ id, edges: [...] }]
@@ -415,30 +415,35 @@ function buildCameraList(data) {
   }
 
   const activeSeen = new Set();
+  const knownActiveNodes = new Set();
 
   for (const node of Object.values(nodes || {})) {
     const isOnline = node.online !== false;
     const pipeline = node.pipeline || (node.health && node.health.pipeline);
     if (!pipeline) continue;
+    if (isOnline) {
+      knownActiveNodes.add(node.node_id);
+    }
 
     const nodeIp = node.advertise_ip || node.ip || (node.health && node.health.advertise_ip) || '';
     const fpsPerCam = pipeline.fps_per_camera || {};
     const camFeats = pipeline.camera_features || {};
 
     if (pipeline.camera_configs) {
-      for (const camId of Object.keys(pipeline.camera_configs)) {
-        if (!allKnownCameras.has(camId)) {
+      for (const [camId, cfg] of Object.entries(pipeline.camera_configs)) {
+        let sourceId = cfg && typeof cfg.source_id === 'number' ? cfg.source_id : null;
+        if (sourceId === null) {
           const parts = String(camId).split('_');
           const num = parts.length > 1 ? parseInt(parts[1], 10) : parseInt(camId.replace(/\D/g, ''), 10);
-          const sourceId = !isNaN(num) ? num - 1 : 0;
-          allKnownCameras.set(camId, {
-            camera_id: camId,
-            source_id: sourceId,
-            node_id: node.node_id,
-            node_ip: nodeIp,
-            stream_path: `${node.node_id}/${camId}`,
-          });
+          sourceId = !isNaN(num) ? num - 1 : 0;
         }
+        allKnownCameras.set(camId, {
+          camera_id: camId,
+          source_id: sourceId,
+          node_id: node.node_id,
+          node_ip: nodeIp,
+          stream_path: `${node.node_id}/${camId}`,
+        });
       }
     }
 
@@ -446,9 +451,13 @@ function buildCameraList(data) {
 
     for (const camId of pipeline.active_cameras) {
       activeSeen.add(camId);
-      const parts = String(camId).split('_');
-      const num = parts.length > 1 ? parseInt(parts[1], 10) : parseInt(camId.replace(/\D/g, ''), 10);
-      const sourceId = !isNaN(num) ? num - 1 : 0;
+      const cfg = pipeline.camera_configs ? pipeline.camera_configs[camId] : null;
+      let sourceId = cfg && typeof cfg.source_id === 'number' ? cfg.source_id : null;
+      if (sourceId === null) {
+        const parts = String(camId).split('_');
+        const num = parts.length > 1 ? parseInt(parts[1], 10) : parseInt(camId.replace(/\D/g, ''), 10);
+        sourceId = !isNaN(num) ? num - 1 : 0;
+      }
       const feat = camFeats[camId] || {};
 
       cams.push({
@@ -468,6 +477,11 @@ function buildCameraList(data) {
   // Preserve offline camera cells in global source_id order
   for (const [camId, prev] of allKnownCameras.entries()) {
     if (!activeSeen.has(camId)) {
+      // Conservative handling: prune stale camera entry if its registered edge node is gone or has no cameras
+      if (prev.node_id && nodes[prev.node_id] === undefined && edges[prev.node_id] === undefined) {
+        allKnownCameras.delete(camId);
+        continue;
+      }
       cams.push({
         ...prev,
         fps: 0,
@@ -542,9 +556,21 @@ async function startWhepPlayer(streamPath, videoEl, onStats) {
   pc.addTransceiver('video', { direction: 'recvonly' });
 
   pc.ontrack = (evt) => {
-    if (evt.track.kind === 'video' && videoEl) {
-      videoEl.srcObject = evt.streams[0];
-      const cell = videoEl.parentElement;
+    if (evt.track.kind === 'video') {
+      const stream = evt.streams[0] || null;
+      for (const [cid, st] of Object.entries(streamStates)) {
+        if (st && st.pc === pc) {
+          st.mediaStream = stream;
+          if (st.video && stream) {
+            st.video.srcObject = stream;
+          }
+          break;
+        }
+      }
+      if (videoEl && stream) {
+        videoEl.srcObject = stream;
+      }
+      const cell = videoEl ? videoEl.parentElement : null;
       if (cell && !cell.classList.contains('offline')) {
         const badge = cell.querySelector('.status-badge');
         if (badge) { badge.className = 'status-badge live'; badge.textContent = 'Live'; }
@@ -633,6 +659,10 @@ function cleanupStream(camId) {
     st.pc.close();
     st.pc = null;
   }
+  if (st.video) {
+    st.video.srcObject = null;
+  }
+  st.mediaStream = null;
   st.connecting = false;
   st.connected = false;
 }
@@ -745,7 +775,12 @@ function updateVideoCell(cell, cam) {
   cell.classList.toggle('offline', isOffline);
 
   const video = cell.querySelector('video');
-  if (video) video.style.display = isOffline ? 'none' : 'block';
+  if (video) {
+    video.style.display = isOffline ? 'none' : 'block';
+    if (isOffline) {
+      video.srcObject = null;
+    }
+  }
 
   const offlineMsg = cell.querySelector('.offline-placeholder');
   if (offlineMsg) offlineMsg.style.display = isOffline ? 'block' : 'none';
@@ -789,6 +824,10 @@ function renderVideoGrid(data) {
   STREAM_BADGE.textContent = `${n} cameras`;
 
   if (n === 0) {
+    const oldVideos = VIDEO_GRID.querySelectorAll('video');
+    for (const v of oldVideos) {
+      v.srcObject = null;
+    }
     VIDEO_GRID.innerHTML = '<div class="video-cell offline"><span class="no-stream">No cameras available</span></div>';
     for (const camId of Object.keys(streamStates)) {
       cleanupStream(camId);
@@ -815,14 +854,20 @@ function renderVideoGrid(data) {
     cams.some((c, i) => c.camera_id !== existingCamIds[i]);
 
   if (needsRebuild) {
+    const oldVideos = VIDEO_GRID.querySelectorAll('video');
+    for (const v of oldVideos) {
+      v.srcObject = null;
+    }
     VIDEO_GRID.innerHTML = '';
     for (const cam of cams) {
       const cell = createVideoCell(cam);
       VIDEO_GRID.appendChild(cell);
+      const newVideo = cell.querySelector('video');
       if (!streamStates[cam.camera_id]) {
         streamStates[cam.camera_id] = {
           pc: null,
-          video: cell.querySelector('video'),
+          mediaStream: null,
+          video: newVideo,
           cell: cell,
           streamPath: cam.stream_path,
           connecting: false,
@@ -832,8 +877,12 @@ function renderVideoGrid(data) {
           connected: false
         };
       } else {
-        streamStates[cam.camera_id].video = cell.querySelector('video');
-        streamStates[cam.camera_id].cell = cell;
+        const st = streamStates[cam.camera_id];
+        st.video = newVideo;
+        st.cell = cell;
+        if (st.mediaStream && newVideo && cam.online) {
+          newVideo.srcObject = st.mediaStream;
+        }
       }
     }
   } else {
@@ -841,6 +890,13 @@ function renderVideoGrid(data) {
       const cell = VIDEO_GRID.querySelector(`.video-cell[data-cam-id="${cam.camera_id}"]`);
       if (cell) {
         updateVideoCell(cell, cam);
+        const st = streamStates[cam.camera_id];
+        if (st && st.mediaStream && cam.online) {
+          const video = cell.querySelector('video');
+          if (video && video.srcObject !== st.mediaStream) {
+            video.srcObject = st.mediaStream;
+          }
+        }
       }
     }
   }
@@ -848,9 +904,11 @@ function renderVideoGrid(data) {
   for (const cam of cams) {
     if (!streamStates[cam.camera_id]) {
       const cell = VIDEO_GRID.querySelector(`.video-cell[data-cam-id="${cam.camera_id}"]`);
+      const newVideo = cell ? cell.querySelector('video') : null;
       streamStates[cam.camera_id] = {
         pc: null,
-        video: cell ? cell.querySelector('video') : null,
+        mediaStream: null,
+        video: newVideo,
         cell: cell,
         streamPath: cam.stream_path,
         connecting: false,
@@ -871,7 +929,7 @@ function renderVideoGrid(data) {
         cleanupStream(cam.camera_id);
         st.streamPath = cam.stream_path;
         tryConnectStream(cam.camera_id);
-      } else if (!st.pc && !st.connecting) {
+      } else if (!st.pc && !st.connecting && !st.reconnectTimer) {
         tryConnectStream(cam.camera_id);
       }
     }
@@ -1127,6 +1185,10 @@ function switchCluster(delta) {
     cleanupStream(name);
     delete streamStates[name];
   }
+  const oldVideos = VIDEO_GRID.querySelectorAll('video');
+  for (const v of oldVideos) {
+    v.srcObject = null;
+  }
 
   currentClusterIdx = newIdx;
   renderClusterNav();
@@ -1228,10 +1290,31 @@ function handleWSMessage(msg) {
         const edge = edges[msg.node_id];
         edge.online = true;
         edge.last_heartbeat = msg.timestamp || Date.now() / 1000;
-        const health = { ...msg };
-        delete health.type;
-        delete health.node_id;
-        edge.health = health;
+        const prevHealth = (typeof edge.health === 'object' && edge.health !== null) ? edge.health : {};
+        const incomingHealth = { ...msg };
+        delete incomingHealth.type;
+        delete incomingHealth.node_id;
+
+        const prevPipeline = (typeof prevHealth.pipeline === 'object' && prevHealth.pipeline !== null) ? prevHealth.pipeline : {};
+        const incomingPipeline = (typeof incomingHealth.pipeline === 'object' && incomingHealth.pipeline !== null) ? incomingHealth.pipeline : null;
+
+        const mergedPipeline = incomingPipeline ? {
+          ...prevPipeline,
+          ...incomingPipeline,
+          fps_per_camera: { ...(prevPipeline.fps_per_camera || {}), ...(incomingPipeline.fps_per_camera || {}) },
+          output_fps_per_camera: { ...(prevPipeline.output_fps_per_camera || {}), ...(incomingPipeline.output_fps_per_camera || {}) },
+          input_fps_per_camera: { ...(prevPipeline.input_fps_per_camera || {}), ...(incomingPipeline.input_fps_per_camera || {}) },
+          camera_features: { ...(prevPipeline.camera_features || {}), ...(incomingPipeline.camera_features || {}) },
+          camera_workload: { ...(prevPipeline.camera_workload || {}), ...(incomingPipeline.camera_workload || {}) },
+          camera_configs: { ...(prevPipeline.camera_configs || {}), ...(incomingPipeline.camera_configs || {}) },
+          active_cameras: incomingPipeline.active_cameras !== undefined ? incomingPipeline.active_cameras : prevPipeline.active_cameras,
+        } : prevPipeline;
+
+        edge.health = {
+          ...prevHealth,
+          ...incomingHealth,
+          pipeline: mergedPipeline,
+        };
         updateDashboard();
       }
       break;

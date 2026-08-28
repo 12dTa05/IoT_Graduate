@@ -35,6 +35,7 @@
 # Press Ctrl+C once to gracefully stop all processes.
 
 set -euo pipefail
+export PYTHONUNBUFFERED=1
 
 EDGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$EDGE_DIR"

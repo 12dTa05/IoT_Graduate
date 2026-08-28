@@ -43,12 +43,19 @@ from speedflow_python.settings import (
     LOAD_POLICY,
     LOAD_MODEL,
     TELEMETRY_INTERVAL,
+    LOG_LEVEL,
 )
 
 def _setup_logging() -> logging.Logger:
-    raw_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+    raw_level = LOG_LEVEL
     level = getattr(logging, raw_level, logging.INFO)
     root_level = logging.INFO if raw_level == "DEBUG" else level
+
+    try:
+        from speedflow_python.log_utils import install_crash_hooks, FlushFileHandler
+        install_crash_hooks()
+    except Exception:
+        FlushFileHandler = None
 
     if not logging.root.handlers:
         logging.basicConfig(
@@ -58,6 +65,17 @@ def _setup_logging() -> logging.Logger:
         )
     else:
         logging.root.setLevel(root_level)
+
+    if FlushFileHandler is not None:
+        try:
+            log_dir = Path(__file__).resolve().parent / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            fh = FlushFileHandler(str(log_dir / "health_agent.log"), mode="a", encoding="utf-8")
+            fh.setLevel(root_level)
+            fh.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(message)s", datefmt="%H:%M:%S"))
+            logging.root.addHandler(fh)
+        except Exception:
+            pass
 
     if raw_level == "DEBUG":
         for name in (

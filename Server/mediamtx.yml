@@ -45,6 +45,9 @@ rtmp: no
 paths:
   all_others:
     source: publisher
+    # Reject a second simultaneous publisher for the same camera path during migration overlap.
+    # The new receiver must take over cleanly only after the prior sender has torn down its sink.
+    overridePublisher: no
     # If the Edge disconnects, wait up to 10s before dropping WebRTC viewers.
     # This absorbs brief WAN hiccups without forcing browser reconnects.
     sourceOnDemandCloseAfter: 10s
