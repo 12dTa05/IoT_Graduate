@@ -10,11 +10,14 @@ TRTEXEC="/usr/src/tensorrt/bin/trtexec"
 
 # 1. Convert YOLO11n (Primary Detector)
 # Config expects: YOLO_n.engine
-# Model is STATIC (Batch 1) -> No dynamic shapes needed
+# Dynamic batch size 1-8, opt 4
 echo "Building YOLO_n.engine..."
 if [ -f "yolo11n.onnx" ]; then
-    # Simply convert without shape args for static model
-    $TRTEXEC --onnx=yolo11n.onnx --saveEngine=YOLO_n.engine --fp16 > build_yolo11n.log 2>&1
+    $TRTEXEC --onnx=yolo11n.onnx --saveEngine=YOLO_n.engine --fp16 \
+        --minShapes=images:1x3x640x640 \
+        --optShapes=images:4x3x640x640 \
+        --maxShapes=images:8x3x640x640 \
+        > build_yolo11n.log 2>&1
         
     if [ $? -eq 0 ]; then 
         echo "SUCCESS: YOLO_n.engine created."
