@@ -376,6 +376,9 @@ class PeerOrchestrator:
         self._last_status_error_time: Optional[float] = None
         # Cameras with RFO sent but vote window still open (prevent re-trigger)
         self._vote_in_progress: set = set()
+        # Consecutive L2/L3 peer-selection misses; used to avoid silently
+        # remaining stuck at a fine-grained offload level.
+        self._fine_offload_peer_misses = 0
         # RFO trigger snapshots: camera_id -> (trigger_load, trigger_fps)
         self._rfo_snapshots: Dict[str, Tuple[float, Optional[float]]] = {}
 
@@ -1959,10 +1962,10 @@ class PeerOrchestrator:
         # for threshold comparisons so Level 1/2/3 boundaries are consistent
         # whether proactive mode is on or off.
         load = self._effective_load(state.load_score, state.risk_index)
-        thr3          = cfg.get("offload_level3_threshold", 60.0)
-        thr2          = cfg.get("offload_level2_threshold", 67.0)
-        thr1          = cfg.get("offload_level1_threshold", 80.0)
-        level_cd      = cfg.get("offload_level_cooldown_s", 20.0)
+        thr3          = cfg.get("offload_level3_threshold", 55.0)
+        thr2          = cfg.get("offload_level2_threshold", 64.0)
+        thr1          = cfg.get("offload_level1_threshold", 72.0)
+        level_cd      = cfg.get("offload_level_cooldown_s", 12.0)
         global_offload = cfg.get("offload_level", 0)
         logger.debug("[PeerOrch] Overload check: load=%.1f, thr1=%.1f, thr2=%.1f, thr3=%.1f, "
                     "global_offload=%d, cam_ready=%s",
@@ -2111,8 +2114,8 @@ class PeerOrchestrator:
 
         # Escalation ladder: 3 → 2 → 1
         # Read dwell config (fail-safe defaults if missing/malformed)
-        l3_dwell = _dwell_s(cfg, "l3_dwell_s", 10.0)
-        l2_dwell = _dwell_s(cfg, "l2_dwell_s", 7.0)
+        l3_dwell = _dwell_s(cfg, "l3_dwell_s", 8.0)
+        l2_dwell = _dwell_s(cfg, "l2_dwell_s", 12.0)
 
         if intended_level == 1:
             # Ownership guard: only cameras this node owns (cameras.yml) may be
@@ -2213,12 +2216,17 @@ class PeerOrchestrator:
 
             best_peer = self._pick_best_peer(for_offload_level=2)
             if not best_peer:
+                self._fine_offload_peer_misses += 1
                 if self._maybe_log_block("no_peer_l2", now):
                     logger.warning(
                         "[PeerOrch] Overloaded (load=%.1f ≥ L2=%.1f) but no suitable "
                         "peer for Level 2 crop offload — offload blocked",
                         load, thr2,
                     )
+                if self._fine_offload_peer_misses < 3:
+                    return
+                logger.warning("[PeerOrch] L2 peer unavailable for %d checks; escalating to L1", self._fine_offload_peer_misses)
+                self._trigger_level1_if_due(state, now, cfg)
                 return
             if current_level != 2:
                 logger.info(
@@ -2227,16 +2235,22 @@ class PeerOrchestrator:
                     load, thr2, cam_to_offload, best_peer,
                 )
                 self.set_offload_level(cam_to_offload, 2, target_node=best_peer)
+            self._fine_offload_peer_misses = 0
 
         elif intended_level == 3:
             best_peer = self._pick_best_peer(for_offload_level=3)
             if not best_peer:
+                self._fine_offload_peer_misses += 1
                 if self._maybe_log_block("no_peer_l3", now):
                     logger.warning(
                         "[PeerOrch] Overloaded (load=%.1f ≥ L3=%.1f) but no suitable "
                         "peer for Level 3 plate-crop offload — offload blocked",
                         load, thr3,
                     )
+                if self._fine_offload_peer_misses < 3:
+                    return
+                logger.warning("[PeerOrch] L3 peer unavailable for %d checks; escalating to L1", self._fine_offload_peer_misses)
+                self._trigger_level1_if_due(state, now, cfg)
                 return
             if current_level != 3:
                 logger.info(
@@ -2245,6 +2259,7 @@ class PeerOrchestrator:
                     load, thr3, cam_to_offload, best_peer,
                 )
                 self.set_offload_level(cam_to_offload, 3, target_node=best_peer)
+            self._fine_offload_peer_misses = 0
 
     def _trigger_level1_if_due(self, state, now: float, cfg: dict) -> None:
         """Legacy Level-1 overload trigger (existing behaviour, unchanged).
@@ -2328,7 +2343,7 @@ class PeerOrchestrator:
                     continue
                 if now - peer.last_seen > timeout:
                     continue
-                if peer.load_score >= 60.0:
+                if peer.load_score >= self._cfg.get("overload_threshold", 55.0):
                     continue
                 if self._peer_consecutive_timeouts.get(nid, 0) >= zombie_timeout_count:
                     continue

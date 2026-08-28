@@ -362,7 +362,7 @@ def build_pipeline(
         sink_elements = [conv, conv_caps, eglT, sink]
 
     elif sink_type == "rtsp_push":
-        conv = make_element("conv", "nvvideoconvert")
+        conv = make_element("conv_push", "nvvideoconvert")
         scale_caps = make_element("scale_caps", "capsfilter")
         scale_caps.set_property(
             "caps", Gst.Caps.from_string(
@@ -443,6 +443,95 @@ def build_pipeline(
     )
 
     return pipeline, nvdsosd, streammux, source_bins
+
+
+def rebuild_rtsp_push_sink(
+    pipeline: Gst.Pipeline,
+    rtsp_push_url: str,
+    bitrate: int = 4_000_000,
+) -> bool:
+    """Tear down and recreate only the RTSP push sink branch on failure.
+
+    This replaces the old sink branch (conv, scale_caps, enc, parse, sink) with a fresh
+    set of elements unlinked from nvdsosd, preserving all upstream AI pipeline state,
+    nvstreammux, and NVDEC decoders without recreating the whole pipeline.
+
+    # ponytail: minimal sink-only rebuild avoids tearing down NVDEC/AI sessions when MediaMTX drops.
+    """
+    nvdsosd = pipeline.get_by_name("onscreendisplay")
+    if nvdsosd is None:
+        logger.error("[Pipeline] rebuild_rtsp_push_sink: nvdsosd element not found")
+        return False
+
+    old_names = ["conv_push", "scale_caps", "enc", "parse", "rtsp_push_sink"]
+    # Fallback to checking older conv name if conv_push is not yet used
+    old_elements = []
+    for name in old_names:
+        el = pipeline.get_by_name(name)
+        if el is not None:
+            old_elements.append(el)
+    if not old_elements:
+        conv_el = pipeline.get_by_name("conv")
+        if conv_el is not None:
+            old_elements.append(conv_el)
+
+    # 1. Unlink nvdsosd from the sink branch
+    nvdsosd_src = nvdsosd.get_static_pad("src")
+    if nvdsosd_src and nvdsosd_src.is_linked():
+        peer = nvdsosd_src.get_peer()
+        if peer:
+            nvdsosd_src.unlink(peer)
+
+    # 2. Sequentially teardown old sink branch elements
+    for target_state in (Gst.State.PAUSED, Gst.State.READY, Gst.State.NULL):
+        for el in old_elements:
+            el.set_state(target_state)
+        for el in old_elements:
+            el.get_state(1 * Gst.SECOND)
+
+    # 3. Remove old sink branch elements from pipeline
+    for el in old_elements:
+        pipeline.remove(el)
+
+    # 4. Create fresh sink branch elements
+    try:
+        conv = make_element("conv_push", "nvvideoconvert")
+        scale_caps = make_element("scale_caps", "capsfilter")
+        scale_caps.set_property(
+            "caps", Gst.Caps.from_string(
+                "video/x-raw(memory:NVMM), format=NV12, width=1280, height=720"
+            )
+        )
+        enc = make_element("enc", "nvv4l2h264enc")
+        enc.set_property("insert-sps-pps", True)
+        enc.set_property("iframeinterval", 30)
+        enc.set_property("bitrate", bitrate)
+        try:
+            enc.set_property("maxperf-enable", True)
+        except (TypeError, Exception):
+            pass
+        parse = make_element("parse", "h264parse")
+        sink = make_element("rtsp_push_sink", "rtspclientsink")
+        sink.set_property("location", rtsp_push_url)
+        sink.set_property("protocols", "tcp")
+        sink.set_property("latency", 0)
+
+        new_elements = [conv, scale_caps, enc, parse, sink]
+        for el in new_elements:
+            pipeline.add(el)
+
+        # 5. Link nvdsosd -> conv -> scale_caps -> enc -> parse -> sink
+        gst_link(nvdsosd, conv, scale_caps, enc, parse, sink)
+
+        # 6. Synchronize state of new elements with parent pipeline
+        for el in new_elements:
+            el.sync_state_with_parent()
+
+        logger.info("[Pipeline] RTSP push sink branch rebuilt and resynced to PLAYING")
+        return True
+    except Exception as exc:
+        logger.error("[Pipeline] Failed to rebuild RTSP push sink branch: %s", exc)
+        return False
 
 
 # ---------------------------------------------------------------------------

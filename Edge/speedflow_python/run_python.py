@@ -15,7 +15,12 @@ import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
 
-from .core_pipeline import build_pipeline, dynamic_add_stream, dynamic_remove_stream
+from .core_pipeline import (
+    build_pipeline,
+    dynamic_add_stream,
+    dynamic_remove_stream,
+    rebuild_rtsp_push_sink,
+)
 from .camera_config import CameraManager
 from .probes import SpeedProbe, ROIFilterProbe
 from .plate_preprocessor import PlatePreprocessorProbe
@@ -488,6 +493,10 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         _error_reason = ["unknown"]
         _removing = set()  # guard against double-remove from multiple error msgs
 
+        _sink_reconnect_attempts = [0]
+        _MAX_SINK_RETRIES = int(os.environ.get("RTSP_PUSH_MAX_RETRIES", "3"))
+        _SINK_RETRY_DELAY_S = float(os.environ.get("RTSP_PUSH_RETRY_DELAY_S", "1.0"))
+
         def on_message(bus, message):
             t = message.type
             if t == Gst.MessageType.ERROR:
@@ -544,8 +553,20 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
                     if debug:
                         print(f"DEBUG INFO: {debug}", file=sys.stderr)
 
-                    # ponytail: in-place NULL->PLAYING on rtspclientsink sends empty SDP (400 Bad Request);
-                    # full pipeline rebuild below resets RTSP session cleanly with fresh caps
+                    if _sink_reconnect_attempts[0] < _MAX_SINK_RETRIES:
+                        _sink_reconnect_attempts[0] += 1
+                        print(
+                            f"[RTSP Push] Sink-only recovery attempt {_sink_reconnect_attempts[0]}/{_MAX_SINK_RETRIES}...",
+                            file=sys.stderr,
+                        )
+                        if _SINK_RETRY_DELAY_S > 0:
+                            import time as _time; _time.sleep(_SINK_RETRY_DELAY_S)
+                        if rebuild_rtsp_push_sink(pipeline, rtsp_url, bitrate=S.RTSP_PUSH_BITRATE):
+                            print("[RTSP Push] Sink branch rebuilt successfully; pipeline remains PLAYING", file=sys.stderr)
+                            return
+                        print("[RTSP Push] Sink branch rebuild failed; falling back to full pipeline rebuild", file=sys.stderr)
+
+                    # Full pipeline rebuild fallback after retry exhaustion or rebuild error
                     _error_reason[0] = f"{err_category}:{src_name}:{err}"
                     _error_flag[0] = True
                     loop.quit()

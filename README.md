@@ -379,6 +379,15 @@ training/evaluation uses Mode-A data only (confounded windows tagged or excluded
 
 ---
 
+## Jetson Lockup & Freeze Investigation
+
+Safe, passive diagnostics and manual setup procedures for triaging Jetson kernel hangs or hardware freezes are documented in:
+- `Edge/deploy/JETSON_LOCKUP_INVESTIGATION.md`
+- Diagnostic collector: `Edge/tools/jetson_diag_collector.sh`
+- Background passive metric ring-buffer: `Edge/tools/jetson_diag_watcher.sh`
+
+---
+
 ## Known Constraints (Jetson-specific)
 
 - Sequential decoder teardown only (PLAYING→PAUSED→READY→NULL with get_state waits);

@@ -82,6 +82,7 @@ class _StubGstElement:
         self.name = name
         self.factory = factory
         self._props: dict = {}
+        self._children: dict[str, _StubGstElement] = {}
 
     def set_property(self, key: str, value) -> None:
         self._props[key] = value
@@ -92,8 +93,20 @@ class _StubGstElement:
     def connect(self, *a, **kw) -> None:
         pass
 
-    def add(self, _child) -> None:
+    def add(self, child) -> None:
+        self._children[child.name] = child
+
+    def remove(self, child) -> None:
+        self._children.pop(child.name, None)
+
+    def get_by_name(self, name: str):
+        return self._children.get(name)
+
+    def set_state(self, state) -> None:
         pass
+
+    def get_state(self, timeout=None):
+        return (0, 0, 0)
 
     def sync_state_with_parent(self) -> None:
         pass
@@ -171,7 +184,8 @@ _gst.Caps = type("_GstCapsStub", (), {
 # Minimal stubs for PadProbe symbols referenced by dynamic helpers (never called)
 _gst.PadProbeReturn = type("_PadProbeReturn", (), {"OK": "OK", "DROP": "DROP"})
 _gst.PadProbeType = type("_PadProbeType", (), {"BUFFER": "BUFFER", "BLOCK_DOWNSTREAM": "BLOCK"})
-_gst.State = type("_GstStateStub", (), {"NULL": "NULL"})
+_gst.State = type("_GstStateStub", (), {"NULL": "NULL", "READY": "READY", "PAUSED": "PAUSED", "PLAYING": "PLAYING"})
+_gst.SECOND = 1_000_000_000
 _gst.init = lambda *a: None
 
 _gi = _stub_module("gi")
@@ -207,6 +221,7 @@ _cp = _exec_deps_stubbed(
 )
 
 build_pipeline = _cp.build_pipeline
+rebuild_rtsp_push_sink = _cp.rebuild_rtsp_push_sink
 
 # ── Restore real modules for sibling test imports ──────────────────────────
 
@@ -330,3 +345,21 @@ def test_live_source_any_live_keeps_push_mode():
     build_pipeline(_DUMMY_CAMS, sink_type="file")  # _DummyCamera URIs are rtsp
     streammux = next(e for e in _ELEMENTS if e.factory == "nvstreammux")
     assert streammux.get_property("live-source") == 1
+
+
+def test_rebuild_rtsp_push_sink_replaces_sink_branch():
+    """Sink-only recovery unlinks nvdsosd, tears down old sink elements, and adds new sink branch."""
+    pipeline = _StubGstElement("pipeline", "pipeline")
+    osd = _StubGstElement("onscreendisplay", "nvdsosd")
+    conv = _StubGstElement("conv_push", "nvvideoconvert")
+    caps = _StubGstElement("scale_caps", "capsfilter")
+    enc = _StubGstElement("enc", "nvv4l2h264enc")
+    parse = _StubGstElement("parse", "h264parse")
+    sink = _StubGstElement("rtsp_push_sink", "rtspclientsink")
+    for el in [osd, conv, caps, enc, parse, sink]:
+        pipeline.add(el)
+
+    res = rebuild_rtsp_push_sink(pipeline, "rtsp://localhost:8554/live/test", bitrate=2_000_000)
+    assert res is True
+    assert pipeline.get_by_name("rtsp_push_sink") is not None
+    assert pipeline.get_by_name("rtsp_push_sink").get_property("location") == "rtsp://localhost:8554/live/test"
