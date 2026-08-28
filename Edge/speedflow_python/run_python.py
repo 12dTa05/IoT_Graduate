@@ -156,6 +156,8 @@ def _attach_camera_manager(
     streammux: Gst.Element,
     source_bins: dict,
     tiler: Gst.Element = None,
+    rtsp_push_base_url: Optional[str] = None,
+    rtsp_push_bitrate: Optional[int] = None,
 ):
     """
     Hooks up the CameraManager to safely add/remove streams dynamically.
@@ -180,6 +182,8 @@ def _attach_camera_manager(
             dynamic_add_stream(
                 pipeline, streammux, cam_cfg, tiler, source_bins,
                 ready_event=ready_ev,
+                rtsp_push_base_url=rtsp_push_base_url,
+                rtsp_push_bitrate=rtsp_push_bitrate,
             )
             # Register mapping immediately after successful add.
             # This function runs in GLib Main Loop → safe, no lock needed.
@@ -441,20 +445,24 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         _stop_active_speed_probes()
 
         print(f"[RTSP Push] Building pipeline (cause: {_last_restart_cause})...")
+        rtsp_push_bitrate = int(os.environ.get("RTSP_PUSH_PER_CAM_BITRATE", os.environ.get("RTSP_PUSH_BITRATE", "1000000")))
         ret_build = build_pipeline(
             camera_configs=camera_manager.get_enabled_configs(),
             sink_type="rtsp_push",
             mux_width=args.width,
             mux_height=args.height,
-            rtsp_push_url=rtsp_url,
-            bitrate=S.RTSP_PUSH_BITRATE,
+            rtsp_push_base_url=rtsp_url,
+            rtsp_push_bitrate=rtsp_push_bitrate,
         )
         pipeline, nvdsosd, streammux, source_bins = ret_build
         tiler = pipeline.get_by_name("tiler")
 
         _last_probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
         ACTIVE_SPEED_PROBE.append(_last_probe)
-        _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
+        _attach_camera_manager(
+            camera_manager, pipeline, streammux, source_bins, tiler,
+            rtsp_push_base_url=rtsp_url, rtsp_push_bitrate=rtsp_push_bitrate,
+        )
 
         ret = pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
@@ -535,35 +543,58 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
                         dynamic_remove_stream(pipeline, streammux, cam_id, sid, tiler, source_bins)
                     return  # don't quit the pipeline
 
-                # Distinguish RTSP push sink (rtsp_push_sink / rtspclientsink) vs other pipeline errors
+                # Distinguish RTSP push sink (rtsp_push_sink / rtspclientsink / per-camera sinks) vs other pipeline errors
                 is_rtsp_sink = False
+                sink_el = None
                 elem = message.src
                 while elem is not None:
                     ename = elem.get_name()
                     fact = elem.get_factory()
                     fact_name = fact.get_name() if fact else ""
-                    if ename == "rtsp_push_sink" or fact_name == "rtspclientsink":
+                    if ename == "rtsp_push_sink" or ename.startswith("sink_rtsp_push_") or fact_name == "rtspclientsink":
                         is_rtsp_sink = True
+                        sink_el = elem
                         break
                     elem = elem.get_parent()
 
                 if is_rtsp_sink:
                     err_category = "publisher_failure"
-                    print(f"ERROR ({err_category}) from {src_name}: {err}", file=sys.stderr)
+                    sink_el_name = sink_el.get_name() if sink_el else (message.src.get_name() if message.src else "unknown")
+                    print(f"ERROR ({err_category}) from {sink_el_name}: {err}", file=sys.stderr)
                     if debug:
                         print(f"DEBUG INFO: {debug}", file=sys.stderr)
 
                     if _sink_reconnect_attempts[0] < _MAX_SINK_RETRIES:
                         _sink_reconnect_attempts[0] += 1
                         print(
-                            f"[RTSP Push] Sink-only recovery attempt {_sink_reconnect_attempts[0]}/{_MAX_SINK_RETRIES}...",
+                            f"[RTSP Push] Sink recovery attempt on {sink_el_name} ({_sink_reconnect_attempts[0]}/{_MAX_SINK_RETRIES})...",
                             file=sys.stderr,
                         )
                         if _SINK_RETRY_DELAY_S > 0:
                             import time as _time; _time.sleep(_SINK_RETRY_DELAY_S)
-                        if rebuild_rtsp_push_sink(pipeline, rtsp_url, bitrate=S.RTSP_PUSH_BITRATE):
-                            print("[RTSP Push] Sink branch rebuilt successfully; pipeline remains PLAYING", file=sys.stderr)
-                            return
+
+                        # Attempt per-camera sink branch rebuild if it matches per-camera name
+                        if sink_el_name.startswith("sink_rtsp_push_"):
+                            try:
+                                from .core_pipeline import _remove_rtsp_push_branch, _add_rtsp_push_branch
+                                sid = int(sink_el_name.split("_")[-1])
+                                cam_cfg = next((c for c in camera_manager.get_enabled_configs() if c.source_id == sid), None)
+                                demux = pipeline.get_by_name("demux")
+                                if cam_cfg and demux:
+                                    _remove_rtsp_push_branch(pipeline, sid)
+                                    _add_rtsp_push_branch(
+                                        pipeline, demux, cam_cfg, rtsp_url, bitrate=rtsp_push_bitrate, sync=True
+                                    )
+                                    _sink_reconnect_attempts[0] = 0
+                                    print(f"[RTSP Push] Rebuilt sink branch for camera '{cam_cfg.camera_id}' (source_id={sid}); pipeline remains PLAYING", file=sys.stderr)
+                                    return
+                            except Exception as rebuild_exc:
+                                print(f"[RTSP Push] Per-camera sink rebuild failed: {rebuild_exc}", file=sys.stderr)
+                        else:
+                            if rebuild_rtsp_push_sink(pipeline, rtsp_url, bitrate=S.RTSP_PUSH_BITRATE):
+                                print("[RTSP Push] Legacy sink branch rebuilt successfully; pipeline remains PLAYING", file=sys.stderr)
+                                return
+
                         print("[RTSP Push] Sink branch rebuild failed; falling back to full pipeline rebuild", file=sys.stderr)
 
                     # Full pipeline rebuild fallback after retry exhaustion or rebuild error

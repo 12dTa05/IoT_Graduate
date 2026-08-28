@@ -23,6 +23,11 @@ from typing import Callable, Deque, Dict, Optional, Tuple
 import os
 import msgpack
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 from speedflow_python.zenoh_session import make_session
 
 # Load settings from .env (must run from Edge/ or have Edge/ in path)
@@ -929,6 +934,10 @@ class HealthAgent:
         self._heartbeat_consecutive_errors = 0
         self._last_heartbeat_sent_time: Optional[float] = None
         self._last_heartbeat_error_time: Optional[float] = None
+        # Bandwidth telemetry state (bytes, timestamp)
+        self._last_net_bytes: Optional[Tuple[int, int]] = None
+        self._last_net_time: Optional[float] = None
+        self._net_lock = threading.Lock()
 
     def _reload_cam_configs(self) -> Dict[str, dict]:
         """Read cameras.yml for peer failover metadata in health payloads."""
@@ -1183,6 +1192,58 @@ class HealthAgent:
 
         return _collect_jetson_metrics()
 
+    def _get_net_bytes(self) -> Tuple[int, int]:
+        """Read cumulative (rx_bytes, tx_bytes) across non-loopback interfaces."""
+        if psutil is not None:
+            try:
+                counters = psutil.net_io_counters()
+                return int(counters.bytes_recv), int(counters.bytes_sent)
+            except Exception:
+                pass
+
+        # Fallback to /proc/net/dev (eno1 / eth* / wlan* / all non-lo)
+        rx_total, tx_total = 0, 0
+        try:
+            with open("/proc/net/dev", "r") as f:
+                lines = f.readlines()
+            for line in lines[2:]:
+                parts = line.strip().split(":")
+                if len(parts) == 2:
+                    iface = parts[0].strip()
+                    if iface != "lo":
+                        data = parts[1].split()
+                        rx_total += int(data[0])
+                        tx_total += int(data[8])
+        except Exception:
+            pass
+        return rx_total, tx_total
+
+    def _sample_network_bps(self) -> Tuple[float, float]:
+        """Compute delta-per-second (network_bps_rx, network_bps_tx)."""
+        with self._net_lock:
+            now = time.monotonic()
+            curr_rx, curr_tx = self._get_net_bytes()
+            if self._last_net_bytes is None or self._last_net_time is None:
+                self._last_net_bytes = (curr_rx, curr_tx)
+                self._last_net_time = now
+                return 0.0, 0.0
+
+            dt = now - self._last_net_time
+            if dt <= 0.0:
+                return 0.0, 0.0
+
+            prev_rx, prev_tx = self._last_net_bytes
+            rx_delta = max(0, curr_rx - prev_rx)
+            tx_delta = max(0, curr_tx - prev_tx)
+
+            # bits per second: bytes * 8 / dt
+            bps_rx = (rx_delta * 8.0) / dt
+            bps_tx = (tx_delta * 8.0) / dt
+
+            self._last_net_bytes = (curr_rx, curr_tx)
+            self._last_net_time = now
+            return round(bps_rx, 1), round(bps_tx, 1)
+
     def _run(self) -> None:
         """Main loop — collect and publish periodically."""
         import traceback
@@ -1375,12 +1436,15 @@ class HealthAgent:
                             logger.debug("[HealthAgent] Failed to retrieve live ownership records: %s", exc)
 
                     now_ts = time.time()
+                    bps_rx, bps_tx = self._sample_network_bps()
                     payload = {
                         "type":          "health",
                         "node_id":       NODE_ID,
                         "advertise_ip":  ADVERTISE_IP,
                         "timestamp":     now_ts,
                         "ts":            now_ts,
+                        "network_bps_rx": bps_rx,
+                        "network_bps_tx": bps_tx,
                         "load_score":    load_score,
                         "omega_preset":  omega_preset,
                         "load_score_breakdown": load_score_breakdown,

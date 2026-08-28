@@ -11,7 +11,7 @@ Architecture:
                                │
                     sink_type == "display":     nvmultistreamtiler → OSD → EGL sink
                     sink_type == "file":        OSD → nvstreamdemux → N × encoder → filesink
-                    sink_type == "rtsp_push":   nvmultistreamtiler → OSD → H264 enc → rtspclientsink
+                    sink_type == "rtsp_push":   OSD → nvstreamdemux → N × [queue → conv → enc → parse → rtspclientsink]
 """
 import logging
 import os
@@ -145,6 +145,107 @@ def _make_source_bin(
     return source
 
 
+def _add_rtsp_push_branch(
+    pipeline: Gst.Pipeline,
+    demux: Gst.Element,
+    cam_cfg: CameraConfig,
+    rtsp_push_base_url: str,
+    bitrate: int = 1_000_000,
+    sync: bool = False,
+) -> list[Gst.Element]:
+    """Create one nvstreamdemux -> encoder -> rtspclientsink branch for cam_cfg."""
+    sid = cam_cfg.source_id
+    if pipeline.get_by_name(f"queue_rtsp_push_{sid}"):
+        return []
+
+    suffix = f"_{sid}"
+    queue = make_element(f"queue_rtsp_push{suffix}", "queue")
+    conv = make_element(f"conv_rtsp_push{suffix}", "nvvideoconvert")
+    caps = make_element(f"caps_rtsp_push{suffix}", "capsfilter")
+    caps.set_property(
+        "caps", Gst.Caps.from_string(
+            "video/x-raw(memory:NVMM), format=NV12, width=1280, height=720"
+        )
+    )
+    enc = make_element(f"enc_rtsp_push{suffix}", "nvv4l2h264enc")
+    enc.set_property("bitrate", bitrate)  # default 1 Mbps per camera
+    enc.set_property("iframeinterval", 30)
+    enc.set_property("insert-sps-pps", True)
+    try:
+        enc.set_property("maxperf-enable", True)
+    except (TypeError, Exception):
+        pass
+
+    parse = make_element(f"parse_rtsp_push{suffix}", "h264parse")
+    sink = make_element(f"sink_rtsp_push{suffix}", "rtspclientsink")
+    sink.set_property("location", f"{rtsp_push_base_url.rstrip('/')}/{cam_cfg.camera_id}")
+    sink.set_property("protocols", "tcp")
+    sink.set_property("latency", 0)
+
+    elements = [queue, conv, caps, enc, parse, sink]
+    for el in elements:
+        pipeline.add(el)
+
+    # Link all downstream chain from queue
+    gst_link(queue, conv, caps, enc, parse, sink)
+
+    # Request and link demux src pad
+    srcpad = demux.get_request_pad(f"src_{sid}")
+    sinkpad = queue.get_static_pad("sink")
+    if srcpad and sinkpad and not sinkpad.is_linked():
+        srcpad.link(sinkpad)
+
+    if sync:
+        for el in elements:
+            el.sync_state_with_parent()
+
+    return elements
+
+
+def _remove_rtsp_push_branch(pipeline: Gst.Pipeline, source_id: int) -> None:
+    demux = pipeline.get_by_name("demux")
+    suffix = f"_{source_id}"
+    names = [
+        f"queue_rtsp_push{suffix}",
+        f"conv_rtsp_push{suffix}",
+        f"caps_rtsp_push{suffix}",
+        f"enc_rtsp_push{suffix}",
+        f"parse_rtsp_push{suffix}",
+        f"sink_rtsp_push{suffix}",
+    ]
+    elements = [pipeline.get_by_name(n) for n in names if pipeline.get_by_name(n) is not None]
+
+    for el in elements:
+        el.set_state(Gst.State.NULL)
+
+    if demux:
+        srcpad = demux.get_static_pad(f"src_{source_id}")
+        queue = pipeline.get_by_name(f"queue_rtsp_push{suffix}")
+        sinkpad = queue.get_static_pad("sink") if queue else None
+        if srcpad and sinkpad and srcpad.is_linked():
+            srcpad.unlink(sinkpad)
+        if srcpad:
+            demux.release_request_pad(srcpad)
+
+    for el in elements:
+        pipeline.remove(el)
+
+
+def init_rtsp_push_branches(
+    pipeline: Gst.Pipeline,
+    demux: Gst.Element,
+    present_cameras: list[CameraConfig],
+    rtsp_push_base_url: str,
+    bitrate: int = 1_000_000,
+) -> None:
+    """Initialize RTSP push branches for all enabled initial cameras."""
+    for cam_cfg in present_cameras:
+        if cam_cfg.enabled:
+            _add_rtsp_push_branch(
+                pipeline, demux, cam_cfg, rtsp_push_base_url, bitrate=bitrate
+            )
+
+
 def _add_file_recording_branch(
     pipeline: Gst.Pipeline,
     demux: Gst.Element,
@@ -230,8 +331,8 @@ def build_pipeline(
     sink_type: str = "display",
     mux_width: int = 1920,
     mux_height: int = 1080,
-    analytics_config: str = None,
-    slot_capacity: int = None,
+    analytics_config: Optional[str] = None,
+    slot_capacity: Optional[int] = None,
     **kwargs,
 ):
     """
@@ -311,7 +412,7 @@ def build_pipeline(
     analytics.set_property("config-file", analytics_config)
 
     # ── Determine display / file-write strategy ──────────────────────────────
-    is_tiled = (sink_type in ["display", "rtsp_push"])
+    is_tiled = (sink_type == "display")
 
     # ── Tiler (only create when a tiled grid is needed) ───────────────────────
     if is_tiled:
@@ -362,27 +463,11 @@ def build_pipeline(
         sink_elements = [conv, conv_caps, eglT, sink]
 
     elif sink_type == "rtsp_push":
-        conv = make_element("conv_push", "nvvideoconvert")
-        scale_caps = make_element("scale_caps", "capsfilter")
-        scale_caps.set_property(
-            "caps", Gst.Caps.from_string(
-                "video/x-raw(memory:NVMM), format=NV12, width=1280, height=720"
-            )
-        )
-        enc = make_element("enc", "nvv4l2h264enc")
-        enc.set_property("insert-sps-pps", True)
-        enc.set_property("iframeinterval", 30)
-        enc.set_property("bitrate", kwargs.get("bitrate", 4_000_000))
-        try:
-            enc.set_property("maxperf-enable", True)
-        except (TypeError, Exception):
-            pass
-        parse = make_element("parse", "h264parse")
-        sink = make_element("rtsp_push_sink", "rtspclientsink")
-        sink.set_property("location", kwargs["rtsp_push_url"])
-        sink.set_property("protocols", "tcp")
-        sink.set_property("latency", 0)
-        sink_elements = [conv, scale_caps, enc, parse, sink]
+        demux = make_element("demux", "nvstreamdemux")
+        pipeline.add(demux)
+        rtsp_base_url = kwargs.get("rtsp_push_base_url") or kwargs.get("rtsp_push_url") or ""
+        rtsp_bitrate = kwargs.get("rtsp_push_bitrate") or kwargs.get("bitrate", 1_000_000)
+        init_rtsp_push_branches(pipeline, demux, camera_configs, rtsp_base_url, bitrate=rtsp_bitrate)
 
     elif sink_type == "file":
         # ── Demuxer ──
@@ -423,13 +508,11 @@ def build_pipeline(
         conv, conv_caps, eglT, sink = sink_elements
         gst_link(nvdsosd, conv, conv_caps, eglT, sink)
 
-    elif sink_type == "rtsp_push":
-        conv, scale_caps, enc, parse, sink = sink_elements
-        gst_link(nvdsosd, conv, scale_caps, enc, parse, sink)
-
-    elif sink_type == "file":
+    elif sink_type in ["rtsp_push", "file"]:
         # Connect OSD to Demux
-        nvdsosd.get_static_pad("src").link(demux.get_static_pad("sink"))
+        demux_el = pipeline.get_by_name("demux")
+        if demux_el is not None:
+            nvdsosd.get_static_pad("src").link(demux_el.get_static_pad("sink"))
 
     # ── Add source bins (N cameras) ───────────────────────────────────────────
     source_bins: dict[str, Gst.Element] = {}
@@ -638,9 +721,11 @@ def dynamic_add_stream(
     pipeline: Gst.Pipeline,
     streammux: Gst.Element,
     cam_cfg: CameraConfig,
-    tiler: Gst.Element,
+    tiler: Optional[Gst.Element],
     source_bins: dict,
     ready_event: Optional[threading.Event] = None,
+    rtsp_push_base_url: Optional[str] = None,
+    rtsp_push_bitrate: Optional[int] = None,
 ) -> Gst.Element:
     # Cleanup stale source_bin from a previous failed ADD attempt.
     # If the prior _send_ack timed out without a REMOVE completing, the old
@@ -681,25 +766,34 @@ def dynamic_add_stream(
     #    to its previous value and leave the pipeline unchanged.
     streammux.set_property("batch-size", old_batch_size + 1)
 
-    # File mode uses nvstreamdemux branches. Dynamic ADD must create the
+    # File / RTSP push modes use nvstreamdemux branches. Dynamic ADD must create the
     # matching branch before frames for the new source_id start flowing.
     demux = pipeline.get_by_name("demux")
     recording_added = False
+    rtsp_push_added = False
     try:
         if demux is not None:
-            _add_file_recording_branch(pipeline, demux, cam_cfg, sync=True)
-            recording_added = True
+            if rtsp_push_base_url:
+                bitrate = rtsp_push_bitrate if rtsp_push_bitrate is not None else 1_000_000
+                _add_rtsp_push_branch(
+                    pipeline, demux, cam_cfg, rtsp_push_base_url, bitrate=bitrate, sync=True
+                )
+                rtsp_push_added = True
+            elif cam_cfg.record:
+                _add_file_recording_branch(pipeline, demux, cam_cfg, sync=True)
+                recording_added = True
 
         # 3. Add and start the new source
         src = _make_source_bin(pipeline, streammux, cam_cfg, ready_event=ready_event)
         src.sync_state_with_parent()
     except Exception:
         # Rollback: restore batch-size and tear down any partially-created
-        # recording branch so the pipeline returns to the state it was in
-        # before this call.
+        # branch so the pipeline returns to the state it was in before this call.
         streammux.set_property("batch-size", old_batch_size)
         if recording_added:
             _remove_file_recording_branch(pipeline, cam_cfg.source_id)
+        if rtsp_push_added:
+            _remove_rtsp_push_branch(pipeline, cam_cfg.source_id)
         raise
 
     source_bins[cam_cfg.camera_id] = src
@@ -778,8 +872,9 @@ def _teardown_source_branch(
         for el in branch_elements:
             pipeline.remove(el)
 
-        # Clean up recording branch
+        # Clean up recording / RTSP push branches
         _remove_file_recording_branch(pipeline, source_id)
+        _remove_rtsp_push_branch(pipeline, source_id)
 
         # Bookkeeping
         if camera_id in source_bins:
@@ -813,7 +908,7 @@ def dynamic_remove_stream(
     streammux: Gst.Element,
     camera_id: str,
     source_id: int,
-    tiler: Gst.Element,
+    tiler: Optional[Gst.Element],
     source_bins: dict,
     done_event: Optional[threading.Event] = None,
 ) -> None:

@@ -653,6 +653,11 @@ class SpeedProbe:
         with self._fps_stats_lock:
             return dict(self._fps_stats_cache)
 
+    def _get_current_fps(self, camera_id: str) -> float:
+        """Return current display-ready FPS for a camera (fallback 0.0)."""
+        with self._fps_stats_lock:
+            return float(self._fps_stats_cache.get(camera_id, 0.0))
+
     # ------------------------------------------------------------------
     # Proactive feature counter
     # ------------------------------------------------------------------
@@ -1497,6 +1502,27 @@ class SpeedProbe:
                 add_polygon_display(batch_meta, frame_meta,
                                     cam_cfg.source_points,
                                     color=(0.0, 1.0, 0.0, 1.0))
+
+            # ── Per-camera telemetry overlay ──────────────────────────────
+            cam_id = cam_cfg.camera_id
+            fps_val = self._get_current_fps(cam_id)
+            feats = self.get_feature_stats().get(cam_id, {})
+            n_track = feats.get("n_track", 0.0)
+            n_plate = feats.get("n_plate", 0.0)
+
+            display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+            if display_meta is not None:
+                display_meta.num_labels = 1
+                txt = display_meta.text_params[0]
+                txt.display_text = f"FPS: {fps_val:.1f} | N_TRACK: {n_track:.1f} | N_PLATE: {n_plate:.1f}"
+                txt.x_offset = 10
+                txt.y_offset = 10
+                txt.font_params.font_name = "Courier"
+                txt.font_params.font_size = 7
+                txt.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
+                txt.set_bg_clr = 1
+                txt.text_bg_clr.set(0.0, 0.0, 0.0, 0.5)
+                pyds.nvds_add_display_meta_to_frame(frame_meta, display_meta)
 
             # Fix #8: always use wall-clock time for the cleanup timer, not the
             # buffer NTP timestamp.  A replayed video file carries old NTP

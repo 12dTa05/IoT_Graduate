@@ -6,11 +6,14 @@
 <title>IoT Graduate — Central Monitor</title>
 <!-- SERVER_CONFIG -->
 <style>
+:root {
+  --video-aspect-ratio: 16/9;
+}
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
   background: #0a0a0f;
   color: #e0e0e0;
-  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
   overflow: hidden;
   height: 100vh;
   display: grid;
@@ -66,18 +69,26 @@ body {
 #video-grid {
   flex: 1;
   display: grid;
-  gap: 4px;
+  gap: 6px;
   padding: 8px;
   min-height: 0;
 }
 .video-cell {
   background: #000;
+  border: 1px solid #1a1a28;
   border-radius: 6px;
   overflow: hidden;
   position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
+  aspect-ratio: var(--video-aspect-ratio);
+  min-height: 0;
+  min-width: 0;
+}
+.video-cell.offline {
+  background: #0a0a10;
+  border-color: #222233;
 }
 .video-cell video {
   width: 100%; height: 100%;
@@ -87,23 +98,55 @@ body {
 .video-cell .label {
   position: absolute; top: 6px; left: 8px;
   font-size: 11px; font-weight: 600;
-  color: #fff; background: rgba(0,0,0,0.65);
+  color: #fff; background: rgba(0,0,0,0.7);
   padding: 2px 8px; border-radius: 4px;
   z-index: 2;
+  display: flex; align-items: center; gap: 6px;
+  backdrop-filter: blur(2px);
+}
+.video-cell .label .node-badge {
+  font-size: 9px;
+  background: #7c7cff;
+  color: #0a0a0f;
+  font-weight: 700;
+  padding: 1px 4px;
+  border-radius: 3px;
+  letter-spacing: 0.5px;
+}
+.video-cell .stats-overlay {
+  position: absolute; bottom: 6px; left: 8px;
+  font-size: 10px; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  color: #00e676; background: rgba(0,0,0,0.75);
+  padding: 2px 7px; border-radius: 4px;
+  z-index: 2;
+  letter-spacing: 0.3px;
+  backdrop-filter: blur(2px);
+}
+.video-cell.offline .stats-overlay {
+  color: #777;
 }
 .video-cell .status-badge {
   position: absolute; bottom: 6px; right: 8px;
   font-size: 10px; padding: 1px 6px; border-radius: 3px;
   z-index: 2;
+  font-weight: 500;
 }
 .video-cell .status-badge.connecting { background: #ff9800; color: #000; }
 .video-cell .status-badge.live { background: #4caf50; color: #fff; }
 .video-cell .status-badge.error { background: #f44336; color: #fff; }
+.video-cell .status-badge.offline { background: #3a3a4a; color: #aaa; }
 .video-cell .bitrate-badge {
-  position: absolute; bottom: 6px; left: 8px;
+  position: absolute; top: 6px; right: 8px;
   font-size: 10px; color: #aaa; background: rgba(0,0,0,0.65);
   padding: 1px 6px; border-radius: 3px;
   z-index: 2;
+}
+.video-cell .offline-placeholder {
+  color: #555;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-align: center;
 }
 .video-cell .no-stream {
   color: #555; font-size: 13px;
@@ -137,23 +180,54 @@ body {
   padding: 10px 12px;
   border-left: 3px solid #4caf50;
   flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
 }
-.health-card.offline { border-left-color: #555; opacity: 0.6; }
+.health-card.offline { border-left-color: #555; opacity: 0.65; }
+.health-card.degraded { border-left-color: #f44336; }
+
 .health-card .header {
   display: flex; align-items: center; gap: 6px;
-  margin-bottom: 6px;
+  margin-bottom: 2px;
 }
-.health-card .dot {
-  width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+.health-card .status-indicator {
+  width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
 }
-.health-card .dot.online { background: #4caf50; }
-.health-card .dot.offline { background: #555; }
-.health-card .node-id { font-weight: 600; font-size: 12px; }
-.health-card .ip { font-size: 10px; color: #888; margin-left: auto; }
+.health-card .status-indicator.online { background: #4caf50; }
+.health-card .status-indicator.offline { background: #555; }
+.health-card .status-indicator.degraded { background: #f44336; }
+
+.health-card .node-badge {
+  font-size: 10px; font-weight: 700;
+  padding: 1px 5px; border-radius: 3px;
+  background: #2a2a3a; color: #7c7cff;
+}
+.health-card .node-id { font-weight: 600; font-size: 12px; color: #e0e0e0; }
+.health-card .btn-copy-ip {
+  background: transparent; border: none; cursor: pointer;
+  font-size: 11px; padding: 1px 3px; color: #888;
+  border-radius: 3px; line-height: 1;
+}
+.health-card .btn-copy-ip:hover { background: #2a2a3a; color: #fff; }
+.health-card .status-pill {
+  font-size: 9px; font-weight: 600;
+  padding: 1px 6px; border-radius: 8px;
+  margin-left: auto; text-transform: uppercase;
+}
+.health-card .status-pill.online { background: #1a3a1a; color: #4caf50; }
+.health-card .status-pill.offline { background: #2a2a2a; color: #888; }
+.health-card .status-pill.degraded { background: #3a1a1a; color: #f44336; }
+
+.health-card .ip-row {
+  display: flex; gap: 4px; font-size: 10px; color: #888;
+  margin-bottom: 2px;
+}
+.health-card .ip-value { color: #aaa; font-family: monospace; }
 
 .metric-row {
   display: flex; align-items: center; gap: 6px;
-  margin-top: 3px;
+  margin-top: 2px;
   font-size: 11px;
 }
 .metric-row .metric-label { color: #aaa; min-width: 28px; text-align: right; font-size: 10px; }
@@ -170,80 +244,29 @@ body {
 .metric-bar .bar-fill.crit { background: #f44336; }
 .metric-row .metric-value { min-width: 36px; text-align: right; font-size: 10px; color: #e0e0e0; }
 
-.metric-row.compact { margin-top: 1px; }
-.metric-row.compact .metric-value { min-width: 50px; }
-.fps-row {
+.stats-meta-row {
+  display: flex; justify-content: space-between; gap: 4px;
+  margin-top: 3px; padding-top: 3px;
+  border-top: 1px solid #222232;
+  font-size: 10px; color: #888;
+}
+.stats-meta-row .meta-item { display: flex; gap: 3px; align-items: center; }
+.stats-meta-row .meta-label { color: #888; }
+.stats-meta-row .meta-value { color: #e0e0e0; font-weight: 500; }
+
+.active-cams-row {
   display: flex; flex-wrap: wrap; gap: 4px;
-  margin-top: 4px; font-size: 10px; color: #888;
+  margin-top: 4px;
 }
-.fps-row span { background: #14141e; padding: 1px 6px; border-radius: 3px; }
-
-/* ── Violation strip ──────────────────────────────────── */
-#violation-strip {
-  background: #14141e;
-  border-top: 1px solid #2a2a3a;
-  display: flex; flex-direction: column;
-  max-height: 140px;
+.cam-badge {
+  font-size: 9px; font-weight: 600;
+  padding: 1px 6px; border-radius: 3px;
+  background: #252538; color: #4fc3f7;
+  border: 1px solid #35354a;
 }
-#violation-header {
-  display: flex; align-items: center; gap: 12px;
-  padding: 6px 16px;
-  font-size: 12px; font-weight: 600;
-  color: #7c7cff;
-  border-bottom: 1px solid #1a1a28;
-  flex-shrink: 0;
-}
-#violation-filters { display: flex; align-items: center; gap: 6px; margin-left: auto; }
-#violation-filters input, #violation-filters select {
-  background: #1a1a28; border: 1px solid #2a2a3a; color: #e0e0e0;
-  padding: 2px 8px; border-radius: 4px; font-size: 11px;
-}
-#violation-filters button {
-  background: #2a2a3a; border: none; color: #ccc;
-  padding: 2px 10px; border-radius: 4px; font-size: 11px;
-  cursor: pointer;
-}
-#violation-filters button:hover { background: #3a3a4a; }
-#violation-count { color: #e0e0e0; }
-
-#violation-list {
-  display: flex; gap: 6px;
-  padding: 4px 16px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  flex: 1;
-  align-items: stretch;
-}
-#violation-list::-webkit-scrollbar { height: 4px; }
-#violation-list::-webkit-scrollbar-thumb { background: #2a2a3a; border-radius: 2px; }
-
-.violation-card {
-  display: flex; flex-direction: column;
-  gap: 2px;
-  background: #1a1a28;
-  border-radius: 6px;
-  padding: 6px 10px;
-  font-size: 11px;
-  min-width: 180px;
-  max-width: 220px;
-  flex-shrink: 0;
-  border-left: 3px solid #f44336;
-  cursor: pointer;
-  transition: background 0.2s;
-}
-.violation-card:hover { background: #22223a; }
-.violation-card .v-time { color: #888; font-size: 10px; }
-.violation-card .v-detail { display: flex; align-items: center; gap: 6px; }
-.violation-card .v-node { color: #7c7cff; font-weight: 600; }
-.violation-card .v-plate { color: #ff9800; font-weight: 600; }
-.violation-card .v-speed { color: #f44336; font-weight: 600; }
-.violation-card .v-thumb {
-  width: 32px; height: 24px; border-radius: 3px;
-  object-fit: cover; margin-left: auto;
-}
-.violation-empty {
-  color: #555; font-size: 12px;
-  display: flex; align-items: center; padding: 0 16px;
+.cam-badge.none {
+  color: #666; background: transparent; border: none;
+  font-style: italic;
 }
 
 /* ── Modal ────────────────────────────────────────────── */
@@ -279,33 +302,19 @@ body {
     <button id="next-cluster" disabled>&rarr;</button>
   </div>
   <span class="badge" id="edge-count-badge">0 edges</span>
-  <span class="badge" id="stream-count-badge" style="color:#4fc3f7;background:#1a2a3a;">0 streams</span>
+  <span class="badge" id="stream-count-badge" style="color:#4fc3f7;background:#1a2a3a;">0 cameras</span>
   <span id="status">Connecting...</span>
 </div>
 
 <div id="main">
   <div id="video-panel">
     <div id="video-grid">
-      <div class="video-cell"><span class="no-stream">No streams available</span></div>
+      <div class="video-cell offline"><span class="no-stream">No cameras available</span></div>
     </div>
     <div id="cluster-dots"></div>
   </div>
   <div id="sidebar"></div>
 </div>
-
-<!-- <div id="violation-strip">
-  <div id="violation-header">
-    <span>Violations (<span id="violation-count">0</span>)</span>
-    <div id="violation-filters">
-      <input type="date" id="filter-date">
-      <select id="filter-node"><option value="">All nodes</option></select>
-      <button id="filter-apply">Filter</button>
-    </div>
-  </div>
-  <div id="violation-list">
-    <div class="violation-empty">No violations yet</div>
-  </div>
-</div> -->
 
 <div id="modal-overlay" onclick="this.classList.remove('open')">
   <span class="close">&times;</span>
@@ -343,21 +352,16 @@ const STREAM_BADGE = $('stream-count-badge');
 const STATUS = $('status');
 const VIDEO_GRID = $('video-grid');
 const SIDEBAR = $('sidebar');
-const VIOLATIONS_HEADER_COUNT = $('violation-count');
-const VIOLATION_LIST = $('violation-list');
 const MODAL = $('modal-overlay');
 const MODAL_IMG = $('modal-img');
-const FILTER_DATE = $('filter-date');
-const FILTER_NODE = $('filter-node');
-const FILTER_APPLY = $('filter-apply');
 
 // ── State ────────────────────────────────────────────────────
-const edges = {};          // node_id -> edge dict (from server)
-const violations = [];     // newest first, max 200
-const streamStates = {};   // streamName -> { pc, video, cell, connecting, reconnectTimer, statsTimer, bitrate }
+const edges = {};                // node_id -> edge dict (from server)
+const streamStates = {};         // camId -> { pc, video, cell, streamPath, connecting, reconnectTimer, statsTimer, bitrate, connected }
+const allKnownCameras = new Map(); // camId -> { camera_id, source_id, node_id, node_ip, stream_path }
 
-let clusters = [];         // [{ id, edges: [...] }]
-let mediaMtxStreamNames = [];  // stream names from MediaMTX (pollStreams)
+let clusters = [];               // [{ id, edges: [...] }]
+let mediaMtxStreamNames = [];    // stream names from MediaMTX (pollStreams)
 let currentClusterIdx = 0;
 let streamPollTimer = null;
 let ws = null;
@@ -365,16 +369,8 @@ let reconnectTimer = null;
 let wsPingTimer = null;
 
 // ── Format helpers ──────────────────────────────────────────
-function fmtTime(ts) {
-  const d = new Date(ts * 1000);
-  return d.toLocaleTimeString();
-}
 function fmtPct(v) { return v != null ? `${v.toFixed(1)}%` : '--'; }
 function fmtTemp(v) { return v != null ? `${v.toFixed(1)}\u00B0C` : '--'; }
-// When the jtop daemon is unavailable on an edge, GPU%, Temp (and all other
-// metrics) are reported as 0.0 — indistinguishable from a real zero reading.
-// The health payload sets "source":"jtop_unavailable" in that case; use it to
-// show "N/A" so users know the metric is unavailable rather than actually 0.
 function fmtGpuPct(v, source) {
   if (source === 'jtop_unavailable') return 'N/A';
   return v != null ? `${v.toFixed(1)}%` : '--';
@@ -388,8 +384,112 @@ function fmtBitrate(bps) {
   if (bps > 1e6) return `${(bps / 1e6).toFixed(1)} Mbps`;
   return `${Math.round(bps / 1000)} kbps`;
 }
-function fmtDate(d) {
-  return d.toISOString().slice(0, 10);
+function escAttr(s) {
+  if (typeof s !== 'string') s = String(s || '');
+  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function escHtml(s) {
+  if (typeof s !== 'string') s = String(s || '');
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function getNodeBadge(nodeId) {
+  if (!nodeId) return '?';
+  const m = String(nodeId).match(/^(?:jetson|edge|node)[_-]?([a-zA-Z0-9]+)$/i);
+  return m ? m[1].toUpperCase() : String(nodeId).slice(0, 3).toUpperCase();
+}
+
+// ── Camera list construction ────────────────────────────────
+function buildCameraList(data) {
+  const cams = [];
+  let nodes = {};
+  if (data && data.nodes) {
+    nodes = data.nodes;
+  } else if (data && data.edges) {
+    nodes = Array.isArray(data.edges)
+      ? Object.fromEntries(data.edges.map(e => [e.node_id, e]))
+      : data.edges;
+  } else if (data && typeof data === 'object' && Object.keys(data).length > 0 && !data.type) {
+    nodes = data;
+  } else {
+    nodes = edges;
+  }
+
+  const activeSeen = new Set();
+
+  for (const node of Object.values(nodes || {})) {
+    const isOnline = node.online !== false;
+    const pipeline = node.pipeline || (node.health && node.health.pipeline);
+    if (!pipeline) continue;
+
+    const nodeIp = node.advertise_ip || node.ip || (node.health && node.health.advertise_ip) || '';
+    const fpsPerCam = pipeline.fps_per_camera || {};
+    const camFeats = pipeline.camera_features || {};
+
+    if (pipeline.camera_configs) {
+      for (const camId of Object.keys(pipeline.camera_configs)) {
+        if (!allKnownCameras.has(camId)) {
+          const parts = String(camId).split('_');
+          const num = parts.length > 1 ? parseInt(parts[1], 10) : parseInt(camId.replace(/\D/g, ''), 10);
+          const sourceId = !isNaN(num) ? num - 1 : 0;
+          allKnownCameras.set(camId, {
+            camera_id: camId,
+            source_id: sourceId,
+            node_id: node.node_id,
+            node_ip: nodeIp,
+            stream_path: `${node.node_id}/${camId}`,
+          });
+        }
+      }
+    }
+
+    if (!pipeline.active_cameras) continue;
+
+    for (const camId of pipeline.active_cameras) {
+      activeSeen.add(camId);
+      const parts = String(camId).split('_');
+      const num = parts.length > 1 ? parseInt(parts[1], 10) : parseInt(camId.replace(/\D/g, ''), 10);
+      const sourceId = !isNaN(num) ? num - 1 : 0;
+      const feat = camFeats[camId] || {};
+
+      cams.push({
+        camera_id: camId,
+        source_id: sourceId,
+        node_id: node.node_id,
+        node_ip: nodeIp,
+        stream_path: `${node.node_id}/${camId}`,
+        fps: fpsPerCam[camId] || 0,
+        n_track: feat.n_track || 0,
+        n_plate: feat.n_plate || 0,
+        online: isOnline,
+      });
+    }
+  }
+
+  // Preserve offline camera cells in global source_id order
+  for (const [camId, prev] of allKnownCameras.entries()) {
+    if (!activeSeen.has(camId)) {
+      cams.push({
+        ...prev,
+        fps: 0,
+        n_track: 0,
+        n_plate: 0,
+        online: false,
+      });
+    }
+  }
+
+  // Update known cameras cache
+  for (const cam of cams) {
+    allKnownCameras.set(cam.camera_id, {
+      camera_id: cam.camera_id,
+      source_id: cam.source_id,
+      node_id: cam.node_id,
+      node_ip: cam.node_ip,
+      stream_path: cam.stream_path,
+    });
+  }
+
+  return cams.sort((a, b) => a.source_id - b.source_id);
 }
 
 // ── Cluster grouping ────────────────────────────────────────
@@ -417,37 +517,19 @@ function getCurrentCluster() {
   return clusters[currentClusterIdx] || null;
 }
 
-function getStreamNamesForCluster(clusterEdges) {
-  const names = [];
-  for (const edge of clusterEdges) {
-    if (!edge.online) continue;
-    // One box per edge node: stream name = node_id (e.g. "jetson_A").
-    // The Jetson pushes its analyzed composite stream under that key.
-    names.push(edge.node_id);
-  }
-  return names;
-}
-
 // ── Grid layout computation ─────────────────────────────────
-function computeGridLayout(n, containerW, containerH) {
-  if (n <= 0) return { cols: 1, rows: 1 };
-  const GAP = 4;
-  let best = { cols: 1, rows: n, cellSize: 0 };
-  for (let cols = 1; cols <= n; cols++) {
-    const rows = Math.ceil(n / cols);
-    const cellW = (containerW - GAP * (cols - 1)) / cols;
-    const cellH = (containerH - GAP * (rows - 1)) / rows;
-    const cellSize = Math.min(cellW, cellH);
-    if (cellSize > best.cellSize) {
-      best = { cols, rows, cellSize };
-    }
-  }
-  return best;
+function computeGridLayout(n) {
+  if (n <= 1) return { cols: 1, rows: 1 };
+  if (n === 2) return { cols: 2, rows: 1 };
+  if (n <= 4) return { cols: 2, rows: 2 };
+  if (n <= 6) return { cols: 3, rows: 2 };
+  if (n <= 9) return { cols: 3, rows: 3 };
+  return { cols: 4, rows: Math.ceil(n / 4) };
 }
 
 // ── WHEP Player ─────────────────────────────────────────────
-async function startWhepPlayer(streamName, videoEl, onStats) {
-  const whepUrl = `${MEDIAMTX_WEBRTC_BASE}/${streamName}/whep`;
+async function startWhepPlayer(streamPath, videoEl, onStats) {
+  const whepUrl = `${MEDIAMTX_WEBRTC_BASE}/${streamPath}/whep`;
   let pc;
   try {
     pc = new RTCPeerConnection({
@@ -462,9 +544,8 @@ async function startWhepPlayer(streamName, videoEl, onStats) {
   pc.ontrack = (evt) => {
     if (evt.track.kind === 'video' && videoEl) {
       videoEl.srcObject = evt.streams[0];
-      // Update status badge to "live" once media flows
       const cell = videoEl.parentElement;
-      if (cell) {
+      if (cell && !cell.classList.contains('offline')) {
         const badge = cell.querySelector('.status-badge');
         if (badge) { badge.className = 'status-badge live'; badge.textContent = 'Live'; }
       }
@@ -480,10 +561,6 @@ async function startWhepPlayer(streamName, videoEl, onStats) {
     return null;
   }
 
-  // Send immediately — do NOT wait for local ICE gathering to complete.
-  // MediaMTX includes all server-side ICE candidates (public IP) directly in
-  // the SDP answer, so the browser can start connectivity checks right away
-  // without needing to finish its own gathering first.
   try {
     const resp = await fetch(whepUrl, {
       method: 'POST',
@@ -501,18 +578,18 @@ async function startWhepPlayer(streamName, videoEl, onStats) {
     return null;
   }
 
-  // Connection state monitoring for reconnection
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
     if (s === 'failed' || s === 'disconnected') {
-      const st = streamStates[streamName];
-      if (st && st.pc === pc) {
-        scheduleStreamReconnect(streamName);
+      for (const [cid, st] of Object.entries(streamStates)) {
+        if (st && st.pc === pc) {
+          scheduleStreamReconnect(cid);
+          break;
+        }
       }
     }
   };
 
-  // Stats polling
   if (onStats) {
     const interval = setInterval(async () => {
       try {
@@ -531,8 +608,12 @@ async function startWhepPlayer(streamName, videoEl, onStats) {
             pc._lastTime = report.timestamp;
           }
         });
-        const st = streamStates[streamName];
-        if (st) st.bitrate = bitrate;
+        for (const st of Object.values(streamStates)) {
+          if (st.pc === pc) {
+            st.bitrate = bitrate;
+            break;
+          }
+        }
         if (onStats) onStats(bitrate);
       } catch(e) {}
     }, 2000);
@@ -542,8 +623,8 @@ async function startWhepPlayer(streamName, videoEl, onStats) {
   return pc;
 }
 
-function cleanupStream(name) {
-  const st = streamStates[name];
+function cleanupStream(camId) {
+  const st = streamStates[camId];
   if (!st) return;
   if (st.reconnectTimer) { clearTimeout(st.reconnectTimer); st.reconnectTimer = null; }
   if (st.pc) {
@@ -556,28 +637,28 @@ function cleanupStream(name) {
   st.connected = false;
 }
 
-function scheduleStreamReconnect(name) {
-  const st = streamStates[name];
+function scheduleStreamReconnect(camId) {
+  const st = streamStates[camId];
   if (!st) return;
-  cleanupStream(name);
+  cleanupStream(camId);
   st.reconnectTimer = setTimeout(() => {
-    if (streamStates[name] && !streamStates[name].pc) {
-      streamStates[name].connecting = false;
-      tryConnectStream(name);
+    if (streamStates[camId] && !streamStates[camId].pc) {
+      streamStates[camId].connecting = false;
+      tryConnectStream(camId);
     }
   }, 3000);
 }
 
-async function tryConnectStream(name) {
-  const st = streamStates[name];
-  if (!st || !st.video || st.connecting) return;
+async function tryConnectStream(camId) {
+  const st = streamStates[camId];
+  if (!st || !st.video || st.connecting || !st.streamPath) return;
   st.connecting = true;
-  if (st.video.parentElement) {
-    const badge = st.video.parentElement.querySelector('.status-badge');
+  if (st.cell && !st.cell.classList.contains('offline')) {
+    const badge = st.cell.querySelector('.status-badge');
     if (badge) { badge.textContent = 'Connecting...'; badge.className = 'status-badge connecting'; }
   }
-  const pc = await startWhepPlayer(name, st.video, (bitrate) => {
-    const cell = streamStates[name] && streamStates[name].cell;
+  const pc = await startWhepPlayer(st.streamPath, st.video, (bitrate) => {
+    const cell = streamStates[camId] && streamStates[camId].cell;
     if (cell) {
       const el = cell.querySelector('.bitrate-badge');
       if (el) el.textContent = fmtBitrate(bitrate);
@@ -587,122 +668,217 @@ async function tryConnectStream(name) {
   if (pc) {
     st.pc = pc;
     st.connected = true;
-    if (st.cell) {
+    if (st.cell && !st.cell.classList.contains('offline')) {
       const badge = st.cell.querySelector('.status-badge');
       if (badge) { badge.textContent = 'Live'; badge.className = 'status-badge live'; }
     }
   } else {
-    if (st.cell) {
+    if (st.cell && !st.cell.classList.contains('offline')) {
       const badge = st.cell.querySelector('.status-badge');
       if (badge) { badge.textContent = 'Error'; badge.className = 'status-badge error'; }
     }
-    scheduleStreamReconnect(name);
+    scheduleStreamReconnect(camId);
   }
 }
 
 // ── Render: Video grid ──────────────────────────────────────
-function renderVideoGrid() {
-  const cluster = getCurrentCluster();
-  let streamNames = [];
-  if (cluster) {
-    // Only show one video box per registered edge node.
-    // Raw per-camera streams (cam_01, cam_02, …) pushed by zenoh_gateway
-    // are intentionally excluded — they are intermediate streams, not the
-    // analyzed output. The edge node pushes its analyzed stream under its
-    // own node_id (e.g. "jetson_A").
-    streamNames = getStreamNamesForCluster(cluster.edges);
+function formatStatsOverlay(cam) {
+  if (!cam.online) return 'OFFLINE';
+  const fps = typeof cam.fps === 'number' ? cam.fps.toFixed(1) : parseFloat(cam.fps || 0).toFixed(1);
+  const nTrack = typeof cam.n_track === 'number' ? cam.n_track.toFixed(1) : parseFloat(cam.n_track || 0).toFixed(1);
+  const nPlate = typeof cam.n_plate === 'number' ? cam.n_plate.toFixed(1) : parseFloat(cam.n_plate || 0).toFixed(1);
+  return `FPS: ${fps} | N: ${nTrack} | P: ${nPlate}`;
+}
+
+function createVideoCell(cam) {
+  const cell = document.createElement('div');
+  cell.className = `video-cell ${cam.online ? '' : 'offline'}`;
+  cell.dataset.camId = cam.camera_id;
+  cell.dataset.streamPath = cam.stream_path;
+
+  const video = document.createElement('video');
+  video.autoplay = true;
+  video.playsInline = true;
+  video.muted = true;
+  if (!cam.online) video.style.display = 'none';
+  cell.appendChild(video);
+
+  const label = document.createElement('div');
+  label.className = 'label';
+  label.innerHTML = `
+    <span class="cam-name">${escHtml(cam.camera_id)}</span>
+    <span class="node-badge" title="Node: ${escAttr(cam.node_id)}">${escHtml(getNodeBadge(cam.node_id))}</span>
+  `;
+  cell.appendChild(label);
+
+  const statsOverlay = document.createElement('div');
+  statsOverlay.className = 'stats-overlay';
+  statsOverlay.textContent = formatStatsOverlay(cam);
+  cell.appendChild(statsOverlay);
+
+  const bitrateBadge = document.createElement('div');
+  bitrateBadge.className = 'bitrate-badge';
+  cell.appendChild(bitrateBadge);
+
+  const statusBadge = document.createElement('div');
+  statusBadge.className = `status-badge ${cam.online ? 'connecting' : 'offline'}`;
+  statusBadge.textContent = cam.online ? 'Connecting...' : 'Offline';
+  cell.appendChild(statusBadge);
+
+  const offlineMsg = document.createElement('div');
+  offlineMsg.className = 'offline-placeholder';
+  offlineMsg.textContent = 'OFFLINE';
+  offlineMsg.style.display = cam.online ? 'none' : 'block';
+  cell.appendChild(offlineMsg);
+
+  if (streamStates[cam.camera_id]) {
+    streamStates[cam.camera_id].video = video;
+    streamStates[cam.camera_id].cell = cell;
   }
 
-  // Clean up streams not in current cluster
-  for (const name of Object.keys(streamStates)) {
-    if (!streamNames.includes(name)) {
-      cleanupStream(name);
-      delete streamStates[name];
-    }
+  return cell;
+}
+
+function updateVideoCell(cell, cam) {
+  cell.dataset.streamPath = cam.stream_path;
+  const isOffline = !cam.online;
+  cell.classList.toggle('offline', isOffline);
+
+  const video = cell.querySelector('video');
+  if (video) video.style.display = isOffline ? 'none' : 'block';
+
+  const offlineMsg = cell.querySelector('.offline-placeholder');
+  if (offlineMsg) offlineMsg.style.display = isOffline ? 'block' : 'none';
+
+  const camNameEl = cell.querySelector('.cam-name');
+  if (camNameEl) camNameEl.textContent = cam.camera_id;
+
+  const nodeBadgeEl = cell.querySelector('.node-badge');
+  if (nodeBadgeEl) {
+    nodeBadgeEl.textContent = getNodeBadge(cam.node_id);
+    nodeBadgeEl.title = `Node: ${cam.node_id}`;
   }
 
-  // Add new streams
-  for (const name of streamNames) {
-    if (!streamStates[name]) {
-      streamStates[name] = { pc: null, video: null, cell: null, connecting: false, reconnectTimer: null, statsTimer: null, bitrate: 0, connected: false };
-    }
-  }
+  const statsEl = cell.querySelector('.stats-overlay');
+  if (statsEl) statsEl.textContent = formatStatsOverlay(cam);
 
-  const n = streamNames.length;
-
-  STREAM_BADGE.textContent = `${n} streams`;
-
-  if (n === 0) {
-    VIDEO_GRID.innerHTML = '<div class="video-cell"><span class="no-stream">No streams available</span></div>';
-    return;
-  }
-
-  // Compute grid dimensions from container size
-  const containerW = VIDEO_GRID.clientWidth;
-  const containerH = VIDEO_GRID.clientHeight;
-  const layout = computeGridLayout(n, containerW, containerH);
-
-  VIDEO_GRID.style.gridTemplateColumns = `repeat(${layout.cols}, 1fr)`;
-  VIDEO_GRID.style.gridTemplateRows = `repeat(${layout.rows}, 1fr)`;
-
-  // Rebuild cells if structure changed
-  const existingNames = Array.from(VIDEO_GRID.querySelectorAll('.video-cell'))
-    .map(el => el.dataset.stream);
-  const needsRebuild = streamNames.length !== existingNames.length ||
-    streamNames.some((n, i) => n !== existingNames[i]);
-
-  if (needsRebuild) {
-    VIDEO_GRID.innerHTML = '';
-    for (const name of streamNames) {
-      const cell = document.createElement('div');
-      cell.className = 'video-cell';
-      cell.dataset.stream = name;
-
-      const video = document.createElement('video');
-      video.autoplay = true;
-      video.playsInline = true;
-      video.muted = true;
-      cell.appendChild(video);
-
-      const label = document.createElement('div');
-      label.className = 'label';
-      label.dataset.nodeId = name;
-      // Show node_id + active camera count if known
-      const edgeInfo = edges[name];
-      const activeCams = edgeInfo && edgeInfo.health && edgeInfo.health.pipeline
-        ? (edgeInfo.health.pipeline.active_cameras || [])
-        : [];
-      label.textContent = activeCams.length > 0
-        ? `${name} (${activeCams.join(', ')})`
-        : name;
-      cell.appendChild(label);
-
-      const bitrateBadge = document.createElement('div');
-      bitrateBadge.className = 'bitrate-badge';
-      cell.appendChild(bitrateBadge);
-
-      const statusBadge = document.createElement('div');
+  const statusBadge = cell.querySelector('.status-badge');
+  if (statusBadge) {
+    if (isOffline) {
+      statusBadge.className = 'status-badge offline';
+      statusBadge.textContent = 'Offline';
+    } else if (!streamStates[cam.camera_id]?.connected) {
       statusBadge.className = 'status-badge connecting';
       statusBadge.textContent = 'Connecting...';
-      cell.appendChild(statusBadge);
-
-      VIDEO_GRID.appendChild(cell);
-
-      streamStates[name].video = video;
-      streamStates[name].cell = cell;
-    }
-  }
-
-  // Start WHEP connections
-  for (const name of streamNames) {
-    const st = streamStates[name];
-    if (!st.pc && !st.connecting) {
-      tryConnectStream(name);
+    } else {
+      statusBadge.className = 'status-badge live';
+      statusBadge.textContent = 'Live';
     }
   }
 }
 
-// ── Render: Health sidebar (DOM-diff update) ────────────────
+function renderVideoGrid(data) {
+  const cluster = getCurrentCluster();
+  let clusterData = data;
+  if (!clusterData && cluster) {
+    clusterData = { edges: cluster.edges };
+  }
+  const cams = buildCameraList(clusterData);
+  const n = cams.length;
+
+  STREAM_BADGE.textContent = `${n} cameras`;
+
+  if (n === 0) {
+    VIDEO_GRID.innerHTML = '<div class="video-cell offline"><span class="no-stream">No cameras available</span></div>';
+    for (const camId of Object.keys(streamStates)) {
+      cleanupStream(camId);
+      delete streamStates[camId];
+    }
+    return;
+  }
+
+  const layout = computeGridLayout(n);
+  VIDEO_GRID.style.gridTemplateColumns = `repeat(${layout.cols}, 1fr)`;
+  VIDEO_GRID.style.gridTemplateRows = `repeat(${layout.rows}, 1fr)`;
+
+  const currentCamIds = new Set(cams.map(c => c.camera_id));
+  for (const camId of Object.keys(streamStates)) {
+    if (!currentCamIds.has(camId)) {
+      cleanupStream(camId);
+      delete streamStates[camId];
+    }
+  }
+
+  const existingCells = Array.from(VIDEO_GRID.querySelectorAll('.video-cell[data-cam-id]'));
+  const existingCamIds = existingCells.map(el => el.dataset.camId);
+  const needsRebuild = existingCamIds.length !== cams.length ||
+    cams.some((c, i) => c.camera_id !== existingCamIds[i]);
+
+  if (needsRebuild) {
+    VIDEO_GRID.innerHTML = '';
+    for (const cam of cams) {
+      const cell = createVideoCell(cam);
+      VIDEO_GRID.appendChild(cell);
+      if (!streamStates[cam.camera_id]) {
+        streamStates[cam.camera_id] = {
+          pc: null,
+          video: cell.querySelector('video'),
+          cell: cell,
+          streamPath: cam.stream_path,
+          connecting: false,
+          reconnectTimer: null,
+          statsTimer: null,
+          bitrate: 0,
+          connected: false
+        };
+      } else {
+        streamStates[cam.camera_id].video = cell.querySelector('video');
+        streamStates[cam.camera_id].cell = cell;
+      }
+    }
+  } else {
+    for (const cam of cams) {
+      const cell = VIDEO_GRID.querySelector(`.video-cell[data-cam-id="${cam.camera_id}"]`);
+      if (cell) {
+        updateVideoCell(cell, cam);
+      }
+    }
+  }
+
+  for (const cam of cams) {
+    if (!streamStates[cam.camera_id]) {
+      const cell = VIDEO_GRID.querySelector(`.video-cell[data-cam-id="${cam.camera_id}"]`);
+      streamStates[cam.camera_id] = {
+        pc: null,
+        video: cell ? cell.querySelector('video') : null,
+        cell: cell,
+        streamPath: cam.stream_path,
+        connecting: false,
+        reconnectTimer: null,
+        statsTimer: null,
+        bitrate: 0,
+        connected: false
+      };
+    }
+
+    const st = streamStates[cam.camera_id];
+    if (!cam.online) {
+      if (st.pc || st.connecting) {
+        cleanupStream(cam.camera_id);
+      }
+    } else {
+      if (st.streamPath !== cam.stream_path) {
+        cleanupStream(cam.camera_id);
+        st.streamPath = cam.stream_path;
+        tryConnectStream(cam.camera_id);
+      } else if (!st.pc && !st.connecting) {
+        tryConnectStream(cam.camera_id);
+      }
+    }
+  }
+}
+
+// ── Render: Health sidebar (Minimal) ─────────────────────────
 function ensureSidebarCards(clusterEdges) {
   const existing = {};
   for (const card of SIDEBAR.querySelectorAll('.health-card')) {
@@ -711,12 +887,10 @@ function ensureSidebarCards(clusterEdges) {
 
   const neededIds = new Set(clusterEdges.map(e => e.node_id));
 
-  // Remove cards for nodes no longer in cluster
   for (const [nid, card] of Object.entries(existing)) {
     if (!neededIds.has(nid)) card.remove();
   }
 
-  // Add/update cards
   for (const edge of clusterEdges) {
     if (existing[edge.node_id]) {
       updateSidebarCard(existing[edge.node_id], edge);
@@ -725,7 +899,6 @@ function ensureSidebarCards(clusterEdges) {
     }
   }
 
-  // Sort cards to match edge order
   const cards = SIDEBAR.querySelectorAll('.health-card');
   const desired = clusterEdges.map(e => e.node_id);
   let idx = 0;
@@ -743,14 +916,24 @@ function ensureSidebarCards(clusterEdges) {
 
 function createSidebarCard(edge) {
   const card = document.createElement('div');
-  card.className = `health-card ${edge.online ? '' : 'offline'}`;
+  const h = edge.health || {};
+  const status = !edge.online ? 'offline' : (h.qos_state === 'DEGRADED' || h.pipeline?.status === 'degraded' ? 'degraded' : 'online');
+  card.className = `health-card ${status}`;
   card.dataset.nodeId = edge.node_id;
+
+  const ip = edge.ip || h.advertise_ip || '';
 
   card.innerHTML = `
     <div class="header">
-      <span class="dot ${edge.online ? 'online' : 'offline'}"></span>
+      <span class="status-indicator ${status}"></span>
+      <span class="node-badge" title="Node ID: ${escAttr(edge.node_id)}">${escHtml(getNodeBadge(edge.node_id))}</span>
       <span class="node-id">${escHtml(edge.node_id)}</span>
-      <span class="ip">${escHtml(edge.ip)}</span>
+      <button class="btn-copy-ip" data-ip="${escAttr(ip)}" title="Copy IP">📋</button>
+      <span class="status-pill ${status}">${status.toUpperCase()}</span>
+    </div>
+    <div class="ip-row">
+      <span class="ip-label">IP:</span>
+      <span class="ip-value">${escHtml(ip || '—')}</span>
     </div>
     <div class="metric-row">
       <span class="metric-label">GPU</span>
@@ -767,31 +950,64 @@ function createSidebarCard(edge) {
       <div class="metric-bar"><div class="bar-fill" data-metric="ram" style="width:0%"></div></div>
       <span class="metric-value" data-metric="ram-text">--</span>
     </div>
-    <div class="metric-row compact">
-      <span class="metric-label" style="color:#aaa;min-width:28px;text-align:right;">Temp</span>
-      <span class="metric-value" data-metric="temp-text" style="min-width:50px;">--</span>
-      <span style="color:#888;margin-left:auto;">Load</span>
-      <span class="metric-value" data-metric="load-text" style="min-width:36px;">--</span>
+    <div class="stats-meta-row">
+      <div class="meta-item">
+        <span class="meta-label">Temp:</span>
+        <span class="meta-value" data-metric="temp-text">--</span>
+      </div>
+      <div class="meta-item">
+        <span class="meta-label">Load:</span>
+        <span class="meta-value" data-metric="load-text">--</span>
+      </div>
+      <div class="meta-item">
+        <span class="meta-label">BW:</span>
+        <span class="meta-value" data-metric="bw-text">--</span>
+      </div>
     </div>
-    <div class="fps-row" data-metric="fps-list"></div>
-    <div class="fps-row" data-metric="workload-list" style="margin-top:2px;"></div>
+    <div class="active-cams-row" data-metric="cams-list"></div>
   `;
+
+  const copyBtn = card.querySelector('.btn-copy-ip');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const ipToCopy = copyBtn.dataset.ip;
+      if (ipToCopy && navigator.clipboard) {
+        navigator.clipboard.writeText(ipToCopy);
+        copyBtn.textContent = '✓';
+        setTimeout(() => { copyBtn.textContent = '📋'; }, 1500);
+      }
+    });
+  }
 
   SIDEBAR.appendChild(card);
   updateSidebarCard(card, edge);
 }
 
 function updateSidebarCard(card, edge) {
-  const online = edge.online;
-  card.className = `health-card ${online ? '' : 'offline'}`;
-  const dot = card.querySelector('.dot');
-  if (dot) { dot.className = `dot ${online ? 'online' : 'offline'}`; }
-
   const h = edge.health || {};
-  const pipeline = h.pipeline || {};
-  const fps = pipeline.fps_per_camera || {};
-  const targetFps = 30;
-  const source = h.source || '';   // 'jtop' | 'psutil' | 'error' | ''
+  const online = edge.online;
+  const status = !online ? 'offline' : (h.qos_state === 'DEGRADED' || h.pipeline?.status === 'degraded' ? 'degraded' : 'online');
+
+  card.className = `health-card ${status}`;
+
+  const indicator = card.querySelector('.status-indicator');
+  if (indicator) indicator.className = `status-indicator ${status}`;
+
+  const statusPill = card.querySelector('.status-pill');
+  if (statusPill) {
+    statusPill.className = `status-pill ${status}`;
+    statusPill.textContent = status.toUpperCase();
+  }
+
+  const ip = edge.ip || h.advertise_ip || '';
+  const ipValue = card.querySelector('.ip-value');
+  if (ipValue) ipValue.textContent = ip || '—';
+
+  const copyBtn = card.querySelector('.btn-copy-ip');
+  if (copyBtn) copyBtn.dataset.ip = ip;
+
+  const source = h.source || '';
 
   const metrics = [
     { key: 'gpu', val: h.gpu_percent },
@@ -802,62 +1018,45 @@ function updateSidebarCard(card, edge) {
   for (const m of metrics) {
     const bar = card.querySelector(`[data-metric="${m.key}"]`);
     const text = card.querySelector(`[data-metric="${m.key}-text"]`);
-    // GPU bar is meaningless on psutil (always 0) — keep it empty
     const isGpuOnPsutil = (m.key === 'gpu' && source === 'psutil');
     if (bar) {
-      const pct = isGpuOnPsutil ? 0 : Math.min(100, Math.max(0, m.val != null ? m.val : 0));
+      const pct = (isGpuOnPsutil || !online) ? 0 : Math.min(100, Math.max(0, m.val != null ? m.val : 0));
       bar.style.width = `${pct}%`;
       bar.className = 'bar-fill' + (pct > 80 ? ' crit' : pct > 60 ? ' warn' : '');
     }
     if (text) {
-      text.textContent = (m.key === 'gpu') ? fmtGpuPct(m.val, source) : fmtPct(m.val);
+      if (!online) {
+        text.textContent = '--';
+      } else {
+        text.textContent = (m.key === 'gpu') ? fmtGpuPct(m.val, source) : fmtPct(m.val);
+      }
     }
   }
 
   const tempEl = card.querySelector('[data-metric="temp-text"]');
-  if (tempEl) tempEl.textContent = fmtGpuTemp(h.gpu_temp_c, source);
+  if (tempEl) tempEl.textContent = online ? fmtGpuTemp(h.gpu_temp_c, source) : '--';
 
   const loadEl = card.querySelector('[data-metric="load-text"]');
-  if (loadEl) loadEl.textContent = h.load_score != null ? h.load_score.toFixed(1) : '--';
+  if (loadEl) loadEl.textContent = online && h.load_score != null ? Number(h.load_score).toFixed(1) : '--';
 
-  const fpsEl = card.querySelector('[data-metric="fps-list"]');
-  if (fpsEl) {
-    const entries = Object.entries(fps);
-    if (entries.length > 0) {
-      fpsEl.innerHTML = entries
-        .map(([cam, f]) => {
-          // BUG-14: pct was computed but never used in the output string.
-          // Use it to colour the FPS value: red < 15fps, yellow < 25fps, green otherwise.
-          const pct = Math.min(100, (f / targetFps) * 100);
-          const colour = pct < 50 ? '#e74c3c' : pct < 83 ? '#f39c12' : '#2ecc71';
-          return `<span>${escHtml(cam)}: <strong style="color:${colour}">${f.toFixed(1)}</strong> fps</span>`;
-        })
-        .join('');
+  const bwEl = card.querySelector('[data-metric="bw-text"]');
+  if (bwEl) {
+    if (!online || h.network_bandwidth == null || h.network_bandwidth === '') {
+      bwEl.textContent = '—';
     } else {
-      fpsEl.innerHTML = '<span style="color:#555">No active cameras</span>';
+      const n = parseFloat(h.network_bandwidth);
+      bwEl.textContent = isNaN(n) ? '—' : `${n.toFixed(1)} Mbps`;
     }
   }
 
-  const wlEl = card.querySelector('[data-metric="workload-list"]');
-  if (wlEl) {
-    const feats = pipeline.camera_features || {};
-    const wl = pipeline.camera_workload || {};
-    const cams = Object.keys(feats).length > 0 ? Object.keys(feats) : Object.keys(wl);
-    if (cams.length > 0) {
-      wlEl.innerHTML = cams
-        .map(cam => {
-          const cf = feats[cam];
-          if (cf && (cf.n_track != null || cf.n_plate != null)) {
-            const tr = cf.n_track != null ? cf.n_track : 0;
-            const pl = cf.n_plate != null ? cf.n_plate : 0;
-            return `<span>${escHtml(cam)}: <strong style="color:#3498db">${tr}</strong>T/<strong style="color:#e67e22">${pl}</strong>P</span>`;
-          }
-          const w = wl[cam];
-          return `<span>${escHtml(cam)}: <strong style="color:#3498db">${w != null ? w.toFixed(0) : '--'}</strong>W</span>`;
-        })
-        .join('');
+  const camsEl = card.querySelector('[data-metric="cams-list"]');
+  if (camsEl) {
+    const pipeline = h.pipeline || {};
+    const activeCams = pipeline.active_cameras || [];
+    if (online && activeCams.length > 0) {
+      camsEl.innerHTML = activeCams.map(c => `<span class="cam-badge">${escHtml(c)}</span>`).join('');
     } else {
-      wlEl.innerHTML = '';
+      camsEl.innerHTML = `<span class="cam-badge none">${online ? 'No active cameras' : 'Offline'}</span>`;
     }
   }
 }
@@ -870,11 +1069,33 @@ function updateSidebar() {
   }
   ensureSidebarCards(cluster.edges);
 
-  // Update edge count badge
   const total = Object.keys(edges).length;
   const online = Object.values(edges).filter(e => e.online).length;
   EDGE_BADGE.textContent = `${total} edges`;
   EDGE_BADGE.className = `badge ${online > 0 ? 'online' : 'offline'}`;
+}
+
+// ── updateDashboard entry point ──────────────────────────────
+function updateDashboard(data) {
+  if (data) {
+    if (data.nodes) {
+      for (const [nid, node] of Object.entries(data.nodes)) {
+        edges[nid] = Object.assign(edges[nid] || { node_id: nid, online: true, health: {} }, node);
+      }
+    } else if (data.edges) {
+      const edgeList = Array.isArray(data.edges) ? data.edges : Object.values(data.edges);
+      for (const edge of edgeList) {
+        if (edge && edge.node_id) {
+          edges[edge.node_id] = Object.assign(edges[edge.node_id] || { node_id: edge.node_id, online: true, health: {} }, edge);
+        }
+      }
+    }
+  }
+
+  rebuildClusters();
+  renderClusterNav();
+  renderVideoGrid(data);
+  updateSidebar();
 }
 
 // ── Render: Cluster nav ──────────────────────────────────────
@@ -902,106 +1123,15 @@ function switchCluster(delta) {
   const newIdx = currentClusterIdx + delta;
   if (newIdx < 0 || newIdx >= clusters.length) return;
 
-  // Clean up current cluster's streams
-  const current = getCurrentCluster();
-  if (current) {
-    const currentStreams = getStreamNamesForCluster(current.edges);
-    for (const name of [...currentStreams, ...mediaMtxStreamNames]) {
-      cleanupStream(name);
-      delete streamStates[name];
-    }
+  for (const name of Object.keys(streamStates)) {
+    cleanupStream(name);
+    delete streamStates[name];
   }
 
   currentClusterIdx = newIdx;
   renderClusterNav();
   renderVideoGrid();
   updateSidebar();
-}
-
-// ── Render: Violations ───────────────────────────────────────
-function renderViolations() {
-  if (!VIOLATION_LIST) return;
-  if (VIOLATIONS_HEADER_COUNT) VIOLATIONS_HEADER_COUNT.textContent = violations.length;
-
-  if (violations.length === 0) {
-    VIOLATION_LIST.innerHTML = '<div class="violation-empty">No violations yet</div>';
-    return;
-  }
-
-  let html = '';
-  for (const v of violations) {
-    const ts = v.timestamp || v.ts || 0;
-    const snapFile = v.snapshot_file || '';
-    // BUG-13: snapshot_file is a relative path like "2026-05-28/edge01/cam_123.jpg".
-    // Preserve the date directory component — the server's handle_snapshot
-    // matches on {node_id}/{filename} and searches all date dirs, so we only
-    // need to strip the leading date segment but keep node_id in the URL.
-    // URL pattern: /api/snapshots/{node_id}/{filename}
-    // snapshot_file format: {date}/{node_id}/{filename}
-    const snapParts = snapFile ? snapFile.split('/') : [];
-    const snapUrl = snapParts.length >= 3
-      ? `/api/snapshots/${encodeURIComponent(snapParts[1])}/${encodeURIComponent(snapParts.slice(2).join('/'))}`
-      : (snapParts.length === 1 ? `/api/snapshots/${encodeURIComponent(v.node_id)}/${encodeURIComponent(snapParts[0])}` : '');
-
-    html += `
-      <div class="violation-card" data-snap="${escAttr(snapUrl)}" title="${escAttr(fmtTime(ts))} - ${escAttr(v.node_id)}">
-        <span class="v-time">${escHtml(fmtTime(ts))}</span>
-        <div class="v-detail">
-          <span class="v-node">${escHtml(v.node_id)}</span>
-          <span class="v-plate">${escHtml(v.plate || v.license_plate || '?')}</span>
-          <span class="v-speed">${v.speed_kmh != null ? v.speed_kmh.toFixed(0) + ' km/h' : '?'}</span>
-          ${snapUrl ? `<img class="v-thumb" data-snap="${escAttr(snapUrl)}" src="${escAttr(snapUrl)}">` : ''}
-        </div>
-      </div>
-    `;
-  }
-  VIOLATION_LIST.innerHTML = html;
-  VIOLATION_LIST.scrollLeft = 0;
-  // (VIOLATION_LIST null-check is at the top of this function)
-}
-
-function openModal(url) {
-  if (!url) return;
-  MODAL_IMG.src = url;
-  MODAL.classList.add('open');
-}
-
-function escAttr(s) {
-  if (typeof s !== 'string') s = String(s || '');
-  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function escHtml(s) {
-  if (typeof s !== 'string') s = String(s || '');
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-// ── Violation history ────────────────────────────────────────
-async function fetchViolationHistory() {
-  const params = new URLSearchParams();
-  const dateVal = FILTER_DATE.value;
-  const nodeVal = FILTER_NODE.value;
-  if (dateVal) params.set('date', dateVal);
-  if (nodeVal) params.set('node_id', nodeVal);
-  params.set('limit', '50');
-  try {
-    const resp = await fetch(`/api/violations?${params}`);
-    if (resp.ok) {
-      const data = await resp.json();
-      // Merge into existing violations (dedup by timestamp + node_id + plate)
-      const seen = new Set(violations.map(v => `${v.timestamp}-${v.node_id}-${v.plate || v.license_plate}`));
-      for (const v of data) {
-        const key = `${v.timestamp}-${v.node_id}-${v.plate || v.license_plate}`;
-        if (!seen.has(key)) {
-          violations.push(v);
-          seen.add(key);
-        }
-      }
-      violations.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-      if (violations.length > 200) violations.length = 200;
-      renderViolations();
-    }
-  } catch(e) {}
 }
 
 // ── WebSocket ────────────────────────────────────────────────
@@ -1044,8 +1174,6 @@ function connectWS() {
   };
 
   ws.onerror = () => {
-    // BUG-19: clear the ping timer on error so it doesn't leak when
-    // onerror fires without a subsequent onclose (e.g. manual ws.close()).
     if (wsPingTimer) { clearInterval(wsPingTimer); wsPingTimer = null; }
   };
 }
@@ -1056,50 +1184,32 @@ function handleWSMessage(msg) {
       for (const edge of msg.edges || []) {
         edges[edge.node_id] = edge;
       }
-      rebuildClusters();
-      renderClusterNav();
-      renderVideoGrid();
-      updateSidebar();
+      updateDashboard({ edges: msg.edges });
       pollStreams();
-      // Fill filter node dropdown
-      populateNodeFilter();
       break;
 
     case 'edge_list':
       for (const edge of msg.edges || []) {
         edges[edge.node_id] = edge;
       }
-      rebuildClusters();
-      renderClusterNav();
-      renderVideoGrid();
-      updateSidebar();
+      updateDashboard({ edges: msg.edges });
       break;
 
     case 'edge_registered':
       if (!edges[msg.node_id]) {
         edges[msg.node_id] = { node_id: msg.node_id, online: true, health: {} };
-        edges[msg.node_id].ip = msg.ip || edges[msg.node_id].ip;
-        edges[msg.node_id].online = true;
-        rebuildClusters();
-        renderClusterNav();
-        renderVideoGrid();
-        updateSidebar();
-        populateNodeFilter();
-        pollStreams();
-      } else {
-        edges[msg.node_id].ip = msg.ip || edges[msg.node_id].ip;
-        edges[msg.node_id].online = true;
       }
+      edges[msg.node_id].ip = msg.ip || edges[msg.node_id].ip;
+      edges[msg.node_id].online = true;
+      updateDashboard();
+      pollStreams();
       break;
 
     case 'edge_offline':
       if (edges[msg.node_id]) {
         edges[msg.node_id].online = false;
       }
-      rebuildClusters();
-      renderClusterNav();
-      renderVideoGrid();
-      updateSidebar();
+      updateDashboard();
       break;
 
     case 'edge_reconnected':
@@ -1107,14 +1217,13 @@ function handleWSMessage(msg) {
         edges[msg.node_id].ip = msg.ip || edges[msg.node_id].ip;
         edges[msg.node_id].online = true;
       }
+      updateDashboard();
       break;
 
     case 'health_update':
       {
-        let isNewEdge = false;
         if (!edges[msg.node_id]) {
           edges[msg.node_id] = { node_id: msg.node_id, online: true, health: {} };
-          isNewEdge = true;
         }
         const edge = edges[msg.node_id];
         edge.online = true;
@@ -1123,52 +1232,10 @@ function handleWSMessage(msg) {
         delete health.type;
         delete health.node_id;
         edge.health = health;
-
-        if (isNewEdge) {
-          rebuildClusters();
-          renderClusterNav();
-          renderVideoGrid();
-          updateSidebar();
-          populateNodeFilter();
-          pollStreams();
-        } else {
-          // Refresh the video cell label to show updated active cameras
-          const labelEl = VIDEO_GRID.querySelector(`[data-node-id="${msg.node_id}"]`);
-          if (labelEl) {
-            const activeCams = (health.pipeline && health.pipeline.active_cameras) || [];
-            labelEl.textContent = activeCams.length > 0
-              ? `${msg.node_id} (${activeCams.join(', ')})`
-              : msg.node_id;
-          }
-          // In-place sidebar update for current cluster
-          const cluster = getCurrentCluster();
-          if (cluster && cluster.edges.some(e => e.node_id === msg.node_id)) {
-            const card = SIDEBAR.querySelector(`[data-node-id="${msg.node_id}"]`);
-            if (card) {
-              updateSidebarCard(card, edge);
-            } else {
-              updateSidebar();
-            }
-          }
-        }
+        updateDashboard();
       }
       break;
-
-    case 'violation':
-      violations.unshift(msg);
-      if (violations.length > 200) violations.length = 200;
-      renderViolations();
-      break;
   }
-}
-
-function populateNodeFilter() {
-  if (!FILTER_NODE) return;
-  const nodeIds = Object.keys(edges).sort();
-  const currentVal = FILTER_NODE.value;
-  FILTER_NODE.innerHTML = '<option value="">All nodes</option>' +
-    nodeIds.map(n => `<option value="${escHtml(n)}">${escHtml(n)}</option>`).join('');
-  FILTER_NODE.value = currentVal;
 }
 
 // ── Stream polling ───────────────────────────────────────────
@@ -1178,28 +1245,14 @@ async function pollStreams() {
     if (!resp.ok) return;
     const data = await resp.json();
     const items = data.items || [];
-    // Track all live MediaMTX stream names for availability checks,
-    // but do NOT add them to the video grid — only edge node_id streams
-    // (from getStreamNamesForCluster) are displayed.
     mediaMtxStreamNames = items
       .filter(p => p.source && p.source.type === 'rtspSession')
       .map(p => p.name);
-
-    // Re-render grid only if the set of edge-derived stream names changed
-    const cluster = getCurrentCluster();
-    const edgeStreams = cluster ? getStreamNamesForCluster(cluster.edges) : [];
-    const existingNames = Object.keys(streamStates);
-    const needsUpdate =
-      edgeStreams.some(n => !existingNames.includes(n)) ||
-      existingNames.some(n => !edgeStreams.includes(n));
-
-    if (needsUpdate) renderVideoGrid();
   } catch(e) {}
 }
 
 // ── Init ─────────────────────────────────────────────────────
 function init() {
-  // Cluster nav
   PREV_BTN.addEventListener('click', () => switchCluster(-1));
   NEXT_BTN.addEventListener('click', () => switchCluster(1));
   CLUSTER_DOTS.addEventListener('click', (e) => {
@@ -1210,47 +1263,17 @@ function init() {
     }
   });
 
-  // Violation card click delegation (only if violation strip is present)
-  if (VIOLATION_LIST) {
-    VIOLATION_LIST.addEventListener('click', (e) => {
-      const card = e.target.closest('.violation-card');
-      const thumb = e.target.closest('.v-thumb');
-      if (thumb) {
-        e.stopPropagation();
-        openModal(thumb.dataset.snap);
-      } else if (card) {
-        openModal(card.dataset.snap);
-      }
-    });
-  }
-
-  // Violation filters
-  if (FILTER_APPLY) FILTER_APPLY.addEventListener('click', fetchViolationHistory);
-  if (FILTER_DATE) FILTER_DATE.value = fmtDate(new Date());
-
-  // Modal close on Escape
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') MODAL.classList.remove('open');
   });
 
-  // Resize observer for video grid
-  if (window.ResizeObserver) {
-    const ro = new ResizeObserver(() => {
-      const cluster = getCurrentCluster();
-      if (cluster && cluster.edges.some(e => e.online)) {
-        renderVideoGrid();
-      }
-    });
-    ro.observe(VIDEO_GRID);
-  }
-
-  // Connect and start polling
   connectWS();
   streamPollTimer = setInterval(pollStreams, 5000);
 }
 
-// Override openModal globally for onclick handlers
-window.openModal = openModal;
+// Expose globally for testing/callbacks
+window.buildCameraList = buildCameraList;
+window.updateDashboard = updateDashboard;
 
 init();
 
