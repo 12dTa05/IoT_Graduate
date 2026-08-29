@@ -25,7 +25,7 @@ import time
 import threading
 import uuid
 from collections import defaultdict, deque
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import gi
@@ -253,6 +253,19 @@ class SpeedProbe:
         # the health loop (camera_id → "file" cameras are never starved).
         self._source_type_by_camera: dict = {}
 
+        # ── Service completion tracking (V2 score) ────────────────────────
+        self._svc_lock = threading.Lock()
+        self._svc_counts: Dict[str, int] = {
+            "plates_finalized": 0,      # plates finalized/locked with text or valid observation
+            "plates_processed": 0,      # total plate extraction/inference attempts
+            "tracks_born": 0,           # new track IDs registered
+            "tracks_expired": 0,        # tracks evicted during periodic cleanup
+            "tracks_expired_locked": 0, # evicted tracks that were successfully locked
+            "tracks_missed": 0,         # evicted tracks with >= min_frames that were never locked
+        }
+        # Track-level service tracking: stid -> {"birth_frame": int, "finalized": bool}
+        self._track_service_meta: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
         # ── Offload result injector ────────────────────────────────────────
         # offload_receiver.py feeds decoded plate results into this queue.
         # Drained at the top of every osd_sink_pad_buffer_probe call so results
@@ -453,6 +466,11 @@ class SpeedProbe:
                 stid_r = tuple(res.get("stid", []))
                 if stid_r:
                     self.plate_locked[stid_r] = res.get("plate_text", "")
+                    with self._svc_lock:
+                        meta = self._track_service_meta.get(stid_r)
+                        if meta is not None and not meta.get("finalized"):
+                            meta["finalized"] = True
+                            self._svc_counts["plates_finalized"] += 1
             except queue.Empty:
                 break
 
@@ -572,8 +590,20 @@ class SpeedProbe:
             "offload_errors_count",
             "offload_results_sent_count",
             "offload_inference_errors_count",
+            "offload_session_dropped_count",
+            "offload_queue_full",
+            "offload_queue_depth",
+            "offload_queue_depth_ratio",
         ):
-            offload_crops[name] = _cnt(self._offload_rcv, name)
+            if name == "offload_queue_full":
+                offload_crops[name] = bool(getattr(self._offload_rcv, name, False))
+            elif name == "offload_queue_depth_ratio":
+                try:
+                    offload_crops[name] = float(getattr(self._offload_rcv, name, 0.0))
+                except Exception:
+                    offload_crops[name] = 0.0
+            else:
+                offload_crops[name] = _cnt(self._offload_rcv, name)
 
         # Sender-side lifetime counters (crops encoded/enqueued/sent)
         for name in (
@@ -768,8 +798,12 @@ class SpeedProbe:
                 # ── Advance sequence ───────────────────────────────────────
                 self._seq += 1
 
+                with self._svc_lock:
+                    svc_snapshot = dict(self._svc_counts)
+
                 # ── Build unified atomic payload ───────────────────────────
                 out: Dict = {
+                    "_service": svc_snapshot,
                     "_updated_at":    time.time(),
                     "_telemetry": {
                         "session_id":                        self._session_id,
@@ -1111,6 +1145,20 @@ class SpeedProbe:
             stale_keys.append(stid)
 
         for stid in stale_keys:
+            # Service tracking: record eviction metrics
+            with self._svc_lock:
+                self._svc_counts["tracks_expired"] += 1
+                meta = self._track_service_meta.pop(stid, None)
+                if meta is not None:
+                    if meta.get("finalized"):
+                        self._svc_counts["tracks_expired_locked"] += 1
+                    else:
+                        age = current_frame - meta.get("birth_frame", current_frame)
+                        if age >= 5:  # min_track_frames default
+                            self._svc_counts["tracks_missed"] += 1
+                elif stid in self.plate_locked and self.plate_locked[stid] is not None:
+                    self._svc_counts["tracks_expired_locked"] += 1
+
             self.history_positions.pop(stid, None)
             self.last_speed_text.pop(stid, None)
             self.last_update_frame.pop(stid, None)
@@ -1254,46 +1302,54 @@ class SpeedProbe:
             # Level 3: plate crops are sent to the peer; local accumulation skipped.
             if offload_level == 3 and self._offload_pub is not None and offload_target:
                 self._gate_inc("l3_active_frames")
-                for plate_info in plates_in_frame:
-                    vehicle_id = self._associate_plate_to_vehicle(
-                        plate_info["bbox"], vehicles_in_frame
-                    )
-                    if vehicle_id is None:
-                        continue
-                    stid = (source_id, vehicle_id)
-                    if stid in self.plate_locked:
-                        continue
-                    # Reached the crop stage — a plate the origin would send.
-                    self._gate_inc("l3_plate_objects")
-                    try:
-                        frame_bgr_off = self._get_frame_bgr_cached(
-                            gst_buffer, frame_meta, frame_bgr_cache)
-                        if frame_bgr_off is not None:
-                            bb = plate_info["bbox"]
-                            px = max(0, int(bb["left"]))
-                            py = max(0, int(bb["top"]))
-                            pw = max(1, int(bb["width"]))
-                            ph = max(1, int(bb["height"]))
-                            plate_crop = frame_bgr_off[py:py+ph, px:px+pw]
-                            if plate_crop.size > 0:
-                                self._gate_inc("l3_valid_crops")
-                                self._offload_pub.put_plate(
-                                    target_node=offload_target,
-                                    stid=stid,
-                                    camera_id=cam_cfg.camera_id,
-                                    frame_no=frame_number,
-                                    crop_bgr=plate_crop,
-                                    confidence=plate_info.get("conf", 0.0),
-                                )
-                        else:
-                            self._gate_inc("l3_surface_unavailable")
-                    except Exception as exc:
-                        self._gate_inc("l3_crop_errors")
-                        self._record_crop_error_type("l3", exc)
-                        logger.debug(
-                            "[SpeedProbe] L3 plate crop offload error for camera=%s frame=%s: %s",
-                            cam_cfg.camera_id, frame_number, exc, exc_info=True,
+                # Backpressure gate: check if offload target peer is saturated
+                target_saturated = False
+                if self._peer_orch is not None and hasattr(self._peer_orch, "is_offload_target_saturated"):
+                    target_saturated = self._peer_orch.is_offload_target_saturated(offload_target)
+
+                if target_saturated:
+                    self._gate_inc("l3_dropped_backpressure", len(plates_in_frame))
+                else:
+                    for plate_info in plates_in_frame:
+                        vehicle_id = self._associate_plate_to_vehicle(
+                            plate_info["bbox"], vehicles_in_frame
                         )
+                        if vehicle_id is None:
+                            continue
+                        stid = (source_id, vehicle_id)
+                        if stid in self.plate_locked:
+                            continue
+                        # Reached the crop stage — a plate the origin would send.
+                        self._gate_inc("l3_plate_objects")
+                        try:
+                            frame_bgr_off = self._get_frame_bgr_cached(
+                                gst_buffer, frame_meta, frame_bgr_cache)
+                            if frame_bgr_off is not None:
+                                bb = plate_info["bbox"]
+                                px = max(0, int(bb["left"]))
+                                py = max(0, int(bb["top"]))
+                                pw = max(1, int(bb["width"]))
+                                ph = max(1, int(bb["height"]))
+                                plate_crop = frame_bgr_off[py:py+ph, px:px+pw]
+                                if plate_crop.size > 0:
+                                    self._gate_inc("l3_valid_crops")
+                                    self._offload_pub.put_plate(
+                                        target_node=offload_target,
+                                        stid=stid,
+                                        camera_id=cam_cfg.camera_id,
+                                        frame_no=frame_number,
+                                        crop_bgr=plate_crop,
+                                        confidence=plate_info.get("conf", 0.0),
+                                    )
+                            else:
+                                self._gate_inc("l3_surface_unavailable")
+                        except Exception as exc:
+                            self._gate_inc("l3_crop_errors")
+                            self._record_crop_error_type("l3", exc)
+                            logger.debug(
+                                "[SpeedProbe] L3 plate crop offload error for camera=%s frame=%s: %s",
+                                cam_cfg.camera_id, frame_number, exc, exc_info=True,
+                            )
 
             else:
                 # Normal local plate accumulation
@@ -1336,6 +1392,11 @@ class SpeedProbe:
                         )
                         if best:
                             self.plate_locked[stid] = best
+                            with self._svc_lock:
+                                meta = self._track_service_meta.get(stid)
+                                if meta is not None and not meta.get("finalized"):
+                                    meta["finalized"] = True
+                                    self._svc_counts["plates_finalized"] += 1
                         else:
                             self.plate_detection_attempts[stid] += 1
                             if self.plate_detection_attempts[stid] < 3:
@@ -1358,32 +1419,40 @@ class SpeedProbe:
                 self._gate_inc("l2_active_frames")
                 # Objects that would be sent if the surface were available.
                 self._gate_inc("l2_vehicle_objects", len(vehicles_in_frame))
-                try:
-                    frame_bgr_l2 = self._get_frame_bgr_cached(
-                        gst_buffer, frame_meta, frame_bgr_cache)
-                    if frame_bgr_l2 is not None:
-                        for tid, veh_info in vehicles_in_frame.items():
-                            stid = (source_id, tid)
-                            veh_crop = self._crop_bbox(frame_bgr_l2, veh_info["obj_meta"])
-                            if veh_crop is not None and veh_crop.size > 0:
-                                self._gate_inc("l2_valid_crops")
-                                self._offload_pub.put_vehicle(
-                                    target_node=offload_target,
-                                    stid=stid,
-                                    camera_id=cam_cfg.camera_id,
-                                    frame_no=frame_number,
-                                    crop_bgr=veh_crop,
-                                    bbox_world_y=y_world_by_tid.get(tid, 0.0),
-                                )
-                    else:
-                        self._gate_inc("l2_surface_unavailable")
-                except Exception as exc:
-                    self._gate_inc("l2_crop_errors")
-                    self._record_crop_error_type("l2", exc)
-                    logger.debug(
-                        "[SpeedProbe] L2 vehicle crop offload error for camera=%s frame=%s: %s",
-                        cam_cfg.camera_id, frame_number, exc, exc_info=True,
-                    )
+                # Backpressure gate: check if offload target peer is saturated
+                target_saturated = False
+                if self._peer_orch is not None and hasattr(self._peer_orch, "is_offload_target_saturated"):
+                    target_saturated = self._peer_orch.is_offload_target_saturated(offload_target)
+
+                if target_saturated:
+                    self._gate_inc("l2_dropped_backpressure", len(vehicles_in_frame))
+                else:
+                    try:
+                        frame_bgr_l2 = self._get_frame_bgr_cached(
+                            gst_buffer, frame_meta, frame_bgr_cache)
+                        if frame_bgr_l2 is not None:
+                            for tid, veh_info in vehicles_in_frame.items():
+                                stid = (source_id, tid)
+                                veh_crop = self._crop_bbox(frame_bgr_l2, veh_info["obj_meta"])
+                                if veh_crop is not None and veh_crop.size > 0:
+                                    self._gate_inc("l2_valid_crops")
+                                    self._offload_pub.put_vehicle(
+                                        target_node=offload_target,
+                                        stid=stid,
+                                        camera_id=cam_cfg.camera_id,
+                                        frame_no=frame_number,
+                                        crop_bgr=veh_crop,
+                                        bbox_world_y=y_world_by_tid.get(tid, 0.0),
+                                    )
+                        else:
+                            self._gate_inc("l2_surface_unavailable")
+                    except Exception as exc:
+                        self._gate_inc("l2_crop_errors")
+                        self._record_crop_error_type("l2", exc)
+                        logger.debug(
+                            "[SpeedProbe] L2 vehicle crop offload error for camera=%s frame=%s: %s",
+                            cam_cfg.camera_id, frame_number, exc, exc_info=True,
+                        )
                 # Fall through to Pass 3 so the origin node keeps speed history,
                 # OSD, and overspeed events while the peer handles LPD/LPR.
 
@@ -1406,6 +1475,12 @@ class SpeedProbe:
 
                 if stid not in self.track_birth_frame:
                     self.track_birth_frame[stid] = frame_number
+                    with self._svc_lock:
+                        self._svc_counts["tracks_born"] += 1
+                        self._track_service_meta[stid] = {
+                            "birth_frame": frame_number,
+                            "finalized": False,
+                        }
 
                 area_now  = max(1.0, obj_meta.rect_params.width) * \
                              max(1.0, obj_meta.rect_params.height)

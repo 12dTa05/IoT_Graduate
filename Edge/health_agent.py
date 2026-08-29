@@ -44,6 +44,7 @@ from speedflow_python.settings import (
     LOAD_MODEL,
     TELEMETRY_INTERVAL,
     LOG_LEVEL,
+    EDGE_LOAD_SCORE_MODE,
 )
 
 def _setup_logging() -> logging.Logger:
@@ -191,20 +192,23 @@ def _payload_parts(
     payload: Optional[dict],
 ) -> tuple:
     """
-    Safely extract the three telemetry parts from a single payload dict.
-    Returns (fps_stats, feature_stats, offload_crops) with safe defaults.
+    Safely extract telemetry parts from a single payload dict.
+    Returns (fps_stats, feature_stats, offload_crops, service_stats) with safe defaults.
 
     Caller must have validated payload freshness via _validate_payload()
     before calling this function.  An invalid payload passed here will
     produce an empty fps_stats dict (score 100 = unavailable).
     """
     if payload is None:
-        return {}, {}, {"received_per_s": 0.0}
+        return {}, {}, {"received_per_s": 0.0}, {}
     fps_stats = {k: v for k, v in payload.items()
                  if not k.startswith("_") and isinstance(v, (int, float))}
     feature_stats = payload.get("_features", {})
     offload_crops = payload.get("_offload_crops", {"received_per_s": 0.0})
-    return fps_stats, feature_stats, offload_crops
+    service_stats = payload.get("_service", {})
+    if not isinstance(service_stats, dict):
+        service_stats = {}
+    return fps_stats, feature_stats, offload_crops, service_stats
 
 
 def _detect_source_starved(
@@ -368,7 +372,7 @@ def _read_pipeline_snapshot() -> tuple:
     Read the pipeline JSON once, validate freshness/integrity, return all parts.
 
     Returns (valid: bool, fps_stats, feature_stats, offload_crops,
-             input_fps, source_modes).
+             service_stats, input_fps, source_modes).
 
     ``source_modes`` is ``_telemetry.source_modes`` from the probe payload
     (camera_id → "live" | "file").  Missing or malformed → {} so callers
@@ -382,7 +386,7 @@ def _read_pipeline_snapshot() -> tuple:
     """
     payload = _read_payload()
     if not _validate_payload(payload):
-        return False, {}, {}, {}, {}, {}
+        return False, {}, {}, {}, {}, {}, {}
     input_fps = payload.get("_input_fps", {})
     if not isinstance(input_fps, dict):
         input_fps = {}
@@ -392,7 +396,8 @@ def _read_pipeline_snapshot() -> tuple:
         m = telemetry.get("source_modes")
         if isinstance(m, dict):
             source_modes = {str(k): str(v) for k, v in m.items()}
-    return True, *_payload_parts(payload), input_fps, source_modes
+    parts = _payload_parts(payload)
+    return True, parts[0], parts[1], parts[2], parts[3], input_fps, source_modes
 
 
 # ---------------------------------------------------------------------------
@@ -482,25 +487,11 @@ def _compute_load_score(
     feature_stats: Optional[dict] = None,
     workload_ema: Optional[float] = None,
     fps_ema: Optional[float] = None,
+    service_ema: Optional[float] = None,
 ) -> tuple:
     """
     Base + Additive Bonus load score with hardware emergency floor.
-
-    Components:
-        fps_score:      piecewise linear on 0-100 scale:
-                        27->0, 22->57, 19->65, 17->75, 0->100
-        workload_bonus: min(max_bonus, max_bonus * (n_track + n_plate) / capacity)
-        thermal_bonus:  min(max_bonus, max_bonus * ramp(onset_c, critical_c))
-        recv_bonus:     min(max_bonus, max_bonus * offload_crops_received_per_s / capacity)
-        trend_bonus:    min(max_bonus, max_bonus * FPS decline slope / max_decline)
-
-    Composite:
-        min(100.0, fps_score + workload_bonus + thermal_bonus + recv_bonus + trend_bonus)
-
-    Hardware emergency floor:
-        If CPU >= hw_fuse_threshold (90) OR RAM >= hw_fuse_threshold
-        AND fps_clamped < TARGET_FPS - 2.0:
-            score = max(composite, hw_fuse_score_floor) (default floor 80.0 = L1)
+    Supports mode="service" (completion-primary) and mode="legacy" / "workload_primary".
     """
     _starved = source_starved_cameras or set()
 
@@ -508,10 +499,12 @@ def _compute_load_score(
     ls_cfg = _EDGE_CFG.get("load_score", {})
     if not isinstance(ls_cfg, dict):
         ls_cfg = {}
+    mode = str(EDGE_LOAD_SCORE_MODE or ls_cfg.get("mode", "service")).strip().lower()
+
     hw_fuse_threshold   = float(ls_cfg.get("hw_fuse_threshold",   90.0))
     hw_fuse_score_floor = float(ls_cfg.get("hw_fuse_score_floor", 80.0))
 
-    # ── FPS component (piecewise linear on [0, 100] scale) ──────
+    # ── FPS component calculation ───────────────────────────────
     active_fps_vals = [
         v for k, v in fps_stats.items()
         if v > 0.0 and k not in _starved
@@ -522,6 +515,40 @@ def _compute_load_score(
         return 0.0, "no_fps"
 
     fps_clamped = max(0.0, min(float(TARGET_FPS), avg_fps))
+
+    # ── Completion-Primary Service Score Mode ───────────────────
+    if mode == "service":
+        svc_cfg = ls_cfg.get("service", {})
+        if not isinstance(svc_cfg, dict):
+            svc_cfg = {}
+        c_target   = _finite_positive(svc_cfg.get("target")) or 0.95
+        c_floor    = _finite_positive(svc_cfg.get("floor")) or 0.50
+        fps_emerg  = _finite_positive(svc_cfg.get("fps_emergency")) or 12.0
+
+        c = service_ema if (service_ema is not None and math.isfinite(service_ema)) else 1.0
+
+        # Piecewise linear service score on [0, 100]
+        if c >= c_target:
+            service_score = 0.0
+        elif c <= c_floor:
+            service_score = 100.0
+        else:
+            denom = max(0.001, c_target - c_floor)
+            service_score = (c_target - c) / denom * 100.0
+
+        # Emergency floors
+        fps_floor = 80.0 if (fps_clamped < fps_emerg) else 0.0
+
+        hw_saturated = (
+            isinstance(metrics, dict) and (
+                float(metrics.get("cpu_percent", 0.0)) >= hw_fuse_threshold or
+                float(metrics.get("ram_percent", 0.0)) >= hw_fuse_threshold
+            )
+        )
+        hw_floor = hw_fuse_score_floor if (hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0) else 0.0
+
+        composite = round(min(100.0, max(service_score, fps_floor, hw_floor)), 1)
+        return composite, "service_primary"
 
     # ── Workload-primary + FPS-confirmation policy gating ────────
     wp_cfg = ls_cfg.get("workload_policy", {})
@@ -679,6 +706,7 @@ def _compute_load_score_breakdown(
     feature_stats: Optional[dict] = None,
     workload_ema: Optional[float] = None,
     fps_ema: Optional[float] = None,
+    service_ema: Optional[float] = None,
 ) -> dict:
     """
     Pure helper yielding auditable breakdown of the load score computation.
@@ -700,6 +728,8 @@ def _compute_load_score_breakdown(
     ls_cfg = _EDGE_CFG.get("load_score", {})
     if not isinstance(ls_cfg, dict):
         ls_cfg = {}
+    mode = str(EDGE_LOAD_SCORE_MODE or ls_cfg.get("mode", "service")).strip().lower()
+
     hw_fuse_threshold   = float(ls_cfg.get("hw_fuse_threshold",   90.0))
     hw_fuse_score_floor = float(ls_cfg.get("hw_fuse_score_floor", 80.0))
 
@@ -724,6 +754,58 @@ def _compute_load_score_breakdown(
     curr_wl = sum(_derive_camera_workload(feature_stats or {}, fps_stats, _starved).values()) if isinstance(feature_stats, dict) else 0.0
     eff_wl = workload_ema if (workload_ema is not None and math.isfinite(workload_ema)) else curr_wl
     eff_fps = fps_ema if (fps_ema is not None and math.isfinite(fps_ema)) else avg_fps
+
+    if mode == "service":
+        svc_cfg = ls_cfg.get("service", {})
+        if not isinstance(svc_cfg, dict):
+            svc_cfg = {}
+        c_target   = _finite_positive(svc_cfg.get("target")) or 0.95
+        c_floor    = _finite_positive(svc_cfg.get("floor")) or 0.50
+        fps_emerg  = _finite_positive(svc_cfg.get("fps_emergency")) or 12.0
+
+        c = service_ema if (service_ema is not None and math.isfinite(service_ema)) else 1.0
+
+        if c >= c_target:
+            service_score = 0.0
+        elif c <= c_floor:
+            service_score = 100.0
+        else:
+            denom = max(0.001, c_target - c_floor)
+            service_score = (c_target - c) / denom * 100.0
+
+        fps_floor = 80.0 if (fps_clamped < fps_emerg) else 0.0
+        hw_saturated = (
+            isinstance(metrics, dict) and (
+                float(metrics.get("cpu_percent", 0.0)) >= hw_fuse_threshold or
+                float(metrics.get("ram_percent", 0.0)) >= hw_fuse_threshold
+            )
+        )
+        hw_floor = hw_fuse_score_floor if (hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0) else 0.0
+        load_score = round(min(100.0, max(service_score, fps_floor, hw_floor)), 1)
+
+        if load_score >= 72.0:
+            qos_state = "overloaded"
+        elif load_score >= 55.0:
+            qos_state = "degraded"
+        elif load_score >= 30.0:
+            qos_state = "moderate"
+        else:
+            qos_state = "healthy"
+
+        return {
+            "mode": "service",
+            "service_c_ema": round(c, 4),
+            "service_score": round(service_score, 1),
+            "fps_score": round(fps_floor, 1),
+            "hw_floor": round(hw_floor, 1),
+            "composite_score": load_score,
+            "load_score": load_score,
+            "qos_state": qos_state,
+            "workload_ema": round(eff_wl, 2),
+            "fps_ema": round(eff_fps, 1),
+            "raw_workload": round(curr_wl, 2),
+            "raw_fps": round(avg_fps, 1),
+        }
 
     # Determine qos_state based on load/fps
     wp_cfg = ls_cfg.get("workload_policy", {})
@@ -946,6 +1028,9 @@ class HealthAgent:
         # EMA state for workload-primary + FPS-confirmation policy
         self._workload_ema: Optional[float] = None
         self._fps_ema: Optional[float] = None
+        # EMA state for service completion score (V2)
+        self._service_ema: Optional[float] = None
+        self._service_ema_ts: float = 0.0
         # Heartbeat telemetry / watchdog metrics
         self._heartbeat_sent_count = 0
         self._heartbeat_error_count = 0
@@ -1321,7 +1406,7 @@ class HealthAgent:
 
                     metrics = self._collect_metrics()
 
-                    snapshot_valid, fps_stats, feature_stats, offload_crops, input_fps, source_modes = \
+                    snapshot_valid, fps_stats, feature_stats, offload_crops, service_stats, input_fps, source_modes = \
                         _read_pipeline_snapshot()
 
                     # ── Pipeline unavailable guard ─────────────────────────
@@ -1364,11 +1449,35 @@ class HealthAgent:
                             self._workload_ema = None
                             self._fps_ema = None
 
+                        # Service completion ratio calculation & EMA
+                        svc_cfg = ls_cfg.get("service", {}) if isinstance(ls_cfg, dict) else {}
+                        s_alpha = _finite_positive(svc_cfg.get("ema_alpha")) or 0.30
+                        s_stale = _finite_positive(svc_cfg.get("ema_stale_s")) or 30.0
+
+                        fin = int(service_stats.get("plates_finalized", 0) or 0)
+                        miss = int(service_stats.get("tracks_missed", 0) or 0)
+                        denom = fin + miss
+
+                        now_mono = time.monotonic()
+                        if denom > 0:
+                            inst_c = fin / float(denom)
+                            if self._service_ema is None:
+                                self._service_ema = inst_c
+                            else:
+                                self._service_ema = s_alpha * inst_c + (1.0 - s_alpha) * self._service_ema
+                            self._service_ema_ts = now_mono
+                        else:
+                            # Gentle decay towards 1.0 if traffic is silent
+                            if self._service_ema is not None and (now_mono - self._service_ema_ts) > s_stale:
+                                self._service_ema = min(1.0, self._service_ema + 0.05)
+                                self._service_ema_ts = now_mono
+
                         load_score, omega_preset = _compute_load_score(
                             metrics, fps_stats, source_starved_cameras=starved_cams,
                             feature_stats=feature_stats,
                             workload_ema=self._workload_ema,
                             fps_ema=self._fps_ema,
+                            service_ema=self._service_ema,
                         )
                         # Compute breakdown for auditable payload
                         load_score_breakdown = _compute_load_score_breakdown(
@@ -1376,8 +1485,12 @@ class HealthAgent:
                             feature_stats=feature_stats,
                             workload_ema=self._workload_ema,
                             fps_ema=self._fps_ema,
+                            service_ema=self._service_ema,
                         )
                         offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
+                        offload_queue_full = bool(offload_crops.get("offload_queue_full", False))
+                        offload_queue_depth = int(offload_crops.get("offload_queue_depth", 0) or 0)
+                        offload_queue_depth_ratio = float(offload_crops.get("offload_queue_depth_ratio", 0.0) or 0.0)
                         # BUG-I fix: exclude 0-fps cameras from avg_fps,
                         # matching the exclusion applied in _compute_load_score()
                         # so the reported avg_fps is consistent with the load_score value.
@@ -1404,6 +1517,9 @@ class HealthAgent:
                             "qos_state": None,
                         }
                         offload_crops_received_per_s = 0.0
+                        offload_queue_full = False
+                        offload_queue_depth = 0
+                        offload_queue_depth_ratio = 0.0
                         active_fps_vals = []
                         avg_fps = None
                         active_cameras = []
@@ -1506,6 +1622,9 @@ class HealthAgent:
                             "camera_epochs":  camera_epochs,
                             "max_streams":    int(self._max_streams or 8),
                             "offload_crops_received_per_s": float(offload_crops_received_per_s or 0.0),
+                            "offload_queue_full": bool(offload_queue_full),
+                            "offload_queue_depth": int(offload_queue_depth),
+                            "offload_queue_depth_ratio": float(offload_queue_depth_ratio),
                         },
                     }
 

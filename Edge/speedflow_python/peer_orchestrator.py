@@ -107,6 +107,9 @@ class PeerState:
     source_starved_cameras: List[str] = field(default_factory=list)
     # Rate of offload crops received per second (for Level 2/3 peer evaluation)
     offload_crops_received_per_s: float = 0.0
+    offload_queue_full: bool = False
+    consecutive_queue_not_full_count: int = 0
+    offload_queue_depth: int = 0
     load_score_breakdown: Dict[str, float] = field(default_factory=dict)
     status: Optional[str] = None
     pipeline_idle: bool = False
@@ -542,6 +545,9 @@ class PeerOrchestrator:
         # Per-camera timestamp when offload (L2/L3) was started
         self._offload_started_at: Dict[str, float] = {}
 
+        # Timestamp since self load dropped below overload threshold (for de-escalation dwell)
+        self._below_thr_since: Optional[float] = None
+
         # Step-7: migration-complete timestamps for Δτ computation
         # camera_id → unix timestamp when REMOVE was confirmed sent
         self._migration_complete_ts: Dict[str, float] = {}
@@ -688,6 +694,36 @@ class PeerOrchestrator:
         with self._offload_lock:
             return self._offload_targets.get(camera_id, "")
 
+    def is_offload_target_saturated(self, target_node: str) -> bool:
+        """Check if target node has reported a saturated offload queue in its recent heartbeat."""
+        if not target_node:
+            return False
+        with self._lock:
+            peer = self._peers.get(target_node)
+            if peer is not None:
+                return bool(peer.offload_queue_full)
+            return False
+
+    def _send_offload_session_msg(self, action: str, camera_id: str, target_node: str, level: int) -> None:
+        """Publish offload session control message (start/stop) to target peer."""
+        try:
+            if self._session is None:
+                return
+            key = f"offload/session/{self._node_id}/{target_node}"
+            payload = {
+                "action": action,
+                "src": self._node_id,
+                "dst": target_node,
+                "camera_id": camera_id,
+                "level": level,
+                "session_ts": time.time(),
+            }
+            self._session.put(key, msgpack.packb(payload, use_bin_type=True))
+            logger.info("[PeerOrch] Published session %s: src=%s dst=%s cam=%s level=%d",
+                        action.upper(), self._node_id, target_node, camera_id, level)
+        except Exception as exc:
+            logger.warning("[PeerOrch] Failed to publish offload session %s msg: %s", action, exc)
+
     def set_offload_level(self, camera_id: str, level: int, target_node: str = "") -> None:
         """
         Set the offload level for camera_id.  Called only from the decision loop.
@@ -698,17 +734,27 @@ class PeerOrchestrator:
         """
         with self._offload_lock:
             old = self._offload_table.get(camera_id, 0)
+            old_target = self._offload_targets.get(camera_id, "")
             self._offload_table[camera_id] = level
             self._offload_targets[camera_id] = target_node
             now = time.time()
             self._offload_level_changed_at[camera_id] = now
             if level > 0 and old == 0:
                 self._offload_started_at[camera_id] = now
-        if old != level:
+
+        if old != level or (level > 0 and old_target != target_node):
             logger.info(
-                "[PeerOrch] Offload level %d→%d for '%s' (target='%s')",
-                old, level, camera_id, target_node,
+                "[PeerOrch] Offload level %d→%d for '%s' (target='%s' was='%s')",
+                old, level, camera_id, target_node, old_target,
             )
+            # Session handshake management
+            if self._session is not None:
+                # Stop old session if previous level was L2/L3 and level changed, target changed, or stopped
+                if old in (2, 3) and old_target and (level != old or old_target != target_node or level == 0):
+                    self._send_offload_session_msg("stop", camera_id, old_target, old)
+                # Start new session if level is 2 or 3 and target specified
+                if level in (2, 3) and target_node and (level != old or old_target != target_node):
+                    self._send_offload_session_msg("start", camera_id, target_node, level)
 
     def stop(self) -> None:
         """Stop orchestrator."""
@@ -852,6 +898,7 @@ class PeerOrchestrator:
                     and not in_waiting
                 )
                 if overloaded:
+                    self._below_thr_since = None
                     if self._self_state.overload_since is None:
                         self._self_state.overload_since = time.time()
                     # Only reset reclaim eligibility outside the post-reclaim
@@ -862,6 +909,18 @@ class PeerOrchestrator:
                         self._reclaim_eligible_since = None
                 else:
                     self._self_state.overload_since = None
+                    now_ts = time.time()
+                    if self._below_thr_since is None:
+                        self._below_thr_since = now_ts
+                    dwell = float(self._cfg.get("offload_release_dwell_s", 15.0))
+                    if now_ts - self._below_thr_since >= dwell:
+                        for cam_id in list(self._self_state.active_cameras):
+                            cl = self.get_offload_level(cam_id)
+                            if cl in (2, 3):
+                                start_ts = self._offload_started_at.pop(cam_id, 0.0)
+                                dur = f" (duration: {now_ts - start_ts:.1f}s)" if start_ts > 0 else ""
+                                self.set_offload_level(cam_id, 0)
+                                logger.info("[PeerOrch] L%d offload ENDED for '%s': load_normalized%s", cl, cam_id, dur)
             return
 
         # Update state of other peers
@@ -926,6 +985,15 @@ class PeerOrchestrator:
             peer.offload_crops_received_per_s = float(
                 pipeline.get("offload_crops_received_per_s", 0.0) or 0.0
             )
+            raw_queue_full = bool(pipeline.get("offload_queue_full", False))
+            if raw_queue_full:
+                peer.offload_queue_full = True
+                peer.consecutive_queue_not_full_count = 0
+            else:
+                peer.consecutive_queue_not_full_count += 1
+                if peer.consecutive_queue_not_full_count >= 3:
+                    peer.offload_queue_full = False
+            peer.offload_queue_depth = int(pipeline.get("offload_queue_depth", 0) or 0)
             peer.camera_owners = payload.get("camera_owners", {}) or {}
             peer.camera_holders = payload.get("camera_holders", {}) or {}
             peer.camera_epochs = payload.get("camera_epochs", {}) or {}
@@ -1896,11 +1964,13 @@ class PeerOrchestrator:
             return
 
         if state.overload_since is None:
-            logger.debug("[PeerOrch] Not overloaded (overload_since=None)")
+            if self._maybe_log_block("not_overloaded", now):
+                logger.debug("[PeerOrch] Not overloaded (overload_since=None)")
             return
         if now - state.overload_since < cfg.get("overload_duration_s", 10.0):
-            logger.debug("[PeerOrch] Overload too recent (%.1fs < %.1fs)",
-                        now - state.overload_since, cfg.get("overload_duration_s", 10.0))
+            if self._maybe_log_block("overload_too_recent", now):
+                logger.debug("[PeerOrch] Overload too recent (%.1fs < %.1fs)",
+                            now - state.overload_since, cfg.get("overload_duration_s", 10.0))
             return
 
         # ponytail: startup warmup gate.  Even with overload_since set,
@@ -1967,9 +2037,10 @@ class PeerOrchestrator:
         thr1          = cfg.get("offload_level1_threshold", 72.0)
         level_cd      = cfg.get("offload_level_cooldown_s", 12.0)
         global_offload = cfg.get("offload_level", 0)
-        logger.debug("[PeerOrch] Overload check: load=%.1f, thr1=%.1f, thr2=%.1f, thr3=%.1f, "
-                    "global_offload=%d, cam_ready=%s",
-                    load, thr1, thr2, thr3, global_offload, state)
+        if self._maybe_log_block("overload_check", now):
+            logger.debug("[PeerOrch] Overload check: load=%.1f, thr1=%.1f, thr2=%.1f, thr3=%.1f, "
+                        "global_offload=%d, cam_ready=%s",
+                        load, thr1, thr2, thr3, global_offload, state)
 
         # If offload is disabled in config, fall straight through to Level 1
         if global_offload == 0:
@@ -1981,21 +2052,22 @@ class PeerOrchestrator:
         hard_fuse = float(cfg.get("proactive", {}).get("hard_fuse_threshold", 0.95))
         fuse_active = state.risk_index >= hard_fuse
 
-        if fuse_active or (load >= thr1 and global_offload >= 1):
+        l2_stuck = False
+        l2_no_improvement_s = float(cfg.get("l2_no_improvement_s", 300.0))
+        for cam_id in list(state.active_cameras):
+            if self.get_offload_level(cam_id) == 2:
+                start_ts = self._offload_started_at.get(cam_id, now)
+                if now - start_ts >= l2_no_improvement_s and load >= thr3:
+                    l2_stuck = True
+                    break
+
+        if fuse_active or (load >= thr1 and global_offload >= 1) or (l2_stuck and global_offload >= 1):
             intended_level = 1
         elif load >= thr2 and global_offload >= 2:
             intended_level = 2
         elif load >= thr3 and global_offload >= 3:
             intended_level = 3
         else:
-            # Load dropped below all thresholds — clear fine-grained offload
-            for cam_id in list(state.active_cameras):
-                cl = self.get_offload_level(cam_id)
-                if cl in (2, 3):
-                    start_ts = self._offload_started_at.pop(cam_id, 0.0)
-                    dur = f" (duration: {now - start_ts:.1f}s)" if start_ts > 0 else ""
-                    self.set_offload_level(cam_id, 0)
-                    logger.info("[PeerOrch] L%d offload ENDED for '%s': load_normalized%s", cl, cam_id, dur)
             return
 
         raw_intended_level = intended_level
@@ -2037,8 +2109,8 @@ class PeerOrchestrator:
 
         current_level = self.get_offload_level(cam_to_offload)
 
-        # In normal mode (no fuse), clamp escalation steps per camera
-        if not fuse_active:
+        # In normal mode (no fuse and not l2_stuck), clamp escalation steps per camera
+        if not fuse_active and not l2_stuck:
             def _clamp_intended_level(cur_lvl: int, raw_lvl: int, g_offload: int) -> int:
                 if cur_lvl == 0:
                     if g_offload >= 3 and raw_lvl in (1, 2, 3):
@@ -4207,7 +4279,7 @@ class PeerOrchestrator:
     # don't spew every 1-second tick.  Each "block reason" key gets logged at
     # most once every BLOCK_LOG_COOLDOWN seconds (default 15 s).  Increase to
     # 30 s if still too noisy.
-    BLOCKED_LOG_COOLDOWN = 15.0
+    BLOCKED_LOG_COOLDOWN = 60.0
 
     def _maybe_log_block(self, reason: str, now: float) -> bool:
         """Return True the first time `reason` fires or after its cooldown expires."""

@@ -58,6 +58,7 @@ NODE_ID = _get("NODE_ID")
 # -----------------------------------------------------------
 LOAD_POLICY = os.environ.get("LOAD_POLICY", "actual").strip().lower()
 LOAD_MODEL  = os.environ.get("LOAD_MODEL", "formula").strip().lower()
+EDGE_LOAD_SCORE_MODE = os.environ.get("EDGE_LOAD_SCORE_MODE", "service").strip().lower()
 
 _VALID_LOAD_POLICIES = {"actual", "predict_no_base", "predict_with_base"}
 _VALID_LOAD_MODELS   = {"formula", "dl"}

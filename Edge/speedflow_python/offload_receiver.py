@@ -536,12 +536,14 @@ class OffloadReceiver:
         lpr_engine_path: str,
         lpd_engine_path: str,
         labels_path: str,
+        session_idle_s: float = 10.0,
     ) -> None:
         self._node_id         = node_id
         self._session         = session
         self._lpr_engine_path = lpr_engine_path
         self._lpd_engine_path = lpd_engine_path
         self._labels_path     = labels_path
+        self._session_idle_s  = float(session_idle_s)
 
         self._work_q: queue.Queue[Optional[dict]] = queue.Queue(maxsize=32)
         self._thread: Optional[threading.Thread]  = None
@@ -560,6 +562,12 @@ class OffloadReceiver:
         # Result publisher cache
         self._result_pubs: Dict[str, Any] = {}
 
+        # F2 Session Handshake state: (src_node, camera_id) -> {"level": int, "last_seen": float}
+        self._sessions: Dict[Tuple[str, str], dict] = {}
+        self._session_dropped_count = 0
+        self._sessions_lock = threading.Lock()
+        self._last_session_clean_ts = time.time()
+
         # Thread-safe lifetime E2E counters (int reads are atomic in CPython)
         self._received       = 0
         self._queue_dropped  = 0
@@ -577,6 +585,63 @@ class OffloadReceiver:
         # Result subscription used when this node sends crops to a peer.
         self._result_handler: Optional[Any] = None
         self._result_sub_declared = False
+
+    @property
+    def queue_depth(self) -> int:
+        """Current number of items queued in the receiver work queue."""
+        return self._work_q.qsize()
+
+    @property
+    def queue_full(self) -> bool:
+        """Whether the receiver work queue is considered saturated (>= 80% capacity)."""
+        return self._work_q.qsize() >= int(self._work_q.maxsize * 0.8)
+
+    @property
+    def queue_depth_ratio(self) -> float:
+        """Work queue occupancy ratio [0.0, 1.0]."""
+        if self._work_q.maxsize <= 0:
+            return 0.0
+        return self._work_q.qsize() / self._work_q.maxsize
+
+    @property
+    def session_dropped_count(self) -> int:
+        """Crops dropped because no active handshake session existed. Thread-safe (int)."""
+        return self._session_dropped_count
+
+    @property
+    def offload_session_dropped_count(self) -> int:
+        """Alias for session_dropped_count for metric consistency."""
+        return self._session_dropped_count
+
+    @property
+    def offload_queue_depth(self) -> int:
+        """Alias for queue_depth."""
+        return self.queue_depth
+
+    @property
+    def offload_queue_full(self) -> bool:
+        """Alias for queue_full."""
+        return self.queue_full
+
+    @property
+    def offload_queue_depth_ratio(self) -> float:
+        """Alias for queue_depth_ratio."""
+        return self.queue_depth_ratio
+
+    def snapshot_counters(self) -> dict:
+        """Snapshot of receiver metrics and queue state."""
+        return {
+            "received": self._received,
+            "processed": self._processed,
+            "queue_dropped": self._queue_dropped,
+            "errors": self._errors,
+            "results_sent": self._results_sent,
+            "inference_errors": self._inference_errors,
+            "queue_depth": self.queue_depth,
+            "queue_full": self.queue_full,
+            "queue_depth_ratio": self.queue_depth_ratio,
+            "session_dropped_count": self._session_dropped_count,
+        }
 
     @property
     def offload_processed_count(self) -> int:
@@ -641,6 +706,10 @@ class OffloadReceiver:
             f"offload/vehicles/*/{self._node_id}",
             self._on_vehicle_sample,
         )
+        self._session.declare_subscriber(
+            f"offload/session/*/{self._node_id}",
+            self._on_session_msg,
+        )
         self._thread = threading.Thread(
             target=self._worker_loop,
             name=f"OffloadReceiver-{self._node_id}",
@@ -648,7 +717,8 @@ class OffloadReceiver:
         )
         self._thread.start()
         logger.info(
-            "[OffloadReceiver] Started. Listening on offload/*/*/%s", self._node_id
+            "[OffloadReceiver] Started. Listening on offload/*/*/%s and offload/session/*/%s",
+            self._node_id, self._node_id,
         )
 
     def stop(self) -> None:
@@ -711,6 +781,31 @@ class OffloadReceiver:
     # Must NOT block.
     # ------------------------------------------------------------------
 
+    def _on_session_msg(self, sample) -> None:
+        """Callback for offload/session/*/{my_node_id} — handle start/stop handshake."""
+        try:
+            payload = msgpack.unpackb(sample.payload.to_bytes(), raw=False)
+            action = payload.get("action", "")
+            src_node = payload.get("src", "")
+            camera_id = payload.get("camera_id", "")
+            level = int(payload.get("level", 0))
+
+            if not src_node or not camera_id:
+                return
+
+            key = (src_node, camera_id)
+            with self._sessions_lock:
+                if action == "start":
+                    self._sessions[key] = {"level": level, "last_seen": time.time()}
+                    logger.info("[OffloadReceiver] Session started: src=%s cam=%s level=%d",
+                                src_node, camera_id, level)
+                elif action == "stop":
+                    if self._sessions.pop(key, None) is not None:
+                        logger.info("[OffloadReceiver] Session closed: src=%s cam=%s",
+                                    src_node, camera_id)
+        except Exception as exc:
+            logger.warning("[OffloadReceiver] Session message parse error: %s", exc)
+
     def _on_plate_sample(self, sample) -> None:
         self._enqueue_sample(sample, crop_type="plate")
 
@@ -722,13 +817,27 @@ class OffloadReceiver:
             payload = msgpack.unpackb(sample.payload.to_bytes(), raw=False)
             payload["_crop_type"] = crop_type
             # Received is credited as soon as the wire payload decodes — even
-            # if the work queue is full and the crop is then dropped.
+            # if dropped due to session handshake or queue full.
             self._received += 1
+
+            src = payload.get("src", "")
+            camera_id = payload.get("camera_id", "")
+            sess_key = (src, camera_id)
+
+            with self._sessions_lock:
+                session = self._sessions.get(sess_key)
+                if session is None:
+                    self._session_dropped_count += 1
+                    return
+                session["last_seen"] = time.time()
+
             try:
                 self._work_q.put_nowait(payload)
             except queue.Full:
                 self._queue_dropped += 1
-                logger.debug("[OffloadReceiver] Work queue full — dropping")
+                if self._queue_dropped == 1 or self._queue_dropped % 500 == 0:
+                    logger.warning("[OffloadReceiver] Work queue full — dropping (count=%d)",
+                                   self._queue_dropped)
         except Exception as exc:
             logger.warning("[OffloadReceiver] Decode error: %s", exc)
 
@@ -738,6 +847,20 @@ class OffloadReceiver:
 
     def _worker_loop(self) -> None:
         while self._running:
+            # Periodically clean up stale sessions
+            now = time.time()
+            if now - self._last_session_clean_ts >= 2.0:
+                self._last_session_clean_ts = now
+                with self._sessions_lock:
+                    stale_keys = [
+                        k for k, v in self._sessions.items()
+                        if now - v.get("last_seen", 0.0) > self._session_idle_s
+                    ]
+                    for k in stale_keys:
+                        self._sessions.pop(k, None)
+                        logger.info("[OffloadReceiver] Session timeout (idle > %.1fs): src=%s cam=%s",
+                                    self._session_idle_s, k[0], k[1])
+
             try:
                 item = self._work_q.get(timeout=2.0)
             except queue.Empty:

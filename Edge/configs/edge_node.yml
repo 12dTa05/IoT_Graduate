@@ -113,6 +113,9 @@ p2p:
   # Bypassed if a hardware emergency fuse is explicitly active.
   l3_dwell_s: 8.0    # L3 must remain active this long before L2
   l2_dwell_s: 12.0     # L2 must remain active this long before L1
+  offload_release_dwell_s: 15.0  # Duration node must stay below thr3 before clearing L2/L3 offload
+  l2_no_improvement_s: 300.0     # Max dwell at Level 2 without load dropping below thr3 before escalating to L1
+  offload_session_idle_s: 10.0   # receiver session TTL in seconds
 
   # TensorRT engine paths used by the offload receiver (Level 2 + 3)
   lpr_engine_path: "models/lpr.engine"
@@ -146,6 +149,14 @@ p2p:
 # Returns preset = "composite" every cycle — stable preset string.
 # ---------------------------------------------------------------------------
 load_score:
+  mode: service            # service (completion-primary) | legacy (FPS-dominant fallback)
+  service:
+    target: 0.95
+    floor: 0.50
+    ema_alpha: 0.30
+    ema_stale_s: 30.0
+    min_track_frames: 5
+    fps_emergency: 12.0
   hw_fuse_threshold: 90.0
   hw_fuse_score_floor: 80.0
 

@@ -823,6 +823,7 @@ def run_python_mode(args) -> None:
                 lpr_engine_path=str(lpr_path),
                 lpd_engine_path=str(lpd_path),
                 labels_path=str(labels_path),
+                session_idle_s=float(p2p_cfg.get("offload_session_idle_s", 10.0)),
             )
             offload_rcv.start()
             print("[OffloadRcv] Started.")
