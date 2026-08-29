@@ -4,6 +4,7 @@
 
 Edge/logs
 Edge/tests
+!Edge/tests/test_service_score.py
 Edge/snapshots
 Edge/__pycache__
 Edge/speedflow_python/__pycache__

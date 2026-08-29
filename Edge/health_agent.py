@@ -480,6 +480,102 @@ except OSError:
 _FPS_HISTORY: Deque[Tuple[float, float]] = collections.deque(maxlen=20)
 
 
+def _update_service_ema_state(
+    service_stats: dict,
+    prev_state: dict,
+    now_mono: float,
+    s_alpha: float = 0.30,
+    s_stale: float = 30.0,
+) -> dict:
+    """
+    Pure state updater for completion-primary service EMA.
+    Uses deltas over interval, tracks pending tracks (born - expired),
+    and enforces stale idle recovery only when there is zero active load.
+    """
+    fin = int(service_stats.get("plates_finalized", 0) or 0)
+    miss = int(service_stats.get("tracks_missed", 0) or 0)
+    born = int(service_stats.get("tracks_born", 0) or 0)
+    exp = int(service_stats.get("tracks_expired", 0) or 0)
+
+    pending_tracks = max(0, born - exp)
+    prev_fin = prev_state.get("prev_fin")
+    prev_miss = prev_state.get("prev_miss")
+    current_ema = prev_state.get("service_ema")
+    last_busy_ts = prev_state.get("last_busy_ts", now_mono)
+    last_update_ts = prev_state.get("last_update_ts", now_mono)
+
+    alpha_clamped = min(1.0, max(0.0, float(s_alpha)))
+    stale_clamped = max(0.1, float(s_stale))
+
+    if prev_fin is None or prev_miss is None:
+        # First sample: initialize baseline counters.
+        # If there are already historical lifetime metrics in /dev/shm snapshot,
+        # seed EMA with the historical ratio instead of falsely claiming 1.0 (perfect).
+        if current_ema is not None:
+            initial_ema = min(1.0, max(0.0, float(current_ema)))
+        elif (fin + miss) > 0:
+            initial_ema = min(1.0, max(0.0, float(fin) / float(fin + miss)))
+        else:
+            initial_ema = 1.0
+
+        return {
+            "service_ema": initial_ema,
+            "prev_fin": fin,
+            "prev_miss": miss,
+            "last_busy_ts": now_mono,
+            "last_update_ts": now_mono,
+            "delta_fin": 0,
+            "delta_miss": 0,
+            "pending_tracks": pending_tracks,
+            "idle_s": 0.0,
+            "cold_start": True,
+        }
+
+    # Handle counter reset / process restart
+    d_fin = fin - prev_fin if fin >= prev_fin else fin
+    d_miss = miss - prev_miss if miss >= prev_miss else miss
+    d_fin = max(0, d_fin)
+    d_miss = max(0, d_miss)
+
+    d_denom = d_fin + d_miss
+    new_ema = 1.0 if current_ema is None else min(1.0, max(0.0, float(current_ema)))
+
+    if d_denom > 0:
+        inst_c = d_fin / float(d_denom)
+        new_ema = alpha_clamped * inst_c + (1.0 - alpha_clamped) * new_ema
+        new_ema = min(1.0, max(0.0, new_ema))
+        last_busy_ts = now_mono
+        last_update_ts = now_mono
+        idle_s = 0.0
+    elif pending_tracks > 0:
+        # Tracks in flight: system is actively processing, keep EMA and mark as busy
+        last_busy_ts = now_mono
+        last_update_ts = now_mono
+        idle_s = 0.0
+    else:
+        # Zero completions and zero pending tracks in flight.
+        idle_s = max(0.0, now_mono - last_busy_ts)
+        elapsed_since_update = max(0.0, now_mono - last_update_ts)
+        if idle_s >= stale_clamped and elapsed_since_update >= 1.0:
+            # Smoothly recover towards 1.0 only after the full stale idle duration has elapsed
+            recovery_delta = min(1.0 - new_ema, 0.10 * elapsed_since_update)
+            new_ema = min(1.0, max(0.0, new_ema + max(0.0, recovery_delta)))
+            last_update_ts = now_mono
+
+    return {
+        "service_ema": new_ema,
+        "prev_fin": fin,
+        "prev_miss": miss,
+        "last_busy_ts": last_busy_ts,
+        "last_update_ts": last_update_ts,
+        "delta_fin": d_fin,
+        "delta_miss": d_miss,
+        "pending_tracks": pending_tracks,
+        "idle_s": round(idle_s, 2),
+        "cold_start": False,
+    }
+
+
 def _compute_load_score(
     metrics: dict,
     fps_stats: dict,
@@ -490,7 +586,7 @@ def _compute_load_score(
     service_ema: Optional[float] = None,
 ) -> tuple:
     """
-    Base + Additive Bonus load score with hardware emergency floor.
+    Completion-primary load score with legacy fallback.
     Supports mode="service" (completion-primary) and mode="legacy" / "workload_primary".
     """
     _starved = source_starved_cameras or set()
@@ -707,6 +803,11 @@ def _compute_load_score_breakdown(
     workload_ema: Optional[float] = None,
     fps_ema: Optional[float] = None,
     service_ema: Optional[float] = None,
+    service_delta_fin: int = 0,
+    service_delta_miss: int = 0,
+    service_pending_tracks: int = 0,
+    service_idle_s: float = 0.0,
+    service_cold_start: bool = False,
 ) -> dict:
     """
     Pure helper yielding auditable breakdown of the load score computation.
@@ -805,6 +906,11 @@ def _compute_load_score_breakdown(
             "fps_ema": round(eff_fps, 1),
             "raw_workload": round(curr_wl, 2),
             "raw_fps": round(avg_fps, 1),
+            "service_delta_fin": int(service_delta_fin),
+            "service_delta_miss": int(service_delta_miss),
+            "service_pending_tracks": int(service_pending_tracks),
+            "service_idle_s": float(service_idle_s),
+            "service_cold_start": bool(service_cold_start),
         }
 
     # Determine qos_state based on load/fps
@@ -1028,9 +1134,18 @@ class HealthAgent:
         # EMA state for workload-primary + FPS-confirmation policy
         self._workload_ema: Optional[float] = None
         self._fps_ema: Optional[float] = None
-        # EMA state for service completion score (V2)
-        self._service_ema: Optional[float] = None
-        self._service_ema_ts: float = 0.0
+        # Service completion score (V2) state
+        self._service_state: dict = {
+            "service_ema": None,
+            "prev_fin": None,
+            "prev_miss": None,
+            "last_busy_ts": 0.0,
+            "last_update_ts": 0.0,
+            "delta_fin": 0,
+            "delta_miss": 0,
+            "pending_tracks": 0,
+            "idle_s": 0.0,
+        }
         # Heartbeat telemetry / watchdog metrics
         self._heartbeat_sent_count = 0
         self._heartbeat_error_count = 0
@@ -1449,35 +1564,26 @@ class HealthAgent:
                             self._workload_ema = None
                             self._fps_ema = None
 
-                        # Service completion ratio calculation & EMA
+                        # Service completion ratio calculation & EMA (delta-based)
                         svc_cfg = ls_cfg.get("service", {}) if isinstance(ls_cfg, dict) else {}
                         s_alpha = _finite_positive(svc_cfg.get("ema_alpha")) or 0.30
                         s_stale = _finite_positive(svc_cfg.get("ema_stale_s")) or 30.0
 
-                        fin = int(service_stats.get("plates_finalized", 0) or 0)
-                        miss = int(service_stats.get("tracks_missed", 0) or 0)
-                        denom = fin + miss
-
                         now_mono = time.monotonic()
-                        if denom > 0:
-                            inst_c = fin / float(denom)
-                            if self._service_ema is None:
-                                self._service_ema = inst_c
-                            else:
-                                self._service_ema = s_alpha * inst_c + (1.0 - s_alpha) * self._service_ema
-                            self._service_ema_ts = now_mono
-                        else:
-                            # Gentle decay towards 1.0 if traffic is silent
-                            if self._service_ema is not None and (now_mono - self._service_ema_ts) > s_stale:
-                                self._service_ema = min(1.0, self._service_ema + 0.05)
-                                self._service_ema_ts = now_mono
+                        self._service_state = _update_service_ema_state(
+                            service_stats=service_stats or {},
+                            prev_state=self._service_state,
+                            now_mono=now_mono,
+                            s_alpha=s_alpha,
+                            s_stale=s_stale,
+                        )
 
                         load_score, omega_preset = _compute_load_score(
                             metrics, fps_stats, source_starved_cameras=starved_cams,
                             feature_stats=feature_stats,
                             workload_ema=self._workload_ema,
                             fps_ema=self._fps_ema,
-                            service_ema=self._service_ema,
+                            service_ema=self._service_state.get("service_ema"),
                         )
                         # Compute breakdown for auditable payload
                         load_score_breakdown = _compute_load_score_breakdown(
@@ -1485,7 +1591,12 @@ class HealthAgent:
                             feature_stats=feature_stats,
                             workload_ema=self._workload_ema,
                             fps_ema=self._fps_ema,
-                            service_ema=self._service_ema,
+                            service_ema=self._service_state.get("service_ema"),
+                            service_delta_fin=self._service_state.get("delta_fin", 0),
+                            service_delta_miss=self._service_state.get("delta_miss", 0),
+                            service_pending_tracks=self._service_state.get("pending_tracks", 0),
+                            service_idle_s=self._service_state.get("idle_s", 0.0),
+                            service_cold_start=self._service_state.get("cold_start", False),
                         )
                         offload_crops_received_per_s = float(offload_crops.get("received_per_s", 0.0))
                         offload_queue_full = bool(offload_crops.get("offload_queue_full", False))

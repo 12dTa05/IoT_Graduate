@@ -2098,13 +2098,14 @@ class PeerOrchestrator:
         # Transition guard: this camera was recently reclaimed and its FPS is
         # still stabilising.  Re-escalating it would immediately undo reclaim.
         reclaim_age = now - self._reclaim_completed_at.get(cam_to_offload, 0.0)
-        reclaim_stable_s = cfg.get("reclaim_stable_s", 30.0)
+        reclaim_stable_s = cfg.get("reclaim_stable_s", 5.0)
         if reclaim_age < reclaim_stable_s:
-            logger.info(
-                "[PeerOrch] Transition guard: '%s' was reclaimed %.0fs ago "
-                "(need %.0fs) — skipping offload to avoid re-escalation.",
-                cam_to_offload, reclaim_age, reclaim_stable_s,
-            )
+            if self._maybe_log_block(f"transition_guard_{cam_to_offload}", now):
+                logger.info(
+                    "[PeerOrch] Transition guard: '%s' was reclaimed %.0fs ago "
+                    "(need %.0fs) — skipping offload to avoid re-escalation.",
+                    cam_to_offload, reclaim_age, reclaim_stable_s,
+                )
             return
 
         current_level = self.get_offload_level(cam_to_offload)
@@ -4416,16 +4417,17 @@ class PeerOrchestrator:
         guard does not apply — it is allowed to pick the last owned camera
         as a crop source.
         """
+        now = time.time()
         if len(state.active_cameras) <= 1:
             if state.active_cameras:
-                logger.debug(
-                    "[PeerOrch] Only 1 camera left ('%s') — cannot offload last camera",
-                    state.active_cameras[0],
-                )
+                if self._maybe_log_block("pick_only_one_camera", now):
+                    logger.debug(
+                        "[PeerOrch] Only 1 camera left ('%s') — cannot offload last camera",
+                        state.active_cameras[0],
+                    )
             return None
 
-        now = time.time()
-        reclaim_stability = self._cfg.get("reclaim_stability_s", 30.0)
+        reclaim_stability = self._cfg.get("reclaim_stability_s", 6.0)
         starved = set(state.source_starved_cameras or [])
 
         # Bounce dampening: exclude cameras that have reached bounce_max migrations within bounce_window_s
@@ -4500,11 +4502,12 @@ class PeerOrchestrator:
             # Explicit L1 guard: never select an L1 candidate when <=1 locally-owned active camera.
             owned_active = owned_cam_ids & set(state.active_cameras)
             if len(owned_active) == 0:
-                logger.info(
-                    "[PeerOrch] L1 fail-safe: no locally-owned camera is active "
-                    "(active=%d). Skipping migration to preserve ownership.",
-                    len(state.active_cameras),
-                )
+                if self._maybe_log_block("l1_no_owned_active", now):
+                    logger.info(
+                        "[PeerOrch] L1 fail-safe: no locally-owned camera is active "
+                        "(active=%d). Skipping migration to preserve ownership.",
+                        len(state.active_cameras),
+                    )
                 return None
 
             # ponytail: foreign cameras MUST NOT be L1-migrated — they can only
@@ -4512,17 +4515,19 @@ class PeerOrchestrator:
             # Forwarding a foreign camera to a third node via RFO creates
             # chain migration (B→A→C) that breaks owner reclaim.
             if foreign_l1:
-                logger.info(
-                    "[PeerOrch] L1: skipping %d foreign camera(s) — only owner can reclaim.",
-                    len(foreign_l1),
-                )
+                if self._maybe_log_block("l1_skipping_foreign", now):
+                    logger.info(
+                        "[PeerOrch] L1: skipping %d foreign camera(s) — only owner can reclaim.",
+                        len(foreign_l1),
+                    )
 
             # If owned active <= 1, guard against offloading owned camera
             if len(owned_active) <= 1:
-                logger.info(
-                    "[PeerOrch] L1 guard: <= 1 locally-owned camera active (owned_active=%d, active=%d) and no foreign candidates. Skipping L1 migration.",
-                    len(owned_active), len(state.active_cameras),
-                )
+                if self._maybe_log_block("l1_guard_single_owned", now):
+                    logger.info(
+                        "[PeerOrch] L1 guard: <= 1 locally-owned camera active (owned_active=%d, active=%d) and no foreign candidates. Skipping L1 migration.",
+                        len(owned_active), len(state.active_cameras),
+                    )
                 return None
 
             # Then owned MIN workload (guard <=1 owned)
@@ -4531,11 +4536,12 @@ class PeerOrchestrator:
                     if (owned_active - {c}):
                         return c
 
-            logger.info(
-                "[PeerOrch] L1 fail-safe: every eligible candidate would leave "
-                "zero owned cameras active (owned_active=%d).",
-                len(owned_active),
-            )
+            if self._maybe_log_block("l1_no_safe_candidate", now):
+                logger.info(
+                    "[PeerOrch] L1 fail-safe: every eligible candidate would leave "
+                    "zero owned cameras active (owned_active=%d).",
+                    len(owned_active),
+                )
             return None
 
         # L2/L3 crop offload: heaviest camera = max workload. The crop

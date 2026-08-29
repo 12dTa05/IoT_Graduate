@@ -10,12 +10,10 @@
 p2p:
   overload_threshold: 55.0      # load_score at or above this triggers RFO; L3 anchor
                                    # under Base + Bonus load_score (L3=60)
-  overload_duration_s: 5.0     # must be overloaded this long before RFO
-                                   # slightly exceeds one traffic-light cycle (6s)
-                                   # to filter transient GPU bursts with healthy FPS
-  cooldown_s: 12.0              # per-camera cooldown between migrations
+  overload_duration_s: 3.0     # must be overloaded this long before RFO
+                                   # quick reaction (3s) while filtering instant 1s telemetry jitter
+  cooldown_s: 6.0              # per-camera cooldown between migrations
                                    # prevents ping-pong while allowing rebalancing
-                                   # after migration effect is observable
   migration_timeout_s: 12.0    # wait for ADD ack before rollback (restored to safe default;
                                  # 2 s was too tight for slow RTSP sources across LAN)
   add_ack_timeout_s: 8.0      # max wait on receiver for ADD stream to reach PLAYING (must be < migration_timeout_s)
@@ -25,20 +23,18 @@ p2p:
   rescue_claim_window_s: 1.0    # claim window to collect peer rescue claims before ADD
   rescue_claim_lease_s: 15.0   # duration during which an active peer claim suppresses local ADD
   failover_retry_interval_s: 30.0 # re-arm interval (s): retry a failed failover while the peer stays dead instead of latching until its heartbeat revives
-  recovery_wait_s: 300.0        # wait 5 minutes in recovery before re-adding locally-owned cameras
+  recovery_wait_s: 60.0        # wait 60s in recovery before re-adding locally-owned cameras
   vote_window_s: 5.0            # proposal collection duration
   failover_jitter_max_s: 5.0    # random delay before failover ADD (race prevention)
   reclaim_margin: 12.0         # reclaim only when load < (overload_threshold - reclaim_margin)
                                 # 55 - 12 = 43; enables reclaim once score drops below 43
-  reclaim_stable_s: 15.0       # load must stay below reclaim threshold this long before
-                                # reclaiming — one full signal cycle to confirm genuine
-                                # capacity recovery rather than a momentary green phase
-  reclaim_stability_s: 15.0    # post-reclaim observation window (seconds): a just-returned
+  reclaim_stable_s: 5.0        # load must stay below reclaim threshold this long before
+                                # reclaiming — 5s confirms genuine recovery
+  reclaim_stability_s: 6.0     # post-reclaim observation window (seconds): a just-returned
                                 # camera cannot be offloaded during this window; prevents oscillation
                                 # from transient FPS spikes during stream warm-up.
-                                # Same cadence as reclaim_stable_s; treat as a pair — change both together.
   bounce_max: 3                # max migrations per camera in bounce_window_s before L1 exclusion
-  bounce_window_s: 300.0       # bounce observation window (seconds)
+  bounce_window_s: 60.0        # bounce observation window (seconds)
   zombie_timeout_count: 3      # consecutive migration timeouts before excluding peer from selection
 
   # Static node-to-camera ownership mapping (for cluster topology & failover isolation)
@@ -105,16 +101,16 @@ p2p:
   offload_level1_threshold: 72.0   # L1: fall-stream RTSP migration at critical load
 
   # Cooldown between level changes for the same camera (seconds)
-  offload_level_cooldown_s: 12.0
+  offload_level_cooldown_s: 6.0
 
   # Minimum dwell time (seconds) before escalation from a lower level.
   # Prevents premature escalation while the lower-level offload takes effect.
   # Dwell starts when set_offload_level commits L3/L2 for that camera.
   # Bypassed if a hardware emergency fuse is explicitly active.
-  l3_dwell_s: 8.0    # L3 must remain active this long before L2
-  l2_dwell_s: 12.0     # L2 must remain active this long before L1
-  offload_release_dwell_s: 15.0  # Duration node must stay below thr3 before clearing L2/L3 offload
-  l2_no_improvement_s: 300.0     # Max dwell at Level 2 without load dropping below thr3 before escalating to L1
+  l3_dwell_s: 4.0    # L3 must remain active this long before L2
+  l2_dwell_s: 5.0     # L2 must remain active this long before L1
+  offload_release_dwell_s: 5.0  # Duration node must stay below thr3 before clearing L2/L3 offload
+  l2_no_improvement_s: 30.0     # Max dwell at Level 2 without load dropping below thr3 before escalating to L1
   offload_session_idle_s: 10.0   # receiver session TTL in seconds
 
   # TensorRT engine paths used by the offload receiver (Level 2 + 3)
@@ -122,31 +118,13 @@ p2p:
   lpd_engine_path: "models/lpd.engine"
 
 # ---------------------------------------------------------------------------
-# Load score — Base + Additive Bonus + Hardware Emergency Floor
+# Load score — Completion-Primary (Service Mode) with Legacy Fallback
 #
-# Form:
-#   load_score = clamp(0, 100,
-#       fps_score
-#     + workload_bonus
-#     + thermal_bonus
-#     + recv_bonus
-#     + trend_bonus
-#     + proactive_bonus   # when proactive.enabled: true
-#   )
-#
-# Components:
-#   fps_score:      piecewise linear on 0-100 scale:
-#                   27->0, 22->57, 19->65, 17->75, 0->100
-#   workload_bonus: min(max_bonus (15), max_bonus * (n_track + n_plate) / capacity (40))
-#   thermal_bonus:  min(max_bonus (5), max_bonus * ramp(onset_c=70, critical_c=85))
-#   recv_bonus:     min(max_bonus (5), max_bonus * (offload_crops_received_per_s / capacity (10)))
-#   trend_bonus:    min(max_bonus (5), max_bonus * (FPS decline slope / max_decline (2.0)))
-#
-# Hardware emergency floor:
-#   If ANY of {CPU, RAM} >= hw_fuse_threshold (90) AND fps_clamped < TARGET_FPS - 2:
-#       score = max(composite, hw_fuse_score_floor) (80.0 = L1 threshold)
-#
-# Returns preset = "composite" every cycle — stable preset string.
+# Form (mode: service):
+#   instant_completion = d_fin / (d_fin + d_miss) over evaluation interval
+#   service_ema = ema_alpha * instant_completion + (1 - ema_alpha) * service_ema
+#   service_score = piecewise linear on [0, 100] from target (0.95 -> 0) to floor (0.50 -> 100)
+#   load_score = max(service_score, fps_emergency_floor [80 if FPS < 12], hw_fuse_floor [80 if CPU/RAM >= 90])
 # ---------------------------------------------------------------------------
 load_score:
   mode: service            # service (completion-primary) | legacy (FPS-dominant fallback)
