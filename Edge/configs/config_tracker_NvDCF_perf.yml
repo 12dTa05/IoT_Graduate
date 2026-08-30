@@ -20,7 +20,7 @@ TargetManagement:
   maxTargetsPerStream: 150    # Max number of targets to track per stream. Recommended to set >10. Note: this value should account for the targets being tracked in shadow mode as well. Max value depends on the GPU memory capacity
 
   # [Creation & Termination Policy]
-  minIouDiff4NewTarget: 0.7418    # If the IOU between the newly detected object and any of the existing targets is higher than this threshold, this newly detected object will be discarded.
+  minIouDiff4NewTarget: 0.5    # If the IOU between the newly detected object and any of the existing targets is higher than this threshold, this newly detected object will be discarded. Lowered from 0.7418: stationary vehicles must be re-acquired after their track expires.
   minTrackerConfidence: 0.4009    # If the confidence of an object tracker is lower than this on the fly, then it will be tracked in shadow mode. Valid Range: [0.0, 1.0]
   probationAge: 2    # If the target's age exceeds this, the target will be considered to be valid.
   maxShadowTrackingAge: 51    # Max length of shadow tracking. If the shadowTrackingAge exceeds this limit, the tracker will be terminated.

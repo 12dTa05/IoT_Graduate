@@ -142,9 +142,9 @@ load_score:
   workload_policy:
     enabled: true
     w_low: 6.0
-    w_high: 10.0
+    w_high: 20.0
     fps_confirm: 22.0
-    fps_critical: 15.0
+    fps_critical: 18.0
     alpha_ema: 0.33
 
   workload:
