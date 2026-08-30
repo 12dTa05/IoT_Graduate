@@ -4,7 +4,6 @@
 
 Edge/logs
 Edge/tests/*
-!Edge/tests/test_service_score.py
 Edge/tests/__pycache__
 Edge/snapshots
 Edge/__pycache__
