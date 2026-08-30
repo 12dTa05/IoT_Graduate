@@ -147,6 +147,40 @@ def _make_source_bin(
     return source
 
 
+def _resolve_rtsp_push_location(
+    rtsp_push_base_url: str,
+    camera_id: str,
+    node_camera_map: Optional[dict] = None,
+) -> str:
+    """
+    ponytail: build RTSP push location keyed by camera owner identity.
+    Preserves server dashboard WHEP mapping '{owner_node}/{camera_id}' across migrations.
+    If camera_id belongs to jetson_B but is running on jetson_A, pushes to '.../jetson_B/cam_03'.
+    """
+    clean_base = rtsp_push_base_url.rstrip('/')
+    if not node_camera_map or not isinstance(node_camera_map, dict):
+        return f"{clean_base}/{camera_id}"
+
+    # Find owner node in node_camera_map: {node_name: [cam_ids...]}
+    owner = None
+    for n_id, cams in node_camera_map.items():
+        if isinstance(cams, list) and camera_id in cams:
+            owner = n_id
+            break
+
+    if not owner:
+        return f"{clean_base}/{camera_id}"
+
+    # Extract host prefix if clean_base ends with a node identifier
+    # e.g., 'rtsp://116.118.9.125:8554/jetson_A' -> 'rtsp://116.118.9.125:8554'
+    parts = clean_base.rsplit('/', 1)
+    if len(parts) == 2 and any(parts[1] == k for k in node_camera_map.keys()):
+        host_prefix = parts[0]
+        return f"{host_prefix}/{owner}/{camera_id}"
+
+    return f"{clean_base}/{camera_id}"
+
+
 def _add_rtsp_push_branch(
     pipeline: Gst.Pipeline,
     demux: Gst.Element,
@@ -154,6 +188,7 @@ def _add_rtsp_push_branch(
     rtsp_push_base_url: str,
     bitrate: int = RTSP_PUSH_BITRATE,
     sync: bool = False,
+    node_camera_map: Optional[dict] = None,
 ) -> list[Gst.Element]:
     """Create one nvstreamdemux -> encoder -> rtspclientsink branch for cam_cfg."""
     sid = cam_cfg.source_id
@@ -180,7 +215,8 @@ def _add_rtsp_push_branch(
 
     parse = make_element(f"parse_rtsp_push{suffix}", "h264parse")
     sink = make_element(f"sink_rtsp_push{suffix}", "rtspclientsink")
-    sink.set_property("location", f"{rtsp_push_base_url.rstrip('/')}/{cam_cfg.camera_id}")
+    location = _resolve_rtsp_push_location(rtsp_push_base_url, cam_cfg.camera_id, node_camera_map)
+    sink.set_property("location", location)
     sink.set_property("protocols", "tcp")
     sink.set_property("latency", 0)
 
@@ -239,12 +275,13 @@ def init_rtsp_push_branches(
     present_cameras: list[CameraConfig],
     rtsp_push_base_url: str,
     bitrate: int = 750_000,
+    node_camera_map: Optional[dict] = None,
 ) -> None:
     """Initialize RTSP push branches for all enabled initial cameras."""
     for cam_cfg in present_cameras:
         if getattr(cam_cfg, "enabled", True):
             _add_rtsp_push_branch(
-                pipeline, demux, cam_cfg, rtsp_push_base_url, bitrate=bitrate
+                pipeline, demux, cam_cfg, rtsp_push_base_url, bitrate=bitrate, node_camera_map=node_camera_map
             )
 
 
@@ -469,7 +506,8 @@ def build_pipeline(
         pipeline.add(demux)
         rtsp_base_url = kwargs.get("rtsp_push_base_url") or kwargs.get("rtsp_push_url") or ""
         rtsp_bitrate = kwargs.get("rtsp_push_bitrate") or kwargs.get("bitrate", 750_000)
-        init_rtsp_push_branches(pipeline, demux, camera_configs, rtsp_base_url, bitrate=rtsp_bitrate)
+        node_cam_map = kwargs.get("node_camera_map")
+        init_rtsp_push_branches(pipeline, demux, camera_configs, rtsp_base_url, bitrate=rtsp_bitrate, node_camera_map=node_cam_map)
 
     elif sink_type == "file":
         # ── Demuxer ──
@@ -727,6 +765,7 @@ def dynamic_add_stream(
     ready_event: Optional[threading.Event] = None,
     rtsp_push_base_url: Optional[str] = None,
     rtsp_push_bitrate: Optional[int] = None,
+    node_camera_map: Optional[dict] = None,
 ) -> Gst.Element:
     # Cleanup stale source_bin from a previous failed ADD attempt.
     # If the prior _send_ack timed out without a REMOVE completing, the old
@@ -777,7 +816,7 @@ def dynamic_add_stream(
             if rtsp_push_base_url:
                 bitrate = rtsp_push_bitrate if rtsp_push_bitrate is not None else 750_000
                 _add_rtsp_push_branch(
-                    pipeline, demux, cam_cfg, rtsp_push_base_url, bitrate=bitrate, sync=True
+                    pipeline, demux, cam_cfg, rtsp_push_base_url, bitrate=bitrate, sync=True, node_camera_map=node_camera_map
                 )
                 rtsp_push_added = True
             elif cam_cfg.record:

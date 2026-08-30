@@ -3,8 +3,9 @@
 .pytest_cache
 
 Edge/logs
-Edge/tests
+Edge/tests/*
 !Edge/tests/test_service_score.py
+Edge/tests/__pycache__
 Edge/snapshots
 Edge/__pycache__
 Edge/speedflow_python/__pycache__

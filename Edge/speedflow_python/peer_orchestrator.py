@@ -2144,13 +2144,14 @@ class PeerOrchestrator:
                     current_level = self.get_offload_level(cam_to_offload)
                     intended_level = _clamp_intended_level(current_level, raw_intended_level, global_offload)
 
-        # Runtime diagnostic log immediately before overload action
-        logger.debug(
-            "[PeerOrch] Overload decision check: load=%.1f (thr1=%.1f, thr2=%.1f, thr3=%.1f), "
-            "risk_index=%.2f, fps_valid=%s, active_cameras=%d, camera='%s', current_level=%d, target_level=%d, fuse=%s",
-            load, thr1, thr2, thr3, state.risk_index, _has_valid_positive_fps(state.fps_per_camera),
-            len(state.active_cameras), cam_to_offload, current_level, intended_level, fuse_active,
-        )
+        # Runtime diagnostic log immediately before overload action (rate-limited)
+        if self._maybe_log_block("overload_decision_check", now):
+            logger.debug(
+                "[PeerOrch] Overload decision check: load=%.1f (thr1=%.1f, thr2=%.1f, thr3=%.1f), "
+                "risk_index=%.2f, fps_valid=%s, active_cameras=%d, camera='%s', current_level=%d, target_level=%d, fuse=%s",
+                load, thr1, thr2, thr3, state.risk_index, _has_valid_positive_fps(state.fps_per_camera),
+                len(state.active_cameras), cam_to_offload, current_level, intended_level, fuse_active,
+            )
 
         # Escalation-aware cooldown: when moving toward greater urgency
         # (numeric level decreases, e.g. 3→2, 3→1, 2→1) use a shorter

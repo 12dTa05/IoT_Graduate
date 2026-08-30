@@ -1146,6 +1146,8 @@ class SpeedProbe:
 
         for stid in stale_keys:
             # Service tracking: record eviction metrics
+            # ponytail: only count as missed if track was born reasonably recently (within ~30s / 900 frames).
+            # Evictions of ancient tracks from long-past overload bursts must not spike d_miss.
             with self._svc_lock:
                 self._svc_counts["tracks_expired"] += 1
                 meta = self._track_service_meta.pop(stid, None)
@@ -1153,8 +1155,10 @@ class SpeedProbe:
                     if meta.get("finalized"):
                         self._svc_counts["tracks_expired_locked"] += 1
                     else:
-                        age = current_frame - meta.get("birth_frame", current_frame)
-                        if age >= 5:  # min_track_frames default
+                        birth = meta.get("birth_frame", current_frame)
+                        age = current_frame - birth
+                        # Guard: must be >= 5 frames (real vehicle) AND not ancient (> 900 frames = 30s)
+                        if 5 <= age <= 900:
                             self._svc_counts["tracks_missed"] += 1
                 elif stid in self.plate_locked and self.plate_locked[stid] is not None:
                     self._svc_counts["tracks_expired_locked"] += 1

@@ -576,6 +576,43 @@ def _update_service_ema_state(
     }
 
 
+def _calc_workload_pressure(
+    wp_cfg: dict,
+    eff_wl: float,
+    eff_fps: float,
+    hw_fuse_score_floor: float,
+) -> float:
+    """
+    ponytail: pure helper computing workload pressure [0..100] from workload & fps.
+    Reused by both unified service mode and standalone workload_primary mode.
+    """
+    w_low = _finite_positive(wp_cfg.get("w_low")) or 6.0
+    w_high = _finite_positive(wp_cfg.get("w_high")) or 10.0
+    fps_confirm = _finite_positive(wp_cfg.get("fps_confirm")) or 22.0
+    fps_critical = _finite_positive(wp_cfg.get("fps_critical")) or 15.0
+
+    if eff_wl < w_low:
+        base_score = 30.0 * max(0.0, eff_wl) / max(0.001, w_low)
+        return max(base_score, hw_fuse_score_floor) if eff_fps < fps_critical else base_score
+    elif eff_wl < w_high:
+        frac = (eff_wl - w_low) / max(0.001, (w_high - w_low))
+        base_score = 30.0 + 25.0 * max(0.0, min(1.0, frac))
+        return max(base_score, hw_fuse_score_floor) if eff_fps < fps_critical else base_score
+    else:
+        # eff_wl >= w_high
+        if eff_fps >= fps_confirm:
+            fps_range = max(0.001, float(TARGET_FPS) - fps_confirm)
+            fps_drop_ratio = max(0.0, min(1.0, (float(TARGET_FPS) - eff_fps) / fps_range))
+            return 55.0 + 4.0 * fps_drop_ratio
+        elif eff_fps >= fps_critical:
+            fps_range = max(0.001, fps_confirm - fps_critical)
+            fps_drop_ratio = max(0.0, min(1.0, (fps_confirm - eff_fps) / fps_range))
+            return 60.0 + 15.0 * fps_drop_ratio
+        else:
+            fps_drop_ratio = max(0.0, min(1.0, (fps_critical - eff_fps) / max(0.001, fps_critical)))
+            return max(hw_fuse_score_floor, 76.0 + 24.0 * fps_drop_ratio)
+
+
 def _compute_load_score(
     metrics: dict,
     fps_stats: dict,
@@ -611,8 +648,11 @@ def _compute_load_score(
         return 0.0, "no_fps"
 
     fps_clamped = max(0.0, min(float(TARGET_FPS), avg_fps))
+    curr_wl = sum(_derive_camera_workload(feature_stats or {}, fps_stats, _starved).values()) if isinstance(feature_stats, dict) else 0.0
+    eff_wl = workload_ema if (workload_ema is not None and math.isfinite(workload_ema)) else curr_wl
+    eff_fps = fps_ema if (fps_ema is not None and math.isfinite(fps_ema)) else avg_fps
 
-    # ── Completion-Primary Service Score Mode ───────────────────
+    # ── Unified Service Score Mode (workload + completion + fps floors) ──
     if mode == "service":
         svc_cfg = ls_cfg.get("service", {})
         if not isinstance(svc_cfg, dict):
@@ -623,7 +663,7 @@ def _compute_load_score(
 
         c = service_ema if (service_ema is not None and math.isfinite(service_ema)) else 1.0
 
-        # Piecewise linear service score on [0, 100]
+        # Piecewise linear service score on [0, 100] (completion deficit)
         if c >= c_target:
             service_score = 0.0
         elif c <= c_floor:
@@ -631,6 +671,13 @@ def _compute_load_score(
         else:
             denom = max(0.001, c_target - c_floor)
             service_score = (c_target - c) / denom * 100.0
+
+        # Workload pressure (if enabled in config, maps vehicle count -> score)
+        wp_cfg = ls_cfg.get("workload_policy", {})
+        if isinstance(wp_cfg, dict) and wp_cfg.get("enabled", True):
+            workload_pressure = _calc_workload_pressure(wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor)
+        else:
+            workload_pressure = 0.0
 
         # Emergency floors
         fps_floor = 80.0 if (fps_clamped < fps_emerg) else 0.0
@@ -643,56 +690,13 @@ def _compute_load_score(
         )
         hw_floor = hw_fuse_score_floor if (hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0) else 0.0
 
-        composite = round(min(100.0, max(service_score, fps_floor, hw_floor)), 1)
+        composite = round(min(100.0, max(service_score, workload_pressure, fps_floor, hw_floor)), 1)
         return composite, "service_primary"
 
     # ── Workload-primary + FPS-confirmation policy gating ────────
     wp_cfg = ls_cfg.get("workload_policy", {})
     if isinstance(wp_cfg, dict) and wp_cfg.get("enabled") is True:
-        w_low = _finite_positive(wp_cfg.get("w_low")) or 6.0
-        w_high = _finite_positive(wp_cfg.get("w_high")) or 10.0
-        fps_confirm = _finite_positive(wp_cfg.get("fps_confirm")) or 22.0
-        fps_critical = _finite_positive(wp_cfg.get("fps_critical")) or 15.0
-
-        # Current or provided EMA values
-        curr_wl = sum(_derive_camera_workload(feature_stats or {}, fps_stats, _starved).values()) if isinstance(feature_stats, dict) else 0.0
-        eff_wl = workload_ema if (workload_ema is not None and math.isfinite(workload_ema)) else curr_wl
-        eff_fps = fps_ema if (fps_ema is not None and math.isfinite(fps_ema)) else avg_fps
-
-        # Threshold-state formula
-        if eff_wl < w_low:
-            base_score = 30.0 * max(0.0, eff_wl) / max(0.001, w_low)
-            if eff_fps < fps_critical:
-                score = max(base_score, hw_fuse_score_floor)
-            else:
-                score = base_score
-        elif eff_wl < w_high:
-            # Score 30..55 based on workload position in [w_low, w_high)
-            frac = (eff_wl - w_low) / max(0.001, (w_high - w_low))
-            base_score = 30.0 + 25.0 * max(0.0, min(1.0, frac))
-            if eff_fps < fps_critical:
-                score = max(base_score, hw_fuse_score_floor)
-            else:
-                score = base_score
-        else:
-            # eff_wl >= w_high
-            if eff_fps >= fps_confirm:
-                # QoS holds: score 55..59 (strictly < 60) so no offload
-                # Map fps in [TARGET_FPS, fps_confirm] -> [55.0, 59.0]
-                fps_range = max(0.001, float(TARGET_FPS) - fps_confirm)
-                fps_drop_ratio = max(0.0, min(1.0, (float(TARGET_FPS) - eff_fps) / fps_range))
-                score = 55.0 + 4.0 * fps_drop_ratio
-            elif eff_fps >= fps_critical:
-                # Progressively cross L3 (60) to L2 (75)
-                # Map fps in [fps_confirm, fps_critical] -> [60.0, 75.0]
-                fps_range = max(0.001, fps_confirm - fps_critical)
-                fps_drop_ratio = max(0.0, min(1.0, (fps_confirm - eff_fps) / fps_range))
-                score = 60.0 + 15.0 * fps_drop_ratio
-            else:
-                # eff_fps < fps_critical -> >= 76.0 (L1 critical)
-                # Map fps in [fps_critical, 0.0] -> [76.0, 100.0]
-                fps_drop_ratio = max(0.0, min(1.0, (fps_critical - eff_fps) / max(0.001, fps_critical)))
-                score = max(hw_fuse_score_floor, 76.0 + 24.0 * fps_drop_ratio)
+        score = _calc_workload_pressure(wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor)
 
         # Hardware emergency fuse
         hw_saturated = (
@@ -874,6 +878,12 @@ def _compute_load_score_breakdown(
             denom = max(0.001, c_target - c_floor)
             service_score = (c_target - c) / denom * 100.0
 
+        wp_cfg = ls_cfg.get("workload_policy", {})
+        if isinstance(wp_cfg, dict) and wp_cfg.get("enabled", True):
+            workload_pressure = _calc_workload_pressure(wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor)
+        else:
+            workload_pressure = 0.0
+
         fps_floor = 80.0 if (fps_clamped < fps_emerg) else 0.0
         hw_saturated = (
             isinstance(metrics, dict) and (
@@ -882,7 +892,7 @@ def _compute_load_score_breakdown(
             )
         )
         hw_floor = hw_fuse_score_floor if (hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0) else 0.0
-        load_score = round(min(100.0, max(service_score, fps_floor, hw_floor)), 1)
+        load_score = round(min(100.0, max(service_score, workload_pressure, fps_floor, hw_floor)), 1)
 
         if load_score >= 72.0:
             qos_state = "overloaded"
@@ -897,6 +907,7 @@ def _compute_load_score_breakdown(
             "mode": "service",
             "service_c_ema": round(c, 4),
             "service_score": round(service_score, 1),
+            "workload_pressure": round(workload_pressure, 1),
             "fps_score": round(fps_floor, 1),
             "hw_floor": round(hw_floor, 1),
             "composite_score": load_score,

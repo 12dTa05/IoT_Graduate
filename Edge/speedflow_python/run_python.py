@@ -161,6 +161,7 @@ def _attach_camera_manager(
     tiler: Gst.Element = None,
     rtsp_push_base_url: Optional[str] = None,
     rtsp_push_bitrate: Optional[int] = None,
+    node_camera_map: Optional[dict] = None,
 ):
     """
     Hooks up the CameraManager to safely add/remove streams dynamically.
@@ -187,6 +188,7 @@ def _attach_camera_manager(
                 ready_event=ready_ev,
                 rtsp_push_base_url=rtsp_push_base_url,
                 rtsp_push_bitrate=rtsp_push_bitrate,
+                node_camera_map=node_camera_map,
             )
             # Register mapping immediately after successful add.
             # This function runs in GLib Main Loop → safe, no lock needed.
@@ -449,6 +451,16 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
 
         print(f"[RTSP Push] Building pipeline (cause: {_last_restart_cause})...")
         rtsp_push_bitrate = RTSP_PUSH_BITRATE
+        _edge_node_yml = S.ROOT / "configs" / "edge_node.yml"
+        _edge_cfg_local = {}
+        try:
+            if _edge_node_yml.exists():
+                with open(_edge_node_yml, "r") as _f:
+                    _edge_cfg_local = yaml.safe_load(_f) or {}
+        except Exception:
+            pass
+        _p2p_local = _edge_cfg_local.get("p2p", {}) if isinstance(_edge_cfg_local, dict) else {}
+        _node_cam_map = _p2p_local.get("node_camera_map") if isinstance(_p2p_local, dict) else None
         ret_build = build_pipeline(
             camera_configs=camera_manager.get_enabled_configs(),
             sink_type="rtsp_push",
@@ -456,6 +468,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             mux_height=args.height,
             rtsp_push_base_url=rtsp_url,
             rtsp_push_bitrate=rtsp_push_bitrate,
+            node_camera_map=_node_cam_map,
         )
         pipeline, nvdsosd, streammux, source_bins = ret_build
         tiler = pipeline.get_by_name("tiler")
@@ -465,6 +478,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         _attach_camera_manager(
             camera_manager, pipeline, streammux, source_bins, tiler,
             rtsp_push_base_url=rtsp_url, rtsp_push_bitrate=rtsp_push_bitrate,
+            node_camera_map=_node_cam_map,
         )
 
         ret = pipeline.set_state(Gst.State.PLAYING)

@@ -127,7 +127,7 @@ p2p:
 #   load_score = max(service_score, fps_emergency_floor [80 if FPS < 12], hw_fuse_floor [80 if CPU/RAM >= 90])
 # ---------------------------------------------------------------------------
 load_score:
-  mode: service            # service (completion-primary) | legacy (FPS-dominant fallback)
+  mode: service            # service (unified: completion-deficit ∨ workload-pressure ∨ fps/hw floors) | legacy (workload/FPS fallback)
   service:
     target: 0.95
     floor: 0.50
