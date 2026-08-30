@@ -603,11 +603,11 @@ def _calc_workload_pressure(
         if eff_fps >= fps_confirm:
             fps_range = max(0.001, float(TARGET_FPS) - fps_confirm)
             fps_drop_ratio = max(0.0, min(1.0, (float(TARGET_FPS) - eff_fps) / fps_range))
-            return 55.0 + 4.0 * fps_drop_ratio
+            return 30.0 + 24.0 * fps_drop_ratio
         elif eff_fps >= fps_critical:
             fps_range = max(0.001, fps_confirm - fps_critical)
             fps_drop_ratio = max(0.0, min(1.0, (fps_confirm - eff_fps) / fps_range))
-            return 60.0 + 15.0 * fps_drop_ratio
+            return 55.0 + 20.0 * fps_drop_ratio
         else:
             fps_drop_ratio = max(0.0, min(1.0, (fps_critical - eff_fps) / max(0.001, fps_critical)))
             return max(hw_fuse_score_floor, 76.0 + 24.0 * fps_drop_ratio)
@@ -690,13 +690,37 @@ def _compute_load_score(
         )
         hw_floor = hw_fuse_score_floor if (hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0) else 0.0
 
-        composite = round(min(100.0, max(service_score, workload_pressure, fps_floor, hw_floor)), 1)
+        raw_score = max(service_score, workload_pressure, fps_floor, hw_floor)
+
+        # De-escalation veto: healthy FPS and non-saturated GPU clamp L3 band below offload trigger
+        p2p_cfg = _EDGE_CFG.get("p2p", {}) if isinstance(_EDGE_CFG.get("p2p"), dict) else {}
+        ovld_thr = float(p2p_cfg.get("overload_threshold", 55.0))
+        l2_thr = float(p2p_cfg.get("offload_level2_threshold", 64.0))
+        rec_margin = float(p2p_cfg.get("reclaim_margin", 12.0))
+        gpu_pct = float(metrics.get("gpu_percent", 0.0)) if isinstance(metrics, dict) else 0.0
+        fps_conf = _finite_positive(wp_cfg.get("fps_confirm")) or 22.0
+
+        if (ovld_thr <= raw_score < l2_thr) and eff_fps >= fps_conf and gpu_pct < 70.0 and (fps_floor == 0.0 and hw_floor == 0.0):
+            raw_score = max(0.0, ovld_thr - rec_margin - 1.0)
+
+        composite = round(min(100.0, raw_score), 1)
         return composite, "service_primary"
 
     # ── Workload-primary + FPS-confirmation policy gating ────────
     wp_cfg = ls_cfg.get("workload_policy", {})
     if isinstance(wp_cfg, dict) and wp_cfg.get("enabled") is True:
         score = _calc_workload_pressure(wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor)
+
+        # De-escalation veto: healthy FPS and non-saturated GPU clamp L3 band below offload trigger
+        p2p_cfg = _EDGE_CFG.get("p2p", {}) if isinstance(_EDGE_CFG.get("p2p"), dict) else {}
+        ovld_thr = float(p2p_cfg.get("overload_threshold", 55.0))
+        l2_thr = float(p2p_cfg.get("offload_level2_threshold", 64.0))
+        rec_margin = float(p2p_cfg.get("reclaim_margin", 12.0))
+        gpu_pct = float(metrics.get("gpu_percent", 0.0)) if isinstance(metrics, dict) else 0.0
+        fps_conf = _finite_positive(wp_cfg.get("fps_confirm")) or 22.0
+
+        if (ovld_thr <= score < l2_thr) and eff_fps >= fps_conf and gpu_pct < 70.0:
+            score = max(0.0, ovld_thr - rec_margin - 1.0)
 
         # Hardware emergency fuse
         hw_saturated = (
@@ -892,7 +916,20 @@ def _compute_load_score_breakdown(
             )
         )
         hw_floor = hw_fuse_score_floor if (hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0) else 0.0
-        load_score = round(min(100.0, max(service_score, workload_pressure, fps_floor, hw_floor)), 1)
+        raw_score = max(service_score, workload_pressure, fps_floor, hw_floor)
+
+        # De-escalation veto: healthy FPS and non-saturated GPU clamp L3 band below offload trigger
+        p2p_cfg = _EDGE_CFG.get("p2p", {}) if isinstance(_EDGE_CFG.get("p2p"), dict) else {}
+        ovld_thr = float(p2p_cfg.get("overload_threshold", 55.0))
+        l2_thr = float(p2p_cfg.get("offload_level2_threshold", 64.0))
+        rec_margin = float(p2p_cfg.get("reclaim_margin", 12.0))
+        gpu_pct = float(metrics.get("gpu_percent", 0.0)) if isinstance(metrics, dict) else 0.0
+        fps_conf = _finite_positive(wp_cfg.get("fps_confirm")) or 22.0
+
+        if (ovld_thr <= raw_score < l2_thr) and eff_fps >= fps_conf and gpu_pct < 70.0 and (fps_floor == 0.0 and hw_floor == 0.0):
+            raw_score = max(0.0, ovld_thr - rec_margin - 1.0)
+
+        load_score = round(min(100.0, raw_score), 1)
 
         if load_score >= 72.0:
             qos_state = "overloaded"
@@ -951,17 +988,27 @@ def _compute_load_score_breakdown(
             if eff_fps >= fps_confirm:
                 fps_range = max(0.001, float(TARGET_FPS) - fps_confirm)
                 fps_drop_ratio = max(0.0, min(1.0, (float(TARGET_FPS) - eff_fps) / fps_range))
-                base_score = 55.0 + 4.0 * fps_drop_ratio
+                base_score = 30.0 + 24.0 * fps_drop_ratio
                 load_score = base_score
             elif eff_fps >= fps_critical:
                 fps_range = max(0.001, fps_confirm - fps_critical)
                 fps_drop_ratio = max(0.0, min(1.0, (fps_confirm - eff_fps) / fps_range))
-                base_score = 60.0 + 15.0 * fps_drop_ratio
+                base_score = 55.0 + 20.0 * fps_drop_ratio
                 load_score = base_score
             else:
                 fps_drop_ratio = max(0.0, min(1.0, (fps_critical - eff_fps) / max(0.001, fps_critical)))
                 base_score = max(hw_fuse_score_floor, 76.0 + 24.0 * fps_drop_ratio)
                 load_score = base_score
+
+        # De-escalation veto: healthy FPS and non-saturated GPU clamp L3 band below offload trigger
+        p2p_cfg = _EDGE_CFG.get("p2p", {}) if isinstance(_EDGE_CFG.get("p2p"), dict) else {}
+        ovld_thr = float(p2p_cfg.get("overload_threshold", 55.0))
+        l2_thr = float(p2p_cfg.get("offload_level2_threshold", 64.0))
+        rec_margin = float(p2p_cfg.get("reclaim_margin", 12.0))
+        gpu_pct = float(metrics.get("gpu_percent", 0.0)) if isinstance(metrics, dict) else 0.0
+
+        if (ovld_thr <= load_score < l2_thr) and eff_fps >= fps_confirm and gpu_pct < 70.0:
+            load_score = max(0.0, ovld_thr - rec_margin - 1.0)
 
         hw_saturated = (
             isinstance(metrics, dict) and (

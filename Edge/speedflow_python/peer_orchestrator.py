@@ -2424,6 +2424,9 @@ class PeerOrchestrator:
                 # Skip peers in startup/recovery or without valid positive FPS (e.g. load_score=0 placeholder)
                 if is_waiting_state(peer.fps_per_camera, peer.active_cameras, getattr(peer, "status", None)):
                     continue
+                # Exclude peers whose offload queue is full to avoid routing to saturated receivers
+                if getattr(peer, "offload_queue_full", False):
+                    continue
                 # For pure least-load greedy baseline, skip stream capacity and thermal admission gates
                 if policy_name not in ("least_load_greedy", "centralized_greedy"):
                     if for_offload_level <= 1 and (

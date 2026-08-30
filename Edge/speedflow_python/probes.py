@@ -1099,11 +1099,11 @@ class SpeedProbe:
             self.snap_count[stid] += 1
 
     # ------------------------------------------------------------------
-    # Stale-track cleanup  (every 30 s)
+    # Stale-track cleanup  (incremental every 1.0 s)
     # ------------------------------------------------------------------
 
     def _periodic_cleanup(self, current_time: float, current_frame: int) -> None:
-        if current_time - self.last_cleanup_time < 30.0:
+        if current_time - self.last_cleanup_time < 1.0:
             return
         self.last_cleanup_time = current_time
 

@@ -46,14 +46,28 @@ def test_service_score_l3_level_trigger():
     metrics = {"cpu_percent": 20.0, "ram_percent": 30.0}
     fps_stats = {"cam_01": 27.0, "cam_02": 27.0}
     
-    # c = 0.70 -> (0.95 - 0.70) / 0.45 * 100 = 0.25 / 0.45 * 100 = 55.5 (Crosses L3 >= 55.0)
+    # In service mode with healthy FPS (27.0) and low GPU (<70%), de-escalation veto keeps score at 42.0 (below L3 55.0).
+    # When FPS drops below fps_confirm (e.g. 20.0 < 22.0), L3 triggers.
+    score, mode = _compute_load_score(
+        metrics=metrics,
+        fps_stats={"cam_01": 20.0, "cam_02": 20.0},
+        service_ema=0.70,
+    )
+    assert mode == "service_primary"
+    assert 55.0 <= score <= 56.0
+
+
+def test_service_score_l3_veto_with_healthy_fps():
+    metrics = {"cpu_percent": 20.0, "ram_percent": 30.0, "gpu_percent": 35.0}
+    fps_stats = {"cam_01": 27.0, "cam_02": 27.0}
     score, mode = _compute_load_score(
         metrics=metrics,
         fps_stats=fps_stats,
         service_ema=0.70,
     )
     assert mode == "service_primary"
-    assert 55.0 <= score <= 56.0
+    # De-escalation veto clamps score to 42.0 (< 55.0)
+    assert score == 42.0
 
 
 def test_service_score_l1_critical_trigger():
@@ -100,7 +114,7 @@ def test_service_score_hardware_fuse_floor():
 
 def test_service_score_breakdown():
     metrics = {"cpu_percent": 25.0, "ram_percent": 30.0}
-    fps_stats = {"cam_01": 27.0}
+    fps_stats = {"cam_01": 20.0}
     
     bd = _compute_load_score_breakdown(
         metrics=metrics,
