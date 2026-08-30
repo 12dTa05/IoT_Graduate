@@ -504,8 +504,23 @@ def _update_service_ema_state(
     last_busy_ts = prev_state.get("last_busy_ts", now_mono)
     last_update_ts = prev_state.get("last_update_ts", now_mono)
 
-    alpha_clamped = min(1.0, max(0.0, float(s_alpha)))
-    stale_clamped = max(0.1, float(s_stale))
+    try:
+        alpha_val = float(s_alpha)
+        if not math.isfinite(alpha_val) or alpha_val <= 0.0 or alpha_val > 1.0:
+            alpha_clamped = 0.30
+        else:
+            alpha_clamped = alpha_val
+    except (TypeError, ValueError):
+        alpha_clamped = 0.30
+
+    try:
+        stale_val = float(s_stale)
+        if not math.isfinite(stale_val) or stale_val <= 0.0:
+            stale_clamped = 30.0
+        else:
+            stale_clamped = max(0.1, stale_val)
+    except (TypeError, ValueError):
+        stale_clamped = 30.0
 
     if prev_fin is None or prev_miss is None:
         # First sample: initialize baseline counters.

@@ -991,7 +991,8 @@ class PeerOrchestrator:
                 peer.consecutive_queue_not_full_count = 0
             else:
                 peer.consecutive_queue_not_full_count += 1
-                if peer.consecutive_queue_not_full_count >= 3:
+                release_count = int(self._cfg.get("offload_queue_full_release_count", 3))
+                if peer.consecutive_queue_not_full_count >= release_count:
                     peer.offload_queue_full = False
             peer.offload_queue_depth = int(pipeline.get("offload_queue_depth", 0) or 0)
             peer.camera_owners = payload.get("camera_owners", {}) or {}
@@ -1209,14 +1210,14 @@ class PeerOrchestrator:
 
         # Shadow mode: telemetry only — strictly passive/reactive decisions
         if proactive_cfg.get("shadow_mode", False):
-            return load_score >= self._cfg.get("overload_threshold", 60.0)
+            return load_score >= self._cfg.get("overload_threshold", 55.0)
 
         if proactive_cfg.get("enabled", False) and risk_index > 0.0:
             threshold = float(proactive_cfg.get("risk_threshold", 0.85))
             return risk_index >= threshold
 
         # Legacy path
-        return load_score >= self._cfg.get("overload_threshold", 60.0)
+        return load_score >= self._cfg.get("overload_threshold", 55.0)
 
     # ------------------------------------------------------------------
     # Overload trigger score helper (for log messages + RFO payload)
@@ -1665,7 +1666,7 @@ class PeerOrchestrator:
         cfg = self._cfg
         now = time.time()
 
-        reclaim_threshold = cfg.get("overload_threshold", 60.0) - cfg.get("reclaim_margin", 15.0)
+        reclaim_threshold = cfg.get("overload_threshold", 55.0) - cfg.get("reclaim_margin", 12.0)
         reclaim_stable_s  = cfg.get("reclaim_stable_s", 30.0)
         cooldown_s        = cfg.get("cooldown_s", 45.0)
         heartbeat_timeout = cfg.get("heartbeat_timeout_s", 6.0)
@@ -2401,7 +2402,9 @@ class PeerOrchestrator:
             if policy_name == "round_robin":
                 eligible = [
                     nid for nid, peer in sorted(self._peers.items())
-                    if nid != self._node_id and (now - peer.last_seen <= timeout)
+                    if nid != self._node_id
+                    and (now - peer.last_seen <= timeout)
+                    and not getattr(peer, "offload_queue_full", False)
                 ]
                 if not eligible:
                     return None
@@ -3962,7 +3965,7 @@ class PeerOrchestrator:
                     continue
 
                 # Capacity load-score gate: do not rescue if node is already near/above overload
-                overload_thresh = self._cfg.get("overload_threshold", 60.0)
+                overload_thresh = self._cfg.get("overload_threshold", 55.0)
                 if current_load >= overload_thresh:
                     logger.warning(
                         "[Failover] Cannot rescue '%s': self load_score (%.1f) >= overload threshold (%.1f). Skipping.",

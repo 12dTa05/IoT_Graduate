@@ -465,12 +465,14 @@ class SpeedProbe:
                 res    = self._offload_result_q.get_nowait()
                 stid_r = tuple(res.get("stid", []))
                 if stid_r:
-                    self.plate_locked[stid_r] = res.get("plate_text", "")
-                    with self._svc_lock:
-                        meta = self._track_service_meta.get(stid_r)
-                        if meta is not None and not meta.get("finalized"):
-                            meta["finalized"] = True
-                            self._svc_counts["plates_finalized"] += 1
+                    plate_txt = res.get("plate_text", "")
+                    self.plate_locked[stid_r] = plate_txt
+                    if isinstance(plate_txt, str) and len(plate_txt.strip()) >= 4:
+                        with self._svc_lock:
+                            meta = self._track_service_meta.get(stid_r)
+                            if meta is not None and not meta.get("finalized"):
+                                meta["finalized"] = True
+                                self._svc_counts["plates_finalized"] += 1
             except queue.Empty:
                 break
 
@@ -1396,11 +1398,12 @@ class SpeedProbe:
                         )
                         if best:
                             self.plate_locked[stid] = best
-                            with self._svc_lock:
-                                meta = self._track_service_meta.get(stid)
-                                if meta is not None and not meta.get("finalized"):
-                                    meta["finalized"] = True
-                                    self._svc_counts["plates_finalized"] += 1
+                            if isinstance(best, str) and len(best.strip()) >= 4:
+                                with self._svc_lock:
+                                    meta = self._track_service_meta.get(stid)
+                                    if meta is not None and not meta.get("finalized"):
+                                        meta["finalized"] = True
+                                        self._svc_counts["plates_finalized"] += 1
                         else:
                             self.plate_detection_attempts[stid] += 1
                             if self.plate_detection_attempts[stid] < 3:

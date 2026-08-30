@@ -224,3 +224,45 @@ def test_service_score_moderate_workload_with_healthy_fps_stays_calm():
     assert score < 30.0
 
 
+def test_service_ema_alpha_and_stale_validation():
+    s0 = {"service_ema": 0.5, "prev_fin": 10, "prev_miss": 10, "last_busy_ts": 100.0, "last_update_ts": 100.0}
+    # Non-finite alpha (NaN, inf) or <=0 / >1 must safely fall back to 0.30 default
+    s_nan = _update_service_ema_state(
+        {"plates_finalized": 20, "tracks_missed": 10},
+        s0,
+        now_mono=101.0,
+        s_alpha=float('nan'),
+        s_stale=30.0,
+    )
+    # Expected fallback alpha 0.30: 0.30 * (10 / 10) + 0.70 * 0.5 = 0.30 + 0.35 = 0.65
+    assert s_nan["service_ema"] == pytest.approx(0.65, 0.01)
+
+    s_zero = _update_service_ema_state(
+        {"plates_finalized": 20, "tracks_missed": 10},
+        s0,
+        now_mono=101.0,
+        s_alpha=0.0,
+        s_stale=-5.0,
+    )
+    assert s_zero["service_ema"] == pytest.approx(0.65, 0.01)
+
+
+def test_service_ema_pending_tracks_blocks_recovery_and_elapsed_time_step():
+    s_pending = {"service_ema": 0.4, "prev_fin": 20, "prev_miss": 10, "last_busy_ts": 100.0, "last_update_ts": 100.0}
+    stats_pending = {"plates_finalized": 20, "tracks_missed": 10, "tracks_born": 50, "tracks_expired": 40}
+    # pending_tracks = 10 > 0 -> blocks recovery even after 100s idle
+    s_res = _update_service_ema_state(stats_pending, s_pending, now_mono=200.0, s_alpha=0.3, s_stale=10.0)
+    assert s_res["pending_tracks"] == 10
+    assert s_res["service_ema"] == 0.4
+    assert s_res["last_busy_ts"] == 200.0
+
+    # Once cleared (pending=0) and idle >= stale (10s), recovery occurs by 0.10 * elapsed_since_update
+    stats_idle = {"plates_finalized": 20, "tracks_missed": 10, "tracks_born": 50, "tracks_expired": 50}
+    # First step at 201.0: idle_s = 1.0 < 10.0 -> no recovery yet
+    s_idle1 = _update_service_ema_state(stats_idle, s_res, now_mono=201.0, s_alpha=0.3, s_stale=10.0)
+    assert s_idle1["service_ema"] == 0.4
+    assert s_idle1["idle_s"] == 1.0
+
+    # Step at 215.0: idle_s = 15.0 >= 10.0, elapsed = 15.0s -> recovers by min(0.6, 0.10 * 15.0) = 0.6 -> reaches 1.0
+    s_idle2 = _update_service_ema_state(stats_idle, s_idle1, now_mono=215.0, s_alpha=0.3, s_stale=10.0)
+    assert s_idle2["service_ema"] == pytest.approx(1.0, 0.01)
