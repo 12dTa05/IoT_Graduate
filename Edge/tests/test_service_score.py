@@ -6,12 +6,17 @@ from pathlib import Path
 edge_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(edge_dir))
 
+# Ensure settings and health_agent use service mode for these tests
+import speedflow_python.settings as settings
+settings.EDGE_LOAD_SCORE_MODE = "service"
+import health_agent
+health_agent.EDGE_LOAD_SCORE_MODE = "service"
+
 from health_agent import (
     _compute_load_score,
     _compute_load_score_breakdown,
     _update_service_ema_state,
 )
-import speedflow_python.settings as settings
 
 
 def test_service_score_perfect_completion():
@@ -266,3 +271,53 @@ def test_service_ema_pending_tracks_blocks_recovery_and_elapsed_time_step():
     # Step at 215.0: idle_s = 15.0 >= 10.0, elapsed = 15.0s -> recovers by min(0.6, 0.10 * 15.0) = 0.6 -> reaches 1.0
     s_idle2 = _update_service_ema_state(stats_idle, s_idle1, now_mono=215.0, s_alpha=0.3, s_stale=10.0)
     assert s_idle2["service_ema"] == pytest.approx(1.0, 0.01)
+
+
+def test_service_score_breakdown_comprehensive_fields():
+    """
+    ponytail: ensure all required breakdown fields for diagnosis are present and exact types.
+    """
+    metrics = {"cpu_percent": 15.0, "ram_percent": 25.0}
+    fps_stats = {"cam_01": 25.0, "cam_02": 25.0}
+
+    bd = _compute_load_score_breakdown(
+        metrics=metrics,
+        fps_stats=fps_stats,
+        service_ema=0.85,
+        service_delta_fin=12,
+        service_delta_miss=3,
+        service_pending_tracks=4,
+        service_idle_s=0.0,
+        service_cold_start=False,
+    )
+
+    expected_keys = [
+        "mode",
+        "service_c_ema",
+        "service_score",
+        "workload_pressure",
+        "fps_score",
+        "hw_floor",
+        "composite_score",
+        "load_score",
+        "qos_state",
+        "workload_ema",
+        "fps_ema",
+        "raw_workload",
+        "raw_fps",
+        "service_delta_fin",
+        "service_delta_miss",
+        "service_pending_tracks",
+        "service_idle_s",
+        "service_cold_start",
+    ]
+    for k in expected_keys:
+        assert k in bd, f"Missing key in load_score_breakdown: {k}"
+
+    assert bd["service_delta_fin"] == 12
+    assert bd["service_delta_miss"] == 3
+    assert bd["service_pending_tracks"] == 4
+    assert bd["service_c_ema"] == 0.85
+    assert bd["fps_score"] == 0.0
+    assert bd["hw_floor"] == 0.0
+    assert bd["qos_state"] == "healthy"

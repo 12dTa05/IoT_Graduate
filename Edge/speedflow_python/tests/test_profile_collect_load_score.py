@@ -38,13 +38,13 @@ def _stub_module(name: str) -> ModuleType:
 # ── Stub the heavy / missing deps the modules import at load time ──────────
 def _make_stubs(attrs: dict):  # noqa: ANN001
     for name, attr_map in attrs.items():
-        m = _stub_module(name)
-        for k, v in attr_map.items():
-            setattr(m, k, v)
+        if name not in sys.modules:
+            m = _stub_module(name)
+            for k, v in attr_map.items():
+                setattr(m, k, v)
 
 
 _make_stubs({
-    "msgpack": {},
     "dotenv": {"load_dotenv": lambda *a, **kw: None},
     "yaml": {"safe_load": lambda *a, **kw: None},
     "zenoh": {},
@@ -55,6 +55,7 @@ _make_stubs({
     "speedflow_python": {"__path__": []},
     "speedflow_python.zenoh_session": {"make_session": lambda *a, **kw: (None, None)},
     "speedflow_python.settings": {
+        "ROOT": _EDGE,
         "NODE_ID": "test_node",
         "HEALTH_INTERVAL": 1.0,
         "HEALTH_LOG_EVERY": 15,
@@ -65,6 +66,10 @@ _make_stubs({
         "LOAD_POLICY": "actual",
         "LOAD_MODEL": "formula",
         "TELEMETRY_INTERVAL": 1.0,
+        "LOG_LEVEL": "INFO",
+        "EDGE_LOAD_SCORE_MODE": "legacy",
+        "SPEEDFLOW_SLOT_CAPACITY": 16,
+        "SPEEDFLOW_NVDEC_SESSION_LIMIT": 14,
     },
 })
 
@@ -72,7 +77,11 @@ _make_stubs({
 @pytest.fixture(scope="module", autouse=True)
 def _cleanup_profile_collect_stubs():
     yield
-    for mod_name in ("msgpack", "dotenv", "yaml", "zenoh", "jtop", "gi", "gi.repository"):
+    for mod_name in (
+        "dotenv", "yaml", "zenoh", "jtop", "gi", "gi.repository",
+        "speedflow_python", "speedflow_python.zenoh_session",
+        "speedflow_python.settings", "health_agent",
+    ):
         sys.modules.pop(mod_name, None)
     importlib.invalidate_caches()
 
@@ -97,6 +106,7 @@ _ha = _exec_deps_stubbed(
         "_maybe_reload_edge_cfg": lambda: None,
         "_EDGE_CFG": {},
         "_EDGE_NODE_YML": Path("/dev/null"),
+        "EDGE_LOAD_SCORE_MODE": "legacy",
     },
 )
 _compute_load_score = _ha._compute_load_score
@@ -108,6 +118,8 @@ _compute_load_score_breakdown = _ha._compute_load_score_breakdown
 _ha_export = _stub_module("health_agent")
 _ha_export._read_payload = lambda: None
 _ha_export._compute_load_score = _compute_load_score
+_ha_export._compute_load_score_breakdown = _compute_load_score_breakdown
+_ha_export._update_service_ema_state = _ha._update_service_ema_state
 
 _pc = _exec_deps_stubbed(
     _EDGE / "tools" / "profile_collect.py",
@@ -116,6 +128,9 @@ _pc = _exec_deps_stubbed(
 _extract_telemetry = _pc._extract_telemetry
 _is_fresh = _pc._is_fresh
 CADENCE_S = _pc.CADENCE_S
+
+# Cleanup health_agent stub so other test files can import the real health_agent
+sys.modules.pop("health_agent", None)
 
 
 # ---------------------------------------------------------------------------

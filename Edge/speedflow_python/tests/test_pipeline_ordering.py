@@ -149,12 +149,28 @@ _sp_common = _stub_module("speedflow_python.common")
 _sp_common.make_element = _make_element
 _sp_common.gst_link = _gst_link
 _sp_settings = _stub_module("speedflow_python.settings")
+_sp_settings.ROOT = _EDGE
+_sp_settings.LOG_LEVEL = "INFO"
+_sp_settings.NODE_ID = "test_node"
+_sp_settings.HEALTH_INTERVAL = 1.0
+_sp_settings.HEALTH_LOG_EVERY = 15
+_sp_settings.TARGET_FPS = 27.0
+_sp_settings.FPS_STATS_FILE = "/tmp/test_fps.json"
+_sp_settings.ZENOH_ROUTER = ""
+_sp_settings.ADVERTISE_IP = "127.0.0.1"
+_sp_settings.LOAD_POLICY = "actual"
+_sp_settings.LOAD_MODEL = "formula"
+_sp_settings.EDGE_LOAD_SCORE_MODE = "legacy"
+_sp_settings.TELEMETRY_INTERVAL = 1.0
 _sp_settings.INFER_CONFIG = ""
 _sp_settings.TRACKER_CFG = ""
 _sp_settings.ANALYTICS_CFG = ""
 _sp_settings.SGIE_CONFIG = ""
 _sp_settings.TRACKER_LIB = ""
 _sp_settings.LPR_CONFIG = ""
+_sp_settings.SPEEDFLOW_SLOT_CAPACITY = 16
+_sp_settings.SPEEDFLOW_NVDEC_SESSION_LIMIT = 14
+_sp_settings.RTSP_PUSH_BITRATE = 750000
 _sp_camcfg = _stub_module("speedflow_python.camera_config")
 
 # Lightweight dummy camera so source-bin stubs don't crash
@@ -299,11 +315,12 @@ def test_display_chain_rgba_before_tiler():
     assert chain == _EXPECTED_TILED, f"display chain: {chain}"
 
 
-def test_rtsp_push_chain_rgba_before_tiler():
-    """Tiled RTSP push: same RGBA-before-tiler ordering."""
+def test_rtsp_push_chain_demux_no_tiler():
+    """RTSP push: per-camera demux branches, no tiler in core chain."""
     build_pipeline(_DUMMY_CAMS, sink_type="rtsp_push", rtsp_push_url="rtsp://x")
     chain = _core_chain_up_to_osd()
-    assert chain == _EXPECTED_TILED, f"rtsp_push chain: {chain}"
+    assert chain == _EXPECTED_FILE, f"rtsp_push chain: {chain}"
+    assert "nvmultistreamtiler" not in chain
 
 
 def test_file_chain_no_tiler():

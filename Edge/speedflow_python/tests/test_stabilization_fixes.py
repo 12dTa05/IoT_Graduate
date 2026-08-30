@@ -27,12 +27,23 @@ if pkg is None:
 
 def _ensure_settings():
     if "speedflow_python.settings" not in sys.modules:
-        spec = importlib.util.spec_from_file_location(
-            "speedflow_python.settings", _EDGE_DIR / "speedflow_python" / "settings.py"
-        )
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["speedflow_python.settings"] = mod
-        spec.loader.exec_module(mod)
+        m = types.ModuleType("speedflow_python.settings")
+        m.ROOT = _EDGE_DIR
+        m.LOG_LEVEL = "INFO"
+        m.NODE_ID = "test_node"
+        m.ZENOH_ROUTER = ""
+        m.ADVERTISE_IP = "127.0.0.1"
+        m.SPEEDFLOW_SLOT_CAPACITY = 16
+        m.SPEEDFLOW_NVDEC_SESSION_LIMIT = 14
+        m.HEALTH_INTERVAL = 1.0
+        m.HEALTH_LOG_EVERY = 15
+        m.TARGET_FPS = 27.0
+        m.FPS_STATS_FILE = "/tmp/test_fps.json"
+        m.LOAD_POLICY = "actual"
+        m.LOAD_MODEL = "formula"
+        m.EDGE_LOAD_SCORE_MODE = "service"
+        m.TELEMETRY_INTERVAL = 1.0
+        sys.modules["speedflow_python.settings"] = m
 
 def _import_peer_orch():
     _ensure_settings()

@@ -71,6 +71,18 @@ def _load_probes():
     if settings is None:
         settings = types.ModuleType("speedflow_python.settings")
         sys.modules["speedflow_python.settings"] = settings
+    settings.ROOT = _EDGE
+    settings.LOG_LEVEL = "INFO"
+    settings.SPEEDFLOW_SLOT_CAPACITY = 16
+    settings.SPEEDFLOW_NVDEC_SESSION_LIMIT = 14
+    settings.HEALTH_INTERVAL = 1.0
+    settings.HEALTH_LOG_EVERY = 15
+    settings.TARGET_FPS = 27.0
+    settings.ZENOH_ROUTER = ""
+    settings.ADVERTISE_IP = "127.0.0.1"
+    settings.LOAD_POLICY = "actual"
+    settings.LOAD_MODEL = "formula"
+    settings.EDGE_LOAD_SCORE_MODE = "legacy"
     settings.VEHICLE_CLASS_IDS = {2, 3, 5, 7}
     settings.SPEED_LOG = "/tmp/test_speed.csv"
     settings.JPEG_QUALITY = 85
@@ -84,7 +96,7 @@ def _load_probes():
     settings.LICENSE_PLATE_CLASS_IDS = {0}
     settings.FPS_STATS_FILE = "/tmp/test_fps.json"
     settings.NODE_ID = "test_node"
-    settings.TELEMETRY_INTERVAL = 3600.0  # writer loop effectively never fires
+    settings.TELEMETRY_INTERVAL = 1.0
 
     draw = sys.modules.get("speedflow_python.draw")
     if draw is None:
