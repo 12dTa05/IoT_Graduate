@@ -1362,12 +1362,18 @@ class PeerOrchestrator:
                             self._failover_triggered[node_id] = now
                     if should_trigger:
                         orphans = list(candidate_orphans)
-                        logger.critical(
-                            "[PeerOrch] Peer '%s' OFFLINE (silent %.1fs ≥ %.1fs) with %d cameras! "
-                            "Triggering failover...",
-                            node_id, silent_s, offline_threshold, len(orphans),
-                        )
-                        self._notified_offline.discard(node_id)
+                        if node_id not in self._notified_offline:
+                            logger.critical(
+                                "[PeerOrch] Peer '%s' OFFLINE (silent %.1fs ≥ %.1fs) with %d cameras! "
+                                "Triggering failover...",
+                                node_id, silent_s, offline_threshold, len(orphans),
+                            )
+                            self._notified_offline.add(node_id)
+                        else:
+                            logger.info(
+                                "[PeerOrch] Peer '%s' still OFFLINE — re-attempting failover for %d cameras (retry interval %.1fs).",
+                                node_id, len(orphans), retry_interval_s,
+                            )
                         self._executor.submit(self._leaderless_failover, node_id, orphans)
                 else:
                     if node_id not in self._notified_offline:
@@ -1667,9 +1673,9 @@ class PeerOrchestrator:
         now = time.time()
 
         reclaim_threshold = cfg.get("overload_threshold", 55.0) - cfg.get("reclaim_margin", 12.0)
-        reclaim_stable_s  = cfg.get("reclaim_stable_s", 30.0)
-        cooldown_s        = cfg.get("cooldown_s", 45.0)
-        heartbeat_timeout = cfg.get("heartbeat_timeout_s", 6.0)
+        reclaim_stable_s  = cfg.get("reclaim_stable_s", 5.0)
+        cooldown_s        = cfg.get("cooldown_s", 6.0)
+        heartbeat_timeout = cfg.get("heartbeat_timeout_s", 5.0)
 
         with self._self_lock:
             if self._self_state.last_seen == 0.0 or (now - self._self_state.last_seen > heartbeat_timeout):
@@ -2165,7 +2171,7 @@ class PeerOrchestrator:
                 and intended_level in (1, 2)
                 and intended_level < current_level):
             esc_cd = min(
-                cfg.get("escalation_cooldown_s", 5),
+                cfg.get("escalation_cooldown_s", 3.0),
                 level_cd,
             )
             if now - last_change < esc_cd:
@@ -2194,19 +2200,20 @@ class PeerOrchestrator:
 
         if intended_level == 1:
             # Ownership guard: only cameras this node owns (cameras.yml) may be
-            # migrated away. Escalation ladders lock onto the L2/L3-picked camera,
-            # which can be foreign — swap to an owned camera for the actual migration.
+            # migrated away. Rescued or foreign cameras cannot be forward-migrated.
+            # Escalation ladders lock onto the L2/L3-picked camera, which can be foreign —
+            # swap to an owned camera for the actual migration.
             owned_cam_ids = self._get_owned_camera_ids()
-            if cam_to_offload not in owned_cam_ids:
+            if cam_to_offload not in owned_cam_ids or cam_to_offload in self._rescued_cameras:
                 new_cam = self._pick_camera_to_offload(state, level=1)
                 if not new_cam:
                     logger.info(
-                        "[PeerOrch] L1 escalation blocked: '%s' is foreign and no owned camera is eligible — retaining Level %d offload",
+                        "[PeerOrch] L1 escalation blocked: '%s' is foreign/rescued and no owned camera is eligible — retaining Level %d offload",
                         cam_to_offload, current_level,
                     )
                     return
                 logger.info(
-                    "[PeerOrch] L1 target swapped: foreign '%s' retained (crop offload continues); migrating owned '%s' instead",
+                    "[PeerOrch] L1 target swapped: foreign/rescued '%s' retained (crop offload continues); migrating owned '%s' instead",
                     cam_to_offload, new_cam,
                 )
                 cam_to_offload = new_cam
@@ -2244,14 +2251,14 @@ class PeerOrchestrator:
                     )
                 return
             last_mig = self._cam_cooldown.get(cam_to_offload, 0.0)
-            if now - last_mig < cfg.get("cooldown_s", 45.0):
+            if now - last_mig < cfg.get("cooldown_s", 6.0):
                 if self._maybe_log_block("l1_cooldown", now):
                     logger.warning(
                         "[PeerOrch] L1 blocked: migration cooldown active for '%s' "
                         "(%.1f s elapsed, need %.1f s) — retaining Level %d offload",
                         cam_to_offload,
                         now - last_mig,
-                        cfg.get("cooldown_s", 45.0),
+                        cfg.get("cooldown_s", 6.0),
                         self.get_offload_level(cam_to_offload),
                     )
                 return
@@ -2298,10 +2305,6 @@ class PeerOrchestrator:
                         "peer for Level 2 crop offload — offload blocked",
                         load, thr2,
                     )
-                if self._fine_offload_peer_misses < 3:
-                    return
-                logger.warning("[PeerOrch] L2 peer unavailable for %d checks; escalating to L1", self._fine_offload_peer_misses)
-                self._trigger_level1_if_due(state, now, cfg)
                 return
             if current_level != 2:
                 logger.info(
@@ -2322,10 +2325,6 @@ class PeerOrchestrator:
                         "peer for Level 3 plate-crop offload — offload blocked",
                         load, thr3,
                     )
-                if self._fine_offload_peer_misses < 3:
-                    return
-                logger.warning("[PeerOrch] L3 peer unavailable for %d checks; escalating to L1", self._fine_offload_peer_misses)
-                self._trigger_level1_if_due(state, now, cfg)
                 return
             if current_level != 3:
                 logger.info(
@@ -2354,11 +2353,16 @@ class PeerOrchestrator:
             logger.debug("[PeerOrch] No camera to offload (all inactive or locked)")
             return
 
+        # Failover rescue guard: never L1-migrate a camera currently held as rescued.
+        if cam_to_offload in self._rescued_cameras:
+            logger.debug("[PeerOrch] '%s' is a rescued camera; cannot be L1-migrated", cam_to_offload)
+            return
+
         last_mig = self._cam_cooldown.get(cam_to_offload, 0.0)
         time_since_mig = now - last_mig
-        if time_since_mig < cfg.get("cooldown_s", 45.0):
+        if time_since_mig < cfg.get("cooldown_s", 6.0):
             logger.debug("[PeerOrch] Cooldown not met for '%s' (%.1fs / %.1fs)",
-                        cam_to_offload, time_since_mig, cfg.get("cooldown_s", 45.0))
+                        cam_to_offload, time_since_mig, cfg.get("cooldown_s", 6.0))
             return
         trigger_reason = (
             "fps_drop"
@@ -2567,7 +2571,7 @@ class PeerOrchestrator:
                 self._cam_cooldown[camera_id] = time.time()
                 logger.info(
                     "[PeerOrch] Cooldown set for '%s' (%.1fs) to prevent RFO spam",
-                    camera_id, self._cfg.get("cooldown_s", 45.0),
+                    camera_id, self._cfg.get("cooldown_s", 6.0),
                 )
             return
 
@@ -2793,7 +2797,7 @@ class PeerOrchestrator:
 
             # ε4 — Per-camera cooldown
             last_mig = self._cam_cooldown.get(camera_id, 0.0)
-            cooldown_s = self._cfg.get("cooldown_s", 45.0)
+            cooldown_s = self._cfg.get("cooldown_s", 6.0)
             time_since_last = time.time() - last_mig
             if time_since_last < cooldown_s:
                 logger.info(
@@ -3084,7 +3088,7 @@ class PeerOrchestrator:
                     "[PeerOrch] Timeout released reservation for '%s' (winner='%s', inflight=%d)",
                     camera_id, winner_node, self._peer_inflight[winner_node],
                 )
-            base_cooldown = self._cfg.get("cooldown_s", 45.0)
+            base_cooldown = self._cfg.get("cooldown_s", 6.0)
             multiplier = min(2 ** (curr_timeouts - 1), 8)
             penalty_duration = max(base_cooldown * 2, base_cooldown * multiplier)
             penalty_until = time.time() + penalty_duration
@@ -3257,7 +3261,7 @@ class PeerOrchestrator:
 
         if not confirmed:
             base_retry_s = float(self._cfg.get("reclaim_retry_s", 5.0))
-            cooldown_s = float(self._cfg.get("cooldown_s", 45.0))
+            cooldown_s = float(self._cfg.get("cooldown_s", 6.0))
             if cooldown_s <= 0.0:
                 cooldown_s = float("inf")
 
@@ -3417,7 +3421,7 @@ class PeerOrchestrator:
             )
         else:
             base_retry_s = float(self._cfg.get("reclaim_retry_s", 5.0))
-            cooldown_s = float(self._cfg.get("cooldown_s", 45.0))
+            cooldown_s = float(self._cfg.get("cooldown_s", 6.0))
             if cooldown_s <= 0.0:
                 cooldown_s = float("inf")
             with self._lock:
@@ -4435,6 +4439,8 @@ class PeerOrchestrator:
             return None
 
         reclaim_stability = self._cfg.get("reclaim_stability_s", 6.0)
+        reclaim_stable = self._cfg.get("reclaim_stable_s", 5.0)
+        reclaim_window = max(reclaim_stability, reclaim_stable)
         starved = set(state.source_starved_cameras or [])
 
         # Bounce dampening: exclude cameras that have reached bounce_max migrations within bounce_window_s
@@ -4478,7 +4484,7 @@ class PeerOrchestrator:
         for c in state.active_cameras:
             if c in starved:
                 continue
-            if now - self._reclaim_completed_at.get(c, 0.0) < reclaim_stability:
+            if now - self._reclaim_completed_at.get(c, 0.0) < reclaim_window:
                 continue
             if _camera_warming_up(c):
                 continue
@@ -4501,9 +4507,9 @@ class PeerOrchestrator:
         owned_eligible = {c: w for c, w in eligible.items() if c in owned_cam_ids}
 
         if level == 1:
-            # Bounce dampening: filter out bounced cameras from L1 candidates
-            foreign_l1 = {c: w for c, w in foreign_eligible.items() if c not in bounced_cameras}
-            owned_l1 = {c: w for c, w in owned_eligible.items() if c not in bounced_cameras}
+            # Foreign and rescued camera filter for L1 candidates
+            foreign_l1 = {c: w for c, w in foreign_eligible.items() if c not in bounced_cameras and c not in self._rescued_cameras}
+            owned_l1 = {c: w for c, w in owned_eligible.items() if c not in bounced_cameras and c not in self._rescued_cameras}
 
             # L1 ownership guard: never migrate away the last owned camera.
             # Explicit L1 guard: never select an L1 candidate when <=1 locally-owned active camera.

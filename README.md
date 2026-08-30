@@ -331,6 +331,9 @@ All Edge commands run from `Edge/` with the `DoAn` conda environment.
 # Default: start pipeline + HealthAgent + PeerOrchestrator (one process), RTSP push mode
 ./run_edge.sh
 
+# Run in background (survives SSH disconnect):
+nohup ./run_edge.sh >/dev/null 2>&1 &
+
 # Display to screen
 ./run_edge.sh --mode display
 

@@ -8,6 +8,9 @@
 #   ./run_edge.sh --load-policy predict_with_base --load-model formula
 #   ./run_edge.sh --telemetry-interval 1.0   # the only supported cadence
 #
+# Background / SSH-safe run (survives disconnect):
+#   nohup ./run_edge.sh >/dev/null 2>&1 &
+#
 # Collect calibration data while the pipeline runs, then stop automatically:
 #   ./run_edge.sh --collect
 #   ./run_edge.sh --collect --collect-output logs/calibration.csv \
@@ -40,10 +43,28 @@ export PYTHONUNBUFFERED=1
 EDGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$EDGE_DIR"
 
+PID_FILE="${EDGE_PID_FILE:-logs/run_edge.pid}"
+
+# Guard against duplicate instances running simultaneously
+if [[ -f "$PID_FILE" ]]; then
+    OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "[run_edge] ERROR: Another run_edge process is already running (PID $OLD_PID)." >&2
+        echo "[run_edge] Stop it first: kill $OLD_PID" >&2
+        exit 1
+    else
+        # Stale PID file; remove safely
+        rm -f "$PID_FILE"
+    fi
+fi
+
 mkdir -p logs
+echo "$$" > "$PID_FILE"
+
 RUN_LOG="${RUN_LOG:-logs/run_$(date +%Y%m%d_%H%M%S).log}"
 exec > >(tee -a "$RUN_LOG") 2>&1
 echo "[run_edge] Runtime log: $RUN_LOG"
+echo "[run_edge] Process PID: $$ (recorded in $PID_FILE)"
 
 PYTHON="${PYTHON:-python3}"
 MODE="${MODE:-rtsp_push}"
@@ -235,6 +256,7 @@ _cleanup() {
     for pid in "${_pids[@]}"; do
         wait "$pid" 2>/dev/null || true
     done
+    rm -f "$PID_FILE"
     echo "[run_edge] Done."
 }
 trap _cleanup EXIT

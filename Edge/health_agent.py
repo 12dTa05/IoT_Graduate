@@ -1753,6 +1753,11 @@ class HealthAgent:
                         except Exception as exc:
                             logger.debug("[HealthAgent] Failed to retrieve live ownership records: %s", exc)
 
+                    # Compute owned and foreign active cameras
+                    owned_cam_ids = set(self._cam_configs_cache.keys())
+                    owned_active = [c for c in active_cameras if camera_owners.get(c, c if c in owned_cam_ids else "") == NODE_ID or (c in owned_cam_ids and c not in camera_owners)]
+                    foreign_active = [c for c in active_cameras if c not in owned_active]
+
                     now_ts = time.time()
                     bps_rx, bps_tx = self._sample_network_bps()
                     payload = {
@@ -1853,10 +1858,25 @@ class HealthAgent:
                             f" H={payload.get('h_reactive', 0.0):.3f}"
                             if payload.get("proactive_enabled") else ""
                         )
+                        _bd = load_score_breakdown if isinstance(load_score_breakdown, dict) else {}
                         logger.info(
-                            "LoadScore=%.1f [%s] | GPU=%.1f%% CPU=%.1f%% RAM=%.1f%% "
-                            "Temp=%.1f°C Power=%.0fmW | FPS=%s%s",
+                            "LoadScore=%.1f [%s] | qos=%s svc_score=%.1f (c=%.3f, +%d/-%d, pend=%d) "
+                            "wl_press=%.1f fps_floor=%.1f hw_floor=%.1f | cams=%d (owned=%d, foreign=%d) q_full=%s | "
+                            "GPU=%.1f%% CPU=%.1f%% RAM=%.1f%% Temp=%.1f°C Power=%.0fmW | FPS=%s%s",
                             load_score, omega_preset,
+                            _bd.get("qos_state", "unknown"),
+                            _bd.get("service_score", 0.0),
+                            _bd.get("service_c_ema", 1.0) if _bd.get("service_c_ema") is not None else 1.0,
+                            _bd.get("service_delta_fin", 0),
+                            _bd.get("service_delta_miss", 0),
+                            _bd.get("service_pending_tracks", 0),
+                            _bd.get("workload_pressure", 0.0),
+                            _bd.get("fps_score", 0.0),
+                            _bd.get("hw_floor", 0.0),
+                            len(active_cameras),
+                            len(owned_active),
+                            len(foreign_active),
+                            offload_queue_full,
                             metrics["gpu_percent"],
                             metrics["cpu_percent"],
                             metrics["ram_percent"],
