@@ -3,17 +3,48 @@ Edge logging resilience and crash diagnostic utilities.
 Provides unhandled exception hooks, thread crash logging, faulthandler,
 and auto-flushing rotating file handlers for freeze/crash survival.
 """
+import contextlib
 import faulthandler
 import logging
 import logging.handlers
 import os
 import sys
 import threading
+import time
 from pathlib import Path
-from typing import Optional, Union
+from typing import Iterator, Optional, Union
 
 # Keep a module-level reference to the faulthandler file descriptor so it is not GC'd
 _faulthandler_file = None
+
+
+@contextlib.contextmanager
+def timed_lock(
+    lock: threading.RLock,
+    name: str,
+    warn_threshold_s: float = 0.05,
+    logger: Optional[logging.Logger] = None,
+) -> Iterator[None]:
+    """Context manager for acquiring locks while diagnosing contention and hold durations."""
+    t0 = time.monotonic()
+    lock.acquire()
+    t_acquired = time.monotonic()
+    wait_s = t_acquired - t0
+    log = logger or logging.getLogger(__name__)
+    if wait_s >= warn_threshold_s:
+        log.warning("[DiagLock] High wait for lock '%s': wait=%.4fs (threshold=%.4fs)", name, wait_s, warn_threshold_s)
+    else:
+        log.debug("[DiagLock] Lock '%s' acquired: wait=%.4fs", name, wait_s)
+    try:
+        yield
+    finally:
+        t_released = time.monotonic()
+        hold_s = t_released - t_acquired
+        lock.release()
+        if hold_s >= warn_threshold_s:
+            log.warning("[DiagLock] High hold duration for lock '%s': hold=%.4fs (threshold=%.4fs)", name, hold_s, warn_threshold_s)
+        else:
+            log.debug("[DiagLock] Lock '%s' released: hold=%.4fs", name, hold_s)
 
 
 class FlushFileHandler(logging.FileHandler):

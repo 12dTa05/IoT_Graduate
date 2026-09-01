@@ -16,6 +16,7 @@ Architecture:
 import logging
 import os
 import threading
+import time
 from typing import Optional
 
 import gi
@@ -431,8 +432,10 @@ def build_pipeline(
     )
 
     # ── Core AI processing ───────────────────────────────────────────────────
+    logger.info("[DeepStream] Configuring AI elements (PGIE, Tracker, SGIE, LPR, Analytics): mono_ts=%.6f", time.monotonic())
     pgie = make_element("primary-infer", "nvinfer")
     pgie.set_property("config-file-path", str(INFER_CONFIG))
+    logger.info("[DeepStream] PGIE configured: config=%s", INFER_CONFIG)
 
     tracker = make_element("tracker", "nvtracker")
     tracker.set_property("ll-lib-file", str(TRACKER_LIB))
@@ -440,15 +443,19 @@ def build_pipeline(
     tracker.set_property("tracker-width", 224)
     tracker.set_property("tracker-height", 224)
     tracker.set_property("gpu_id", 0)
+    logger.info("[DeepStream] Tracker configured: lib=%s, config=%s", TRACKER_LIB, TRACKER_CFG)
 
     sgie = make_element("secondary-infer", "nvinfer")
     sgie.set_property("config-file-path", str(SGIE_CONFIG))
+    logger.info("[DeepStream] SGIE configured: config=%s", SGIE_CONFIG)
 
     sgie2 = make_element("lpr-classifier", "nvinfer")
     sgie2.set_property("config-file-path", str(LPR_CONFIG))
+    logger.info("[DeepStream] LPR configured: config=%s", LPR_CONFIG)
 
     analytics = make_element("analytics", "nvdsanalytics")
     analytics.set_property("config-file", analytics_config)
+    logger.info("[DeepStream] Analytics configured: config=%s, mono_ts=%.6f", analytics_config, time.monotonic())
 
     # ── Determine display / file-write strategy ──────────────────────────────
     is_tiled = (sink_type == "display")

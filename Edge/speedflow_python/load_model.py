@@ -275,10 +275,12 @@ class DLPredictor:
 
     def _load_model(self) -> None:
         try:
+            import time as _time
+            t0 = _time.monotonic()
             import onnxruntime as ort
             self._session = ort.InferenceSession(self._model_path)
             self._input_name = self._session.get_inputs()[0].name
-            logger.info("[DLPredictor] Loaded ONNX model: %s", self._model_path)
+            logger.info("[DLPredictor] Loaded ONNX model: %s (load_time_ms=%.2f, mono_ts=%.6f)", self._model_path, (_time.monotonic() - t0) * 1000.0, _time.monotonic())
         except Exception as exc:
             logger.warning("[DLPredictor] Disabled; failed to load %s: %s", self._model_path, exc)
             self._session = None

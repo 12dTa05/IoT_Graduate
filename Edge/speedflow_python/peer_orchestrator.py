@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .log_utils import timed_lock
+
 import msgpack
 
 from .zenoh_session import make_session
@@ -606,6 +608,7 @@ class PeerOrchestrator:
             name=f"PeerDecision-{self._node_id}",
             daemon=True,
         )
+        logger.info("[Thread] Starting PeerDecision thread: name=%s, mono_ts=%.6f", self._decision_thread.name, time.monotonic())
         self._decision_thread.start()
 
         # Park — Zenoh peer mode needs no blocking loop
@@ -615,20 +618,25 @@ class PeerOrchestrator:
         """Publish health status on peers/status/<node_id> (called by health push loop)."""
         pub = self._pubs.get("status")
         if pub:
+            t_pub_start = time.monotonic()
+            seq = self._status_sent_count + self._status_error_count + 1
+            logger.debug("[PeerOrch] Status publish attempt: seq=%d, mono_ts=%.6f", seq, t_pub_start)
             try:
                 pub.put(payload)
+                t_pub_end = time.monotonic()
                 self._status_sent_count += 1
                 self._status_consecutive_errors = 0
                 self._last_status_sent_time = time.time()
+                logger.debug("[PeerOrch] Status publish success: seq=%d, dur_ms=%.2f, mono_ts=%.6f", seq, (t_pub_end - t_pub_start) * 1000.0, t_pub_end)
             except Exception as exc:
+                t_pub_err = time.monotonic()
                 self._status_error_count += 1
                 self._status_consecutive_errors += 1
                 self._last_status_error_time = time.time()
-                if self._status_consecutive_errors == 1 or self._status_consecutive_errors % 10 == 0:
-                    logger.warning(
-                        "[PeerOrch] Status publish failed (consecutive=%d, total=%d): %s",
-                        self._status_consecutive_errors, self._status_error_count, exc,
-                    )
+                logger.warning(
+                    "[PeerOrch] Status publish failure: seq=%d, consecutive=%d, total=%d, err=%s, dur_ms=%.2f, mono_ts=%.6f",
+                    seq, self._status_consecutive_errors, self._status_error_count, exc, (t_pub_err - t_pub_start) * 1000.0, t_pub_err,
+                )
 
     def update_self_state(self, payload: dict) -> None:
         """Update this node's local state without publishing a Zenoh heartbeat.
@@ -650,8 +658,8 @@ class PeerOrchestrator:
         """
         records = {}
         static_owned = self._get_owned_camera_ids()
-        with self._lock:
-            with self._self_lock:
+        with timed_lock(self._lock, "_lock.get_ownership_records", logger=logger):
+            with timed_lock(self._self_lock, "_self_lock.get_ownership_records", logger=logger):
                 active_cams = list(self._self_state.active_cameras)
             for cam_id in active_cams:
                 epoch = self._camera_epochs.get(cam_id, 1)
@@ -810,9 +818,20 @@ class PeerOrchestrator:
 
         # Update state of this node itself
         if node_id == self._node_id:
-            # BUG-1 fix: hold _self_lock while updating so the decision loop
-            # always reads a consistent snapshot of _self_state.
-            with self._self_lock:
+            with timed_lock(self._self_lock, "_self_lock.update_self_state", logger=logger):
+                old_last_seen = self._self_state.last_seen
+                new_last_seen = time.time()
+                mono_now = time.monotonic()
+                if old_last_seen > 0.0:
+                    logger.debug(
+                        "[PeerOrch] Self heartbeat received: node='%s', last_seen_gap_s=%.3f, mono_ts=%.6f",
+                        node_id, new_last_seen - old_last_seen, mono_now,
+                    )
+                else:
+                    logger.debug(
+                        "[PeerOrch] First self heartbeat received: node='%s', mono_ts=%.6f",
+                        node_id, mono_now,
+                    )
                 self._self_state.load_score  = payload.get("load_score",  0.0)
                 self._self_state.load_score_breakdown = payload.get("load_score_breakdown", {})
                 self._self_state.workload_ema = payload.get("workload_ema")
@@ -931,12 +950,26 @@ class PeerOrchestrator:
         # Update state of other peers
         # BUG-04: update ALL mutable fields inside the lock to prevent torn
         # reads from _decision_loop running on a separate thread.
-        with self._lock:
+        with timed_lock(self._lock, "_lock.update_peer_state", logger=logger):
             is_new = node_id not in self._peers
             if is_new:
                 self._peers[node_id] = PeerState(node_id=node_id)
                 logger.info("[PeerOrch] Discovered peer '%s' via Zenoh", node_id)
             peer = self._peers[node_id]
+
+            old_last_seen = peer.last_seen
+            new_last_seen = time.time()
+            mono_now = time.monotonic()
+            if old_last_seen > 0.0:
+                logger.debug(
+                    "[PeerOrch] Peer heartbeat received: node='%s', last_seen_gap_s=%.3f, mono_ts=%.6f",
+                    node_id, new_last_seen - old_last_seen, mono_now,
+                )
+            else:
+                logger.debug(
+                    "[PeerOrch] First peer heartbeat received: node='%s', mono_ts=%.6f",
+                    node_id, mono_now,
+                )
 
             peer.load_score  = payload.get("load_score",  0.0)
             peer.load_score_breakdown = payload.get("load_score_breakdown", {})
@@ -1373,20 +1406,22 @@ class PeerOrchestrator:
                         orphans = list(candidate_orphans)
                         if node_id not in self._notified_offline:
                             logger.critical(
-                                "[PeerOrch] Peer '%s' OFFLINE (silent %.1fs ≥ %.1fs) with %d cameras! "
-                                "Triggering failover...",
-                                node_id, silent_s, offline_threshold, len(orphans),
+                                "[PeerOrch] Peer '%s' OFFLINE: reason=heartbeat_timeout, last_seen_s=%.2f, silent_s=%.2f, threshold_s=%.2f, mono_ts=%.6f, cameras=%d. Triggering failover...",
+                                node_id, peer.last_seen, silent_s, offline_threshold, time.monotonic(), len(orphans),
                             )
                             self._notified_offline.add(node_id)
                         else:
                             logger.info(
-                                "[PeerOrch] Peer '%s' still OFFLINE — re-attempting failover for %d cameras (retry interval %.1fs).",
-                                node_id, len(orphans), retry_interval_s,
+                                "[PeerOrch] Peer '%s' still OFFLINE — re-attempting failover for %d cameras (retry interval %.1fs, mono_ts=%.6f).",
+                                node_id, len(orphans), retry_interval_s, time.monotonic(),
                             )
                         self._executor.submit(self._leaderless_failover, node_id, orphans)
                 else:
                     if node_id not in self._notified_offline:
-                        logger.warning("[PeerOrch] Peer '%s' OFFLINE (no cameras).", node_id)
+                        logger.warning(
+                            "[PeerOrch] Peer '%s' OFFLINE: reason=heartbeat_timeout_no_cameras, last_seen_s=%.2f, silent_s=%.2f, threshold_s=%.2f, mono_ts=%.6f",
+                            node_id, peer.last_seen, silent_s, offline_threshold, time.monotonic(),
+                        )
                         self._notified_offline.add(node_id)
             else:
                 # Peer is alive — clear the notified/failover flags so we
@@ -2433,7 +2468,8 @@ class PeerOrchestrator:
                     continue
                 if now - peer.last_seen > timeout:
                     continue
-                if peer.load_score >= self._cfg.get("overload_threshold", 55.0):
+                # For Level 1 stream migration, retain pipeline load headroom gate (peer.load_score < overload_threshold)
+                if for_offload_level <= 1 and peer.load_score >= self._cfg.get("overload_threshold", 55.0):
                     continue
                 if self._peer_consecutive_timeouts.get(nid, 0) >= zombie_timeout_count:
                     continue

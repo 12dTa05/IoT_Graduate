@@ -228,6 +228,8 @@ def _attach_camera_manager(
         if removed:
             print(f"[Dynamic] Cleaned up mapping: source_id={source_id} → '{removed}'")
         camera_manager.cleanup_stream_ready(source_id)
+        for p in ACTIVE_SPEED_PROBE:
+            p.remove_camera(cam_id, source_id=source_id)
 
     camera_manager.start(on_add, on_remove, GLib.idle_add)
 
@@ -355,13 +357,16 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
     ACTIVE_SPEED_PROBE.append(probe)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
+    logger.info("[Pipeline] set_state(PLAYING) BEGIN: mode=display, mono_ts=%.6f", time.monotonic())
     t0_playing = time.monotonic()
     ret = pipeline.set_state(Gst.State.PLAYING)
+    t1_playing = time.monotonic()
+    logger.info("[Pipeline] set_state(PLAYING) END: mode=display, result=%s, duration_ms=%.2f, mono_ts=%.6f", ret.value_nick if hasattr(ret, "value_nick") else ret, (t1_playing - t0_playing) * 1000.0, t1_playing)
     if ret == Gst.StateChangeReturn.FAILURE:
         _stop_active_speed_probes()
         _graceful_stop_pipeline(pipeline)
         raise RuntimeError("Unable to set display pipeline to PLAYING state")
-    warmup_ms = (time.monotonic() - t0_playing) * 1000.0
+    warmup_ms = (t1_playing - t0_playing) * 1000.0
     probe.record_warmup_ms(warmup_ms)
     logger.info("[Display] Pipeline PLAYING after %.0f ms (warmup)", warmup_ms)
 
@@ -392,7 +397,11 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, None)
 
     print(f"[Python File Mode] Processing multi-streams to output files...")
+    logger.info("[Pipeline] set_state(PLAYING) BEGIN: mode=file, mono_ts=%.6f", time.monotonic())
+    t0_playing = time.monotonic()
     ret = pipeline.set_state(Gst.State.PLAYING)
+    t1_playing = time.monotonic()
+    logger.info("[Pipeline] set_state(PLAYING) END: mode=file, result=%s, duration_ms=%.2f, mono_ts=%.6f", ret.value_nick if hasattr(ret, "value_nick") else ret, (t1_playing - t0_playing) * 1000.0, t1_playing)
     if ret == Gst.StateChangeReturn.FAILURE:
         _stop_active_speed_probes()
         _graceful_stop_pipeline(pipeline)
@@ -481,7 +490,11 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             node_camera_map=_node_cam_map,
         )
 
+        logger.info("[Pipeline] set_state(PLAYING) BEGIN: mode=rtsp_push, mono_ts=%.6f", time.monotonic())
+        t0_playing = time.monotonic()
         ret = pipeline.set_state(Gst.State.PLAYING)
+        t1_playing = time.monotonic()
+        logger.info("[Pipeline] set_state(PLAYING) END: mode=rtsp_push, result=%s, duration_ms=%.2f, mono_ts=%.6f", ret.value_nick if hasattr(ret, "value_nick") else ret, (t1_playing - t0_playing) * 1000.0, t1_playing)
         if ret == Gst.StateChangeReturn.FAILURE:
             print("ERROR: Unable to set pipeline to PLAYING state", file=sys.stderr)
             _stop_active_speed_probes()
@@ -709,6 +722,8 @@ def run_python_mode(args) -> None:
     except Exception as exc:
         print(f"[Logging] Failed to attach {debug_log_path} handler: {exc}", file=sys.stderr)
 
+    logger.info("[Process] Startup: pid=%d, node_id='%s', mode='%s', args=%s, mono_ts=%.6f", os.getpid(), NODE_ID, args.mode, vars(args), time.monotonic())
+
     camera_manager = CameraManager(CAMERAS_YML)
 
     # --- P2P config (edge_node.yml) ---
@@ -733,10 +748,13 @@ def run_python_mode(args) -> None:
             camera_manager=camera_manager,
         )
         orch_thread = threading.Thread(target=peer_orch.start, daemon=True)
+        logger.info("[Thread] Starting PeerOrchestrator thread: ident=%s, mono_ts=%.6f", orch_thread.name, time.monotonic())
         orch_thread.start()
         peer_orch._ready_event.wait(timeout=5)
+        logger.info("[PeerOrch] Started. Node='%s', Overload threshold=%s%%, mono_ts=%.6f", NODE_ID, p2p_cfg.get("overload_threshold", 75.0), time.monotonic())
         print(f"[PeerOrch] Started. Node='{NODE_ID}', Overload threshold={p2p_cfg.get('overload_threshold', 75.0)}%")
     except Exception as exc:
+        logger.error("[PeerOrch] Failed to start: %s, mono_ts=%.6f", exc, time.monotonic(), exc_info=True)
         print(f"[PeerOrch] Failed to start: {exc}", file=sys.stderr)
         peer_orch = None
 
@@ -752,10 +770,13 @@ def run_python_mode(args) -> None:
             held_provider=held_cb,
         )
         ha_thread = threading.Thread(target=health_agent.run, daemon=True, name="HealthAgent")
+        logger.info("[Thread] Starting HealthAgent thread: ident=%s, mono_ts=%.6f", ha_thread.name, time.monotonic())
         ha_thread.start()
         health_agent._ready_event.wait(timeout=5)
+        logger.info("[HealthAgent] Started. Node='%s', Interval=%ss, mono_ts=%.6f", NODE_ID, S.HEALTH_INTERVAL, time.monotonic())
         print(f"[HealthAgent] Started. Node='{NODE_ID}', Interval={S.HEALTH_INTERVAL}s")
     except Exception as exc:
+        logger.error("[HealthAgent] Failed to start: %s, mono_ts=%.6f", exc, time.monotonic(), exc_info=True)
         print(f"[HealthAgent] Failed to start: {exc}", file=sys.stderr)
         health_agent = None
 

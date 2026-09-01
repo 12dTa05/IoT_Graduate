@@ -28,7 +28,7 @@ try:
 except ImportError:
     psutil = None
 
-from speedflow_python.zenoh_session import make_session
+from speedflow_python.log_utils import timed_lock
 
 # Load settings from .env (must run from Edge/ or have Edge/ in path)
 import sys as _sys
@@ -1512,7 +1512,7 @@ class HealthAgent:
 
     def _sample_network_bps(self) -> Tuple[float, float]:
         """Compute delta-per-second (network_bps_rx, network_bps_tx)."""
-        with self._net_lock:
+        with timed_lock(self._net_lock, "_net_lock.sample_network_bps", logger=logger):
             now = time.monotonic()
             curr_rx, curr_tx = self._get_net_bytes()
             if self._last_net_bytes is None or self._last_net_time is None:
@@ -1545,6 +1545,7 @@ class HealthAgent:
                 logger.error("[HealthAgent] Zenoh unavailable. Running in log-only mode.")
 
             self._ready_event.set()
+            logger.info("[HealthAgent] Collector loop ready, mono_ts=%.6f", time.monotonic())
 
             self._jtop = self._open_jtop()
 
@@ -1845,20 +1846,25 @@ class HealthAgent:
                         payload.update(proactive_result)
 
                     if self._pub:
+                        t_pub_start = time.monotonic()
+                        seq = self._heartbeat_sent_count + self._heartbeat_error_count + 1
+                        logger.debug("[HealthAgent] Heartbeat publish attempt: seq=%d, mono_ts=%.6f", seq, t_pub_start)
                         try:
                             self._pub.put(msgpack.packb(payload, use_bin_type=True))
+                            t_pub_end = time.monotonic()
                             self._heartbeat_sent_count += 1
                             self._heartbeat_consecutive_errors = 0
                             self._last_heartbeat_sent_time = time.time()
+                            logger.debug("[HealthAgent] Heartbeat publish success: seq=%d, dur_ms=%.2f, mono_ts=%.6f", seq, (t_pub_end - t_pub_start) * 1000.0, t_pub_end)
                         except Exception as pub_exc:
+                            t_pub_err = time.monotonic()
                             self._heartbeat_error_count += 1
                             self._heartbeat_consecutive_errors += 1
                             self._last_heartbeat_error_time = time.time()
-                            if self._heartbeat_consecutive_errors == 1 or self._heartbeat_consecutive_errors % 10 == 0:
-                                logger.warning(
-                                    "[HealthAgent] Heartbeat publish failed (consecutive=%d, total=%d): %s",
-                                    self._heartbeat_consecutive_errors, self._heartbeat_error_count, pub_exc,
-                                )
+                            logger.warning(
+                                "[HealthAgent] Heartbeat publish failure: seq=%d, consecutive=%d, total=%d, err=%s, dur_ms=%.2f, mono_ts=%.6f",
+                                seq, self._heartbeat_consecutive_errors, self._heartbeat_error_count, pub_exc, (t_pub_err - t_pub_start) * 1000.0, t_pub_err,
+                            )
                             self._close_zenoh()
                             _last_zenoh_attempt = 0  # force immediate reconnect on next loop iteration
 

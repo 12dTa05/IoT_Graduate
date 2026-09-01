@@ -42,6 +42,7 @@ class ServerState:
         self._watchdog_task: asyncio.Task = None
         self._zenoh_session = None
         self._zenoh_sub = None
+        self._zenoh_events_sub = None
         self._loop: asyncio.AbstractEventLoop = None
 
     def broadcast(self, msg: Dict[str, Any]) -> None:
@@ -234,8 +235,41 @@ def _start_zenoh_subscriber(state: ServerState) -> Optional[Any]:
 
         sub = session.declare_subscriber("peers/status/**", _on_status)
         logger.info("[Zenoh Server] Subscribed to 'peers/status/**'")
+
+        def _on_traffic_event(sample) -> None:
+            try:
+                payload = msgpack.unpackb(sample.payload.to_bytes(), raw=False)
+            except Exception as exc:
+                logger.warning("[Zenoh Server] Failed to unpack traffic event: %s", exc)
+                return
+
+            if not isinstance(payload, dict):
+                return
+
+            # Normalize Edge image_b64 to store snapshot_b64
+            if "snapshot_b64" not in payload and "image_b64" in payload:
+                payload["snapshot_b64"] = payload.pop("image_b64")
+
+            # Fallback camera_id / node_id from key expr if missing
+            key_expr = str(sample.key_expr)
+            key_parts = key_expr.split("/")
+            if "node_id" not in payload and len(key_parts) >= 3:
+                payload["node_id"] = key_parts[2]
+            if "camera_id" not in payload and len(key_parts) >= 4:
+                payload["camera_id"] = key_parts[3]
+
+            def _save_task(rec=payload):
+                asyncio.create_task(state.store.save_async(rec))
+
+            if state.store and state._loop and state._loop.is_running():
+                state._loop.call_soon_threadsafe(_save_task)
+
+        events_sub = session.declare_subscriber("traffic/events/**", _on_traffic_event)
+        logger.info("[Zenoh Server] Subscribed to 'traffic/events/**'")
+
         state._zenoh_session = session
         state._zenoh_sub = sub
+        state._zenoh_events_sub = events_sub
         return session
     except Exception as exc:
         logger.warning("[Zenoh Server] Failed to start Zenoh subscriber: %s", exc)
@@ -314,6 +348,11 @@ def create_app() -> web.Application:
         if state._zenoh_sub:
             try:
                 state._zenoh_sub.undeclare()
+            except Exception:
+                pass
+        if state._zenoh_events_sub:
+            try:
+                state._zenoh_events_sub.undeclare()
             except Exception:
                 pass
         if state._zenoh_session:

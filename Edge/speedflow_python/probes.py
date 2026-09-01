@@ -381,6 +381,59 @@ class SpeedProbe:
     # Publisher
     # ------------------------------------------------------------------
 
+    def remove_camera(self, camera_id: str, source_id: Optional[int] = None) -> None:
+        """
+        Thread-safe removal cleanup for a camera that was removed from the pipeline.
+        Evicts configured FPS, frame counters, proactive feature accumulators,
+        and associated per-camera / per-track probe state.
+        """
+        if not camera_id:
+            return
+
+        with self._configured_fps_lock:
+            self._configured_fps.pop(camera_id, None)
+
+        with self._fps_frame_lock:
+            self._fps_frame_count.pop(camera_id, None)
+
+        with self._feature_lock:
+            self._feature_acc.pop(camera_id, None)
+            self._feature_snapshot_cache.pop(camera_id, None)
+
+        with self._fps_stats_lock:
+            self._fps_stats_cache.pop(camera_id, None)
+
+        self._source_type_by_camera.pop(camera_id, None)
+        self._first_valid_speed_ts.pop(camera_id, None)
+
+        if source_id is not None:
+            # Purge stid = (source_id, track_id) records
+            with self._svc_lock:
+                stids_to_purge = [
+                    stid for stid in self._track_service_meta if stid[0] == source_id
+                ]
+                for stid in stids_to_purge:
+                    self._track_service_meta.pop(stid, None)
+
+            track_dicts = [
+                self.history_positions,
+                self.last_speed_text,
+                self.last_update_frame,
+                self.last_alert_ts,
+                self.snap_count,
+                self.speed_history,
+                self.track_birth_frame,
+                self.last_area,
+                self.plate_detection_start_frame,
+                self.plate_candidates,
+                self.plate_locked,
+                self.plate_detection_attempts,
+            ]
+            for d in track_dicts:
+                keys = [k for k in d if isinstance(k, tuple) and len(k) >= 1 and k[0] == source_id]
+                for k in keys:
+                    d.pop(k, None)
+
     def set_publisher(self, publisher) -> None:
         self.publisher = publisher
 
