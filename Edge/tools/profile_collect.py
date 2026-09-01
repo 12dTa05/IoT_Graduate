@@ -13,9 +13,9 @@ interleaved FPS + features to a single writer window, and skips warmup data.
 
 Usage (run on the target Jetson while the DeepStream pipeline is active):
 
-    python3 tools/profile_collect.py --output logs/calibration.csv --duration 600
+    python3 tools/profile_collect.py --output logs/calibration_jetson_A.csv --duration 600
 
-    --output    Path to output CSV (default: logs/calibration.csv)
+    --output    Path to output CSV (default: logs/calibration_<NODE_ID>.csv)
     --duration  Collection window in seconds (default: 600 = 10 min)
     --interval  Polling interval in seconds (default: 2.0)
 
@@ -61,7 +61,7 @@ from pathlib import Path
 _EDGE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_EDGE_DIR))
 
-from speedflow_python.settings import FPS_STATS_FILE
+from speedflow_python.settings import FPS_STATS_FILE, NODE_ID
 from health_agent import _read_payload, _compute_load_score
 
 # ---------------------------------------------------------------------------
@@ -453,7 +453,7 @@ def measure_wbase(output: Path, duration: float, interval: float) -> float:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="System profiling data collector for load-model regression")
-    ap.add_argument("--output",         type=Path, default=Path("logs/calibration.csv"))
+    ap.add_argument("--output",         type=Path, default=Path(f"logs/calibration_{NODE_ID}.csv"))
     ap.add_argument("--duration",       type=float, default=600.0,
                     help="Collection duration in seconds (default 600)")
     ap.add_argument("--interval",       type=float, default=1.0,

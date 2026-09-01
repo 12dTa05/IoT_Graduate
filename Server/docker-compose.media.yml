@@ -4,5 +4,9 @@ services:
     container_name: mediamtx
     network_mode: host
     restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - MTX_WEBRTCICEHOSTNAT1TO1IPS=${MEDIAMTX_PUBLIC_IP:-116.118.9.125}
     volumes:
       - ./mediamtx.yml:/mediamtx.yml

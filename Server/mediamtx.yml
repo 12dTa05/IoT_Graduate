@@ -4,7 +4,7 @@
 # Browser clients consume via WebRTC (WHEP protocol).
 
 # ── Logging ──────────────────────────────────────────────────
-logLevel: info
+logLevel: debug
 logDestinations: [stdout]
 
 # ── RTSP server (receives push from Edge nodes) ─────────────
@@ -24,7 +24,9 @@ webrtcICEUDPMuxAddress: 0.0.0.0:8189
 # CRITICAL: tells MediaMTX to include the public IP in ICE candidates
 # Without this, ICE candidates only contain Docker/private IPs and
 # external browsers cannot connect via WebRTC.
-webrtcICEHostNAT1To1IPs: ["116.118.9.125"]
+# Configured via docker-compose.media.yml (MTX_WEBRTCICEHOSTNAT1TO1IPS / MEDIAMTX_PUBLIC_IP).
+# Optional fallback if run directly without env:
+webrtcICEHostNAT1To1IPs: []
 
 # ── API server (query active streams) ───────────────────────
 api: yes

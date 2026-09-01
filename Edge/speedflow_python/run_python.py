@@ -368,6 +368,8 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
         raise RuntimeError("Unable to set display pipeline to PLAYING state")
     warmup_ms = (t1_playing - t0_playing) * 1000.0
     probe.record_warmup_ms(warmup_ms)
+    if peer_orch is not None:
+        peer_orch.set_pipeline_ready(True)
     logger.info("[Display] Pipeline PLAYING after %.0f ms (warmup)", warmup_ms)
 
     try:
@@ -406,6 +408,10 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
         _stop_active_speed_probes()
         _graceful_stop_pipeline(pipeline)
         raise RuntimeError("Unable to set file pipeline to PLAYING state")
+    warmup_ms = (t1_playing - t0_playing) * 1000.0
+    probe.record_warmup_ms(warmup_ms)
+    if peer_orch is not None:
+        peer_orch.set_pipeline_ready(True)
 
     try:
         _run_loop_until_eos_or_error(pipeline, camera_manager)
@@ -520,6 +526,9 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
             print("[RTSP Push] State change NO_PREROLL: live pipeline running (preroll not required)")
         elif ret == Gst.StateChangeReturn.SUCCESS:
             print("[RTSP Push] State change SUCCESS: pipeline is PLAYING")
+
+        if peer_orch is not None:
+            peer_orch.set_pipeline_ready(True)
 
         restart_idx = 0  # reset backoff on successful start
         print(f"[RTSP Push] Streaming to {rtsp_url}")

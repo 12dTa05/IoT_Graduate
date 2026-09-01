@@ -13,7 +13,7 @@
 #
 # Collect calibration data while the pipeline runs, then stop automatically:
 #   ./run_edge.sh --collect
-#   ./run_edge.sh --collect --collect-output logs/calibration.csv \
+#   ./run_edge.sh --collect --collect-output logs/calibration_jetson_A.csv \
 #                           --collect-duration 600 \
 #                           --collect-wbase-ref 12.5
 #
@@ -21,7 +21,7 @@
 #   ./run_edge.sh --calibrate
 #   ./run_edge.sh --calibrate --load-model dl \
 #                             --collect-duration 1200 \
-#                             --collect-output logs/calibration.csv \
+#                             --collect-output logs/calibration_jetson_A.csv \
 #                             --wbase-output   logs/wbase.txt \
 #                             --wbase-duration 60 \
 #                             --model-output   models/load_predictor.onnx \
@@ -73,9 +73,15 @@ LOAD_MODEL="${LOAD_MODEL:-formula}"
 # ponytail: 1.0 s is locked — the single operational cadence.
 TELEMETRY_INTERVAL="1.0"
 
+# Load NODE_ID from .env if present and not set in environment
+if [[ -z "${NODE_ID:-}" ]] && [[ -f .env ]]; then
+    NODE_ID="$(grep -E '^NODE_ID=' .env | cut -d= -f2- | tr -d '\r\n ' || true)"
+fi
+NODE_ID="${NODE_ID:-edge}"
+
 # --collect defaults
 COLLECT=0
-COLLECT_OUTPUT="logs/calibration.csv"
+COLLECT_OUTPUT="logs/calibration_${NODE_ID}.csv"
 COLLECT_DURATION=600
 COLLECT_INTERVAL=1.0
 COLLECT_WBASE_REF=0.0

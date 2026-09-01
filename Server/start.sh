@@ -13,6 +13,9 @@ echo "[start.sh] MediaMTX started."
 
 # ── 2. Python dashboard server ────────────────────────────────
 echo "[start.sh] Checking/installing dependencies..."
-pip install -q -r requirements.txt || true
+if ! pip install -q -r requirements.txt; then
+    echo "[start.sh] ERROR: Failed to install Python dependencies from requirements.txt" >&2
+    exit 1
+fi
 echo "[start.sh] Starting dashboard server..."
 exec python3 app.py "$@"

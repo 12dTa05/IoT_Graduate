@@ -2,8 +2,10 @@
 .cortexkit
 .pytest_cache
 
+Camera/videos
+
 Edge/logs
-Edge/tests/*
+Edge/tests
 Edge/tests/__pycache__
 Edge/snapshots
 Edge/__pycache__
@@ -15,5 +17,7 @@ Edge/.pytest_cache
 
 Server/__pycache__
 Server/violations
+Server/test_traffic_events.py
+Server/speedflow-server.service
 
-Data_From_Jetsons
+Data_From_Jetsons/

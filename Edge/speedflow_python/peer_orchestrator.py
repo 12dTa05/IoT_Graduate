@@ -555,6 +555,9 @@ class PeerOrchestrator:
         # camera_id → unix timestamp when REMOVE was confirmed sent
         self._migration_complete_ts: Dict[str, float] = {}
 
+        # Flag indicating whether the local pipeline has finished initializing / reached PLAYING state
+        self._pipeline_ready: bool = False
+
         # Stop event for cleanly blocking start()
         self._stop_event = threading.Event()
         # Signaled once Zenoh session and publishers are ready
@@ -571,6 +574,17 @@ class PeerOrchestrator:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def set_pipeline_ready(self, ready: bool = True) -> None:
+        """Set local pipeline readiness status (called when pipeline enters PLAYING)."""
+        with self._lock:
+            self._pipeline_ready = bool(ready)
+        logger.info("[PeerOrch] Pipeline ready state set to %s", self._pipeline_ready)
+
+    def is_pipeline_ready(self) -> bool:
+        """Check whether the local pipeline is ready."""
+        with self._lock:
+            return self._pipeline_ready
 
     def start(self) -> None:
         """Open Zenoh session, declare pubs/subs, start decision thread."""
@@ -1319,6 +1333,11 @@ class PeerOrchestrator:
         grace_s = float(self._cfg.get("failover_grace_s", timeout))
         offline_threshold = timeout + grace_s
         convergence_grace_s = float(self._cfg.get("failover_convergence_grace_s", 15.0))
+
+        with self._lock:
+            if not self._pipeline_ready:
+                logger.debug("[PeerOrch] Local pipeline not ready yet. Suppressing peer-offline detection and failover.")
+                return
 
         with self._self_lock:
             if self._self_state.last_seen == 0.0 or (now - self._self_state.last_seen > offline_threshold):
@@ -3881,6 +3900,11 @@ Duplicate prevention (local)
         cfg = self._cfg
         now = time.time()
         timeout = cfg.get("heartbeat_timeout_s", 5.0)
+
+        with self._lock:
+            if not self._pipeline_ready:
+                logger.debug("[Failover] Local pipeline not ready yet. Suppressing leaderless failover execution.")
+                return
 
         cm = self._camera_manager
         default_max = cm.get_max_streams() if cm is not None else 4
