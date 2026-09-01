@@ -57,21 +57,25 @@ fi
 
 # CAM_LOCAL_NUMS : the two Docker service names (cam1 cam2 OR cam3 cam4)
 # CAM_EDGE_IDS   : the two global Edge camera IDs (cam_01 cam_02 OR cam_03 cam_04)
+# CAM_SOURCE_IDS : the two global pipeline slot IDs, stable across all Jetsons
 case "$NODE_ID" in
     jetson_A)
         ADVERTISE_IP="192.168.212.20"
         CAM_LOCAL_NUMS=(1 2)
         CAM_EDGE_IDS=(cam_01 cam_02)
+        CAM_SOURCE_IDS=(0 1)
         ;;
     jetson_B)
         ADVERTISE_IP="192.168.212.21"
         CAM_LOCAL_NUMS=(3 4)
         CAM_EDGE_IDS=(cam_03 cam_04)
+        CAM_SOURCE_IDS=(2 3)
         ;;
     jetson_C)
         ADVERTISE_IP="192.168.212.22"
         CAM_LOCAL_NUMS=(5 6)
         CAM_EDGE_IDS=(cam_05 cam_06)
+        CAM_SOURCE_IDS=(4 5)
         ;;
     *)
         die "Unknown NODE_ID '$NODE_ID'. Expected jetson_A, jetson_B, or jetson_C."
@@ -288,7 +292,7 @@ tiler_cols: 2
 cameras:
   ${CAM_EDGE_IDS[0]}:
     camera_id: "${CAM_EDGE_IDS[0]}"
-    source_id: 0
+    source_id: ${CAM_SOURCE_IDS[0]}
     uri: "rtsp://$ADVERTISE_IP:8554/cam${CAM_LOCAL_NUMS[0]}"
     enabled: true
     name: "Camera ${CAM_LOCAL_NUMS[0]}"
@@ -309,7 +313,7 @@ cameras:
 
   ${CAM_EDGE_IDS[1]}:
     camera_id: "${CAM_EDGE_IDS[1]}"
-    source_id: 1
+    source_id: ${CAM_SOURCE_IDS[1]}
     uri: "rtsp://$ADVERTISE_IP:8554/cam${CAM_LOCAL_NUMS[1]}"
     enabled: true
     name: "Camera ${CAM_LOCAL_NUMS[1]}"

@@ -58,6 +58,12 @@ class ZenohCommandSubscriber:
         self._subscriber = None
         self._running = False
 
+        # Per-camera held epoch for stale ADD/REMOVE rejection
+        # Incremented on every applied ADD/REMOVE; receiver rejects
+        # commands with epoch < held_epoch to prevent partition-rejoin
+        # data-loss where stale REMOVE tears down new owner's stream.
+        self._held_epochs: Dict[str, int] = {}
+
         from concurrent.futures import ThreadPoolExecutor
         self._ack_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ZenohC2-ACK")
 
@@ -171,6 +177,26 @@ class ZenohCommandSubscriber:
         try:
             cam_id    = payload["camera_id"]
             source_id = int(payload["source_id"])
+            epoch     = payload.get("epoch")
+
+            # Epoch fencing: reject stale ADD if we've already applied a newer one.
+            # Legacy payloads without epoch skip this guard (backward compatibility).
+            if epoch is not None:
+                held_epoch = self._held_epochs.get(cam_id, -1)
+                if int(epoch) < held_epoch:
+                    logger.info(
+                        "[Zenoh C2] ADD rejected for '%s': stale_epoch (epoch=%d < held_epoch=%d)",
+                        cam_id, int(epoch), held_epoch,
+                    )
+                    self.publish_status({
+                        "node_id": self._node_id,
+                        "event": "ADD_REJECTED",
+                        "camera_id": cam_id,
+                        "reason": "stale_epoch",
+                        "epoch": epoch,
+                        "held_epoch": held_epoch,
+                    })
+                    return
 
             # Delegate config building + delta enqueue to CameraManager so the
             # same logic is shared with PeerOrchestrator's direct-dispatch path.
@@ -183,6 +209,10 @@ class ZenohCommandSubscriber:
                     "reason": "camera_or_source_id_conflict",
                 })
                 return
+
+            # Update held_epoch on successful accept
+            if epoch is not None:
+                self._held_epochs[cam_id] = int(epoch)
 
             self.publish_status({
                 "node_id": self._node_id,
@@ -231,23 +261,22 @@ class ZenohCommandSubscriber:
                         "PLAYING within %.0fs.", _cam_id, _ack_timeout,
                     )
                     # Local cleanup of unacknowledged stream to avoid duplicate orphan processing
+                    # Use callback tuple so CameraManager processes REMOVE before any pending ADD
+                    # and cleanup_stream_ready runs as part of the ordered teardown.
                     try:
-                        if hasattr(_cam_manager, "cleanup_stream_ready"):
-                            _cam_manager.cleanup_stream_ready(_source_id)
                         with _cam_manager._lock:
                             cfg = _cam_manager._configs.get(_cam_id)
-                            if cfg and cfg.enabled:
+                            if (cfg is not None and cfg.enabled
+                                    and cfg.source_id == _source_id):
                                 cfg.enabled = False
                                 _cam_manager._rebuild_lookup()
-                        logger.info("[Zenoh C2] Disabled timed-out config for stream '%s'", _cam_id)
-                        # Release the half-added source for real (#774/#598):
-                        # leaving the uridecodebin in the pipeline leaks its
-                        # NVDEC session until some future ADD reclaims it.
-                        delta = StreamDelta(to_remove=[_source_id])
+                        delta = StreamDelta(
+                            to_remove=[(_source_id, lambda: _cam_manager.cleanup_stream_ready(_source_id))]
+                        )
                         _cam_manager._delta_q.put(delta)
                         logger.info(
                             "[Zenoh C2] Queued REMOVE for timed-out ADD stream '%s' "
-                            "(source_id=%d)", _cam_id, _source_id,
+                            "(source_id=%d) with callback", _cam_id, _source_id,
                         )
                     except Exception as exc:
                         logger.error("[Zenoh C2] Failed local cleanup after ADD timeout for '%s': %s", _cam_id, exc)
@@ -297,6 +326,26 @@ class ZenohCommandSubscriber:
             cam_id = payload["camera_id"]
             epoch = payload.get("epoch")
             migration_id = payload.get("migration_id")
+
+            # Epoch fencing: reject stale REMOVE if we've already applied a newer one.
+            # Legacy payloads without epoch skip this guard (backward compatibility).
+            if epoch is not None:
+                held_epoch = self._held_epochs.get(cam_id, -1)
+                if int(epoch) < held_epoch:
+                    logger.info(
+                        "[Zenoh C2] REMOVE rejected for '%s': stale_epoch (epoch=%d < held_epoch=%d)",
+                        cam_id, int(epoch), held_epoch,
+                    )
+                    self.publish_status({
+                        "node_id": self._node_id,
+                        "event": "REMOVE_REJECTED",
+                        "camera_id": cam_id,
+                        "reason": "stale_epoch",
+                        "epoch": epoch,
+                        "held_epoch": held_epoch,
+                        "migration_id": migration_id,
+                    })
+                    return
 
             with self._camera_manager._lock:
                 cfg = self._camera_manager._configs.get(cam_id)
@@ -351,6 +400,8 @@ class ZenohCommandSubscriber:
                 source_id = cfg.source_id
                 cfg.enabled = False
                 self._camera_manager._rebuild_lookup()
+                if epoch is not None:
+                    self._held_epochs[cam_id] = int(epoch)
 
             def _on_teardown_done():
                 try:

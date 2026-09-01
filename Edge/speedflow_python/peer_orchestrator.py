@@ -87,6 +87,7 @@ class PeerState:
     fps_per_camera: Dict[str, float] = field(default_factory=dict)
     active_cameras: List[str] = field(default_factory=list)
     streaming_cameras: List[str] = field(default_factory=list)
+    held_cameras: List[str] = field(default_factory=list)
     camera_configs: Dict[str, dict] = field(default_factory=dict)
     camera_owners: Dict[str, str] = field(default_factory=dict)
     camera_holders: Dict[str, str] = field(default_factory=dict)
@@ -95,7 +96,7 @@ class PeerState:
     last_seen: float = field(default_factory=time.time)
     overload_since: Optional[float] = None
     penalty_until: float = 0.0
-    # Proactive model output — populated when proactive.enabled is True.
+    # Proactive model output -- populated when proactive.enabled is True.
     # Defaults to 0.0 (no risk) so legacy comparisons (load_score only) are unaffected.
     risk_index: float = 0.0
     # Per-camera workload (n_track + n_plate) from health payload.
@@ -835,6 +836,10 @@ class PeerOrchestrator:
                     self._self_state.streaming_cameras = [str(c) for c in pipeline["streaming_cameras"] if isinstance(c, (str, int))]
                 else:
                     self._self_state.streaming_cameras = list(self._self_state.active_cameras)
+                if isinstance(pipeline.get("held_cameras"), (list, tuple, set)):
+                    self._self_state.held_cameras = [str(c) for c in pipeline["held_cameras"] if isinstance(c, (str, int))]
+                else:
+                    self._self_state.held_cameras = list(self._self_state.active_cameras)
                 raw_configs = pipeline.get("camera_configs")
                 if isinstance(raw_configs, dict) and raw_configs:
                     self._self_state.camera_configs = raw_configs
@@ -961,6 +966,10 @@ class PeerOrchestrator:
                 peer.streaming_cameras = [str(c) for c in pipeline["streaming_cameras"] if isinstance(c, (str, int))]
             else:
                 peer.streaming_cameras = list(peer.active_cameras)
+            if isinstance(pipeline.get("held_cameras"), (list, tuple, set)):
+                peer.held_cameras = [str(c) for c in pipeline["held_cameras"] if isinstance(c, (str, int))]
+            else:
+                peer.held_cameras = list(peer.active_cameras)
             # Preserve valid prior camera_configs when payload field is missing/malformed
             raw_configs = pipeline.get("camera_configs")
             if isinstance(raw_configs, dict) and raw_configs:
@@ -1043,7 +1052,7 @@ class PeerOrchestrator:
                 cam_id for cam_id, orig_owner in self._rescued_cameras.items()
                 if orig_owner == node_id and (
                     peer_ready_to_resume
-                    and cam_id in peer.active_cameras
+                    and cam_id in peer.held_cameras
                 )
             ]
             for cam_id in cameras_to_yield:
@@ -1058,18 +1067,18 @@ class PeerOrchestrator:
                 )
 
             # Safe duplicate reconciliation defense-in-depth:
-            # If self and an alive peer both report the same active camera, check monotonic epoch / identity:
+            # If self and an alive peer both report the same HELD camera, check monotonic epoch / identity:
             # 1. Higher epoch wins. Lower epoch node yields/removes.
             # 2. Equal epoch / absent identity: static owner is deterministic tie-breaker.
             # 3. Duplicate observation must be stable across at least 2 consecutive heartbeats.
             # Skip if camera is in-flight across rescue/reclaim/migration/warmup.
             to_remove_self_reconcile: List[str] = []
             with self._self_lock:
-                self_active = set(self._self_state.active_cameras)
+                self_held = set(self._self_state.held_cameras)
 
             # Update duplicate observation trackers
-            peer_active = set(peer.active_cameras)
-            for cam_id in list(self_active & peer_active):
+            peer_held = set(peer.held_cameras)
+            for cam_id in list(self_held & peer_held):
                 key = (node_id, cam_id)
                 self._duplicate_camera_seen[key] = self._duplicate_camera_seen.get(key, 0) + 1
 
@@ -1142,7 +1151,7 @@ class PeerOrchestrator:
 
             # Clean tracking for non-duplicate cameras on this peer
             for (p_node, p_cam) in list(self._duplicate_camera_seen.keys()):
-                if p_node == node_id and p_cam not in (self_active & peer_active):
+                if p_node == node_id and p_cam not in (self_held & peer_held):
                     self._duplicate_camera_seen.pop((p_node, p_cam), None)
 
             # Issue REMOVE outside _lock
@@ -1331,8 +1340,8 @@ class PeerOrchestrator:
                             candidate_orphans.append(c)
                             seen_candidates.add(c)
 
-                # 2. active_cameras
-                for c in peer.active_cameras:
+                # 2. held_cameras (includes warming-up and stalled streams with live pipeline branches)
+                for c in peer.held_cameras:
                     if c and c not in seen_candidates:
                         candidate_orphans.append(c)
                         seen_candidates.add(c)
@@ -1743,10 +1752,10 @@ class PeerOrchestrator:
                 holder_peer = self._peers.get(holder_node)
             holder_alive = holder_peer is not None and (now - holder_peer.last_seen <= heartbeat_timeout)
 
-            if holder_alive and holder_peer is not None and camera_id in holder_peer.active_cameras:
+            if holder_alive and holder_peer is not None and camera_id in holder_peer.held_cameras:
                 # Still running fine on holder; check if load/cooldown allows normal reclaim
                 pass
-            elif holder_alive and holder_peer is not None and camera_id not in holder_peer.active_cameras:
+            elif holder_alive and holder_peer is not None and camera_id not in holder_peer.held_cameras:
                 # Holder dropped the camera while still alive!
                 # If camera is already active on self, reclaim has succeeded; clear state safely.
                 with self._self_lock:
@@ -1769,7 +1778,7 @@ class PeerOrchestrator:
                 other_holder = None
                 with self._lock:
                     for pid, p in self._peers.items():
-                        if pid != holder_node and (now - p.last_seen <= heartbeat_timeout) and (camera_id in p.active_cameras):
+                        if pid != holder_node and (now - p.last_seen <= heartbeat_timeout) and (camera_id in p.held_cameras):
                             other_holder = pid
                             break
                     if other_holder is not None:
@@ -2429,7 +2438,7 @@ class PeerOrchestrator:
                 if self._peer_consecutive_timeouts.get(nid, 0) >= zombie_timeout_count:
                     continue
                 # Skip peers in startup/recovery or without valid positive FPS (e.g. load_score=0 placeholder)
-                if is_waiting_state(peer.fps_per_camera, peer.active_cameras, getattr(peer, "status", None)):
+                if is_waiting_state(peer.fps_per_camera, peer.streaming_cameras, getattr(peer, "status", None)):
                     continue
                 # Exclude peers whose offload queue is full to avoid routing to saturated receivers
                 if getattr(peer, "offload_queue_full", False):
@@ -2437,7 +2446,7 @@ class PeerOrchestrator:
                 # For pure least-load greedy baseline, skip stream capacity and thermal admission gates
                 if policy_name not in ("least_load_greedy", "centralized_greedy"):
                     if for_offload_level <= 1 and (
-                        len(peer.active_cameras) + self._peer_inflight.get(nid, 0)
+                        len(peer.held_cameras) + self._peer_inflight.get(nid, 0)
                         >= peer.max_streams
                     ):
                         continue
@@ -2683,14 +2692,14 @@ class PeerOrchestrator:
                 logger.info("[PeerOrch] RFO rejected for '%s': uncommitted state/already handled", camera_id)
                 return
 
-            # Reject if an alive peer already reports this camera active
+            # Reject if an alive peer already reports this camera held
             for pid, p in self._peers.items():
-                if pid != requester and (now - p.last_seen <= heartbeat_timeout) and (camera_id in p.active_cameras):
-                    logger.info("[PeerOrch] RFO rejected for '%s': already active on alive peer '%s'", camera_id, pid)
+                if pid != requester and (now - p.last_seen <= heartbeat_timeout) and (camera_id in p.held_cameras):
+                    logger.info("[PeerOrch] RFO rejected for '%s': already held on alive peer '%s'", camera_id, pid)
                     return
         with self._self_lock:
-            if camera_id in self._self_state.active_cameras:
-                logger.info("[PeerOrch] RFO rejected for '%s': already active locally", camera_id)
+            if camera_id in self._self_state.held_cameras:
+                logger.info("[PeerOrch] RFO rejected for '%s': already held locally", camera_id)
                 return
 
         # BUG-1 fix: read _self_state under its own lock
@@ -3233,7 +3242,7 @@ class PeerOrchestrator:
         with self._lock:
             holder_peer = self._peers.get(holder_node)
             if holder_peer is not None and (now - holder_peer.last_seen <= heartbeat_timeout):
-                if camera_id not in holder_peer.active_cameras:
+                if camera_id not in holder_peer.held_cameras:
                     with self._self_lock:
                         is_active_local = camera_id in self._self_state.active_cameras
                     if is_active_local:
@@ -3600,7 +3609,7 @@ class PeerOrchestrator:
           - peer status is not waiting/recovering
           - peer has valid positive FPS
           - peer is not overloaded
-          - camera_id is in peer.active_cameras
+          - camera_id is in peer.held_cameras
         """
         if peer is None:
             return False
@@ -3609,7 +3618,7 @@ class PeerOrchestrator:
         if (now - peer.last_seen) > timeout:
             return False
         peer_fps_valid = _has_valid_positive_fps(peer.fps_per_camera)
-        peer_in_waiting = is_waiting_state(peer.fps_per_camera, peer.active_cameras, peer.status)
+        peer_in_waiting = is_waiting_state(peer.fps_per_camera, peer.streaming_cameras, peer.status)
         peer_overloaded = self._is_overloaded(
             peer.load_score,
             peer.risk_index,
@@ -3617,10 +3626,10 @@ class PeerOrchestrator:
         )
         if not peer_fps_valid or peer_in_waiting or peer_overloaded:
             return False
-        if camera_id not in peer.active_cameras:
+        if camera_id not in peer.held_cameras:
             return False
-        # Also ensure peer has capacity (active_cameras <= max_streams)
-        if len(peer.active_cameras) > peer.max_streams:
+        # Also ensure peer has capacity (held_cameras <= max_streams)
+        if len(peer.held_cameras) > peer.max_streams:
             return False
         return True
 
@@ -3825,12 +3834,12 @@ class PeerOrchestrator:
         populated ``camera_configs`` (older firmware / missing field), we fall
         back to the full orphan list — never silently drop a mandatory rescue.
 
-        Duplicate prevention (local)
+Duplicate prevention (local)
         ────────────────────────────
         The consistent hash ensures only one node wins each camera across the
         cluster.  Within this node, we additionally guard against double-rescue:
           * camera already in ``_rescued_cameras`` (rescued in a prior run)
-          * camera already in ``_self_state.active_cameras`` (we're running it)
+          * camera already in ``_self_state.held_cameras`` (we're running it)
         Both are checked under their respective locks.
         """
         cfg = self._cfg
@@ -3849,10 +3858,10 @@ class PeerOrchestrator:
             dead_peer = self._peers.get(dead_node_id)
             peer_cam_configs = dict(dead_peer.camera_configs) if dead_peer else {}
 
-            # Build alive candidate list — includes self so this node can rescue too
-            # BUG-1 fix: read active_cameras from _self_state under _self_lock.
+        # Build alive candidate list -- includes self so this node can rescue too
+        # BUG-1 fix: read held_cameras from _self_state under _self_lock.
         with self._self_lock:
-            self_streams = len(self._self_state.active_cameras)
+            self_streams = len(self._self_state.held_cameras)
         with self._lock:
             self_eligible = (
                 self._node_id != dead_node_id
@@ -3862,7 +3871,7 @@ class PeerOrchestrator:
                 nid for nid, peer in self._peers.items()
                 if nid != dead_node_id
                 and now - peer.last_seen <= timeout
-                and len(peer.active_cameras) < peer.max_streams
+                and len(peer.held_cameras) < peer.max_streams
             ] + ([self._node_id] if self_eligible else []))
 
         # Dead-owner filtering: camera MUST be originally owned by dead_node_id.
@@ -3949,17 +3958,17 @@ class PeerOrchestrator:
                         )
                         continue
                 with self._self_lock:
-                    if camera_id in self._self_state.active_cameras:
+                    if camera_id in self._self_state.held_cameras:
                         logger.info(
-                            "[Failover] Camera '%s' already active on self. Skipping duplicate rescue.",
+                            "[Failover] Camera '%s' already held on self. Skipping duplicate rescue.",
                             camera_id,
                         )
                         continue
 
                 # Re-check capacity including cameras accepted earlier in this loop against rescue ceiling
-                # BUG-1 fix: read active_cameras and load_score under _self_lock
+                # BUG-1 fix: read held_cameras and load_score under _self_lock
                 with self._self_lock:
-                    current_streams = len(self._self_state.active_cameras)
+                    current_streams = len(self._self_state.held_cameras)
                     current_load = self._self_state.load_score
                 if current_streams + self_accepted >= rescue_ceiling:
                     logger.warning(
@@ -3979,11 +3988,11 @@ class PeerOrchestrator:
 
                 # Double-check: camera already rescued by another peer?
                 # Exclude both self AND the dead peer — the dead peer's stale
-                # active_cameras still lists its own cameras and would otherwise
+                # held_cameras still lists its own cameras and would otherwise
                 # cause every rescue to be skipped in a 2-node cluster.
                 with self._lock:
                     already_handled = any(
-                        camera_id in peer.active_cameras
+                        camera_id in peer.held_cameras
                         for nid, peer in self._peers.items()
                         if nid != self._node_id and nid != dead_node_id
                     )
@@ -4087,7 +4096,7 @@ class PeerOrchestrator:
                         if other_id == dead_node_id:
                             continue
                         if ((time.time() - other_state.last_seen) <= timeout
-                                and camera_id in other_state.active_cameras):
+                                and camera_id in other_state.held_cameras):
                             alive_owner = other_id
                             break
                 if alive_owner is not None:
@@ -4099,9 +4108,9 @@ class PeerOrchestrator:
 
                 # Re-check local active ownership immediately before publishing failover ADD
                 with self._self_lock:
-                    if camera_id in self._self_state.active_cameras:
+                    if camera_id in self._self_state.held_cameras:
                         logger.info(
-                            "[Failover] Camera '%s' became active locally before publishing. Skipping.",
+                            "[Failover] Camera '%s' became held locally before publishing. Skipping.",
                             camera_id,
                         )
                         continue
@@ -4413,28 +4422,28 @@ class PeerOrchestrator:
 
         L1 ownership invariant
         ──────────────────────
-        Full-stream migration removes a stream from this node. We must keep
+Full-stream migration removes a stream from this node. We must keep
         at least one locally-owned camera (enabled in this node's cameras.yml)
         active at all times. Rescued/migrated-in cameras are NOT owned by
-        this node — the previous selector kept one arbitrary active camera,
+        this node -- the previous selector kept one arbitrary active camera,
         so a foreign camera could "stand in" while every owned camera got
         migrated away.
 
-          * If no owned camera is active → fail safe (return None).
+          * If no owned camera is held -> fail safe (return None).
           * Otherwise, among eligible candidates, pick the lightest whose
-            migration still leaves ≥1 owned camera active.
+            migration still leaves >= 1 owned camera held.
 
         L2/L3 crop offload does NOT remove the stream, so the ownership
-        guard does not apply — it is allowed to pick the last owned camera
+        guard does not apply -- it is allowed to pick the last owned camera
         as a crop source.
         """
         now = time.time()
-        if len(state.active_cameras) <= 1:
-            if state.active_cameras:
+        if len(state.held_cameras) <= 1:
+            if state.held_cameras:
                 if self._maybe_log_block("pick_only_one_camera", now):
                     logger.debug(
                         "[PeerOrch] Only 1 camera left ('%s') — cannot offload last camera",
-                        state.active_cameras[0],
+                        state.held_cameras[0],
                     )
             return None
 
@@ -4481,7 +4490,7 @@ class PeerOrchestrator:
         # are skipped (fail safe). Do NOT fall back to output FPS.
         workload = state.camera_workload or {}
         eligible = {}
-        for c in state.active_cameras:
+        for c in state.held_cameras:
             if c in starved:
                 continue
             if now - self._reclaim_completed_at.get(c, 0.0) < reclaim_window:
@@ -4512,14 +4521,14 @@ class PeerOrchestrator:
             owned_l1 = {c: w for c, w in owned_eligible.items() if c not in bounced_cameras and c not in self._rescued_cameras}
 
             # L1 ownership guard: never migrate away the last owned camera.
-            # Explicit L1 guard: never select an L1 candidate when <=1 locally-owned active camera.
-            owned_active = owned_cam_ids & set(state.active_cameras)
-            if len(owned_active) == 0:
+            # Explicit L1 guard: never select an L1 candidate when <=1 locally-owned held camera.
+            owned_held = owned_cam_ids & set(state.held_cameras)
+            if len(owned_held) == 0:
                 if self._maybe_log_block("l1_no_owned_active", now):
                     logger.info(
-                        "[PeerOrch] L1 fail-safe: no locally-owned camera is active "
-                        "(active=%d). Skipping migration to preserve ownership.",
-                        len(state.active_cameras),
+                        "[PeerOrch] L1 fail-safe: no locally-owned camera is held "
+                        "(held=%d). Skipping migration to preserve ownership.",
+                        len(state.held_cameras),
                     )
                 return None
 
@@ -4534,26 +4543,26 @@ class PeerOrchestrator:
                         len(foreign_l1),
                     )
 
-            # If owned active <= 1, guard against offloading owned camera
-            if len(owned_active) <= 1:
+            # If owned held <= 1, guard against offloading owned camera
+            if len(owned_held) <= 1:
                 if self._maybe_log_block("l1_guard_single_owned", now):
                     logger.info(
-                        "[PeerOrch] L1 guard: <= 1 locally-owned camera active (owned_active=%d, active=%d) and no foreign candidates. Skipping L1 migration.",
-                        len(owned_active), len(state.active_cameras),
+                        "[PeerOrch] L1 guard: <= 1 locally-owned camera held (owned_held=%d, held=%d) and no foreign candidates. Skipping L1 migration.",
+                        len(owned_held), len(state.held_cameras),
                     )
                 return None
 
             # Then owned MIN workload (guard <=1 owned)
             if owned_l1:
                 for c in sorted(owned_l1, key=lambda cam: owned_l1[cam]):
-                    if (owned_active - {c}):
+                    if (owned_held - {c}):
                         return c
 
             if self._maybe_log_block("l1_no_safe_candidate", now):
                 logger.info(
                     "[PeerOrch] L1 fail-safe: every eligible candidate would leave "
-                    "zero owned cameras active (owned_active=%d).",
-                    len(owned_active),
+                    "zero owned cameras held (owned_held=%d).",
+                    len(owned_held),
                 )
             return None
 

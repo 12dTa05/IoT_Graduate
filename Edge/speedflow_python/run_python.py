@@ -745,9 +745,11 @@ def run_python_mode(args) -> None:
     try:
         from health_agent import HealthAgent
         ownership_cb = peer_orch.get_ownership_records if peer_orch else None
+        held_cb = camera_manager.get_held_camera_ids if camera_manager else None
         health_agent = HealthAgent(
             external_session=peer_orch._session if peer_orch else None,
             ownership_provider=ownership_cb,
+            held_provider=held_cb,
         )
         ha_thread = threading.Thread(target=health_agent.run, daemon=True, name="HealthAgent")
         ha_thread.start()

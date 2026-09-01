@@ -1186,13 +1186,14 @@ class HealthAgent:
     WebSocket to push health payloads to the Central Monitor Server.
     """
 
-    def __init__(self, external_session=None, ownership_provider: Optional[Callable[[], Dict[str, dict]]] = None) -> None:
+    def __init__(self, external_session=None, ownership_provider: Optional[Callable[[], Dict[str, dict]]] = None, held_provider: Optional[Callable[[], List[str]]] = None) -> None:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._session = None
         self._pub = None
         self._external_session = external_session
         self._ownership_provider = ownership_provider
+        self._held_provider = held_provider
         self._ready_event = threading.Event()
         self._jtop = None          # persistent jtop session
         self._monitor_client = None  # own WS client when run standalone
@@ -1758,6 +1759,15 @@ class HealthAgent:
                     owned_active = [c for c in active_cameras if camera_owners.get(c, c if c in owned_cam_ids else "") == NODE_ID or (c in owned_cam_ids and c not in camera_owners)]
                     foreign_active = [c for c in active_cameras if c not in owned_active]
 
+                    # Get held cameras from CameraManager (enabled configs with live pipeline branches)
+                    # This includes warming-up and stalled streams that streaming_cameras (FPS>0) would miss.
+                    held_cameras = []
+                    if self._held_provider is not None:
+                        try:
+                            held_cameras = self._held_provider() or []
+                        except Exception as exc:
+                            logger.debug("[HealthAgent] Failed to retrieve held cameras: %s", exc)
+
                     now_ts = time.time()
                     bps_rx, bps_tx = self._sample_network_bps()
                     payload = {
@@ -1783,6 +1793,7 @@ class HealthAgent:
                         "camera_owners": camera_owners,
                         "camera_holders": camera_holders,
                         "camera_epochs": camera_epochs,
+                        "held_cameras": held_cameras,
                         "pipeline": {
                             # pipeline_available distinguishes "pipeline not yet
                             # started / stale snapshot" (False, load_score=100)
@@ -1800,16 +1811,17 @@ class HealthAgent:
                             # falling back to bounded OSD output rate when PTS
                             # is unavailable.  Used for source-starved detection.
                             "input_fps_per_camera":  input_fps if snapshot_valid else {},
-                            "avg_fps":        avg_fps,
-                            "active_cameras": active_cameras,
-                            "streaming_cameras": active_cameras,
+                            "avg_fps":            avg_fps,
+                            "active_cameras":     active_cameras,
+                            "streaming_cameras":  active_cameras,
+                            "held_cameras":       held_cameras,
                             "source_starved_cameras": sorted(starved_cams),
-                            "camera_workload": camera_workload,
-                            "camera_features": feature_stats if snapshot_valid else {},
-                            "camera_configs": self._cam_configs_cache,
-                            "camera_owners":  camera_owners,
-                            "camera_epochs":  camera_epochs,
-                            "max_streams":    int(self._max_streams or 8),
+                            "camera_workload":    camera_workload,
+                            "camera_features":    feature_stats if snapshot_valid else {},
+                            "camera_configs":     self._cam_configs_cache,
+                            "camera_owners":      camera_owners,
+                            "camera_epochs":      camera_epochs,
+                            "max_streams":        int(self._max_streams or 8),
                             "offload_crops_received_per_s": float(offload_crops_received_per_s or 0.0),
                             "offload_queue_full": bool(offload_queue_full),
                             "offload_queue_depth": int(offload_queue_depth),

@@ -373,6 +373,15 @@ class CameraManager:
         with self._lock:
             return [c for c in self._configs.values() if c.enabled]
 
+    def get_held_camera_ids(self) -> List[str]:
+        """Return camera_ids of all enabled cameras (pipeline branches that exist).
+
+        Unlike FPS-based active cameras, this includes warming-up and stalled
+        streams that have a live pipeline branch (enabled config).
+        """
+        with self._lock:
+            return [c.camera_id for c in self._configs.values() if c.enabled]
+
     def get_max_streams(self) -> int:
         """Read max_streams from yml file (cached on init)."""
         return self._max_streams
@@ -728,12 +737,13 @@ class CameraManager:
                     cfg = manager._configs.get(camera_id)
                     if not cfg or not cfg.enabled:
                         return {"status": "not_running", "camera_id": camera_id}
-                    # Disable and push delta
+                    # Disable and push delta with callback for proper ordering
                     cfg.enabled = False
                     manager._rebuild_lookup()
-                    delta = StreamDelta(to_remove=[cfg.source_id])
+                    source_id = cfg.source_id
+                    delta = StreamDelta(to_remove=[(source_id, lambda: manager.cleanup_stream_ready(source_id))])
                 manager._delta_q.put(delta)
-                return {"status": "removing", "source_id": cfg.source_id}
+                return {"status": "removing", "source_id": source_id}
 
             def _run():
                 uvicorn.run(app, host=host, port=port, log_level="warning")
