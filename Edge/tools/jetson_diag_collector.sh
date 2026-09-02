@@ -62,9 +62,33 @@ cat /proc/meminfo > "$TARGET_DIR/meminfo.txt" 2>&1 || true
 cat /proc/vmstat > "$TARGET_DIR/vmstat.txt" 2>&1 || true
 cat /proc/loadavg > "$TARGET_DIR/loadavg.txt" 2>&1 || true
 
-# 4. Kernel / Syslog / Journal excerpts
+# 4. Kernel / Syslog / Journal excerpts & Hardware Error Triage
 echo "[jetson_diag] Extracting kernel and system logs..."
 dmesg -T > "$TARGET_DIR/dmesg.txt" 2>&1 || true
+
+HW_PATTERN='cqhci:.*timeout|cqhci.*timed out|mmc[0-9]*:.*timeout|mmc.*timed out|cache flush.*-110|-110.*cache flush|rcu(_preempt|_sched)?:.*stall|rcu.*stall|detected stalls on CPUs/tasks'
+HW_ERRORS_FILE="$TARGET_DIR/hardware_errors.txt"
+
+{
+    echo "=== Passive Hardware & Kernel Anomaly Summary ==="
+    echo "Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    echo ""
+
+    echo "--- dmesg hardware error matches ---"
+    (grep -iE "$HW_PATTERN" "$TARGET_DIR/dmesg.txt" 2>/dev/null || echo "No matches in current dmesg.")
+    echo ""
+
+    if [ -f "/sys/fs/pstore" ] || [ -d "/sys/fs/pstore" ]; then
+        echo "--- pstore contents overview ---"
+        ls -la /sys/fs/pstore 2>/dev/null || echo "pstore not readable or empty."
+        if [ "$(ls -A /sys/fs/pstore 2>/dev/null)" ]; then
+            echo ""
+            echo "--- pstore hardware error matches ---"
+            grep -iE "$HW_PATTERN" /sys/fs/pstore/* 2>/dev/null || echo "No matches in pstore logs."
+        fi
+        echo ""
+    fi
+} > "$HW_ERRORS_FILE" 2>&1 || true
 
 # Check pstore if available (ramoops / panic log from previous crash)
 if [ -d "/sys/fs/pstore" ] && [ "$(ls -A /sys/fs/pstore 2>/dev/null)" ]; then
@@ -77,14 +101,33 @@ if command -v journalctl >/dev/null 2>&1; then
     journalctl -n 1000 --no-pager > "$TARGET_DIR/journalctl_tail.txt" 2>&1 || true
     # Capture previous boot journal if persistent logging was enabled
     journalctl -b -1 -n 1000 --no-pager > "$TARGET_DIR/journalctl_prev_boot.txt" 2>&1 || true
+
+    {
+        echo "--- journalctl current boot hardware matches ---"
+        journalctl -n 2000 --no-pager 2>/dev/null | grep -iE "$HW_PATTERN" || echo "No matches in journalctl."
+        echo ""
+        echo "--- journalctl previous boot hardware matches ---"
+        journalctl -b -1 -n 2000 --no-pager 2>/dev/null | grep -iE "$HW_PATTERN" || echo "No matches in prev boot journalctl."
+        echo ""
+    } >> "$HW_ERRORS_FILE" 2>&1 || true
 fi
 
 if [ -f "/var/log/syslog" ]; then
     tail -n 1000 /var/log/syslog > "$TARGET_DIR/syslog_tail.txt" 2>&1 || true
+    {
+        echo "--- /var/log/syslog hardware matches ---"
+        grep -iE "$HW_PATTERN" "$TARGET_DIR/syslog_tail.txt" 2>/dev/null || echo "No matches in syslog."
+        echo ""
+    } >> "$HW_ERRORS_FILE" 2>&1 || true
 fi
 
 if [ -f "/var/log/kern.log" ]; then
     tail -n 1000 /var/log/kern.log > "$TARGET_DIR/kern_tail.txt" 2>&1 || true
+    {
+        echo "--- /var/log/kern.log hardware matches ---"
+        grep -iE "$HW_PATTERN" "$TARGET_DIR/kern_tail.txt" 2>/dev/null || echo "No matches in kern.log."
+        echo ""
+    } >> "$HW_ERRORS_FILE" 2>&1 || true
 fi
 
 # 5. SpeedFlow Application State & Telemetry

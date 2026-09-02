@@ -154,9 +154,34 @@ def _open_jtop():
     return None
 
 
-def _read_hw(jtop_session) -> dict:
-    """Return {gpu_percent, cpu_percent, ram_percent, gpu_temp_c}."""
+def _read_hw(jtop_session, payload: dict | None = None) -> dict:
+    """Return {gpu_percent, cpu_percent, ram_percent, gpu_temp_c}.
+
+    If jtop is unavailable (e.g. HealthAgent owns the single jtop socket),
+    fall back to reading hardware fields embedded in payload by HealthAgent.
+    """
     if jtop_session is None:
+        if isinstance(payload, dict):
+            # Check if payload embeds health/hardware metrics (or breakdown)
+            gpu = payload.get("gpu_percent")
+            if isinstance(gpu, (int, float)) and not isinstance(gpu, bool):
+                return {
+                    "gpu_percent": round(float(gpu), 1),
+                    "cpu_percent": round(float(payload.get("cpu_percent", 0.0) or 0.0), 1),
+                    "ram_percent": round(float(payload.get("ram_percent", 0.0) or 0.0), 1),
+                    "gpu_temp_c":  round(float(payload.get("gpu_temp_c", 0.0) or 0.0), 1),
+                }
+            # Also check load_score_breakdown if present
+            bd = payload.get("load_score_breakdown")
+            if isinstance(bd, dict):
+                bd_gpu = bd.get("gpu_percent")
+                if isinstance(bd_gpu, (int, float)) and not isinstance(bd_gpu, bool):
+                    return {
+                        "gpu_percent": round(float(bd_gpu), 1),
+                        "cpu_percent": round(float(bd.get("cpu_percent", 0.0) or 0.0), 1),
+                        "ram_percent": round(float(bd.get("ram_percent", 0.0) or 0.0), 1),
+                        "gpu_temp_c":  round(float(bd.get("gpu_temp_c", 0.0) or 0.0), 1),
+                    }
         return {"gpu_percent": 0.0, "cpu_percent": 0.0,
                 "ram_percent": 0.0, "gpu_temp_c": 0.0}
     try:
@@ -317,7 +342,7 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
             ts = time.time()
 
             # 6) Sample hardware ONCE only after accepting the snapshot
-            hw = _read_hw(jtop)
+            hw = _read_hw(jtop, payload)
 
             # 7) Compute FPS average and camera totals from payload
             all_fps_keys = [k for k, v in payload.items()

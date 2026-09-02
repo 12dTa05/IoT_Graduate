@@ -1334,12 +1334,12 @@ class PeerOrchestrator:
         offline_threshold = timeout + grace_s
         convergence_grace_s = float(self._cfg.get("failover_convergence_grace_s", 15.0))
 
-        with self._lock:
+        with timed_lock(self._lock, "_lock.check_offline_peers.ready_check", logger=logger):
             if not self._pipeline_ready:
                 logger.debug("[PeerOrch] Local pipeline not ready yet. Suppressing peer-offline detection and failover.")
                 return
 
-        with self._self_lock:
+        with timed_lock(self._self_lock, "_self_lock.check_offline_peers.self_heartbeat", logger=logger):
             if self._self_state.last_seen == 0.0 or (now - self._self_state.last_seen > offline_threshold):
                 logger.debug(
                     "[PeerOrch] Self heartbeat stale or missing (age=%.1fs > %.1fs). "
@@ -1349,7 +1349,7 @@ class PeerOrchestrator:
                 )
                 return
 
-        with self._lock:
+        with timed_lock(self._lock, "_lock.check_offline_peers.scan", logger=logger):
             # Per-dead-node / per-peer suppression:
             # Map of node_id -> timestamp of recent failover/offline event
             all_offline_events = {**self._failover_triggered, **self._peer_offline_at}
@@ -1365,7 +1365,7 @@ class PeerOrchestrator:
             # fps={}, 0 active cameras, or waiting/recovery state, the peer is alive
             # and MUST NOT be declared offline or trigger failover rescue.
             if silent_s > offline_threshold:
-                with self._lock:
+                with timed_lock(self._lock, "_lock.check_offline_peers.check_dead", logger=logger):
                     already_triggered = node_id in self._failover_triggered
                     last_event_time = all_offline_events.get(node_id, 0.0)
                 # Per-dead-node suppression: if this specific node already triggered recently,
@@ -1374,7 +1374,7 @@ class PeerOrchestrator:
                 if not already_triggered and (now - last_event_time) < convergence_grace_s and last_event_time > 0.0:
                     continue
 
-                with self._lock:
+                with timed_lock(self._lock, "_lock.check_offline_peers.mark_offline", logger=logger):
                     self._peer_offline_at[node_id] = now
                 self._clear_offload_target(node_id)
                 # Reclaim cameras migrated out to this dead peer locally
@@ -1404,7 +1404,7 @@ class PeerOrchestrator:
                             candidate_orphans.append(c)
                             seen_candidates.add(c)
                 # 4. _migrated_out entries whose holder is the dead peer
-                with self._lock:
+                with timed_lock(self._lock, "_lock.check_offline_peers.find_migrated_out", logger=logger):
                     for c, holder in self._migrated_out.items():
                         if holder == node_id and c and c not in seen_candidates:
                             candidate_orphans.append(c)
@@ -1416,7 +1416,7 @@ class PeerOrchestrator:
                     # sources come back, instead of latching until the peer's
                     # heartbeat revives.
                     retry_interval_s = float(self._cfg.get("failover_retry_interval_s", 30.0))
-                    with self._lock:
+                    with timed_lock(self._lock, "_lock.check_offline_peers.trigger_failover", logger=logger):
                         last_attempt = self._failover_triggered.get(node_id, 0.0)
                         should_trigger = (now - last_attempt) >= retry_interval_s
                         if should_trigger:
@@ -1446,7 +1446,7 @@ class PeerOrchestrator:
                 # Peer is alive — clear the notified/failover flags so we
                 # react again if it goes offline a second time.
                 self._notified_offline.discard(node_id)
-                with self._lock:
+                with timed_lock(self._lock, "_lock.check_offline_peers.alive_reset", logger=logger):
                     self._failover_triggered.pop(node_id, None)
                     self._peer_offline_at.pop(node_id, None)
 
@@ -2008,6 +2008,8 @@ class PeerOrchestrator:
                 avg_fps=self._self_state.avg_fps,
                 fps_per_camera=dict(self._self_state.fps_per_camera),
                 active_cameras=list(self._self_state.active_cameras),
+                streaming_cameras=list(self._self_state.streaming_cameras),
+                held_cameras=list(self._self_state.held_cameras),
                 overload_since=self._self_state.overload_since,
                 penalty_until=self._self_state.penalty_until,
                 risk_index=self._self_state.risk_index,

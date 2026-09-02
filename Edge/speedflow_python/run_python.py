@@ -217,19 +217,23 @@ def _attach_camera_manager(
             return
 
         print(f"[Dynamic] Removing camera '{cam_id}' (source_id={source_id})")
-        dynamic_remove_stream(
-            pipeline, streammux, cam_id, source_id, tiler, source_bins, done_event=done_event
-        )
-
-        # Clean up key after initiating/scheduling removal.
-        # Prevents memory leak during continuous operation over months
-        # and avoids source_id conflicts if the same ID is reused later.
-        removed = source_id_to_cam_id.pop(source_id, None)
-        if removed:
-            print(f"[Dynamic] Cleaned up mapping: source_id={source_id} → '{removed}'")
-        camera_manager.cleanup_stream_ready(source_id)
-        for p in ACTIVE_SPEED_PROBE:
-            p.remove_camera(cam_id, source_id=source_id)
+        try:
+            dynamic_remove_stream(
+                pipeline, streammux, cam_id, source_id, tiler, source_bins, done_event=done_event
+            )
+        except Exception as exc:
+            print(f"[Dynamic] ERROR removing camera '{cam_id}': {exc}", file=sys.stderr)
+            raise
+        finally:
+            # Clean up key after initiating/scheduling removal.
+            # Prevents memory leak during continuous operation over months
+            # and avoids source_id conflicts if the same ID is reused later.
+            removed = source_id_to_cam_id.pop(source_id, None)
+            if removed:
+                print(f"[Dynamic] Cleaned up mapping: source_id={source_id} → '{removed}'")
+            camera_manager.cleanup_stream_ready(source_id)
+            for p in ACTIVE_SPEED_PROBE:
+                p.remove_camera(cam_id, source_id=source_id)
 
     camera_manager.start(on_add, on_remove, GLib.idle_add)
 
@@ -622,7 +626,7 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
                                 if cam_cfg and demux:
                                     _remove_rtsp_push_branch(pipeline, sid)
                                     _add_rtsp_push_branch(
-                                        pipeline, demux, cam_cfg, rtsp_url, bitrate=rtsp_push_bitrate, sync=True
+                                        pipeline, demux, cam_cfg, rtsp_url, bitrate=rtsp_push_bitrate, sync=True, node_camera_map=_node_cam_map
                                     )
                                     _sink_reconnect_attempts[0] = 0
                                     print(f"[RTSP Push] Rebuilt sink branch for camera '{cam_cfg.camera_id}' (source_id={sid}); pipeline remains PLAYING", file=sys.stderr)

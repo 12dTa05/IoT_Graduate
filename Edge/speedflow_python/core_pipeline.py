@@ -193,10 +193,18 @@ def _add_rtsp_push_branch(
 ) -> list[Gst.Element]:
     """Create one nvstreamdemux -> encoder -> rtspclientsink branch for cam_cfg."""
     sid = cam_cfg.source_id
-    if pipeline.get_by_name(f"queue_rtsp_push_{sid}"):
-        return []
-
     suffix = f"_{sid}"
+
+    # Clean up any stale RTSP push branch for this slot before adding fresh branch
+    existing_queue = pipeline.get_by_name(f"queue_rtsp_push{suffix}")
+    existing_sink = pipeline.get_by_name(f"sink_rtsp_push{suffix}")
+    if existing_queue is not None or existing_sink is not None:
+        logger.info(
+            "[Pipeline] Cleaning up stale RTSP push branch for '%s' (source_id=%d) before adding fresh branch",
+            cam_cfg.camera_id, sid,
+        )
+        _remove_rtsp_push_branch(pipeline, sid)
+
     queue = make_element(f"queue_rtsp_push{suffix}", "queue")
     conv = make_element(f"conv_rtsp_push{suffix}", "nvvideoconvert")
     caps = make_element(f"caps_rtsp_push{suffix}", "capsfilter")
@@ -225,20 +233,54 @@ def _add_rtsp_push_branch(
     for el in elements:
         pipeline.add(el)
 
-    # Link all downstream chain from queue
-    gst_link(queue, conv, caps, enc, parse, sink)
+    try:
+        # Link all downstream chain from queue
+        gst_link(queue, conv, caps, enc, parse, sink)
 
-    # Request and link demux src pad
-    srcpad = demux.get_request_pad(f"src_{sid}")
-    sinkpad = queue.get_static_pad("sink")
-    if srcpad and sinkpad and not sinkpad.is_linked():
-        srcpad.link(sinkpad)
+        # Demux request pads are permanent; get pre-created static pad
+        srcpad = demux.get_static_pad(f"src_{sid}")
+        sinkpad = queue.get_static_pad("sink")
 
-    if sync:
-        for el in elements:
-            el.sync_state_with_parent()
+        if srcpad is None:
+            raise RuntimeError(
+                f"Permanent demux src pad 'src_{sid}' not found for camera '{cam_cfg.camera_id}' (source_id={sid})"
+            )
+        if sinkpad is None:
+            raise RuntimeError(
+                f"Queue sink pad not found for camera '{cam_cfg.camera_id}' (source_id={sid})"
+            )
 
-    return elements
+        if hasattr(srcpad, "get_direction") and hasattr(Gst, "PadDirection"):
+            if srcpad.get_direction() != Gst.PadDirection.SRC:
+                raise RuntimeError(f"Demux pad for source_id={sid} is not a SRC pad")
+        if hasattr(sinkpad, "get_direction") and hasattr(Gst, "PadDirection"):
+            if sinkpad.get_direction() != Gst.PadDirection.SINK:
+                raise RuntimeError(f"Queue sink pad for source_id={sid} is not a SINK pad")
+
+        link_ret = srcpad.link(sinkpad)
+        ok_val = getattr(getattr(Gst, "PadLinkReturn", None), "OK", 0)
+        if link_ret is not None and link_ret != ok_val and link_ret is not True:
+            link_nick = getattr(link_ret, "value_nick", str(link_ret))
+            logger.error(
+                "[Pipeline] Failed to link demux pad to RTSP push queue for camera '%s' (source_id=%d): return=%s",
+                cam_cfg.camera_id, sid, link_nick,
+            )
+            raise RuntimeError(
+                f"Failed to link demux pad to RTSP push queue for camera '{cam_cfg.camera_id}' (source_id={sid}): return={link_nick}"
+            )
+
+        if sync:
+            for el in elements:
+                el.sync_state_with_parent()
+
+        return elements
+    except Exception as exc:
+        logger.error(
+            "[Pipeline] Error setting up RTSP push branch for '%s' (source_id=%d): %s",
+            cam_cfg.camera_id, sid, exc,
+        )
+        _remove_rtsp_push_branch(pipeline, sid)
+        raise
 
 
 def _remove_rtsp_push_branch(pipeline: Gst.Pipeline, source_id: int) -> None:
@@ -253,19 +295,37 @@ def _remove_rtsp_push_branch(pipeline: Gst.Pipeline, source_id: int) -> None:
         f"sink_rtsp_push{suffix}",
     ]
     elements = [pipeline.get_by_name(n) for n in names if pipeline.get_by_name(n) is not None]
+    if not elements:
+        return
 
-    for el in elements:
-        el.set_state(Gst.State.NULL)
+    # 1. Unlink from nvstreamdemux (idempotent, demux request pad is permanent and never released)
+    queue = pipeline.get_by_name(f"queue_rtsp_push{suffix}")
+    sinkpad = queue.get_static_pad("sink") if queue else None
+    demux_srcpad = demux.get_static_pad(f"src_{source_id}") if demux else None
 
-    if demux:
-        srcpad = demux.get_static_pad(f"src_{source_id}")
-        queue = pipeline.get_by_name(f"queue_rtsp_push{suffix}")
-        sinkpad = queue.get_static_pad("sink") if queue else None
-        if srcpad and sinkpad and srcpad.is_linked():
-            srcpad.unlink(sinkpad)
-        if srcpad:
-            demux.release_request_pad(srcpad)
+    if sinkpad and sinkpad.is_linked():
+        peer = sinkpad.get_peer() if hasattr(sinkpad, "get_peer") else None
+        if peer:
+            peer.unlink(sinkpad)
+    elif demux_srcpad and demux_srcpad.is_linked():
+        peer = demux_srcpad.get_peer() if hasattr(demux_srcpad, "get_peer") else None
+        if peer:
+            demux_srcpad.unlink(peer)
 
+    # 2. Sequential teardown PLAYING -> PAUSED -> READY -> NULL with get_state waits
+    for target_state in (Gst.State.PAUSED, Gst.State.READY, Gst.State.NULL):
+        for el in elements:
+            el.set_state(target_state)
+        for el in elements:
+            state_ret, current_state, _ = el.get_state(1 * Gst.SECOND)
+            if state_ret == Gst.StateChangeReturn.FAILURE:
+                target_nick = getattr(target_state, "value_nick", str(target_state))
+                curr_nick = getattr(current_state, "value_nick", str(current_state))
+                raise RuntimeError(
+                    f"RTSP push element {el.get_name()} failed to reach {target_nick}: state={curr_nick}"
+                )
+
+    # 3. Remove elements from pipeline
     for el in elements:
         pipeline.remove(el)
 
@@ -298,7 +358,7 @@ def _add_file_recording_branch(
 
     sid = cam_cfg.source_id
     if pipeline.get_by_name(f"queue_file_{sid}"):
-        return
+        _remove_file_recording_branch(pipeline, sid)
 
     queue = make_element(f"queue_file_{sid}", "queue")
     postosd = make_element(f"postosd_{sid}", "nvvideoconvert")
@@ -323,7 +383,7 @@ def _add_file_recording_branch(
 
     gst_link(queue, postosd, enc, parse, muxer, fsink)
 
-    srcpad = demux.get_request_pad(f"src_{sid}")
+    srcpad = demux.get_static_pad(f"src_{sid}")
     sinkpad = queue.get_static_pad("sink")
     if srcpad and sinkpad and not sinkpad.is_linked():
         srcpad.link(sinkpad)
@@ -343,23 +403,36 @@ def _remove_file_recording_branch(pipeline: Gst.Pipeline, source_id: int) -> Non
         pipeline.get_by_name(f"mux_{source_id}"),
         pipeline.get_by_name(f"fsink_{source_id}"),
     ]
+    elements = [el for el in elements if el is not None]
+    if not elements:
+        return
+
+    # 1. Unlink from nvstreamdemux (idempotent, demux request pad is permanent and never released)
+    queue = pipeline.get_by_name(f"queue_file_{source_id}")
+    sinkpad = queue.get_static_pad("sink") if queue else None
+    srcpad = demux.get_static_pad(f"src_{source_id}") if demux else None
+
+    if sinkpad and sinkpad.is_linked():
+        peer = sinkpad.get_peer() if hasattr(sinkpad, "get_peer") else None
+        if peer:
+            peer.unlink(sinkpad)
+    elif srcpad and srcpad.is_linked():
+        peer = srcpad.get_peer() if hasattr(srcpad, "get_peer") else None
+        if peer:
+            srcpad.unlink(peer)
+
+    # 2. Sequential teardown PLAYING -> PAUSED -> READY -> NULL with get_state waits
+    for target_state in (Gst.State.PAUSED, Gst.State.READY, Gst.State.NULL):
+        for el in elements:
+            el.set_state(target_state)
+        for el in elements:
+            try:
+                el.get_state(1 * Gst.SECOND)
+            except Exception:
+                pass
 
     for el in elements:
-        if el:
-            el.set_state(Gst.State.NULL)
-
-    if demux:
-        srcpad = demux.get_static_pad(f"src_{source_id}")
-        queue = elements[0]
-        sinkpad = queue.get_static_pad("sink") if queue else None
-        if srcpad and sinkpad and srcpad.is_linked():
-            srcpad.unlink(sinkpad)
-        if srcpad:
-            demux.release_request_pad(srcpad)
-
-    for el in elements:
-        if el:
-            pipeline.remove(el)
+        pipeline.remove(el)
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +584,12 @@ def build_pipeline(
     elif sink_type == "rtsp_push":
         demux = make_element("demux", "nvstreamdemux")
         pipeline.add(demux)
+        for sid in range(slot_capacity):
+            demux.get_request_pad(f"src_{sid}")
+        logger.info(
+            "[Pipeline] Pre-created %d permanent demux src pads (slot_capacity=%d)",
+            slot_capacity, slot_capacity,
+        )
         rtsp_base_url = kwargs.get("rtsp_push_base_url") or kwargs.get("rtsp_push_url") or ""
         rtsp_bitrate = kwargs.get("rtsp_push_bitrate") or kwargs.get("bitrate", 750_000)
         node_cam_map = kwargs.get("node_camera_map")
@@ -520,6 +599,12 @@ def build_pipeline(
         # ── Demuxer ──
         demux = make_element("demux", "nvstreamdemux")
         pipeline.add(demux)
+        for sid in range(slot_capacity):
+            demux.get_request_pad(f"src_{sid}")
+        logger.info(
+            "[Pipeline] Pre-created %d permanent demux src pads (slot_capacity=%d)",
+            slot_capacity, slot_capacity,
+        )
 
         for cam_cfg in camera_configs:
             _add_file_recording_branch(pipeline, demux, cam_cfg)
@@ -877,6 +962,11 @@ def _teardown_source_branch(
     pre_rss = _proc_rss_mb()
 
     try:
+        # Teardown downstream RTSP push / file recording branch first
+        # so source removal cannot send EOS / broken state into live rtspclientsink
+        _remove_rtsp_push_branch(pipeline, source_id)
+        _remove_file_recording_branch(pipeline, source_id)
+
         q_elem = pipeline.get_by_name(f"q_{camera_id}")
         conv_elem = pipeline.get_by_name(f"conv_{camera_id}")
         conv_pad = conv_elem.get_static_pad("src") if conv_elem else None
@@ -919,10 +1009,6 @@ def _teardown_source_branch(
         for el in branch_elements:
             pipeline.remove(el)
 
-        # Clean up recording / RTSP push branches
-        _remove_file_recording_branch(pipeline, source_id)
-        _remove_rtsp_push_branch(pipeline, source_id)
-
         # Bookkeeping
         if camera_id in source_bins:
             del source_bins[camera_id]
@@ -948,6 +1034,7 @@ def _teardown_source_branch(
         logger.info("[Pipeline] Cleaned up resources for camera %s", camera_id)
     except Exception as exc:
         logger.error("[Pipeline] Error during cleanup of camera %s: %s", camera_id, exc)
+        raise
 
 
 def dynamic_remove_stream(
