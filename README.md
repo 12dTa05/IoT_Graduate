@@ -153,15 +153,26 @@ The **vehicle-crop tier is retired**: no orchestrator trigger assigns
 `offload_level==2`, no session publisher emits a level-2 `start` handshake, and the
 receiver drops unsessioned vehicle crops. It is not part of the ratified tier model.
 
-### Trigger model (two independent decisions)
+### Mandatory Escalation Ladder (L0 → L2 → L1)
 
-- **L1** is driven by node overload (load_score / stream-pressure via the existing
-  RFO/lease path) — the decode/tracking relief primitive.
-- **L2** is driven by **local LPR-queue saturation** (`lpr_offload_up_threshold`,
-  default 0.75): when the local `LocalLprWorker` pool saturates, the owner escalates the
-  heaviest local camera's plate-crop work to a peer; it reclaims (back to L0) when the
-  queue drains (`lpr_offload_down_threshold`, default 0.35). L2 does **not** move the
-  stream and does **not** require a load-band dwell ladder.
+The system strictly enforces a sequential offload ladder under node overload:
+
+1. **L0 → L2 Escalation**: When a node is overloaded (`load_score >= overload_threshold`,
+   default 55.0 sustained for `overload_duration_s=3.0s`), the orchestrator initiates
+   L2 plate-crop offload for its **heaviest local camera** (`rank_by="workload"`).
+2. **L2 Observation Hold Window**: The node enters an observation hold window
+   (`l2_hold_duration_s=8.0s`), tracking `_l2_escalation_ts` while peer LPR relieves
+   local queue and service deficit.
+3. **L2 → L1 Escalation**: Only if the node **remains overloaded** (`load_score >= 55.0`
+   and `stream_pressure >= 0.30`) after the 8.0s hold has elapsed does the orchestrator
+   escalate to L1 full-stream migration (RFO broadcast). If local load recovers below
+   the threshold during the hold window, L1 migration is avoided entirely.
+4. **L2 Cleanup on L1**: When L1 migration is triggered for a camera, any existing L2
+   plate-crop offload for that camera is de-escalated back to L0 (`set_offload_level(cam, 0)`).
+5. **Direct L2 Queue Relief**: In addition to the overload ladder, L2 plate-crop offload
+   can activate independently when the local LPR worker queue saturates
+   (`lpr_queue_ratio > lpr_offload_up_threshold`, default 0.75), and reclaims when the
+   queue drains (`lpr_offload_down_threshold`, default 0.35).
 
 ### De-escalation (return to level 0)
 
@@ -262,6 +273,13 @@ Lessons baked into code after field incidents:
 
 ## Stream Lifecycle Robustness
 
+- **Teardown cascade elimination (`NOT_LINKED` probe + prefix matching).** During dynamic
+  removal (`_teardown_source_branch`), an IDLE block pad probe is placed on `conv_pad`
+  to drop all buffers and downstream events before `conv_pad.unlink(mux_sinkpad)`,
+  completely eliminating `GST_FLOW_NOT_LINKED (-1)` bus errors from upstream queues.
+  The GStreamer bus error handler matches `q_` and `conv_` element prefixes to isolate
+  branch teardown errors from the main pipeline. Synchronous teardown waits (`get_state`,
+  `drained.wait`) execute decoupled from the GLib main loop.
 - **Synchronous removal.** Teardown is a sequential PLAYING→PAUSED→READY→NULL state
   walk with get_state waits (nvv4l2decoder hardware-register requirement — direct
   PLAYING→NULL deadlocks the kernel and requires a power cycle). A post-teardown audit

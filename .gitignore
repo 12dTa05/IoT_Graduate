@@ -2,6 +2,7 @@
 .cortexkit
 .pytest_cache
 __pycache__
+conftest.py
 
 Camera/videos
 
@@ -14,6 +15,7 @@ Edge/__pycache__
 Edge/speedflow_python/__pycache__
 Edge/speedflow_python/tests
 Edge/tools/__pycache__
+Edge/tools/test_*.py
 Edge/tests/__pycache__
 Edge/.pytest_cache
 
@@ -21,6 +23,14 @@ Server/__pycache__
 Server/violations
 Server/test_*.py
 Server/speedflow-server.service
+
+# All tests and test harnesses (host-only)
+tests/
+**/tests/
+test_*.py
+**/test_*.py
+*_test.py
+**/test_*.sh
 
 Data_From_Jetsons/
 
