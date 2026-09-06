@@ -3,11 +3,9 @@
 Builds a DeepStream pipeline with multi-stream support.
 
 Architecture:
-  N × uridecodebin ──→ nvstreammux ──→ PGIE ──→ Tracker ──→ SGIE1 ──→ SGIE2
-                                                                        │
-                                                                  nvdsanalytics
-                                                                        │
-                               ┌──────────────────────────────────────────┘
+  N × uridecodebin ──→ nvstreammux ──→ PGIE ──→ Tracker ──→ SGIE ──→ nvdsanalytics
+                                                                           │
+                               ┌───────────────────────────────────────────┘
                                │
                     sink_type == "display":     nvmultistreamtiler → OSD → EGL sink
                     sink_type == "file":        OSD → nvstreamdemux → N × encoder → filesink
@@ -26,7 +24,7 @@ from gi.repository import Gst
 from .common import make_element, gst_link
 from .settings import (
     INFER_CONFIG, TRACKER_CFG, ANALYTICS_CFG,
-    SGIE_CONFIG, TRACKER_LIB, LPR_CONFIG,
+    SGIE_CONFIG, TRACKER_LIB,
     SPEEDFLOW_SLOT_CAPACITY, SPEEDFLOW_NVDEC_SESSION_LIMIT,
     RTSP_PUSH_BITRATE,
 )
@@ -505,7 +503,7 @@ def build_pipeline(
     )
 
     # ── Core AI processing ───────────────────────────────────────────────────
-    logger.info("[DeepStream] Configuring AI elements (PGIE, Tracker, SGIE, LPR, Analytics): mono_ts=%.6f", time.monotonic())
+    logger.info("[DeepStream] Configuring AI elements (PGIE, Tracker, SGIE, Analytics): mono_ts=%.6f", time.monotonic())
     pgie = make_element("primary-infer", "nvinfer")
     pgie.set_property("config-file-path", str(INFER_CONFIG))
     logger.info("[DeepStream] PGIE configured: config=%s", INFER_CONFIG)
@@ -521,10 +519,6 @@ def build_pipeline(
     sgie = make_element("secondary-infer", "nvinfer")
     sgie.set_property("config-file-path", str(SGIE_CONFIG))
     logger.info("[DeepStream] SGIE configured: config=%s", SGIE_CONFIG)
-
-    sgie2 = make_element("lpr-classifier", "nvinfer")
-    sgie2.set_property("config-file-path", str(LPR_CONFIG))
-    logger.info("[DeepStream] LPR configured: config=%s", LPR_CONFIG)
 
     analytics = make_element("analytics", "nvdsanalytics")
     analytics.set_property("config-file", analytics_config)
@@ -614,7 +608,7 @@ def build_pipeline(
 
     # ── Add core elements to pipeline ─────────────────────────────────────────
     core_elements = [
-        streammux, pgie, tracker, sgie, sgie2,
+        streammux, pgie, tracker, sgie,
         analytics, preosd_convert, preosd_caps, nvdsosd,
     ]
     if is_tiled:
@@ -626,12 +620,12 @@ def build_pipeline(
     # ── Link core chain ───────────────────────────────────────────────────────
     if is_tiled:
         gst_link(
-            streammux, pgie, tracker, sgie, sgie2,
+            streammux, pgie, tracker, sgie,
             analytics, preosd_convert, preosd_caps, tiler, nvdsosd,
         )
     else:
         gst_link(
-            streammux, pgie, tracker, sgie, sgie2,
+            streammux, pgie, tracker, sgie,
             analytics, preosd_convert, preosd_caps, nvdsosd,
         )
 
@@ -972,8 +966,31 @@ def _teardown_source_branch(
         conv_pad = conv_elem.get_static_pad("src") if conv_elem else None
         mux_sinkpad = conv_pad.get_peer() if conv_pad and conv_pad.is_linked() else None
 
-        # Transition source branch elements sequentially PLAYING -> PAUSED -> READY -> NULL
-        branch_elements = [el for el in [src, q_elem, conv_elem] if el is not None]
+        # P1: 1) Unlink conv->mux FIRST so the drain/EOS can never reach the shared
+        #        nvstreammux (which serves other cameras — EOS there would kill them).
+        if conv_pad and mux_sinkpad and conv_pad.is_linked():
+            conv_pad.unlink(mux_sinkpad)
+
+        # 2) Drain the decoder: inject EOS at the branch head and let nvv4l2decoder
+        #    flush its picture-buffer pool downstream into the now-dead-ended conv.
+        #    A blocking pad probe at conv:src catches the EOS so we know the decoder
+        #    has released every output surface BEFORE any element goes to NULL.
+        drained = threading.Event()
+        if conv_pad is not None:
+            def _catch_eos(pad, info):
+                ev = info.get_event()
+                if ev and ev.type == Gst.EventType.EOS:
+                    drained.set()
+                    return Gst.PadProbeReturn.DROP
+                return Gst.PadProbeReturn.PASS
+            conv_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, _catch_eos)
+            src.send_event(Gst.Event.new_eos())
+            if not drained.wait(timeout=3.0):
+                logger.warning("[Pipeline] '%s' EOS drain timed out (3s); forcing teardown.", camera_id)
+
+        # 3) State down DOWNSTREAM-FIRST (conv -> q -> src): the decoder reaches NULL
+        #    last, after its surfaces are already drained and unreferenced.
+        branch_elements = [el for el in [conv_elem, q_elem, src] if el is not None]
         for target_state in (Gst.State.PAUSED, Gst.State.READY, Gst.State.NULL):
             for el in branch_elements:
                 el.set_state(target_state)
@@ -999,11 +1016,6 @@ def _teardown_source_branch(
                         "camera %s — NVDEC session leak risk!",
                         dec_el.get_name(), fname, dec_state.value_nick, camera_id,
                     )
-
-        # Unlink conv src from the mux sink pad.
-        # ponytail: release_request_pad deliberately omitted — pads are permanent (#596).
-        if conv_pad and mux_sinkpad and conv_pad.is_linked():
-            conv_pad.unlink(mux_sinkpad)
 
         # Remove elements from pipeline
         for el in branch_elements:
@@ -1062,3 +1074,189 @@ def dynamic_remove_stream(
     _teardown_source_branch(pipeline, streammux, camera_id, source_id, tiler, source_bins)
     if done_event is not None:
         done_event.set()
+
+
+# ---------------------------------------------------------------------------
+# RTSP publisher failure isolation (P1)
+# ---------------------------------------------------------------------------
+#
+# A publisher (rtspclientsink) failure must stay a *per-camera leaf*: it must
+# never propagate into a full DeepStream pipeline restart or an ADD/REMOVE
+# storm.  The logic below is intentionally free of any GStreamer dependency so
+# it can be unit-tested in isolation (the recovery controller, the error
+# classifier, and the decision router are pure Python).
+
+def classify_pipeline_error(
+    src_name: str,
+    err_text: str = "",
+    debug_text: str = "",
+    *,
+    is_rtsp_sink: bool = False,
+) -> str:
+    """Classify a GStreamer ERROR bus message.
+
+    Returns one of:
+      - "transient"   : benign, self-healing decoder starvation (NVDEC buffer
+                        exhaustion) — caller should keep the pipeline running.
+      - "publisher"   : the failure originated in an RTSP push publisher
+                        (rtspclientsink / per-camera push branch) — isolate it.
+      - "pipeline"    : any other genuine pipeline-level error.
+    """
+    text = f"{err_text} {debug_text or ''}"
+    if "OutputBufferUnavailable" in text or "cbAllocPictureBuffer" in text:
+        return "transient"
+    if is_rtsp_sink:
+        return "publisher"
+    return "pipeline"
+
+
+class PublisherRecovery:
+    """Per-camera single-flight bounded-exponential retry + circuit breaker.
+
+    State is keyed by camera id.  The controller guarantees:
+      * single-flight — at most one in-flight recovery per camera, so a burst
+        of publisher errors cannot spawn an ADD/REMOVE storm (one rebuild at
+        a time, scheduled retries coalesced).
+      * bounded exponential backoff — delay grows base*2**n, capped at
+        ``max_delay_s``.
+      * circuit breaker — after ``max_attempts`` consecutive failures the
+        branch is left DOWN (leaf) instead of thrashing; it auto-resets after
+        ``reset_after_s`` so a later healthy window can retry.
+      * intentional teardown — cameras being removed on purpose are excluded
+        from recovery entirely.
+
+    No GStreamer calls: safe to import and exercise under stdlib-only tests.
+    """
+
+    def __init__(
+        self,
+        max_attempts: int = 5,
+        base_delay_s: float = 2.0,
+        max_delay_s: float = 60.0,
+        reset_after_s: float = 300.0,
+    ):
+        self.max_attempts = int(max_attempts)
+        self.base_delay_s = float(base_delay_s)
+        self.max_delay_s = float(max_delay_s)
+        self.reset_after_s = float(reset_after_s)
+        self._state: dict = {}          # cam_id -> {attempts, last_failure, in_flight, circuit_open}
+        self._intentional: set = set()
+
+    # -- intentional teardown ------------------------------------------------
+    def mark_intentional_teardown(self, cam_id) -> None:
+        self._intentional.add(cam_id)
+
+    def clear_intentional_teardown(self, cam_id) -> None:
+        self._intentional.discard(cam_id)
+
+    def is_intentional_teardown(self, cam_id) -> bool:
+        return cam_id in self._intentional
+
+    # -- state helpers ------------------------------------------------------
+    def _st(self, cam_id) -> dict:
+        s = self._state.get(cam_id)
+        if s is None:
+            s = {"attempts": 0, "last_failure": 0.0, "in_flight": False, "circuit_open": False}
+            self._state[cam_id] = s
+        return s
+
+    def begin_attempt(self, cam_id) -> None:
+        self._st(cam_id)["in_flight"] = True
+
+    def clear_in_flight(self, cam_id) -> None:
+        self._st(cam_id)["in_flight"] = False
+
+    def _hold(self, cam_id) -> None:
+        self._st(cam_id)["in_flight"] = True
+
+    def record_success(self, cam_id) -> None:
+        s = self._st(cam_id)
+        s["attempts"] = 0
+        s["in_flight"] = False
+        s["circuit_open"] = False
+        s["last_failure"] = 0.0
+
+    def record_failure(self, cam_id, now: float = None) -> None:
+        s = self._st(cam_id)
+        s["in_flight"] = False
+        s["attempts"] += 1
+        s["last_failure"] = now if now is not None else time.monotonic()
+        if s["attempts"] >= self.max_attempts:
+            s["circuit_open"] = True
+
+    def backoff_seconds(self, cam_id) -> float:
+        s = self._st(cam_id)
+        exp = self.base_delay_s * (2 ** max(0, s["attempts"] - 1))
+        return min(self.max_delay_s, exp)
+
+    def _maybe_reset(self, cam_id, now: float = None) -> None:
+        s = self._state.get(cam_id)
+        if not s or not s["last_failure"]:
+            return
+        now = now if now is not None else time.monotonic()
+        if (now - s["last_failure"]) >= self.reset_after_s:
+            s["attempts"] = 0
+            s["circuit_open"] = False
+            s["last_failure"] = 0.0
+
+    def is_recoverable(self, cam_id) -> bool:
+        if cam_id in self._intentional:
+            return False
+        s = self._state.get(cam_id)
+        if s is None:
+            return True
+        if s["in_flight"]:
+            return False
+        self._maybe_reset(cam_id)
+        s = self._state[cam_id]
+        if s["circuit_open"]:
+            return False
+        if s["attempts"] >= self.max_attempts:
+            return False
+        return True
+
+
+def handle_publisher_failure(
+    recovery: "PublisherRecovery",
+    cam_id,
+    rebuild_fn,
+    schedule_fn,
+) -> str:
+    """Route one publisher error for a single camera.
+
+    ``rebuild_fn`` takes no arguments and returns True on success.
+    ``schedule_fn(delay_seconds)`` schedules a later retry (single-flight).
+
+    Returns one of:
+      - "intentional" : camera is being intentionally removed — do nothing.
+      - "recovered"   : rebuild succeeded; analytics pipeline stays PLAYING.
+      - "scheduled"   : rebuild failed, a single bounded retry was scheduled.
+      - "leaf"        : retry budget / circuit exhausted — branch left down,
+                        analytics pipeline stays PLAYING (NO full restart).
+
+    Callers MUST NOT call loop.quit() on any of these outcomes: publisher
+    failure is a per-camera leaf by construction.
+    """
+    if recovery.is_intentional_teardown(cam_id):
+        return "intentional"
+
+    if not recovery.is_recoverable(cam_id):
+        return "leaf"
+
+    recovery.begin_attempt(cam_id)
+    try:
+        ok = bool(rebuild_fn())
+    except Exception:
+        ok = False
+
+    if ok:
+        recovery.record_success(cam_id)
+        return "recovered"
+
+    recovery.record_failure(cam_id)
+    if recovery.is_recoverable(cam_id):
+        delay = recovery.backoff_seconds(cam_id)
+        recovery._hold(cam_id)
+        schedule_fn(delay)
+        return "scheduled"
+    return "leaf"

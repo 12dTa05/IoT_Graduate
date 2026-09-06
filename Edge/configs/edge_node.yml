@@ -8,8 +8,8 @@
 # ============================================================
 
 p2p:
-  overload_threshold: 55.0      # load_score at or above this triggers RFO; L3 anchor
-                                   # under Base + Bonus load_score (L3=60)
+  overload_threshold: 55.0      # load_score at or above this triggers RFO (L1 full-stream migration)
+                                   # peak under Base + Bonus load_score ≈ 60
   overload_duration_s: 3.0     # must be overloaded this long before RFO
                                    # quick reaction (3s) while filtering instant 1s telemetry jitter
   cooldown_s: 6.0              # per-camera cooldown between migrations
@@ -17,7 +17,7 @@ p2p:
   migration_timeout_s: 12.0    # wait for ADD ack before rollback (restored to safe default;
                                  # 2 s was too tight for slow RTSP sources across LAN)
   add_ack_timeout_s: 8.0      # max wait on receiver for ADD stream to reach PLAYING (must be < migration_timeout_s)
-  heartbeat_timeout_s: 5.0      # peer declared OFFLINE after this silence
+  heartbeat_timeout_s: 10.0     # peer declared OFFLINE after this silence (match Server/edge_registry.py HEARTBEAT_TIMEOUT=10.0)
   failover_grace_s: 10.0        # grace period between heartbeat timeout and offline declaration; allows Zenoh mesh reconvergence after container restart without triggering false-offline cascades
   failover_convergence_grace_s: 15.0 # suppress mutual false-offline cascade during failover convergence
   rescue_claim_window_s: 1.0    # claim window to collect peer rescue claims before ADD
@@ -36,6 +36,21 @@ p2p:
   bounce_max: 3                # max migrations per camera in bounce_window_s before L1 exclusion
   bounce_window_s: 60.0        # bounce observation window (seconds)
   zombie_timeout_count: 3      # consecutive migration timeouts before excluding peer from selection
+
+  # Offload tiers (ADR-0002, canonical governance naming):
+  #   L0 — local full DeepStream analytics (default; offload_level==0)
+  #   L1 — full-stream RTSP migration via the RFO/lease path (offload_level==1)
+  #   L2 — plate-crop offload for off-pipeline LPR (offload_level==3; the
+  #        source enum skips 2 — see the note on the `offload_level` block below)
+  # The vehicle-crop tier (source offload_level==2) was retired — no trigger,
+  # no session publisher, receiver drops unsessioned vehicle crops.
+  # The single L1 transfer decision is gated by an offload-aware stream-pressure
+  # signal (see membership._compute_stream_pressure). ADR-0001: stream-pressure is
+  # workload/resource pressure (GPU/CPU/RAM saturation + per-camera demand +
+  # source starvation) — NOT FPS deficit. Fail closed only when telemetry invalid.
+  target_fps: 25.0             # decode/inference target FPS (bid scoring / eps tiers only; NOT a migration gate)
+  workload_saturation_point: 10.0  # PROVISIONAL/INFERRED per-camera demand saturation (sum n_track+n_plate); mirrors load_score.workload_policy.w_high. Tune vs real telemetry.
+  stream_pressure_threshold: 0.30  # min [0,1] workload/resource pressure to authorize L1 (fail closed below this)
 
   # Static node-to-camera ownership mapping (for cluster topology & failover isolation)
   node_camera_map:
@@ -83,34 +98,17 @@ p2p:
     4: 15.5
 
   # ---------------------------------------------------------------------------
-  # Multi-level offload (Levels 1–3 from the paper)
-  # offload_level: 0 = disabled — bypass ladder, jump straight to Level 1 only
-  #                1 = Level 1 only  (full-stream RTSP migration)
-  #                2 = Level 2 + 1   (vehicle-crop offload, then stream migration)
-  #                3 = Level 3 + 2 + 1 (full escalation ladder — plate → vehicle → stream)
-  # The orchestrator escalates automatically: 3 → 2 → 1.
-  # Set offload_level: 0 to skip fine-grained offload and go straight to migration.
+  # Offload level enum (source numeric; canonical governance tiers in ADR-0002)
+  #   offload_level: 0 = L0 local full analytics (default)
+  #                 1 = L1 full-stream RTSP migration (the only decode/tracking relief)
+  #                 3 = L2 plate-crop offload for off-pipeline LPR (stream stays local)
+  #   NOTE: source enum skips 2 — the vehicle-crop tier (would be 2) is RETIRED.
+  #   Do NOT read this as a 3→2→1 escalation ladder; L1 and L2(=3) are independent
+  #   offload modes selected by separate triggers (overload vs LPR-queue saturation).
   # ---------------------------------------------------------------------------
   offload_level: 3
 
-  # Load thresholds that trigger each escalation step
-  # Calibrated for the weighted multi-signal composite load_score:
-  #   L3: 42.0 (plate crops) · L2: 50.0 (vehicle crops) · L1: 60.0 (stream migration)
-  offload_level3_threshold: 55.0   # L3: crop offload → plate-crop offload first
-  offload_level2_threshold: 64.0   # L2: vehicle-crop offload when load worsens
-  offload_level1_threshold: 72.0   # L1: fall-stream RTSP migration at critical load
-
-  # Cooldown between level changes for the same camera (seconds)
-  offload_level_cooldown_s: 6.0
-
-  # Minimum dwell time (seconds) before escalation from a lower level.
-  # Prevents premature escalation while the lower-level offload takes effect.
-  # Dwell starts when set_offload_level commits L3/L2 for that camera.
-  # Bypassed if a hardware emergency fuse is explicitly active.
-  l3_dwell_s: 4.0    # L3 must remain active this long before L2
-  l2_dwell_s: 5.0     # L2 must remain active this long before L1
-  offload_release_dwell_s: 5.0  # Duration node must stay below thr3 before clearing L2/L3 offload
-  l2_no_improvement_s: 30.0     # Max dwell at Level 2 without load dropping below thr3 before escalating to L1
+  offload_release_dwell_s: 5.0  # node must stay below L2/L1 release threshold this long before clearing offload
   offload_session_idle_s: 10.0   # receiver session TTL in seconds
 
   # TensorRT engine paths used by the offload receiver (Level 2 + 3)
@@ -118,7 +116,10 @@ p2p:
   lpd_engine_path: "models/lpd.engine"
 
 # ---------------------------------------------------------------------------
-# Load score — Completion-Primary (Service Mode) with Legacy Fallback
+# Load score — `legacy` is the ACTIVE default mode (workload/FPS fallback);
+# the Completion-Primary (Service Mode) form below applies ONLY if
+# load_score.mode (line ~151) is set to "service". (mode default switched to
+# legacy by commit d46fe87.)
 #
 # Form (mode: service):
 #   instant_completion = d_fin / (d_fin + d_miss) over evaluation interval
@@ -138,14 +139,33 @@ load_score:
   hw_fuse_threshold: 90.0
   hw_fuse_score_floor: 80.0
 
-  # Workload-primary + FPS-confirmation policy gating
+  # Workload-primary demand/resource/service policy (ADR-0001).
+  # FPS is an EMERGENCY SAFETY FUSE ONLY (fps_emergency floor on collapse) —
+  # never a primary trigger or de-escalation veto.
+  # NOTE: w_demand / w_resource / w_service / fps_emergency are PROVISIONAL /
+  # INFERRED — weights are reasonable defaults, NOT measured constants. Tune
+  # against real Jetson telemetry before asserting any numeric value (W_sat
+  # remains provisional per ADR-0001).
   workload_policy:
     enabled: true
     w_low: 6.0
-    w_high: 20.0
-    fps_confirm: 22.0
-    fps_critical: 18.0
+    # w_high: provisional saturation point (INFERRED) for the demand axis.
+    # Aligned with load_score.workload.capacity (40) and p2p.workload_saturation_point
+    # so NORMAL calibrated demand can reach the overload threshold WITHOUT requiring
+    # FPS. W_sat remains provisional per ADR-0001 — tune against real telemetry.
+    w_high: 10.0
     alpha_ema: 0.33
+    # Stream concurrency axis: convex knee on EMC LPDDR5 bus.
+    stream_knee: 2.5
+    stream_exp: 2.2
+    # Resource axis: CPU/RAM saturation safety margin (rho_r = 0 below this).
+    u_safe: 0.60
+    # Service axis: bounded completion-deficit vs achievable floor (rho_v_max cap).
+    svc_target: 0.95
+    svc_floor: 0.50
+    rho_v_max: 1.0
+    # Emergency FPS safety fuse: floor the score only when FPS collapses below this.
+    fps_emergency: 12.0
 
   workload:
     enabled: true
@@ -158,10 +178,8 @@ load_score:
     critical_c: 85.0
     max_bonus: 5.0
 
-  recv:
-    enabled: true
-    capacity: 10.0
-    max_bonus: 5.0
+  # recv: (removed) crop-receive bonus was dead scoring — crop offload is a
+  # non-genuine GPU offload (ADR-0001); no active scoring used it.
 
   trend:
     enabled: true

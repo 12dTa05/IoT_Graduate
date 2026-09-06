@@ -380,13 +380,25 @@ while true; do
     fi
 
     if [[ -n "$COLLECT_PID" ]] && ! kill -0 "$COLLECT_PID" 2>/dev/null; then
-        echo "[run_edge] Collection complete → $COLLECT_OUTPUT"
-        echo "[run_edge] Stopping pipeline..."
-        kill "$PIPELINE_PID" 2>/dev/null || true
-        wait "$PIPELINE_PID" 2>/dev/null || true
-        # Remove from _pids so _cleanup doesn't double-kill
-        _pids=()
-        break
+        # Reap the collector to learn its true exit code. A clean completion
+        # (rc=0) stops the pipeline; a failed collector (non-zero, e.g. crashed
+        # or killed by signal → 128+signum) must NOT tear down a healthy
+        # pipeline (REQ-2). Stopping on collector failure was the bug that took
+        # nodes down during the 2026-09-05 run.
+        collect_rc=0
+        wait "$COLLECT_PID" 2>/dev/null || collect_rc=$?
+        if [[ $collect_rc -eq 0 ]]; then
+            echo "[run_edge] Collection complete → $COLLECT_OUTPUT"
+            echo "[run_edge] Stopping pipeline..."
+            kill "$PIPELINE_PID" 2>/dev/null || true
+            wait "$PIPELINE_PID" 2>/dev/null || true
+            # Remove from _pids so _cleanup doesn't double-kill
+            _pids=()
+            break
+        else
+            echo "[run_edge] WARNING: collector exited with failure (rc=$collect_rc) — leaving pipeline running." >&2
+            COLLECT_PID=""
+        fi
     fi
 done
 

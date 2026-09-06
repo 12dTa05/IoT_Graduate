@@ -15,8 +15,6 @@ try:
     from .probes import SpeedProbe, ROIFilterProbe
     from .plate_preprocessor import PlatePreprocessorProbe
     from .common import make_element, gst_link
-    from .offload_publisher import OffloadPublisher
-    from .offload_receiver  import OffloadReceiver
 except ImportError:
     # Optional DeepStream / GStreamer / PyGObject dependencies in headless or test envs
     pass
@@ -30,6 +28,4 @@ __all__ = [
     'gst_link',
     'settings',
     'speedflow_c',
-    'OffloadPublisher',
-    'OffloadReceiver',
 ]

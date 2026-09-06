@@ -1,10 +1,12 @@
 .codegraph
 .cortexkit
 .pytest_cache
+__pycache__
 
 Camera/videos
 
 Edge/logs
+Edge/lease_state.json
 Edge/tests
 Edge/tests/__pycache__
 Edge/snapshots
@@ -17,7 +19,12 @@ Edge/.pytest_cache
 
 Server/__pycache__
 Server/violations
-Server/test_traffic_events.py
+Server/test_*.py
 Server/speedflow-server.service
 
 Data_From_Jetsons/
+
+docs
+.sdd
+AGENTS.md
+.opencode

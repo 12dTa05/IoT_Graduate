@@ -359,6 +359,8 @@ const MODAL_IMG = $('modal-img');
 const edges = {};                // node_id -> edge dict (from server)
 const streamStates = {};         // camId -> { pc, mediaStream, video, cell, streamPath, connecting, reconnectTimer, statsTimer, bitrate, connected }
 const allKnownCameras = new Map(); // camId -> { camera_id, source_id, node_id, node_ip, stream_path }
+const authoritativeCameras = new Map(); // camId -> server projection row (one per camera_id)
+let cameraPollTimer = null;
 
 let clusters = [];               // [{ id, edges: [...] }]
 let mediaMtxStreamNames = [];    // stream names from MediaMTX (pollStreams)
@@ -400,7 +402,7 @@ function getNodeBadge(nodeId) {
 
 // ── Camera list construction ────────────────────────────────
 function buildCameraList(data) {
-  const cams = [];
+  let cams = [];
   let nodes = {};
   if (data && data.nodes) {
     nodes = data.nodes;
@@ -416,6 +418,25 @@ function buildCameraList(data) {
 
   const activeSeen = new Set();
   const knownActiveNodes = new Set();
+
+  const camOwner = {};
+  for (const n of Object.values(nodes || {})) {
+    const pl = n.pipeline || (n.health && n.health.pipeline) || {};
+    const owners = pl.camera_owners || (n.health && n.health.camera_owners) || {};
+    for (const [cid, owner] of Object.entries(owners)) {
+      if (owner) camOwner[cid] = owner;
+    }
+  }
+  const ownerOf = (camId, runningNode) => {
+    if (camOwner[camId]) return camOwner[camId];
+    // Fallback based on camera number matching node_camera_map
+    const m = String(camId).match(/(\d+)/);
+    const n = m ? parseInt(m[1], 10) : 0;
+    if (n >= 1 && n <= 2) return 'jetson_A';
+    if (n >= 3 && n <= 4) return 'jetson_B';
+    if (n >= 5 && n <= 6) return 'jetson_C';
+    return runningNode;
+  };
 
   for (const node of Object.values(nodes || {})) {
     const isOnline = node.online !== false;
@@ -442,7 +463,7 @@ function buildCameraList(data) {
           source_id: sourceId,
           node_id: node.node_id,
           node_ip: nodeIp,
-          stream_path: `${node.node_id}/${camId}`,
+          stream_path: `${ownerOf(camId, node.node_id)}/${camId}`,
         });
       }
     }
@@ -465,7 +486,7 @@ function buildCameraList(data) {
         source_id: sourceId,
         node_id: node.node_id,
         node_ip: nodeIp,
-        stream_path: `${node.node_id}/${camId}`,
+        stream_path: `${ownerOf(camId, node.node_id)}/${camId}`,
         fps: fpsPerCam[camId] || 0,
         n_track: feat.n_track || 0,
         n_plate: feat.n_plate || 0,
@@ -501,6 +522,27 @@ function buildCameraList(data) {
       node_ip: cam.node_ip,
       stream_path: cam.stream_path,
     });
+  }
+
+  // Deduplicate to exactly one row per camera using the server's authoritative
+  // projection: when two nodes both report the same camera_id (e.g. a stale
+  // peer or a takeover in flight), keep only the authoritative holder's entry
+  // instead of unioning duplicates into the grid.
+  if (authoritativeCameras.size > 0) {
+    const byId = new Map();
+    for (const cam of cams) {
+      const auth = authoritativeCameras.get(cam.camera_id);
+      const holder = auth && (auth.holder_node || auth.node_id);
+      const existing = byId.get(cam.camera_id);
+      if (!existing) {
+        byId.set(cam.camera_id, cam);
+      } else if (holder && cam.node_id === holder) {
+        byId.set(cam.camera_id, cam); // authoritative holder wins
+      } else if (holder && existing.node_id !== holder && cam.online) {
+        byId.set(cam.camera_id, cam); // prefer an online non-stale copy
+      }
+    }
+    cams = Array.from(byId.values());
   }
 
   return cams.sort((a, b) => a.source_id - b.source_id);
@@ -1334,6 +1376,22 @@ async function pollStreams() {
   } catch(e) {}
 }
 
+// ── Authoritative camera projection ────────────────────────
+// Server collapses per-node active_cameras into one row per camera_id. Pull it
+// so the dashboard never unions duplicate per-node reports.
+async function refreshAuthoritativeCameras() {
+  try {
+    const resp = await fetch('/api/cameras');
+    if (!resp.ok) return;
+    const rows = await resp.json();
+    authoritativeCameras.clear();
+    for (const row of (rows || [])) {
+      authoritativeCameras.set(row.camera_id, row);
+    }
+    updateDashboard();
+  } catch(e) {}
+}
+
 // ── Init ─────────────────────────────────────────────────────
 function init() {
   PREV_BTN.addEventListener('click', () => switchCluster(-1));
@@ -1352,6 +1410,8 @@ function init() {
 
   connectWS();
   streamPollTimer = setInterval(pollStreams, 5000);
+  refreshAuthoritativeCameras();
+  cameraPollTimer = setInterval(refreshAuthoritativeCameras, 5000);
 }
 
 // Expose globally for testing/callbacks

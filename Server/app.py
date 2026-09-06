@@ -31,11 +31,13 @@ logger = logging.getLogger("server_app")
 
 from Server.edge_registry import EdgeRegistry, HEARTBEAT_TIMEOUT
 from Server.violation_store import ViolationStore
+from Server.camera_projection import CameraProjection
 
 
 class ServerState:
     def __init__(self) -> None:
         self.registry: EdgeRegistry = None
+        self.cameras: CameraProjection = None
         self.browser_ws: List[web.WebSocketResponse] = []
         self.store: ViolationStore = None
         self.http_session: aiohttp.ClientSession = None
@@ -116,6 +118,11 @@ async def handle_edges(request: web.Request) -> web.Response:
 async def handle_clusters(request: web.Request) -> web.Response:
     state: ServerState = request.app["state"]
     return web.json_response(state.registry.get_clusters())
+
+
+async def handle_cameras(request: web.Request) -> web.Response:
+    state: ServerState = request.app["state"]
+    return web.json_response(state.cameras.get_all())
 
 
 async def handle_violations(request: web.Request) -> web.Response:
@@ -221,17 +228,7 @@ def _start_zenoh_subscriber(state: ServerState) -> Optional[Any]:
             if not node_id:
                 return
 
-            event = payload.get("event")
-            if event == "NODE_ONLINE":
-                ip = payload.get("advertise_ip", "")
-                is_new = state.registry.register(node_id, ip)
-                if is_new:
-                    state.broadcast({"type": "edge_registered", "node_id": node_id, "ip": ip})
-                return
-
-            state.registry.update_health(node_id, payload)
-            health_msg = {**payload, "type": "health_update", "node_id": node_id}
-            state.broadcast(health_msg)
+            handle_status(state, payload)
 
         sub = session.declare_subscriber("peers/status/**", _on_status)
         logger.info("[Zenoh Server] Subscribed to 'peers/status/**'")
@@ -274,6 +271,37 @@ def _start_zenoh_subscriber(state: ServerState) -> Optional[Any]:
     except Exception as exc:
         logger.warning("[Zenoh Server] Failed to start Zenoh subscriber: %s", exc)
         return None
+
+
+def handle_status(state: ServerState, payload: Dict[str, Any]) -> None:
+    """Process one edge status message over the actual app path.
+
+    NODE_ONLINE (register) is the only transition that re-arms a node that
+    has been swept offline. A plain health frame from an already-offline node
+    is dropped by the registry and must not resurrect its camera rows.
+    """
+    node_id = payload.get("node_id", "")
+    if not node_id:
+        return
+
+    event = payload.get("event")
+    if event == "NODE_ONLINE":
+        ip = payload.get("advertise_ip", "")
+        is_new = state.registry.register(node_id, ip)
+        state.cameras.on_node_online(node_id)
+        if is_new:
+            state.broadcast({"type": "edge_registered", "node_id": node_id, "ip": ip})
+        return
+
+    # Normal health update. The registry rejects it (returns False) when the
+    # node is already offline, so a stale/buffered frame cannot re-arm the
+    # registry or the projection. Online nodes update normally.
+    applied = state.registry.update_health(node_id, payload)
+    if not applied:
+        return
+    state.cameras.apply_health(node_id, payload)
+    health_msg = {**payload, "type": "health_update", "node_id": node_id}
+    state.broadcast(health_msg)
 
 
 async def handle_ws_server(request: web.Request) -> web.WebSocketResponse:
@@ -325,9 +353,11 @@ def create_app() -> web.Application:
 
     def on_registry_change(event: str, node_id: str) -> None:
         if event == "offline":
+            state.cameras.on_node_offline(node_id)
             state.broadcast({"type": "edge_offline", "node_id": node_id})
 
     state.registry = EdgeRegistry(on_change=on_registry_change)
+    state.cameras = CameraProjection()
 
     app = web.Application()
     app["state"] = state
@@ -369,6 +399,7 @@ def create_app() -> web.Application:
     app.router.add_get("/static/{filename}", serve_static)
     app.router.add_get("/api/edges", handle_edges)
     app.router.add_get("/api/clusters", handle_clusters)
+    app.router.add_get("/api/cameras", handle_cameras)
     app.router.add_get("/api/violations", handle_violations)
     app.router.add_get("/api/streams", handle_streams)
     app.router.add_get("/api/snapshots/{node_id}/{filename}", handle_snapshot)

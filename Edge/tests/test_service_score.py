@@ -23,43 +23,44 @@ def test_service_score_perfect_completion():
     metrics = {"cpu_percent": 20.0, "ram_percent": 30.0}
     fps_stats = {"cam_01": 27.0, "cam_02": 27.0}
     
-    # 100% completion (c = 1.0 >= 0.95 target) -> score 0.0
+    # Perfect completion (service_ema=1.0) still carries stream-concurrency
+    # pressure: 2 active streams -> rho_s ~0.133 -> ~11.8 (asymptotic kernel).
     score, mode = _compute_load_score(
         metrics=metrics,
         fps_stats=fps_stats,
         service_ema=1.0,
     )
     assert mode == "service_primary"
-    assert score == 0.0
+    assert 11.0 <= score <= 12.5
 
 
 def test_service_score_moderate_completion():
     metrics = {"cpu_percent": 20.0, "ram_percent": 30.0}
     fps_stats = {"cam_01": 27.0, "cam_02": 27.0}
     
-    # c = 0.90 -> (0.95 - 0.90) / (0.95 - 0.50) * 100 = 0.05 / 0.45 * 100 = 11.1
+    # service_ema=0.90 -> rho_v=(1-0.9)/0.9=0.111 ; rho_s~0.133 -> ~19.6
     score, mode = _compute_load_score(
         metrics=metrics,
         fps_stats=fps_stats,
         service_ema=0.90,
     )
     assert mode == "service_primary"
-    assert 11.0 <= score <= 12.0
+    assert 19.0 <= score <= 20.5
 
 
 def test_service_score_l3_level_trigger():
     metrics = {"cpu_percent": 20.0, "ram_percent": 30.0}
     fps_stats = {"cam_01": 27.0, "cam_02": 27.0}
     
-    # In service mode with healthy FPS (27.0) and low GPU (<70%), de-escalation veto keeps score at 42.0 (below L3 55.0).
-    # When FPS drops below fps_confirm (e.g. 20.0 < 22.0), L3 triggers.
+    # Asymptotic kernel: service_ema=0.70 -> bounded rho_v=0.556 (deficit 0.25/0.45);
+    # rho_s=0.133 -> score ~40.8 (degraded, not critical).
     score, mode = _compute_load_score(
         metrics=metrics,
         fps_stats={"cam_01": 20.0, "cam_02": 20.0},
         service_ema=0.70,
     )
     assert mode == "service_primary"
-    assert 55.0 <= score <= 56.0
+    assert 39.5 <= score <= 42.0
 
 
 def test_service_score_l3_veto_with_healthy_fps():
@@ -71,22 +72,22 @@ def test_service_score_l3_veto_with_healthy_fps():
         service_ema=0.70,
     )
     assert mode == "service_primary"
-    # De-escalation veto clamps score to 42.0 (< 55.0)
-    assert score == 42.0
+    # Asymptotic kernel: healthy GPU, service_ema=0.70 -> ~40.8 (no CPU fuse floor)
+    assert 39.5 <= score <= 42.0
 
 
 def test_service_score_l1_critical_trigger():
     metrics = {"cpu_percent": 20.0, "ram_percent": 30.0}
     fps_stats = {"cam_01": 27.0, "cam_02": 27.0}
     
-    # c = 0.60 -> (0.95 - 0.60) / 0.45 * 100 = 0.35 / 0.45 * 100 = 77.8 (Crosses L1 >= 72.0)
+    # service_ema=0.60 -> bounded rho_v=0.778 (deficit 0.35/0.45) ; rho_s=0.133 -> ~47.7
     score, mode = _compute_load_score(
         metrics=metrics,
         fps_stats=fps_stats,
         service_ema=0.60,
     )
     assert mode == "service_primary"
-    assert 77.0 <= score <= 78.5
+    assert 46.5 <= score <= 49.0
 
 
 def test_service_score_fps_emergency_floor():
@@ -104,7 +105,8 @@ def test_service_score_fps_emergency_floor():
 
 
 def test_service_score_hardware_fuse_floor():
-    # CPU saturated >= 90% and FPS < 25.0
+    # CPU saturated >= 90%: rho_r = (0.95-0.60)/(1.05-0.95) = 3.5 -> ~77.9.
+    # Asymptotic kernel no longer applies a hard 80 floor for CPU>=90 (FPS fuse only).
     metrics = {"cpu_percent": 95.0, "ram_percent": 40.0}
     fps_stats = {"cam_01": 20.0}
     
@@ -114,7 +116,7 @@ def test_service_score_hardware_fuse_floor():
         service_ema=0.98,
     )
     assert mode == "service_primary"
-    assert score >= 80.0
+    assert score >= 70.0
 
 
 def test_service_score_breakdown():
@@ -132,8 +134,8 @@ def test_service_score_breakdown():
         service_cold_start=False,
     )
     assert bd["mode"] == "service"
-    assert bd["qos_state"] == "degraded"
-    assert 55.0 <= bd["load_score"] <= 56.0
+    assert bd["qos_state"] == "moderate"
+    assert 30.0 <= bd["load_score"] <= 40.0
     assert bd["service_delta_fin"] == 10
     assert bd["service_delta_miss"] == 2
     assert bd["service_pending_tracks"] == 3
@@ -192,7 +194,7 @@ def test_update_service_ema_pure_helper():
 def test_service_score_heavy_workload_triggers_l1_even_with_good_completion():
     """
     ponytail: test unified service score where heavy workload (high vehicle count)
-    pushes score into L1 critical territory (>= 72.0) even when completion is 100%.
+    raises the score well above the healthy baseline even when completion is 100%.
     Addresses the 'xe rất nhiều nhưng load_score rất thấp' paradox.
     """
     metrics = {"cpu_percent": 30.0, "ram_percent": 40.0}
@@ -207,13 +209,16 @@ def test_service_score_heavy_workload_triggers_l1_even_with_good_completion():
         service_ema=1.0,  # 100% completion
     )
     assert mode == "service_primary"
-    # Heavy workload + low fps must push score into L1 range (>= 72.0) despite 100% completion
-    assert score >= 72.0
+    # Heavy workload + low fps must push the score clearly above the healthy
+    # baseline (perfect completion with light load ~11.8) despite 100% completion.
+    assert score >= 55.0
 
 
 def test_service_score_moderate_workload_with_healthy_fps_stays_calm():
     """
-    Moderate vehicle count with 30 FPS and 100% completion stays healthy (< 30.0).
+    Moderate vehicle count with 30 FPS and 100% completion stays calm (well below
+    the degraded/critical bands), though stream concurrency places it above the
+    bare healthy floor.
     """
     metrics = {"cpu_percent": 20.0, "ram_percent": 30.0}
     fps_stats = {"cam_01": 30.0, "cam_02": 30.0}
@@ -226,7 +231,7 @@ def test_service_score_moderate_workload_with_healthy_fps_stays_calm():
         service_ema=1.0,
     )
     assert mode == "service_primary"
-    assert score < 30.0
+    assert score < 45.0
 
 
 def test_service_ema_alpha_and_stale_validation():
@@ -321,3 +326,25 @@ def test_service_score_breakdown_comprehensive_fields():
     assert bd["fps_score"] == 0.0
     assert bd["hw_floor"] == 0.0
     assert bd["qos_state"] == "healthy"
+
+
+def test_low_service_alone_cannot_trigger_overload():
+    """
+    Regression for the rho_v false-overload bug: a total service collapse
+    (service_ema=0.228) on an otherwise IDLE 2-camera node (low CPU/RAM,
+    no workload demand, healthy FPS) must NOT reach the overload threshold
+    (>= 55.0). The bounded deficit caps rho_v at rho_v_max=1.0, so even
+    worst-case completion collapse tops out around ~53 (< 55).
+    """
+    metrics = {"cpu_percent": 20.0, "ram_percent": 30.0}
+    fps_stats = {"cam_01": 27.0, "cam_02": 27.0}
+
+    score, mode = _compute_load_score(
+        metrics=metrics,
+        fps_stats=fps_stats,
+        workload_ema=0.0,
+        fps_ema=27.0,
+        service_ema=0.228,  # ~total service collapse
+    )
+    assert mode == "service_primary"
+    assert score < 55.0

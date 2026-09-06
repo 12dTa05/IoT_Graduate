@@ -1,19 +1,21 @@
 """
 speedflow_python/offload_publisher.py
 
-Non-blocking Zenoh publisher for multi-level offload crops.
+Non-blocking Zenoh publisher for plate-crop offload.
 
-Publishes on two key expressions:
-  offload/plates/{src_node}/{dst_node}   — Level 3 (plate crops, ~1–3 KB)
-  offload/vehicles/{src_node}/{dst_node} — Level 2 (vehicle crops, ~15–40 KB)
+Publishes on one key expression:
+  offload/plates/{src_node}/{dst_node} — L2 plate-crop (source offload_level==3; ~1–3 KB)
 
-Both channels share a single background thread and queue.
+The channel runs a single background thread and queue.
 The caller enqueues a payload dict; the thread serialises and publishes.
 
 Key design constraints (same as ZenohPublisher):
   - put() is non-blocking and safe to call from the GLib main loop thread.
   - If the queue is full the oldest entry is dropped (freshness > completeness).
   - Uses the shared Zenoh session from PeerOrchestrator when available.
+
+The vehicle-crop tier (Level 2, offload/vehicles/*) was a dead runtime tier
+with no orchestrator trigger and was removed — see ADR-0002.
 """
 
 from __future__ import annotations
@@ -33,8 +35,7 @@ from .zenoh_session import make_session
 logger = logging.getLogger(__name__)
 
 # Payload type constants (included in every message)
-TYPE_PLATE   = "plate"    # Level 3
-TYPE_VEHICLE = "vehicle"  # Level 2
+TYPE_PLATE   = "plate"    # L2 plate-crop (source offload_level==3)
 
 OFFLOAD_PAYLOAD_SCHEMA_VERSION = 1
 
@@ -43,7 +44,7 @@ _QUEUE_MAXSIZE = 64  # ~2 s of bursts at 30 fps × 1 cam; older entries dropped
 
 class OffloadPublisher:
     """
-    Non-blocking crop publisher for Level 2 and Level 3 offload.
+    Non-blocking crop publisher for L2 plate-crop offload (source offload_level==3).
 
     Usage:
         pub = OffloadPublisher(node_id="edge-01", session=shared_session)
@@ -53,10 +54,6 @@ class OffloadPublisher:
         pub.put_plate(target_node="edge-02", stid=(0, 42),
                       camera_id="cam_01", frame_no=1234,
                       crop_bgr=plate_bgr, confidence=0.91)
-
-        pub.put_vehicle(target_node="edge-02", stid=(0, 42),
-                        camera_id="cam_01", frame_no=1234,
-                        crop_bgr=vehicle_bgr, bbox_world_y=-12.3)
 
         pub.stop()
     """
@@ -153,7 +150,7 @@ class OffloadPublisher:
         confidence: float = 0.0,
     ) -> None:
         """
-        Enqueue a plate crop for Level 3 offload.
+        Enqueue a plate crop for L2 plate-crop offload (source offload_level==3).
         crop_bgr: (H, W, 3) BGR uint8 array — typically ~120×48.
         """
         jpeg = self._encode_jpeg(crop_bgr, quality=85)
@@ -175,41 +172,6 @@ class OffloadPublisher:
             "confidence":  float(confidence),
             "timestamp":   now,
             "ts":          now,
-        })
-
-    def put_vehicle(
-        self,
-        target_node: str,
-        stid: tuple,
-        camera_id: str,
-        frame_no: int,
-        crop_bgr: np.ndarray,
-        bbox_world_y: float = 0.0,
-    ) -> None:
-        """
-        Enqueue a vehicle crop for Level 2 offload.
-        crop_bgr: (H, W, 3) BGR uint8 array — typically ~120×120 or larger.
-        bbox_world_y: world-Y coordinate already computed by perspective transform.
-        """
-        jpeg = self._encode_jpeg(crop_bgr, quality=80)
-        if jpeg is None:
-            return
-        self._encoded += 1
-        now = time.time()
-        self._enqueue({
-            "schema_version": OFFLOAD_PAYLOAD_SCHEMA_VERSION,
-            "version":      OFFLOAD_PAYLOAD_SCHEMA_VERSION,
-            "level":        2,
-            "type":         TYPE_VEHICLE,
-            "src":          self._node_id,
-            "dst":          target_node,
-            "camera_id":    camera_id,
-            "stid":         list(stid),
-            "frame_no":     frame_no,
-            "jpeg":         jpeg,
-            "bbox_world_y": float(bbox_world_y),
-            "timestamp":    now,
-            "ts":           now,
         })
 
     # ------------------------------------------------------------------
@@ -261,10 +223,7 @@ class OffloadPublisher:
                 crop_type   = item["type"]
                 dst         = item["dst"]
 
-                if crop_type == TYPE_PLATE:
-                    key = f"offload/plates/{self._node_id}/{dst}"
-                else:
-                    key = f"offload/vehicles/{self._node_id}/{dst}"
+                key = f"offload/plates/{self._node_id}/{dst}"
 
                 pub = self._get_or_declare_pub(key)
                 pub.put(msgpack.packb(item, use_bin_type=True))

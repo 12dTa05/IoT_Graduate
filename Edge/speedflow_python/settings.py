@@ -132,6 +132,10 @@ ANALYTICS_CFG   = ROOT / _get("ANALYTICS_CFG")
 TRACKER_CFG     = ROOT / _get("TRACKER_CFG")
 TRACKER_LPD_CFG = ROOT / _get("TRACKER_LPD_CFG")
 
+# Local LPR worker (Phase 2/3): plate-crop TRT engine + label file.
+LPR_ENGINE = ROOT / "models" / "lpr.engine"
+LPR_LABELS = ROOT / "configs" / "labels_lpr.txt"
+
 # Absolute — DeepStream system library
 TRACKER_LIB     = _get("TRACKER_LIB")
 

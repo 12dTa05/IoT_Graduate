@@ -29,8 +29,8 @@ files as RTSP streams simulating live cameras.
 2. `HealthAgent` — collects Jetson metrics (jtop), computes `load_score`,
    publishes the **sole** heartbeat on Zenoh (1 s cadence, hard-enforced),
    forwards overspeed events to Server.
-3. `PeerOrchestrator` — local load decisions, escalation ladder, RFO voting,
-   failover rescue, reclaim.
+ 3. `PeerOrchestrator` — local load decisions (L0/L1/L2 offload), RFO voting,
+    failover rescue, reclaim.
 4. `ZenohCommandSubscriber` / `OffloadPublisher` / `OffloadReceiver` — camera
    ADD/REMOVE commands and crop-offload data plane.
 
@@ -55,9 +55,7 @@ N × uridecodebin
       │
   NvDCF tracker
       │
-  SGIE1 (LPD — license plate detection)
-      │
-  SGIE2 (LPR — license plate recognition)
+  SGIE  (LPD — license plate detection, single secondary classifier)
       │
  nvdsanalytics  (ROI polygon, line crossing)
       │
@@ -66,7 +64,12 @@ N × uridecodebin
   display EGL / file sink / rtsp_push sink → MediaMTX relay on Server
 ```
 
-Per-camera homography maps pixel displacement to world coordinates (meters);
+License-plate **recognition (LPR)** runs **off-pipeline** — not in the DeepStream
+graph. The graph detects plates via the single SGIE (LPD only); sgie2 was removed
+in Phase 1. Recognized plate crops are decoded either by the local `LocalLprWorker`
+pool (default, L0) or, under L2 plate-crop offload, shipped to a peer's
+`OffloadReceiver` for LPR (`offload/plates/{src}/{dst}`). Per-camera homography
+maps pixel displacement to world coordinates (meters);
 median-filtered speed estimate triggers an overspeed event when `speed_kmh > SPEED_LIMIT_KMH`.
 
 **Permanent mux pads** (`SPEEDFLOW_SLOT_CAPACITY=16`): all mux sink pads are created
@@ -100,9 +103,9 @@ streams together. Workload counts (`n_track`, `n_plate`) are the per-camera sign
 | avg FPS | score | level anchor |
 |---------|-------|--------------|
 | ≥ 27    |   0   | healthy      |
-| 22      |  57   | near L3      |
-| 19      |  65   | L2 threshold |
-| 17      |  75   | near L1      |
+| 22      |  57   | L2 plate-crop region (≥55) |
+| 19      |  65   | — (legacy vehicle-crop anchor, retired) |
+| 17      |  75   | L1 migration region (≥72) |
 | 0       | 100   | unavailable  |
 
 Linear interpolation between anchors; source-starved cameras excluded from the average
@@ -134,52 +137,58 @@ to legacy load-score behaviour otherwise.
 ## Multi-Level Offload Policy
 
 Each Jetson runs an independent `PeerOrchestrator`; no master node. Decisions are
-strictly local; Zenoh is only the message layer.
+strictly local; Zenoh is only the message layer. Canonical tiers (ADR-0002):
 
-### Escalation ladder (current `edge_node.yml` values)
+- **L0 — local full DeepStream analytics** (default). Every static-owned camera runs
+  the full graph (decode + PGIE + tracker + single LPD SGIE + off-pipeline LPR) on its
+  owner edge.
+- **L1 — owner-authoritative full-stream camera migration**. The entire stream is
+  migrated to a peer via the RFO/lease path. The only mechanism that relieves
+  decode/tracking/resource pressure; owner retains lease authority, receiver is host-only.
+- **L2 — plate-crop offload for off-pipeline LPR**. Only plate crops are shipped to a
+  peer for LPR inference (`offload/plates/{src}/{dst}`); the decode/tracking stream stays
+  local. Relieves the **LPR crop queue only** — explicitly *not* decode/tracking/GPU load.
+  Source numeric level `offload_level==3`.
 
-| Level     | Threshold | Dwell | Action |
-|-----------|-----------|-------|--------|
-| L3        | ≥ 55.0    | `l3_dwell_s=20` | Offload **plate crops** (JPEG ~1–3 KB) to best peer |
-| L2        | ≥ 64.0    | `l2_dwell_s=30` | Offload **vehicle crops** (~15–40 KB) for LPD+LPR |
-| L1        | ≥ 72.0    | —     | Full-stream **camera migration** via RFO vote |
-| QoS moderate | 30.0 | — |  Telemetry state only, no action |
-| Reclaim   | < 40.0 (= thr3 55 − `reclaim_margin` 15) | stable 30 s | Take back migrated cameras |
+The **vehicle-crop tier is retired**: no orchestrator trigger assigns
+`offload_level==2`, no session publisher emits a level-2 `start` handshake, and the
+receiver drops unsessioned vehicle crops. It is not part of the ratified tier model.
 
-L3/L2 crop offload does **not** reduce source-node pipeline load (PGIE + tracker still
-process full frames); only L1 migration actually sheds stream load. To prevent a node
-being stuck permanently at L2 with degraded FPS, a camera held at L2 for longer than
-`l2_no_improvement_s` (300 s) without load dropping below the L3 threshold escalates
-directly to L1 (`l2_stuck` fast path, bypassing the ladder clamp).
+### Trigger model (two independent decisions)
+
+- **L1** is driven by node overload (load_score / stream-pressure via the existing
+  RFO/lease path) — the decode/tracking relief primitive.
+- **L2** is driven by **local LPR-queue saturation** (`lpr_offload_up_threshold`,
+  default 0.75): when the local `LocalLprWorker` pool saturates, the owner escalates the
+  heaviest local camera's plate-crop work to a peer; it reclaims (back to L0) when the
+  queue drains (`lpr_offload_down_threshold`, default 0.35). L2 does **not** move the
+  stream and does **not** require a load-band dwell ladder.
 
 ### De-escalation (return to level 0)
 
-When load drops below the overloaded band and stays there for `offload_release_dwell_s`
-(15 s), all L2/L3 levels are cleared: `set_offload_level(cam, 0)` stops crop production
-at the SpeedProbe and a session-STOP is published (below). The dwell prevents flapping
-when load oscillates around the L3 threshold.
+When the relevant signal clears and stays clear for `offload_release_dwell_s` (default 15 s;
+5.0 in `edge_node.yml`), the level is cleared: `set_offload_level(cam, 0)` stops crop
+production at the SpeedProbe. A short dwell prevents flapping when the signal oscillates
+near the threshold.
 
-### Offload session handshake + backpressure
+### Crop offload backpressure (L2 plate-crop)
 
-L2/L3 crop offload is session-scoped, not fire-and-forget:
+L2 plate-crop offload is sender-gated, not a load-band handshake:
 
-- Any level transition publishes `start`/`stop` on `offload/session/{src}/{dst}`,
-  including the previous target getting a `stop` when the target is re-selected.
-- The receiver only queues crops that belong to an open session; crops without one are
+- For plate crops the receiver **synthesizes** a session on first receipt (no explicit
+  `start`/`stop` handshake is published for L2); crops without a synthesized session are
   dropped at the subscriber callback (counter `session_dropped_count`) — no GPU cost.
-- Sessions expire after `offload_session_idle_s` (10 s) without traffic — a dead sender
-  cannot leave a phantom session alive.
 - **Backpressure**: the receiver exports `offload_queue_full` (≥ 80% of its 32-slot
   queue) and queue-depth ratio into the heartbeat; the sender's orchestrator tracks per
-  -peer saturation with a 3-heartbeat release hysteresis, and SpeedProbe skips crop
-  production for saturated targets (counters `l2_dropped_backpressure` /
-  `l3_dropped_backpressure`). Dropping at the sender is almost free; dropping at the
-  receiver costs queue + GPU pressure — the system deliberately drops early.
+  -peer saturation with a release hysteresis, and SpeedProbe skips crop production for
+  saturated targets (counter `l2_dropped_backpressure`). Dropping at the sender is almost
+  free; dropping at the receiver costs queue + GPU pressure — the system deliberately
+  drops early.
 
 ### Camera selection & ownership policy (hard rules)
 
 - Per-camera ranking uses **workload** (`n_track + n_plate`), never post-mux FPS:
-  L1 picks the *lightest* owned camera, L2/L3 pick the *heaviest* camera.
+  L1 picks the *lightest* owned camera, L2 plate-crop picks the *heaviest* camera.
 - **A node never migrates away a camera it does not own** (ownership defined by
   `node_camera_map`, built from all nodes' `cameras.yml`). Foreign/rescued cameras are
   skipped for L1 — never re-homed to third nodes; they may only return to their owner
@@ -282,9 +291,9 @@ the router endpoint (used for the cross-subnet server link).
 | `peers/control/{node_id}` | directed | Camera ADD/REMOVE commands (+ACKs) |
 | `peers/failover/claim` | broadcast | Rescue priority claims (HRW weights) |
 | `traffic/events/{node_id}/**` | local | Pipeline → HealthAgent → Server (overspeed) |
-| `offload/plates/{src}/{dst}` | directed | L3 plate crops |
-| `offload/vehicles/{src}/{dst}` | directed | L2 vehicle crops |
-| `offload/session/{src}/{dst}` | directed | L2/L3 session start/stop handshake |
+| `offload/plates/{src}/{dst}` | directed | L2 plate crops (source offload_level==3) |
+| `offload/vehicles/{src}/{dst}` | directed | (retired — vehicle-crop tier removed, see ADR-0002) |
+| `offload/session/{src}/{dst}` | directed | RFO/lease control channel (L1 migration) |
 | `offload/results/{recv}/{sender}` | directed | Inference results back to origin |
 
 ---
@@ -292,9 +301,9 @@ the router endpoint (used for the cross-subnet server link).
 ## B-side Offload Receiver
 
 `OffloadReceiver` subscribes to:
-- `offload/plates/*/{my_node_id}` — L3: run LPR engine on plate crop
-- `offload/vehicles/*/{my_node_id}` — L2: run LPD then LPR engine on vehicle crop
-- `offload/session/*/{my_node_id}` — session handshake (see above)
+- `offload/plates/*/{my_node_id}` — L2 plate-crop (source offload_level==3): run LPR engine on plate crop
+- `offload/vehicles/*/{my_node_id}` — (retired — vehicle-crop tier removed, see ADR-0002)
+- `offload/session/*/{my_node_id}` — RFO/lease control channel for L1 migration
 
 TensorRT engines (`models/lpd.engine`, `models/lpr.engine`) are loaded lazily on first
 request. Dynamic shapes: profile 0 MIN shape used for batch-1 inference (supports both
@@ -361,8 +370,8 @@ conda run -n DoAn python3 -m py_compile Edge/speedflow_python/run_python.py
 ```
 
 Deployment to Jetsons is git-based: push from host, `git pull` on device, restart
-`run_edge.sh`. All nodes must run the same offload-protocol version (sender/receiver
-session handshake is not backward compatible). Verify deployed code matches host
+`run_edge.sh`. All nodes must run the same offload-protocol version (sender/receiver crop-offload
+protocol is not backward compatible). Verify deployed code matches host
 before analysing field logs.
 
 ---
@@ -401,7 +410,7 @@ router (`:7447`) for cross-subnet discovery.
 |------|---------|
 | `Edge/.env` | Flat settings: `NODE_ID`, `TARGET_FPS=28`, `HEALTH_INTERVAL=1.0`, RTSP URLs, `ZENOH_ROUTER`, model paths, `SPEEDFLOW_SLOT_CAPACITY=16`, `SPEEDFLOW_NVDEC_SESSION_LIMIT`, `EDGE_BLEED_DIAGNOSTICS=1` |
 | `Edge/configs/cameras.yml` | Per-camera RTSP URIs, homography, ROI, speed limit, nominal FPS. Hot-reloaded (~100 ms via inotify). Defines **ownership**. |
-| `Edge/configs/edge_node.yml` | P2P thresholds (L3=55/L2=64/L1=72), dwell timers (`l3_dwell_s`, `l2_dwell_s`, `l2_no_improvement_s`, `offload_release_dwell_s`, `offload_session_idle_s`), heartbeat/failover/grace windows, load_score bonuses, workload policy, proactive model |
+| `Edge/configs/edge_node.yml` | P2P thresholds (L2 plate-crop=55 source level 3 / L1=72; L2=64 is a retired vehicle-crop phantom key), dwell timers (`l3_dwell_s`, `l2_dwell_s` — legacy source-level naming debt; `offload_release_dwell_s`, `offload_session_idle_s`), heartbeat/failover/grace windows, load_score bonuses, workload policy, proactive model |
 | `Server/.env` | `SERVER_PORT=9090`, `MEDIAMTX_API` |
 | `Camera/.env` | RTSP port, video file paths for Docker sim |
 
@@ -450,8 +459,8 @@ or hardware freezes are documented in:
 
 ## Limitations / Unproven
 
-- L2/L3 crop-offload end-to-end throughput under sustained thermal load not yet
-  benchmarked after the session/backpressure rework.
+- L2 plate-crop offload end-to-end throughput under sustained thermal load not yet
+  benchmarked after the backpressure rework.
 - Simultaneous multi-node failure recovery tested only up to three-node setups.
 - WAN uplink to the server is ~4.5 Mbps — well under 3 nodes × 4 cameras × 3 Mbps
   encoder defaults; per-camera push bitrate (`RTSP_PUSH_BITRATE`) must be tuned down

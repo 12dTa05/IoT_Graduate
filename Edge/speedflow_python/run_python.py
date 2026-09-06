@@ -9,6 +9,7 @@ import os
 import logging
 import time
 import threading
+from pathlib import Path
 from typing import Optional
 
 import gi
@@ -20,10 +21,16 @@ from .core_pipeline import (
     dynamic_add_stream,
     dynamic_remove_stream,
     rebuild_rtsp_push_sink,
+    PublisherRecovery,
+    classify_pipeline_error,
+    handle_publisher_failure,
 )
 from .camera_config import CameraManager
 from .probes import SpeedProbe, ROIFilterProbe
 from .plate_preprocessor import PlatePreprocessorProbe
+from .lpr_worker import LocalLprWorker
+from .offload_publisher import OffloadPublisher
+from .offload_receiver import OffloadReceiver
 from . import settings as S
 from .settings import (
     CAMERAS_YML,
@@ -37,6 +44,8 @@ from .settings import (
     RTSP_PUSH_BITRATE,
     RTSP_PUSH_MAX_RETRIES,
     RTSP_PUSH_RETRY_DELAY_S,
+    LPR_ENGINE,
+    LPR_LABELS,
 )
 
 import yaml
@@ -66,7 +75,8 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
                   peer_orch=None,
                   offload_pub=None,
                   offload_rcv=None,
-                  zenoh_pub=None) -> SpeedProbe:
+                  zenoh_pub=None,
+                  lpr_worker=None) -> SpeedProbe:
     """
     Attach ROI filter, plate preprocessor, and speed probe to *pipeline*.
     Returns the SpeedProbe instance.
@@ -75,6 +85,7 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
     offload_pub: OffloadPublisher — lets the probe send crops to peers.
     offload_rcv: OffloadReceiver — lets peer-returned crop results reach the probe.
     zenoh_pub:   ZenohPublisher — lets the probe publish overspeed events.
+    lpr_worker:  LocalLprWorker — local plate-crop LPR off the DeepStream graph.
     """
     # 1. ROI filter
     analytics = pipeline.get_by_name("analytics")
@@ -131,6 +142,9 @@ def _setup_probes(pipeline: Gst.Pipeline, nvdsosd: Gst.Element,
     if offload_rcv is not None:
         offload_rcv.set_result_handler(probe.inject_offload_result)
         probe.set_offload_receiver(offload_rcv)
+    if lpr_worker is not None:
+        probe.set_lpr_worker(lpr_worker)
+        lpr_worker.set_result_sink(probe.inject_offload_result)
     if zenoh_pub is not None:
         probe.set_publisher(zenoh_pub)
 
@@ -162,6 +176,7 @@ def _attach_camera_manager(
     rtsp_push_base_url: Optional[str] = None,
     rtsp_push_bitrate: Optional[int] = None,
     node_camera_map: Optional[dict] = None,
+    recovery: Optional["PublisherRecovery"] = None,
 ):
     """
     Hooks up the CameraManager to safely add/remove streams dynamically.
@@ -216,6 +231,12 @@ def _attach_camera_manager(
                 done_event.set()
             return
 
+        # P1: flag intentional teardown so any publisher (rtspclientsink) error
+        # emitted while this branch is being torn down is NOT treated as an
+        # unexpected failure requiring recovery.
+        if recovery is not None:
+            recovery.mark_intentional_teardown(cam_id)
+
         print(f"[Dynamic] Removing camera '{cam_id}' (source_id={source_id})")
         try:
             dynamic_remove_stream(
@@ -234,6 +255,12 @@ def _attach_camera_manager(
             camera_manager.cleanup_stream_ready(source_id)
             for p in ACTIVE_SPEED_PROBE:
                 p.remove_camera(cam_id, source_id=source_id)
+            # Clear the intentional-teardown flag after a short cooldown so
+            # async publisher errors caused by the teardown are absorbed, but a
+            # later real failure on this camera can still recover.
+            if recovery is not None:
+                _cid = cam_id
+                GLib.timeout_add(2000, lambda: (recovery.clear_intentional_teardown(_cid), False)[1])
 
     camera_manager.start(on_add, on_remove, GLib.idle_add)
 
@@ -341,7 +368,7 @@ def _run_loop_until_eos_or_error(
 # Modes
 # ---------------------------------------------------------------------------
 
-def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, offload_rcv=None, zenoh_pub=None) -> SpeedProbe:
+def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, offload_rcv=None, zenoh_pub=None, lpr_worker=None) -> SpeedProbe:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
@@ -357,7 +384,7 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
     # Stop any previous active probe's FPS writer before creating a new one
     _stop_active_speed_probes()
 
-    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
+    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, lpr_worker=lpr_worker)
     ACTIVE_SPEED_PROBE.append(probe)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, tiler)
 
@@ -383,7 +410,7 @@ def run_display_mode(args, camera_manager: CameraManager, peer_orch=None, offloa
     return probe
 
 
-def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, offload_rcv=None, zenoh_pub=None) -> SpeedProbe:
+def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, offload_rcv=None, zenoh_pub=None, lpr_worker=None) -> SpeedProbe:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
@@ -398,7 +425,7 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
     # Stop any previous active probe's FPS writer before creating a new one
     _stop_active_speed_probes()
 
-    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
+    probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, lpr_worker=lpr_worker)
     ACTIVE_SPEED_PROBE.append(probe)
     _attach_camera_manager(camera_manager, pipeline, streammux, source_bins, None)
 
@@ -424,7 +451,7 @@ def run_file_mode(args, camera_manager: CameraManager, peer_orch=None, offload_p
     return probe
 
 
-def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, offload_rcv=None, zenoh_pub=None) -> Optional["SpeedProbe"]:
+def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offload_pub=None, offload_rcv=None, zenoh_pub=None, lpr_worker=None) -> Optional["SpeedProbe"]:
     Gst.init(None)
     configs = camera_manager.get_enabled_configs()
 
@@ -492,12 +519,25 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         pipeline, nvdsosd, streammux, source_bins = ret_build
         tiler = pipeline.get_by_name("tiler")
 
-        _last_probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
+        _last_probe = _setup_probes(pipeline, nvdsosd, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, lpr_worker=lpr_worker)
         ACTIVE_SPEED_PROBE.append(_last_probe)
+
+        # P1: per-camera publisher-failure recovery controller. Publisher
+        # failures are isolated leaves — they never trigger loop.quit / full
+        # DeepStream pipeline rebuild or an ADD/REMOVE storm.
+        # Constructed before _attach_camera_manager so the initial attach
+        # receives a live recovery controller (not an undefined name).
+        recovery = PublisherRecovery(
+            max_attempts=RTSP_PUSH_MAX_RETRIES,
+            base_delay_s=RTSP_PUSH_RETRY_DELAY_S,
+            max_delay_s=60.0,
+            reset_after_s=300.0,
+        )
         _attach_camera_manager(
             camera_manager, pipeline, streammux, source_bins, tiler,
             rtsp_push_base_url=rtsp_url, rtsp_push_bitrate=rtsp_push_bitrate,
             node_camera_map=_node_cam_map,
+            recovery=recovery,
         )
 
         logger.info("[Pipeline] set_state(PLAYING) BEGIN: mode=rtsp_push, mono_ts=%.6f", time.monotonic())
@@ -543,10 +583,6 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
         _error_flag = [False]
         _error_reason = ["unknown"]
         _removing = set()  # guard against double-remove from multiple error msgs
-
-        _sink_reconnect_attempts = [0]
-        _MAX_SINK_RETRIES = RTSP_PUSH_MAX_RETRIES
-        _SINK_RETRY_DELAY_S = RTSP_PUSH_RETRY_DELAY_S
 
         def on_message(bus, message):
             t = message.type
@@ -600,54 +636,83 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
                         break
                     elem = elem.get_parent()
 
-                if is_rtsp_sink:
-                    err_category = "publisher_failure"
+                err_category = classify_pipeline_error(
+                    src_name, str(err), debug or "",
+                    is_rtsp_sink=is_rtsp_sink,
+                )
+
+                if err_category == "publisher":
                     sink_el_name = sink_el.get_name() if sink_el else (message.src.get_name() if message.src else "unknown")
-                    print(f"ERROR ({err_category}) from {sink_el_name}: {err}", file=sys.stderr)
+                    print(f"ERROR (publisher_failure) from {sink_el_name}: {err}", file=sys.stderr)
                     if debug:
                         print(f"DEBUG INFO: {debug}", file=sys.stderr)
 
-                    if _sink_reconnect_attempts[0] < _MAX_SINK_RETRIES:
-                        _sink_reconnect_attempts[0] += 1
-                        print(
-                            f"[RTSP Push] Sink recovery attempt on {sink_el_name} ({_sink_reconnect_attempts[0]}/{_MAX_SINK_RETRIES})...",
-                            file=sys.stderr,
+                    # P1: a publisher failure is a per-camera leaf. Resolve the
+                    # camera identity for per-camera push branches; legacy single
+                    # sink uses a synthetic key.
+                    if sink_el_name.startswith("sink_rtsp_push_"):
+                        try:
+                            _sid = int(sink_el_name.split("_")[-1])
+                        except ValueError:
+                            _sid = None
+                        _cid = next(
+                            (c.camera_id for c in camera_manager.get_enabled_configs() if c.source_id == _sid),
+                            f"src_{_sid}" if _sid is not None else "unknown",
                         )
-                        if _SINK_RETRY_DELAY_S > 0:
-                            import time as _time; _time.sleep(_SINK_RETRY_DELAY_S)
+                    else:
+                        _cid = "__rtsp_push_legacy__"
+                        _sid = None
 
-                        # Attempt per-camera sink branch rebuild if it matches per-camera name
-                        if sink_el_name.startswith("sink_rtsp_push_"):
+                    def _rebuild_publisher_branch():
+                        if _sid is not None:
                             try:
                                 from .core_pipeline import _remove_rtsp_push_branch, _add_rtsp_push_branch
-                                sid = int(sink_el_name.split("_")[-1])
-                                cam_cfg = next((c for c in camera_manager.get_enabled_configs() if c.source_id == sid), None)
+                                cam_cfg = next(
+                                    (c for c in camera_manager.get_enabled_configs() if c.source_id == _sid),
+                                    None,
+                                )
                                 demux = pipeline.get_by_name("demux")
                                 if cam_cfg and demux:
-                                    _remove_rtsp_push_branch(pipeline, sid)
+                                    _remove_rtsp_push_branch(pipeline, _sid)
                                     _add_rtsp_push_branch(
-                                        pipeline, demux, cam_cfg, rtsp_url, bitrate=rtsp_push_bitrate, sync=True, node_camera_map=_node_cam_map
+                                        pipeline, demux, cam_cfg, rtsp_url,
+                                        bitrate=rtsp_push_bitrate, sync=True,
+                                        node_camera_map=_node_cam_map,
                                     )
-                                    _sink_reconnect_attempts[0] = 0
-                                    print(f"[RTSP Push] Rebuilt sink branch for camera '{cam_cfg.camera_id}' (source_id={sid}); pipeline remains PLAYING", file=sys.stderr)
-                                    return
+                                    return True
                             except Exception as rebuild_exc:
                                 print(f"[RTSP Push] Per-camera sink rebuild failed: {rebuild_exc}", file=sys.stderr)
-                        else:
-                            if rebuild_rtsp_push_sink(pipeline, rtsp_url, bitrate=S.RTSP_PUSH_BITRATE):
-                                print("[RTSP Push] Legacy sink branch rebuilt successfully; pipeline remains PLAYING", file=sys.stderr)
-                                return
+                            return False
+                        return rebuild_rtsp_push_sink(pipeline, rtsp_url, bitrate=S.RTSP_PUSH_BITRATE)
 
-                        print("[RTSP Push] Sink branch rebuild failed; falling back to full pipeline rebuild", file=sys.stderr)
+                    def _schedule_publisher_retry(delay):
+                        def _fire():
+                            recovery.clear_in_flight(_cid)
+                            handle_publisher_failure(
+                                recovery, _cid, _rebuild_publisher_branch, _schedule_publisher_retry
+                            )
+                            return False
+                        GLib.timeout_add(int(delay * 1000), _fire)
 
-                    # Full pipeline rebuild fallback after retry exhaustion or rebuild error
-                    _error_reason[0] = f"{err_category}:{src_name}:{err}"
-                    _error_flag[0] = True
-                    loop.quit()
-                    return
+                    result = handle_publisher_failure(
+                        recovery, _cid, _rebuild_publisher_branch, _schedule_publisher_retry
+                    )
+                    if result == "recovered":
+                        print(f"[RTSP Push] Publisher branch for '{_cid}' recovered; analytics pipeline PLAYING", file=sys.stderr)
+                    elif result == "scheduled":
+                        print(f"[RTSP Push] Publisher recovery scheduled for '{_cid}'; pipeline PLAYING", file=sys.stderr)
+                    elif result == "intentional":
+                        print(f"[RTSP Push] Publisher error on '{_cid}' during intentional teardown — ignored", file=sys.stderr)
+                    else:
+                        print(
+                            f"[RTSP Push] Publisher recovery exhausted/circuit-open for '{_cid}'; "
+                            f"branch left DOWN, analytics pipeline PLAYING (no full restart)",
+                            file=sys.stderr,
+                        )
+                    return  # never quit the loop for publisher-only errors
 
-                # Non-RTSP errors (source/decoder/pipeline) trigger full pipeline restart
-                err_category = "pipeline"
+                # Non-RTSP / non-publisher pipeline errors still trigger a full
+                # restart (owned by the outer supervisor loop).
                 _error_reason[0] = f"{err_category}:{src_name}:{err}"
                 print(f"ERROR ({err_category}) from {src_name}: {err}", file=sys.stderr)
                 if debug:
@@ -707,9 +772,10 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
 
 def run_python_mode(args) -> None:
     """Entry point called by main.py for the Python backend."""
-    # Dual logging handler: terminal INFO+, file /tmp/edge_debug.log DEBUG+
+    # Logging handlers: level controlled by S.LOG_LEVEL (default INFO)
+    log_level = getattr(logging, S.LOG_LEVEL, logging.INFO)
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(log_level)
     # Clear existing root handlers to avoid duplicate logs
     for h in list(root_logger.handlers):
         root_logger.removeHandler(h)
@@ -717,7 +783,7 @@ def run_python_mode(args) -> None:
     formatter = logging.Formatter("[%(asctime)s] %(levelname)s %(name)s — %(message)s", datefmt="%H:%M:%S")
 
     term_handler = logging.StreamHandler(sys.stderr)
-    term_handler.setLevel(logging.INFO)
+    term_handler.setLevel(log_level)
     term_handler.setFormatter(formatter)
     root_logger.addHandler(term_handler)
 
@@ -729,7 +795,7 @@ def run_python_mode(args) -> None:
 
     try:
         file_handler = FlushRotatingFileHandler(debug_log_path, mode="a", encoding="utf-8")
-        file_handler.setLevel(logging.DEBUG)
+        file_handler.setLevel(log_level)
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
     except Exception as exc:
@@ -755,10 +821,18 @@ def run_python_mode(args) -> None:
     peer_orch = None
     try:
         from .peer_orchestrator import PeerOrchestrator
+        # P5 — lease persistence path (Edge-local, stdlib-only JSON). Override
+        # via LEASE_STATE_PATH; default is <configs_dir>/lease_state.json.
+        lease_state_path = os.environ.get("LEASE_STATE_PATH") or (
+            edge_cfg.get("_config_dir") if isinstance(edge_cfg, dict) else None
+        )
+        if not lease_state_path:
+            lease_state_path = Path(__file__).resolve().parent.parent / "lease_state.json"
         peer_orch = PeerOrchestrator(
             node_id=NODE_ID,
             cfg=p2p_cfg,
             camera_manager=camera_manager,
+            lease_state_path=Path(lease_state_path),
         )
         orch_thread = threading.Thread(target=peer_orch.start, daemon=True)
         logger.info("[Thread] Starting PeerOrchestrator thread: ident=%s, mono_ts=%.6f", orch_thread.name, time.monotonic())
@@ -781,6 +855,7 @@ def run_python_mode(args) -> None:
             external_session=peer_orch._session if peer_orch else None,
             ownership_provider=ownership_cb,
             held_provider=held_cb,
+            boot_id_provider=(lambda: peer_orch._boot_id) if peer_orch is not None else None,
         )
         ha_thread = threading.Thread(target=health_agent.run, daemon=True, name="HealthAgent")
         logger.info("[Thread] Starting HealthAgent thread: ident=%s, mono_ts=%.6f", ha_thread.name, time.monotonic())
@@ -809,14 +884,29 @@ def run_python_mode(args) -> None:
                 f"add_ack_timeout_s ({ack_timeout:.1f}s) must be strictly less than "
                 f"migration_timeout_s ({migration_timeout:.1f}s) to ensure sender timeout safety"
             )
-        zenoh_sub = ZenohCommandSubscriber(
-            camera_manager=camera_manager,
-            node_id=NODE_ID,
-            session=shared_session,
-            ack_timeout_s=ack_timeout,
-        )
-        zenoh_sub.start()
-        print(f"[Zenoh C2] Subscriber active. Node='{NODE_ID}', Key=peers/control/{NODE_ID}")
+        if shared_session is None:
+            # P5 fail-closed: the PeerOrchestrator did not join the mesh
+            # (e.g. lease persistence failed), so the control plane must not
+            # open its own rogue session and accept commands.
+            print(
+                "[Zenoh C2] Control plane disabled: PeerOrchestrator did not join "
+                "(lease persistence failed or session not opened).",
+                file=sys.stderr,
+            )
+        else:
+            zenoh_sub = ZenohCommandSubscriber(
+                camera_manager=camera_manager,
+                node_id=NODE_ID,
+                session=shared_session,
+                ack_timeout_s=ack_timeout,
+                # P5 — receiver fencing: pass the node's current boot_id and the
+                # persisted epoch high-water so the subscriber rejects pre-reboot
+                # commands after a restart.
+                boot_id=peer_orch._boot_id if peer_orch is not None else 0,
+                lease=peer_orch._lease if peer_orch is not None else None,
+            )
+            zenoh_sub.start()
+            print(f"[Zenoh C2] Subscriber active. Node='{NODE_ID}', Key=peers/control/{NODE_ID}")
     except ImportError:
         print(
             "[Zenoh C2] zenoh/msgpack not installed — control disabled. "
@@ -847,39 +937,36 @@ def run_python_mode(args) -> None:
     except Exception as exc:
         print(f"[ZenohPub] Failed to start: {exc}", file=sys.stderr)
 
-    # --- Offload Publisher + Receiver (Level 2/3 crop offload) ---
+    # --- Local LPR worker + L1 stream + L2 plate-crop offload (Phase 3) ---
+    # LocalLprWorker runs TRT LPR on plate crops off the DeepStream graph
+    # (sgie2 was removed in Phase 1).  The OffloadPublisher/OffloadReceiver
+    # move plate crops to a peer (L2, source offload_level==3) and return decoded text; the
+    # orchestrator escalates a camera to L2 (source offload_level==3) when this node's LPR queue saturates.
+    # The worker runs even without a Zenoh session so local LPR always works.
+    lpr_worker = LocalLprWorker(str(LPR_ENGINE), str(LPR_LABELS))
+    lpr_worker.start()
+
+    zenoh_session = peer_orch._session if peer_orch is not None else None
     offload_pub = None
     offload_rcv = None
-    p2p_cfg     = edge_cfg.get("p2p", {})
-    if p2p_cfg.get("offload_level", 0) > 0 and peer_orch is not None:
+    if zenoh_session is not None:
         try:
-            from .offload_publisher import OffloadPublisher
-            from .offload_receiver  import OffloadReceiver
-
-            offload_pub = OffloadPublisher(
-                node_id=NODE_ID,
-                session=peer_orch._session,
-            )
+            offload_pub = OffloadPublisher(node_id=NODE_ID, session=zenoh_session)
             offload_pub.start()
-            print("[OffloadPub] Started.")
-
-            lpr_path    = S.ROOT / p2p_cfg.get("lpr_engine_path", "models/lpr.engine")
-            lpd_path    = S.ROOT / p2p_cfg.get("lpd_engine_path", "models/lpd.engine")
-            labels_path = S.ROOT / "configs" / "labels_lpr.txt"
-
             offload_rcv = OffloadReceiver(
                 node_id=NODE_ID,
-                session=peer_orch._session,
-                lpr_engine_path=str(lpr_path),
-                lpd_engine_path=str(lpd_path),
-                labels_path=str(labels_path),
-                session_idle_s=float(p2p_cfg.get("offload_session_idle_s", 10.0)),
+                session=zenoh_session,
+                lpr_engine_path=str(LPR_ENGINE),
+                lpd_engine_path="",
+                labels_path=str(LPR_LABELS),
+                lpr_worker=lpr_worker,
             )
             offload_rcv.start()
-            print("[OffloadRcv] Started.")
-
+            print(f"[Offload] Started L1 stream + L2 plate-crop offload (source offload_level==3). Node='{NODE_ID}'")
         except Exception as exc:
-            print(f"[OffloadPub/Rcv] Failed to start: {exc}", file=sys.stderr)
+            print(f"[Offload] Failed to start (plate-crop offload disabled): {exc}", file=sys.stderr)
+            offload_pub = None
+            offload_rcv = None
 
     # Note: Production health_agent.py is the sole metrics/load-score publisher
     # and publishes self-heartbeats to peers/status/<NODE_ID> over Zenoh.
@@ -904,11 +991,11 @@ def run_python_mode(args) -> None:
                 print(f"[Supervisor] Found {len(enabled_cams)} enabled cameras after recovery. Resuming pipeline.")
 
             if args.mode == "display":
-                probe = run_display_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
+                probe = run_display_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, lpr_worker=lpr_worker)
             elif args.mode == "file":
-                probe = run_file_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
+                probe = run_file_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, lpr_worker=lpr_worker)
             elif args.mode == "rtsp_push":
-                probe = run_rtsp_push_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub)
+                probe = run_rtsp_push_mode(args, camera_manager, peer_orch=peer_orch, offload_pub=offload_pub, offload_rcv=offload_rcv, zenoh_pub=zenoh_pub, lpr_worker=lpr_worker)
             else:
                 raise ValueError(f"Unknown mode: '{args.mode}'")
             # A GStreamer EOS/error returns here after the mode runner has
@@ -947,3 +1034,20 @@ def run_python_mode(args) -> None:
             zenoh_pub.stop()
         except Exception as exc:
             print(f"[ZenohPub] Stop error: {exc}", file=sys.stderr)
+
+    # Phase 3: tear down crop-offload + local LPR worker on exit.
+    if offload_rcv is not None:
+        try:
+            offload_rcv.stop()
+        except Exception as exc:
+            print(f"[OffloadReceiver] Stop error: {exc}", file=sys.stderr)
+    if offload_pub is not None:
+        try:
+            offload_pub.stop()
+        except Exception as exc:
+            print(f"[OffloadPublisher] Stop error: {exc}", file=sys.stderr)
+    if lpr_worker is not None:
+        try:
+            lpr_worker.stop()
+        except Exception as exc:
+            print(f"[LocalLprWorker] Stop error: {exc}", file=sys.stderr)

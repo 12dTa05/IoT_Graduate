@@ -183,8 +183,11 @@ cat > "$SCRIPT_DIR/.env" <<EOF
 # =============================================================
 
 # --- Node identity ---
+# NODE_ID is the sole node identity consumed by the runtime
+# (settings.py:54, health_agent.py, run_python.py). EDGE_ID was a legacy alias
+# of NODE_ID and is NOT read by any runtime code, so it is intentionally NOT
+# emitted here to avoid a misleading dead identity on provisioned devices.
 NODE_ID=$NODE_ID
-EDGE_ID=$NODE_ID
 
 # --- Load balancing experiment mode ---
 # LOAD_POLICY: actual | predict_no_base | predict_with_base

@@ -69,7 +69,15 @@ class EdgeRegistry:
         self._emit("registered", node_id)
         return True
 
-    def update_health(self, node_id: str, payload: Dict[str, Any]) -> None:
+    def update_health(self, node_id: str, payload: Dict[str, Any]) -> bool:
+        """Apply a health frame. Returns True if applied.
+
+        A node already swept offline is NOT resurrected by a stale/buffered
+        health frame — only an explicit NODE_ONLINE (register()) may re-arm
+        it. This is the authoritative online-gate that prevents late reports
+        from reviving a dead edge in both the registry and the camera
+        projection.
+        """
         now = time.time()
         with self._lock:
             info = self._edges.get(node_id)
@@ -79,6 +87,9 @@ class EdgeRegistry:
                 self._edges[node_id] = EdgeInfo(node_id, ip)
                 info = self._edges[node_id]
                 logger.info("[Registry] Edge '%s' auto-registered via status", node_id)
+            if not info.online:
+                logger.info("[Registry] Ignoring health from offline node '%s'", node_id)
+                return False
             info.online = True
             info.received_at = now
             info.last_heartbeat = now
@@ -87,6 +98,7 @@ class EdgeRegistry:
             health = {k: v for k, v in payload.items() if k not in ("type", "node_id")}
             info.health = health
         self._emit("health_updated", node_id)
+        return True
 
     def mark_offline(self, node_id: str) -> None:
         with self._lock:

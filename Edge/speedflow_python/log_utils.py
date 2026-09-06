@@ -33,8 +33,6 @@ def timed_lock(
     log = logger or logging.getLogger(__name__)
     if wait_s >= warn_threshold_s:
         log.warning("[DiagLock] High wait for lock '%s': wait=%.4fs (threshold=%.4fs)", name, wait_s, warn_threshold_s)
-    else:
-        log.debug("[DiagLock] Lock '%s' acquired: wait=%.4fs", name, wait_s)
     try:
         yield
     finally:
@@ -43,8 +41,6 @@ def timed_lock(
         lock.release()
         if hold_s >= warn_threshold_s:
             log.warning("[DiagLock] High hold duration for lock '%s': hold=%.4fs (threshold=%.4fs)", name, hold_s, warn_threshold_s)
-        else:
-            log.debug("[DiagLock] Lock '%s' released: hold=%.4fs", name, hold_s)
 
 
 class FlushFileHandler(logging.FileHandler):

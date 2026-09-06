@@ -66,49 +66,51 @@ class PlatePreprocessorProbe:
                 n_frame    = pyds.get_nvds_buf_surface(
                     hash(gst_buffer), frame_meta.batch_id
                 )
-                frame_copy = np.array(n_frame, copy=True, order="C")
+                try:
+                    frame_copy = np.array(n_frame, copy=True, order="C")
 
-                # Convert to BGR for C enhancement functions
-                if frame_copy.ndim == 3 and frame_copy.shape[2] == 4:
-                    frame_bgr = cv2.cvtColor(frame_copy, cv2.COLOR_RGBA2BGR)
-                    is_rgba   = True
-                elif frame_copy.ndim == 2:
-                    frame_bgr = cv2.cvtColor(frame_copy, cv2.COLOR_GRAY2BGR)
-                    is_rgba   = False
-                else:
-                    frame_bgr = frame_copy
-                    is_rgba   = False
-
-                h_frame, w_frame = frame_bgr.shape[:2]
-                modified = False
-
-                l_obj = frame_meta.obj_meta_list
-                while l_obj:
-                    obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
-
-                    if obj_meta.class_id in self.VEHICLE_CLASS_IDS:
-                        crop, x, y, x2, y2 = self._crop_vehicle(
-                            frame_bgr, obj_meta, w_frame, h_frame
-                        )
-                        if crop is not None and crop.size > 0:
-                            # Enhance in-place via C extension
-                            self.preprocess_image_inplace(crop)
-                            # crop is a view; write the enhanced pixels back
-                            frame_bgr[y:y2, x:x2] = crop
-                            modified = True
-
-                    l_obj = l_obj.next
-
-                # Write modified BGR frame back to NVMM surface
-                if modified:
-                    if is_rgba:
-                        enhanced_out = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA)
+                    # Convert to BGR for C enhancement functions
+                    if frame_copy.ndim == 3 and frame_copy.shape[2] == 4:
+                        frame_bgr = cv2.cvtColor(frame_copy, cv2.COLOR_RGBA2BGR)
+                        is_rgba   = True
+                    elif frame_copy.ndim == 2:
+                        frame_bgr = cv2.cvtColor(frame_copy, cv2.COLOR_GRAY2BGR)
+                        is_rgba   = False
                     else:
-                        enhanced_out = frame_bgr
-                    np.copyto(n_frame, enhanced_out)
+                        frame_bgr = frame_copy
+                        is_rgba   = False
 
-                # VERY IMPORTANT: release the NVMM lock
-                pyds.unmap_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+                    h_frame, w_frame = frame_bgr.shape[:2]
+                    modified = False
+
+                    l_obj = frame_meta.obj_meta_list
+                    while l_obj:
+                        obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+
+                        if obj_meta.class_id in self.VEHICLE_CLASS_IDS:
+                            crop, x, y, x2, y2 = self._crop_vehicle(
+                                frame_bgr, obj_meta, w_frame, h_frame
+                            )
+                            if crop is not None and crop.size > 0:
+                                # Enhance in-place via C extension
+                                self.preprocess_image_inplace(crop)
+                                # crop is a view; write the pixels back
+                                frame_bgr[y:y2, x:x2] = crop
+                                modified = True
+
+                        l_obj = l_obj.next
+
+                    # Write modified BGR frame back to NVMM surface
+                    if modified:
+                        if is_rgba:
+                            enhanced_out = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA)
+                        else:
+                            enhanced_out = frame_bgr
+                        np.copyto(n_frame, enhanced_out)
+
+                # VERY IMPORTANT: release the NVMM lock even if crop/convert/put raises
+                finally:
+                    pyds.unmap_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
 
                 self.processed_count += 1
                 l_frame = l_frame.next

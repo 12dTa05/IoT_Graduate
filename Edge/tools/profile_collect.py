@@ -270,177 +270,193 @@ def collect(output: Path, duration: float, interval: float, wbase_ref: float) ->
 
         while time.monotonic() < deadline:
             t0 = time.monotonic()
+            try:
 
-            # 1) Read the unified pipeline payload exactly once per loop
-            payload = _read_payload()
-            if payload is None:
-                # No payload has been written yet — wait and retry, write nothing
+                # 1) Read the unified pipeline payload exactly once per loop
+                payload = _read_payload()
+                if payload is None:
+                    # No payload has been written yet — wait and retry, write nothing
+                    _skip(interval, t0)
+                    continue
+
+                # 2) Validity gate 1 — identity metadata (missing/malformed).
+                #    Skip the sample entirely; never write a fabricated row.
+                identity = _extract_telemetry(payload)
+                if identity is None:
+                    _skip(interval, t0)
+                    continue
+                sess_id, seq = identity
+
+                # 2b) Validity gate 2 — freshness at the 1s cadence.  A payload
+                #     older than CADENCE_S (or with an unknown age) is stale by
+                #     definition; a zero-fps snapshot is a real measurement, but a
+                #     stale one is not collectible state, so it is skipped.
+                if not _is_fresh(payload, time.time()):
+                    _skip(interval, t0)
+                    continue
+
+                # ── Phase: not yet committed ? manage candidate ───────────────
+                if _committed_session_id == "":
+                    # 3a) Candidate session changed → reset candidate tracking
+                    if sess_id != _cand_session_id:
+                        _cand_session_id = sess_id
+                        _cand_first_ts   = time.time()
+                        _cand_last_seq   = -1
+
+                    # 3b) Requirement: candidate must have an advancing sequence
+                    #     (fresh pipeline, not a stale payload). Non-advancing
+                    #     seqs are silently ignored during candidate phase.
+                    if seq <= _cand_last_seq:
+                        elapsed = time.monotonic() - t0
+                        time.sleep(max(0.0, interval - elapsed))
+                        continue
+                    _cand_last_seq = seq
+
+                    # 3c) Warmup gate: require at least 6 s of elapsed wall time
+                    #     since the candidate session's first payload was observed.
+                    cand_age_s = time.time() - _cand_first_ts
+                    if cand_age_s < 6.0:
+                        elapsed = time.monotonic() - t0
+                        time.sleep(max(0.0, interval - elapsed))
+                        continue
+
+                    # 3d) Candidate has survived warmup with advancing seqs →
+                    #     COMMIT this session.  We now write the first row.
+                    _committed_session_id = _cand_session_id
+                    _committed_last_seq   = seq
+                # ── Phase: committed ──────────────────────────────────────────
+                else:
+                    # 4a) Session changed → pipeline restarted. Reset ALL session
+                    #     state and re-enter the candidate/warmup path so the
+                    #     collector keeps sampling across the restart (REQ-1).
+                    if sess_id != _committed_session_id:
+                        _committed_session_id = ""
+                        _committed_last_seq   = -1
+                        _cand_session_id = sess_id
+                        _cand_first_ts   = time.time()
+                        _cand_last_seq   = -1
+                        elapsed = time.monotonic() - t0
+                        time.sleep(max(0.0, interval - elapsed))
+                        continue
+
+                    # 4b) Sequence dedup — only strictly advancing seqs accepted
+                    if seq <= _committed_last_seq:
+                        elapsed = time.monotonic() - t0
+                        time.sleep(max(0.0, interval - elapsed))
+                        continue
+
+                    # 4c) Advance committed sequence
+                    _committed_last_seq = seq
+                ts = time.time()
+
+                # 6) Sample hardware ONCE only after accepting the snapshot
+                hw = _read_hw(jtop, payload)
+
+                # 7) Compute FPS average and camera totals from payload
+                all_fps_keys = [k for k, v in payload.items()
+                                if not k.startswith("_") and isinstance(v, (int, float))]
+                fps_vals = [payload[k] for k in all_fps_keys if payload[k] > 0.0]
+                fps_avg = sum(fps_vals) / len(fps_vals) if fps_vals else 0.0
+                n_active_cameras = len(fps_vals)
+                n_cameras_total = len(all_fps_keys)
+
+                # Expected FPS derivation:
+                # 1. From _telemetry.configured_fps_per_camera if available
+                # 2. Else from settings.TARGET_FPS / env fallback (27.0 or 25.0)
+                tmeta = payload.get("_telemetry", {})
+                cfg_fps_dict = tmeta.get("configured_fps_per_camera", {}) if isinstance(tmeta, dict) else {}
+                active_cfg_fps = [
+                    float(cfg_fps_dict[k]) for k in all_fps_keys
+                    if k in cfg_fps_dict and isinstance(cfg_fps_dict[k], (int, float)) and cfg_fps_dict[k] > 0
+                ]
+                if active_cfg_fps:
+                    expected_fps = min(active_cfg_fps)
+                else:
+                    expected_fps = float(os.environ.get("TARGET_FPS", 27.0))
+
+                # 8) Compute input FPS average from the same snapshot
+                input_fps_dict = payload.get("_input_fps", {})
+                if isinstance(input_fps_dict, dict) and input_fps_dict:
+                    input_fps_vals = [v for v in input_fps_dict.values()
+                                      if isinstance(v, (int, float))]
+                    input_fps_avg = (sum(input_fps_vals) / len(input_fps_vals)
+                                     if input_fps_vals else 0.0)
+                else:
+                    input_fps_avg = 0.0
+
+                # 9) Aggregate features across active cameras
+                feat_dict = payload.get("_features", {})
+                _active_ids = {k for k in all_fps_keys if payload[k] > 0.0}
+                active_feat_stats = {
+                    k: v for k, v in feat_dict.items()
+                    if k in _active_ids and isinstance(v, dict)
+                } if isinstance(feat_dict, dict) else {}
+                n_track_total  = 0.0
+                n_plate_total  = 0.0
+                stat_frac_vals = []
+                for cam_feats in active_feat_stats.values():
+                    n_track_total  += cam_feats.get("n_track", 0.0)
+                    n_plate_total  += cam_feats.get("n_plate", 0.0)
+                    stat_frac_vals.append(cam_feats.get("stationary_fraction", 0.0))
+                stat_mean = (sum(stat_frac_vals) / len(stat_frac_vals)
+                             if stat_frac_vals else 0.0)
+
+                # 10) Offload rate from the same payload
+                offload_crops = payload.get("_offload_crops", {})
+                offload_rate = round(float(offload_crops.get("received_per_s", 0.0)), 3)
+
+                delta = round(hw["gpu_percent"] - wbase_ref, 2)
+
+                # 11) Compute load_score from the payload fps
+                # Build fps_dict as health_agent expects: {cam_id: float}
+                fps_dict = {k: payload[k] for k in all_fps_keys}
+                load_score, _preset = _compute_load_score(
+                    hw, fps_dict, feature_stats=active_feat_stats
+                )
+
+                # 12) Snapshot metadata directly from the gate-verified payload
+                win_started = tmeta.get("pipeline_window_started_monotonic", 0.0) if isinstance(tmeta, dict) else 0.0
+                win_ended   = tmeta.get("pipeline_window_ended_monotonic", 0.0) if isinstance(tmeta, dict) else 0.0
+                win_dur     = tmeta.get("pipeline_window_duration_s", 0.0) if isinstance(tmeta, dict) else 0.0
+                updated_at  = payload.get("_updated_at", 0.0)
+
+                writer.writerow({
+                    "ts":                                 round(ts, 3),
+                    "gpu_percent":                        hw["gpu_percent"],
+                    "cpu_percent":                        hw["cpu_percent"],
+                    "ram_percent":                        hw["ram_percent"],
+                    "gpu_temp_c":                         hw["gpu_temp_c"],
+                    "session_id":                         sess_id,
+                    "sequence":                           seq,
+                    "pipeline_window_started_monotonic":  round(win_started, 3),
+                    "pipeline_window_ended_monotonic":    round(win_ended, 3),
+                    "pipeline_window_duration_s":         round(win_dur, 3),
+                    "pipeline_updated_at":                round(updated_at, 3),
+                    "fps_avg":                            round(fps_avg, 2),
+                    "expected_fps":                       round(expected_fps, 2),
+                    "input_fps_avg":                       round(input_fps_avg, 2),
+                    "n_active_cameras":                   n_active_cameras,
+                    "n_cameras_total":                    n_cameras_total,
+                    "n_track_total":                      round(n_track_total, 2),
+                    "n_plate_total":                      round(n_plate_total, 2),
+                    "stationary_fraction_mean":           round(stat_mean, 3),
+                    "offload_crops_received_per_s":       offload_rate,
+                    "load_score":                         load_score,
+                    "delta_load":                         delta,
+                })
+                rows_written += 1
+
+                elapsed = time.monotonic() - t0
+                time.sleep(max(0.0, interval - elapsed))
+
+            except Exception as exc:  # keep collector alive; do NOT swallow KeyboardInterrupt/SystemExit
+                print(
+                    f"[profile_collect] WARNING: sample error "
+                    f"({type(exc).__name__}): {exc}; retrying next cycle",
+                    file=sys.stderr,
+                )
                 _skip(interval, t0)
                 continue
-
-            # 2) Validity gate 1 — identity metadata (missing/malformed).
-            #    Skip the sample entirely; never write a fabricated row.
-            identity = _extract_telemetry(payload)
-            if identity is None:
-                _skip(interval, t0)
-                continue
-            sess_id, seq = identity
-
-            # 2b) Validity gate 2 — freshness at the 1s cadence.  A payload
-            #     older than CADENCE_S (or with an unknown age) is stale by
-            #     definition; a zero-fps snapshot is a real measurement, but a
-            #     stale one is not collectible state, so it is skipped.
-            if not _is_fresh(payload, time.time()):
-                _skip(interval, t0)
-                continue
-
-            # ── Phase: not yet committed ? manage candidate ───────────────
-            if _committed_session_id == "":
-                # 3a) Candidate session changed → reset candidate tracking
-                if sess_id != _cand_session_id:
-                    _cand_session_id = sess_id
-                    _cand_first_ts   = time.time()
-                    _cand_last_seq   = -1
-
-                # 3b) Requirement: candidate must have an advancing sequence
-                #     (fresh pipeline, not a stale payload). Non-advancing
-                #     seqs are silently ignored during candidate phase.
-                if seq <= _cand_last_seq:
-                    elapsed = time.monotonic() - t0
-                    time.sleep(max(0.0, interval - elapsed))
-                    continue
-                _cand_last_seq = seq
-
-                # 3c) Warmup gate: require at least 6 s of elapsed wall time
-                #     since the candidate session's first payload was observed.
-                cand_age_s = time.time() - _cand_first_ts
-                if cand_age_s < 6.0:
-                    elapsed = time.monotonic() - t0
-                    time.sleep(max(0.0, interval - elapsed))
-                    continue
-
-                # 3d) Candidate has survived warmup with advancing seqs →
-                #     COMMIT this session.  We now write the first row.
-                _committed_session_id = _cand_session_id
-                _committed_last_seq   = seq
-            # ── Phase: committed ──────────────────────────────────────────
-            else:
-                # 4a) Session changed → reject (pipeline restarted mid-collection)
-                if sess_id != _committed_session_id:
-                    elapsed = time.monotonic() - t0
-                    time.sleep(max(0.0, interval - elapsed))
-                    continue
-
-                # 4b) Sequence dedup — only strictly advancing seqs accepted
-                if seq <= _committed_last_seq:
-                    elapsed = time.monotonic() - t0
-                    time.sleep(max(0.0, interval - elapsed))
-                    continue
-
-                # 4c) Advance committed sequence
-                _committed_last_seq = seq
-            ts = time.time()
-
-            # 6) Sample hardware ONCE only after accepting the snapshot
-            hw = _read_hw(jtop, payload)
-
-            # 7) Compute FPS average and camera totals from payload
-            all_fps_keys = [k for k, v in payload.items()
-                            if not k.startswith("_") and isinstance(v, (int, float))]
-            fps_vals = [payload[k] for k in all_fps_keys if payload[k] > 0.0]
-            fps_avg = sum(fps_vals) / len(fps_vals) if fps_vals else 0.0
-            n_active_cameras = len(fps_vals)
-            n_cameras_total = len(all_fps_keys)
-
-            # Expected FPS derivation:
-            # 1. From _telemetry.configured_fps_per_camera if available
-            # 2. Else from settings.TARGET_FPS / env fallback (27.0 or 25.0)
-            tmeta = payload.get("_telemetry", {})
-            cfg_fps_dict = tmeta.get("configured_fps_per_camera", {}) if isinstance(tmeta, dict) else {}
-            active_cfg_fps = [
-                float(cfg_fps_dict[k]) for k in all_fps_keys
-                if k in cfg_fps_dict and isinstance(cfg_fps_dict[k], (int, float)) and cfg_fps_dict[k] > 0
-            ]
-            if active_cfg_fps:
-                expected_fps = min(active_cfg_fps)
-            else:
-                expected_fps = float(os.environ.get("TARGET_FPS", 27.0))
-
-            # 8) Compute input FPS average from the same snapshot
-            input_fps_dict = payload.get("_input_fps", {})
-            if isinstance(input_fps_dict, dict) and input_fps_dict:
-                input_fps_vals = [v for v in input_fps_dict.values()
-                                  if isinstance(v, (int, float))]
-                input_fps_avg = (sum(input_fps_vals) / len(input_fps_vals)
-                                 if input_fps_vals else 0.0)
-            else:
-                input_fps_avg = 0.0
-
-            # 9) Aggregate features across active cameras
-            feat_dict = payload.get("_features", {})
-            _active_ids = {k for k in all_fps_keys if payload[k] > 0.0}
-            active_feat_stats = {
-                k: v for k, v in feat_dict.items()
-                if k in _active_ids and isinstance(v, dict)
-            } if isinstance(feat_dict, dict) else {}
-            n_track_total  = 0.0
-            n_plate_total  = 0.0
-            stat_frac_vals = []
-            for cam_feats in active_feat_stats.values():
-                n_track_total  += cam_feats.get("n_track", 0.0)
-                n_plate_total  += cam_feats.get("n_plate", 0.0)
-                stat_frac_vals.append(cam_feats.get("stationary_fraction", 0.0))
-            stat_mean = (sum(stat_frac_vals) / len(stat_frac_vals)
-                         if stat_frac_vals else 0.0)
-
-            # 10) Offload rate from the same payload
-            offload_crops = payload.get("_offload_crops", {})
-            offload_rate = round(float(offload_crops.get("received_per_s", 0.0)), 3)
-
-            delta = round(hw["gpu_percent"] - wbase_ref, 2)
-
-            # 11) Compute load_score from the payload fps
-            # Build fps_dict as health_agent expects: {cam_id: float}
-            fps_dict = {k: payload[k] for k in all_fps_keys}
-            load_score, _preset = _compute_load_score(
-                hw, fps_dict, feature_stats=active_feat_stats
-            )
-
-            # 12) Snapshot metadata directly from the gate-verified payload
-            win_started = tmeta.get("pipeline_window_started_monotonic", 0.0) if isinstance(tmeta, dict) else 0.0
-            win_ended   = tmeta.get("pipeline_window_ended_monotonic", 0.0) if isinstance(tmeta, dict) else 0.0
-            win_dur     = tmeta.get("pipeline_window_duration_s", 0.0) if isinstance(tmeta, dict) else 0.0
-            updated_at  = payload.get("_updated_at", 0.0)
-
-            writer.writerow({
-                "ts":                                 round(ts, 3),
-                "gpu_percent":                        hw["gpu_percent"],
-                "cpu_percent":                        hw["cpu_percent"],
-                "ram_percent":                        hw["ram_percent"],
-                "gpu_temp_c":                         hw["gpu_temp_c"],
-                "session_id":                         sess_id,
-                "sequence":                           seq,
-                "pipeline_window_started_monotonic":  round(win_started, 3),
-                "pipeline_window_ended_monotonic":    round(win_ended, 3),
-                "pipeline_window_duration_s":         round(win_dur, 3),
-                "pipeline_updated_at":                round(updated_at, 3),
-                "fps_avg":                            round(fps_avg, 2),
-                "expected_fps":                       round(expected_fps, 2),
-                "input_fps_avg":                       round(input_fps_avg, 2),
-                "n_active_cameras":                   n_active_cameras,
-                "n_cameras_total":                    n_cameras_total,
-                "n_track_total":                      round(n_track_total, 2),
-                "n_plate_total":                      round(n_plate_total, 2),
-                "stationary_fraction_mean":           round(stat_mean, 3),
-                "offload_crops_received_per_s":       offload_rate,
-                "load_score":                         load_score,
-                "delta_load":                         delta,
-            })
-            rows_written += 1
-
-            elapsed = time.monotonic() - t0
-            time.sleep(max(0.0, interval - elapsed))
-
     if jtop:
         try: jtop.close()
         except Exception: pass

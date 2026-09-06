@@ -208,7 +208,7 @@ class SpeedProbe:
 
         # Zenoh publisher (set externally via set_publisher)
         self.publisher     = None
-        # OffloadPublisher for Level 2/3 crop sending (set via set_offload_publisher)
+        # OffloadPublisher for plate-crop (L2) offload sending (set via set_offload_publisher)
         self._offload_pub  = None
         self._offload_rcv  = None
 
@@ -231,6 +231,14 @@ class SpeedProbe:
         self.plate_detection_start_frame = {}
         self.plate_candidates            = defaultdict(list)
         self.plate_locked                = {}
+        # Local LPR worker (Phase 2): runs TRT LPR off the DeepStream pipeline.
+        # Fed from osd_sink_pad_buffer_probe with plate crops; results arrive
+        # asynchronously via _drain_offload_results-style injection.  None until
+        # run_python.py wires a LocalLprWorker instance via set_lpr_worker.
+        self._lpr_worker = None
+        # In-flight guard: stids whose crop has been submitted to the worker
+        # but not yet answered/rejected — prevents re-submit / crop flooding.
+        self._lpr_inflight: set = set()
         self.plate_detection_attempts    = defaultdict(int)
 
         self.last_cleanup_time = time.time()
@@ -282,7 +290,8 @@ class SpeedProbe:
         # "results_rejected".
         self._results_rejected: int = 0
 
-        # ── Producer-gate counters for L2/L3 crop offload ──────────────────
+        # ── Producer-gate counters for governance L2 (plate-crop) offload ────
+        # Canonical source enum: 0 local, 1 full-stream migration, 3 plate-crop; retired vehicle-crop would have been 2.
         # Lifetime, cumulative, lock-protected. Incremented on the
         # GStreamer/GLib thread inside osd_sink_pad_buffer_probe; read by the
         # FPS writer thread during the 1 s snapshot.  Each gate outcome is
@@ -290,21 +299,18 @@ class SpeedProbe:
         # under the lock (dict copy) means a snapshot can never raise, even
         # if a counter name is missing.
         #
-        # Gate meaning:
-        #   l*_active_frames       — frames where the offload level matched
-        #                            (L2: vehicles, L3: plates) AND a publisher
-        #                            + target peer were configured
-        #   l*_object_*            — objects that reached the crop stage
-        #                            (L2: vehicles_in_frame; L3: plates after
-        #                            association/locked gates)
-        #   l*_surface_unavailable — frame surface fetch returned None
-        #   l*_valid_crops         — crops that passed size checks and were
-        #                            handed to put_plate/put_vehicle
-        #   l*_crop_errors         — exceptions during crop fetch/crop/put
+        # Gate meaning (L2 = plate crops):
+        #   l2_active_frames       — frames where offload_level==3 AND a
+        #                            publisher + target peer were configured
+        #   l2_plate_objects       — plates that reached the crop stage
+        #   l2_surface_unavailable — frame surface fetch returned None
+        #   l2_valid_crops         — crops that passed size checks and were
+        #                            handed to put_plate
+        #   l2_crop_errors         — exceptions during crop fetch/crop/put
         #
-        # l*_valid_crops doubles as the publish-attempt counter: put_plate /
-        # put_vehicle is called exactly once per valid crop, so the sender's
-        # encoded/enqueued counters remain the unambiguous follow-through.
+        # l2_valid_crops doubles as the publish-attempt counter: put_plate is
+        # called exactly once per valid crop, so the sender's encoded/enqueued
+        # counters remain the unambiguous follow-through.
         self._offload_gate_lock: threading.Lock = threading.Lock()
         self._offload_gate_counts: Dict[str, int] = defaultdict(int)
 
@@ -314,7 +320,6 @@ class SpeedProbe:
         # Max 16 distinct types per level; overflow still counted in total
         # l*_crop_errors but no new type key is created.
         self._l2_crop_error_types: Dict[str, int] = {}
-        self._l3_crop_error_types: Dict[str, int] = {}
 
         # ── Load-score breakdown (set by health-push loop, read by writer) ──
         self._load_score_breakdown: Optional[Dict] = None
@@ -322,7 +327,6 @@ class SpeedProbe:
         # Per-level count for rate-limited warning (fires on 1, 101, 201, …)
         # pony tail: separate counter from gate_inc so gate_inc stays unchanged.
         self._l2_crop_error_total: int = 0
-        self._l3_crop_error_total: int = 0
 
         # ── Unified telemetry counters (reset on every writer flush) ───────
         # Per-camera FPS frame counters — incremented in _tick_fps, drained
@@ -447,7 +451,7 @@ class SpeedProbe:
 
     def set_offload_publisher(self, pub) -> None:
         """
-        Set the OffloadPublisher instance used for Level 2/3 crop sending.
+        Set the OffloadPublisher instance used for plate-crop (L2) offload sending.
         Called by run_python_mode after the orchestrator and publisher are ready.
         """
         self._offload_pub = pub
@@ -458,6 +462,14 @@ class SpeedProbe:
         and surface offload_crops_received_per_s in the telemetry snapshot.
         """
         self._offload_rcv = rcv
+
+    def set_lpr_worker(self, worker) -> None:
+        """
+        Wire the LocalLprWorker (Phase 2).  When set, plate crops extracted in
+        osd_sink_pad_buffer_probe are submitted here for local TRT LPR instead of
+        relying on the removed in-pipeline sgie2 classifier.
+        """
+        self._lpr_worker = worker
 
     def set_source_types(self, source_type_by_camera: dict) -> None:
         """
@@ -481,7 +493,7 @@ class SpeedProbe:
         Thread-safe entry point for OffloadReceiver to push decoded plate text
         back into this probe.  Called from the offload receiver worker thread.
         result: {stid, camera_id, frame_no, plate_text, confidence, ts,
-                 inference_ok?}
+                 inference_ok?, vote?, source?}
 
         Result contract (receiver → sender):
           • inference_ok present and False → inference failure; the result is
@@ -490,7 +502,18 @@ class SpeedProbe:
           • inference_ok missing (legacy payloads) or True → valid observation,
             accepted even when plate_text is empty / confidence is 0.  An empty
             plate_text is a legitimate "plate not readable" outcome and still
-            locks the track so it is not re-offloaded.
+            participates in voting so it is not re-offloaded.
+          • vote present and True → route through the SAME multi-frame voting
+            path as local LocalLprWorker results (plate_candidates +
+            _select_best_plate_from_candidates).  This is the correct contract
+            for peer-decoded LPR crops: a single possibly-empty peer reading
+            must NOT lock the track — it accumulates with later readings and
+            only the majority/quality-best text locks.  Empty plate_text is
+            filtered out by the voter until a real reading arrives.
+          • vote absent/False (legacy payloads) → lock the plate immediately
+            (backward-compatible L1 behavior).  source marks provenance:
+            "peer" for offloaded crops, "worker" for local LPR; default
+            "worker" when the key is absent.
         """
         # Strict identity check: only explicit boolean False is rejected.
         # Legacy payloads lacking the key get default True → accepted.
@@ -519,13 +542,62 @@ class SpeedProbe:
                 stid_r = tuple(res.get("stid", []))
                 if stid_r:
                     plate_txt = res.get("plate_text", "")
-                    self.plate_locked[stid_r] = plate_txt
-                    if isinstance(plate_txt, str) and len(plate_txt.strip()) >= 4:
-                        with self._svc_lock:
-                            meta = self._track_service_meta.get(stid_r)
-                            if meta is not None and not meta.get("finalized"):
-                                meta["finalized"] = True
-                                self._svc_counts["plates_finalized"] += 1
+                    vote = res.get("vote", False)
+                    if vote:
+                        # Local LPR (Phase 2/3): multi-frame voting.  Accumulate a
+                        # dict-shaped candidate (matches _select_best_plate_from_candidates)
+                        # and let it decide the locked plate — do NOT lock immediately.
+                        conf = res.get("confidence", 0.0)
+                        ts   = res.get("ts", time.time())
+                        # source marker carried by the result payload: "peer"
+                        # (offloaded crop decoded by a peer) or default "worker"
+                        # (local LocalLprWorker result).  Lets the voting path
+                        # distinguish provenance without a second voter.
+                        src = res.get("source", "worker")
+                        self.plate_candidates[stid_r].append({
+                            "text": plate_txt, "quality": conf, "ts": ts, "source": src,
+                        })
+                        best = self._select_best_plate_from_candidates(
+                            self.plate_candidates[stid_r])
+                        if best is not None:
+                            # Sufficient evidence: lock, clear candidates, finalize.
+                            self.plate_locked[stid_r] = best
+                            self.plate_candidates[stid_r] = []
+                            if isinstance(best, str) and len(best.strip()) >= 4:
+                                with self._svc_lock:
+                                    meta = self._track_service_meta.get(stid_r)
+                                    if meta is not None and not meta.get("finalized"):
+                                        meta["finalized"] = True
+                                        self._svc_counts["plates_finalized"] += 1
+                            # Release the in-flight guard — lifecycle complete.
+                            self._lpr_inflight.discard(stid_r)
+                        else:
+                            # Inconclusive vote (no non-empty best): reopen the
+                            # in-flight gate so a future frame can re-submit the
+                            # crop and retry, but bound retries via the existing
+                            # plate_detection_attempts counter so a track that
+                            # never yields a readable plate cannot re-submit
+                            # unbounded.  (Mirror of the Phase-1 give-up bound.)
+                            self.plate_detection_attempts[stid_r] += 1
+                            if self.plate_detection_attempts[stid_r] < 3:
+                                self._lpr_inflight.discard(stid_r)
+                            else:
+                                # Retry budget exhausted — terminate this track's
+                                # LPR with no plate (matches Phase-1 give-up).
+                                self.plate_locked[stid_r] = None
+                                self._lpr_inflight.discard(stid_r)
+                    else:
+                        # Legacy / no-vote payload (backward-compatible L1):
+                        # lock the plate immediately.
+                        self.plate_locked[stid_r] = plate_txt
+                        if isinstance(plate_txt, str) and len(plate_txt.strip()) >= 4:
+                            with self._svc_lock:
+                                meta = self._track_service_meta.get(stid_r)
+                                if meta is not None and not meta.get("finalized"):
+                                    meta["finalized"] = True
+                                    self._svc_counts["plates_finalized"] += 1
+                        # Always release the in-flight guard for this stid.
+                        self._lpr_inflight.discard(stid_r)
             except queue.Empty:
                 break
 
@@ -548,9 +620,9 @@ class SpeedProbe:
         except Exception:
             return {}
 
-    # Bounded error-type telemetry for the L2/L3 crop exception paths.
+    # Bounded error-type telemetry for governance L2 (plate-crop) exception path.
+    # Canonical source enum: 0 local, 1 full-stream migration, 3 plate-crop; retired vehicle-crop would have been 2.
     # Used to diagnose a swallowed-at-debug crop failure on matched Jetson
-    # A+B: L2 active 1018 frames, l2_crop_errors 1018, l2_valid_crops 0.
     # All access under _offload_gate_lock so the GStreamer callback and the
     # writer thread can never raise; cap is 16 distinct class names per level.
     _CROP_ERROR_TYPES_CAP: int = 16
@@ -561,7 +633,8 @@ class SpeedProbe:
         """
         Record an exception class name for crop-error diagnosis.
 
-        Called from the L2/L3 crop exception handlers on the GStreamer thread.
+        Called from the governance L2 (plate-crop) exception handler on the GStreamer
+        thread.
         Must never raise and must not spam: a warning is emitted on the first
         error and every 100th error per level (type + message, no traceback).
         """
@@ -575,10 +648,6 @@ class SpeedProbe:
                     types = self._l2_crop_error_types
                     self._l2_crop_error_total += 1
                     total = self._l2_crop_error_total
-                elif level == "l3":
-                    types = self._l3_crop_error_types
-                    self._l3_crop_error_total += 1
-                    total = self._l3_crop_error_total
                 else:
                     return
                 if exc_name in types:
@@ -606,10 +675,9 @@ class SpeedProbe:
             with self._offload_gate_lock:
                 return {
                     "l2_crop_error_types": dict(self._l2_crop_error_types),
-                    "l3_crop_error_types": dict(self._l3_crop_error_types),
                 }
         except Exception:
-            return {"l2_crop_error_types": {}, "l3_crop_error_types": {}}
+            return {"l2_crop_error_types": {}}
 
     def _snapshot_offload_crops(self, prev_count: int, prev_ts: float):
         """
@@ -677,22 +745,34 @@ class SpeedProbe:
         # inference failure (inference_ok=False).
         offload_crops["results_rejected"] = self._results_rejected
 
-        # Producer-gate counters (L2/L3 crop offload) — cumulative lifetime
+        # Local LPR worker queue saturation (Phase 2/3).  0.0 when no worker
+        # is wired — used by the orchestrator to decide L1 offload escalation.
+        lpr_queue_ratio = (
+            self._lpr_worker.queue_depth_ratio() if self._lpr_worker else 0.0
+        )
+        offload_crops["lpr_queue_ratio"] = lpr_queue_ratio
+
+        # Phase 3: feed the ratio to the orchestrator so it can escalate
+        # plate-crop offload to a peer when the local LPR pool saturates.
+        if self._peer_orch is not None and hasattr(self._peer_orch, "set_lpr_queue_ratio"):
+            try:
+                self._peer_orch.set_lpr_queue_ratio(lpr_queue_ratio)
+            except Exception:
+                pass
+
+        # Producer-gate counters (governance L2 plate-crop offload) — cumulative lifetime
         # counters incremented on the GStreamer thread. Read via a lock-held
         # dict copy so the writer thread can never see a torn value.
         gate_counts = self._gate_counts_copy()
         for name in (
-            # L2 (vehicle crops)
-            "l2_active_frames", "l2_vehicle_objects", "l2_surface_unavailable",
+            # L2 (plate crops)
+            "l2_active_frames", "l2_plate_objects", "l2_surface_unavailable",
             "l2_valid_crops", "l2_crop_errors",
-            # L3 (plate crops)
-            "l3_active_frames", "l3_plate_objects", "l3_surface_unavailable",
-            "l3_valid_crops", "l3_crop_errors",
         ):
             offload_crops[name] = gate_counts.get(name, 0)
 
         # Bounded crop error-type breakdowns — added to the snapshot so the
-        # swallowed-at-debug L2/L3 crop failure is visible at runtime.
+        # swallowed-at-debug governance L2 (plate-crop) failure is visible at runtime.
         for name, err_types in self._crop_error_types_copy().items():
             offload_crops[name] = err_types
 
@@ -1094,7 +1174,10 @@ class SpeedProbe:
     @staticmethod
     def _frame_bgr_from_gst_buffer(gst_buffer, frame_meta):
         surface = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
-        img = np.array(surface, copy=True, order="C")
+        try:
+            img = np.array(surface, copy=True, order="C")
+        finally:
+            pyds.unmap_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
         if img.ndim == 3 and img.shape[2] == 4:
             img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
         elif img.ndim == 2:
@@ -1212,8 +1295,15 @@ class SpeedProbe:
                     else:
                         birth = meta.get("birth_frame", current_frame)
                         age = current_frame - birth
-                        # Guard: must be >= 5 frames (real vehicle) AND not ancient (> 900 frames = 30s)
-                        if 5 <= age <= 900:
+                        lpd_engaged = (
+                            stid in self.plate_detection_start_frame
+                            or self.plate_detection_attempts.get(stid, 0) > 0
+                        )
+                        # Guard: must be >= 5 frames (real vehicle) AND not ancient
+                        # (> 900 frames = 30s). Only count as missed if LPD actually
+                        # engaged — vehicles that never presented a readable plate
+                        # (trucks, occlusions, bad angles) are NOT pipeline collapse.
+                        if 5 <= age <= 900 and lpd_engaged:
                             self._svc_counts["tracks_missed"] += 1
                 elif stid in self.plate_locked and self.plate_locked[stid] is not None:
                     self._svc_counts["tracks_expired_locked"] += 1
@@ -1230,6 +1320,7 @@ class SpeedProbe:
             self.plate_candidates.pop(stid, None)
             self.plate_locked.pop(stid, None)
             self.plate_detection_attempts.pop(stid, None)
+            self._lpr_inflight.discard(stid)
 
     # ------------------------------------------------------------------
     # Main probe callback
@@ -1266,7 +1357,7 @@ class SpeedProbe:
                 continue
 
             # ── Offload level for this camera ──────────────────────────────
-            # 0 = local, 2 = vehicle crops → peer, 3 = plate crops → peer
+            # Canonical source enum: 0 local, 1 full-stream migration, 3 plate-crop; retired vehicle-crop would have been 2.
             offload_level  = 0
             offload_target = ""
             if self._peer_orch is not None:
@@ -1357,17 +1448,18 @@ class SpeedProbe:
             # classification uses cached median, free of the batch-transform result.
             self._tick_features(cam_cfg.camera_id, source_id, vehicles_in_frame)
 
-            # ── Pass 2: License plate accumulation or Level-3 offload ────────
-            # Level 3: plate crops are sent to the peer; local accumulation skipped.
+            # ── Pass 2: License plate accumulation or L2 plate-crop offload ──
+            # L2 (source offload_level==3): plate crops are sent to the peer;
+            # local accumulation skipped.
             if offload_level == 3 and self._offload_pub is not None and offload_target:
-                self._gate_inc("l3_active_frames")
+                self._gate_inc("l2_active_frames")
                 # Backpressure gate: check if offload target peer is saturated
                 target_saturated = False
                 if self._peer_orch is not None and hasattr(self._peer_orch, "is_offload_target_saturated"):
                     target_saturated = self._peer_orch.is_offload_target_saturated(offload_target)
 
                 if target_saturated:
-                    self._gate_inc("l3_dropped_backpressure", len(plates_in_frame))
+                    self._gate_inc("l2_dropped_backpressure", len(plates_in_frame))
                 else:
                     for plate_info in plates_in_frame:
                         vehicle_id = self._associate_plate_to_vehicle(
@@ -1378,8 +1470,13 @@ class SpeedProbe:
                         stid = (source_id, vehicle_id)
                         if stid in self.plate_locked:
                             continue
+                        # Guard against duplicate sends: once a crop for this
+                        # stid has been handed to put_plate, skip until the
+                        # track expires and the in-flight marker is cleared.
+                        if stid in self._lpr_inflight:
+                            continue
                         # Reached the crop stage — a plate the origin would send.
-                        self._gate_inc("l3_plate_objects")
+                        self._gate_inc("l2_plate_objects")
                         try:
                             frame_bgr_off = self._get_frame_bgr_cached(
                                 gst_buffer, frame_meta, frame_bgr_cache)
@@ -1389,9 +1486,9 @@ class SpeedProbe:
                                 py = max(0, int(bb["top"]))
                                 pw = max(1, int(bb["width"]))
                                 ph = max(1, int(bb["height"]))
-                                plate_crop = frame_bgr_off[py:py+ph, px:px+pw]
+                                plate_crop = frame_bgr_off[py:py+ph, px:px+pw].copy()
                                 if plate_crop.size > 0:
-                                    self._gate_inc("l3_valid_crops")
+                                    self._gate_inc("l2_valid_crops")
                                     self._offload_pub.put_plate(
                                         target_node=offload_target,
                                         stid=stid,
@@ -1400,18 +1497,33 @@ class SpeedProbe:
                                         crop_bgr=plate_crop,
                                         confidence=plate_info.get("conf", 0.0),
                                     )
+                                    # Mark in-flight only after put_plate returns
+                                    # (no exception) so a failed enqueue can retry.
+                                    self._lpr_inflight.add(stid)
                             else:
-                                self._gate_inc("l3_surface_unavailable")
+                                self._gate_inc("l2_surface_unavailable")
                         except Exception as exc:
-                            self._gate_inc("l3_crop_errors")
-                            self._record_crop_error_type("l3", exc)
+                            self._gate_inc("l2_crop_errors")
+                            self._record_crop_error_type("l2", exc)
                             logger.debug(
-                                "[SpeedProbe] L3 plate crop offload error for camera=%s frame=%s: %s",
+                                "[SpeedProbe] L2 plate crop offload error for camera=%s frame=%s: %s",
                                 cam_cfg.camera_id, frame_number, exc, exc_info=True,
                             )
 
             else:
-                # Normal local plate accumulation
+                # Normal local plate accumulation OR local LPR via LocalLprWorker (Phase 2)
+                frame_bgr_local = None
+                if self._lpr_worker is not None:
+                    try:
+                        frame_bgr_local = self._get_frame_bgr_cached(
+                            gst_buffer, frame_meta, frame_bgr_cache)
+                    except Exception as exc:
+                        logger.debug(
+                            "[SpeedProbe] local LPR frame fetch error cam=%s frame=%s: %s",
+                            cam_cfg.camera_id, frame_number, exc, exc_info=True,
+                        )
+                        frame_bgr_local = None
+
                 for plate_info in plates_in_frame:
                     vehicle_id = self._associate_plate_to_vehicle(
                         plate_info["bbox"], vehicles_in_frame
@@ -1422,6 +1534,25 @@ class SpeedProbe:
                     stid = (source_id, vehicle_id)
                     if stid in self.plate_locked:
                         continue
+
+                    # Phase 2: feed crop to LocalLprWorker; multi-frame voting
+                    # (drained in _drain_offload_results) decides the locked plate.
+                    if self._lpr_worker is not None:
+                        if stid in self._lpr_inflight:
+                            continue
+                        if frame_bgr_local is not None:
+                            bb = plate_info["bbox"]
+                            px = max(0, int(bb["left"]))
+                            py = max(0, int(bb["top"]))
+                            pw = max(1, int(bb["width"]))
+                            ph = max(1, int(bb["height"]))
+                            plate_crop = frame_bgr_local[py:py+ph, px:px+pw].copy()
+                            if plate_crop.size > 0:
+                                if self._lpr_worker.submit(
+                                    stid, cam_cfg.camera_id, frame_number,
+                                    plate_crop, plate_info.get("conf", 0.0), vote=True):
+                                    self._lpr_inflight.add(stid)
+                        continue  # worker owns this track's LPR now
 
                     if stid not in self.plate_detection_start_frame:
                         self.plate_detection_start_frame[stid] = frame_number
@@ -1472,49 +1603,6 @@ class SpeedProbe:
 
             # ── Pass 3: Speed & OSD display ───────────────────────────────
             fps_int = int(cam_cfg.fps)
-
-            # Level 2: send full vehicle crops to peer for LPD/LPR, while the
-            # origin node keeps local speed/event processing below.
-            if offload_level == 2 and self._offload_pub is not None and offload_target:
-                self._gate_inc("l2_active_frames")
-                # Objects that would be sent if the surface were available.
-                self._gate_inc("l2_vehicle_objects", len(vehicles_in_frame))
-                # Backpressure gate: check if offload target peer is saturated
-                target_saturated = False
-                if self._peer_orch is not None and hasattr(self._peer_orch, "is_offload_target_saturated"):
-                    target_saturated = self._peer_orch.is_offload_target_saturated(offload_target)
-
-                if target_saturated:
-                    self._gate_inc("l2_dropped_backpressure", len(vehicles_in_frame))
-                else:
-                    try:
-                        frame_bgr_l2 = self._get_frame_bgr_cached(
-                            gst_buffer, frame_meta, frame_bgr_cache)
-                        if frame_bgr_l2 is not None:
-                            for tid, veh_info in vehicles_in_frame.items():
-                                stid = (source_id, tid)
-                                veh_crop = self._crop_bbox(frame_bgr_l2, veh_info["obj_meta"])
-                                if veh_crop is not None and veh_crop.size > 0:
-                                    self._gate_inc("l2_valid_crops")
-                                    self._offload_pub.put_vehicle(
-                                        target_node=offload_target,
-                                        stid=stid,
-                                        camera_id=cam_cfg.camera_id,
-                                        frame_no=frame_number,
-                                        crop_bgr=veh_crop,
-                                        bbox_world_y=y_world_by_tid.get(tid, 0.0),
-                                    )
-                        else:
-                            self._gate_inc("l2_surface_unavailable")
-                    except Exception as exc:
-                        self._gate_inc("l2_crop_errors")
-                        self._record_crop_error_type("l2", exc)
-                        logger.debug(
-                            "[SpeedProbe] L2 vehicle crop offload error for camera=%s frame=%s: %s",
-                            cam_cfg.camera_id, frame_number, exc, exc_info=True,
-                        )
-                # Fall through to Pass 3 so the origin node keeps speed history,
-                # OSD, and overspeed events while the peer handles LPD/LPR.
 
             for tid, veh_info in vehicles_in_frame.items():
                 stid     = (source_id, tid)

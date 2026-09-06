@@ -29,6 +29,7 @@ except ImportError:
     psutil = None
 
 from speedflow_python.log_utils import timed_lock
+from speedflow_python.zenoh_session import make_session
 
 # Load settings from .env (must run from Edge/ or have Edge/ in path)
 import sys as _sys
@@ -596,36 +597,74 @@ def _calc_workload_pressure(
     eff_wl: float,
     eff_fps: float,
     hw_fuse_score_floor: float,
+    metrics: dict = None,
+    service_ema: Optional[float] = None,
+    n_active: int = 0,
 ) -> float:
     """
-    ponytail: pure helper computing workload pressure [0..100] from workload & fps.
-    Reused by both unified service mode and standalone workload_primary mode.
-    """
-    w_low = _finite_positive(wp_cfg.get("w_low")) or 6.0
-    w_high = _finite_positive(wp_cfg.get("w_high")) or 10.0
-    fps_confirm = _finite_positive(wp_cfg.get("fps_confirm")) or 22.0
-    fps_critical = _finite_positive(wp_cfg.get("fps_critical")) or 15.0
+    ponytail: asymptotic workload pressure [0..100).
 
-    if eff_wl < w_low:
-        base_score = 30.0 * max(0.0, eff_wl) / max(0.001, w_low)
-        return max(base_score, hw_fuse_score_floor) if eff_fps < fps_critical else base_score
-    elif eff_wl < w_high:
-        frac = (eff_wl - w_low) / max(0.001, (w_high - w_low))
-        base_score = 30.0 + 25.0 * max(0.0, min(1.0, frac))
-        return max(base_score, hw_fuse_score_floor) if eff_fps < fps_critical else base_score
+    load_score = 100.0 * rho / (1.0 + rho), strictly < 100.0.
+    100.0 represents infinite delay / hardware collapse, unreachable alive.
+    rho = rho_s + rho_d + rho_r + rho_v (orthogonal load dimensions):
+      - rho_s : stream concurrency (EMC LPDDR5 bus convex knee)
+      - rho_d : vehicle workload demand vs capacity w_high
+      - rho_r : CPU/RAM hardware contention (asymptotic)
+      - rho_v : service completion deficit (odds of missed plates)
+    Per ADR-0001: FPS is a safety witness only, never the primary driver.
+    GPU% is excluded from rho (DVFS noise) and acts only as an emergency fuse.
+    """
+    k_s = _finite_positive(wp_cfg.get("stream_knee")) or 2.5
+    p_s = _finite_positive(wp_cfg.get("stream_exp")) or 2.2
+    w_sat = _finite_positive(wp_cfg.get("w_high")) or 10.0
+    eps = 1e-3
+
+    # ── Stream concurrency axis: non-linear convex knee on EMC bus ──
+    rho_s = (max(0.0, float(n_active) - 1.0) / k_s) ** p_s
+
+    # ── Demand axis: vehicle workload ratio ──
+    rho_d = max(0.0, eff_wl) / max(0.001, w_sat)
+
+    # ── Resource axis: CPU/RAM saturation (GPU excluded from rho due to DVFS) ──
+    u_safe = _finite_positive(wp_cfg.get("u_safe")) or 0.60
+    u = 0.0
+    if isinstance(metrics, dict):
+        vals = [
+            v for v in (
+                metrics.get("cpu_percent"),
+                metrics.get("ram_percent"),
+            )
+            if isinstance(v, (int, float)) and math.isfinite(v)
+        ]
+        if vals:
+            u = min(1.0, max(0.0, max(vals) / 100.0))
+    rho_r = 0.0 if u <= u_safe else (u - u_safe) / max(0.05, 1.05 - u)
+
+    # ── Service axis: bounded completion deficit vs achievable floor ──
+    if service_ema is not None and math.isfinite(service_ema):
+        svc = max(0.0, min(1.0, float(service_ema)))
+        s_target = _finite_positive(wp_cfg.get("svc_target")) or 0.95
+        s_floor = _finite_positive(wp_cfg.get("svc_floor")) or 0.50
+        rho_v_max = _finite_positive(wp_cfg.get("rho_v_max")) or 1.0
+        deficit = (s_target - svc) / max(1e-3, s_target - s_floor)
+        rho_v = rho_v_max * max(0.0, min(1.0, deficit))
     else:
-        # eff_wl >= w_high
-        if eff_fps >= fps_confirm:
-            fps_range = max(0.001, float(TARGET_FPS) - fps_confirm)
-            fps_drop_ratio = max(0.0, min(1.0, (float(TARGET_FPS) - eff_fps) / fps_range))
-            return 30.0 + 24.0 * fps_drop_ratio
-        elif eff_fps >= fps_critical:
-            fps_range = max(0.001, fps_confirm - fps_critical)
-            fps_drop_ratio = max(0.0, min(1.0, (fps_confirm - eff_fps) / fps_range))
-            return 55.0 + 20.0 * fps_drop_ratio
-        else:
-            fps_drop_ratio = max(0.0, min(1.0, (fps_critical - eff_fps) / max(0.001, fps_critical)))
-            return max(hw_fuse_score_floor, 76.0 + 24.0 * fps_drop_ratio)
+        rho_v = 0.0
+
+    rho = rho_s + rho_d + rho_r + rho_v
+    # Asymptotic kernel: strictly in [0.0, 100.0) for all finite rho >= 0
+    raw = 100.0 * rho / (1.0 + rho)
+
+    # ── Emergency fuses (floors, never primary path) ──
+    gpu = metrics.get("gpu_percent") if isinstance(metrics, dict) else None
+    if isinstance(gpu, (int, float)) and math.isfinite(gpu) and gpu >= 99.0 and eff_fps < 15.0:
+        raw = max(raw, min(99.9, hw_fuse_score_floor))
+
+    fps_emerg = _finite_positive(wp_cfg.get("fps_emergency")) or 12.0
+    if eff_fps < fps_emerg:
+        raw = max(raw, min(99.9, hw_fuse_score_floor))
+
+    return min(99.9, max(0.0, raw))
 
 
 def _compute_load_score(
@@ -659,8 +698,15 @@ def _compute_load_score(
     ] if isinstance(fps_stats, dict) else []
     if active_fps_vals:
         avg_fps = sum(active_fps_vals) / len(active_fps_vals)
-    else:
+    elif not (isinstance(ls_cfg.get("workload_policy"), dict)
+              and ls_cfg["workload_policy"].get("enabled")):
+        # No FPS and no workload policy → score undefined; report unavailable.
         return 0.0, "no_fps"
+    else:
+        # ADR-0001: workload/resource/service axes must still drive the score
+        # when FPS is absent (FPS is a safety witness, not a requirement). Proceed
+        # with zero FPS so resource saturation can still signal overload.
+        avg_fps = 0.0
 
     fps_clamped = max(0.0, min(float(TARGET_FPS), avg_fps))
     curr_wl = sum(_derive_camera_workload(feature_stats or {}, fps_stats, _starved).values()) if isinstance(feature_stats, dict) else 0.0
@@ -669,73 +715,28 @@ def _compute_load_score(
 
     # ── Unified Service Score Mode (workload + completion + fps floors) ──
     if mode == "service":
-        svc_cfg = ls_cfg.get("service", {})
-        if not isinstance(svc_cfg, dict):
-            svc_cfg = {}
-        c_target   = _finite_positive(svc_cfg.get("target")) or 0.95
-        c_floor    = _finite_positive(svc_cfg.get("floor")) or 0.50
-        fps_emerg  = _finite_positive(svc_cfg.get("fps_emergency")) or 12.0
-
-        c = service_ema if (service_ema is not None and math.isfinite(service_ema)) else 1.0
-
-        # Piecewise linear service score on [0, 100] (completion deficit)
-        if c >= c_target:
-            service_score = 0.0
-        elif c <= c_floor:
-            service_score = 100.0
-        else:
-            denom = max(0.001, c_target - c_floor)
-            service_score = (c_target - c) / denom * 100.0
-
-        # Workload pressure (if enabled in config, maps vehicle count -> score)
         wp_cfg = ls_cfg.get("workload_policy", {})
         if isinstance(wp_cfg, dict) and wp_cfg.get("enabled", True):
-            workload_pressure = _calc_workload_pressure(wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor)
-        else:
-            workload_pressure = 0.0
-
-        # Emergency floors
-        fps_floor = 80.0 if (fps_clamped < fps_emerg) else 0.0
-
-        hw_saturated = (
-            isinstance(metrics, dict) and (
-                float(metrics.get("cpu_percent", 0.0)) >= hw_fuse_threshold or
-                float(metrics.get("ram_percent", 0.0)) >= hw_fuse_threshold
+            score = _calc_workload_pressure(
+                wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor,
+                metrics=metrics, service_ema=service_ema,
+                n_active=len(active_fps_vals),
             )
-        )
-        hw_floor = hw_fuse_score_floor if (hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0) else 0.0
+        else:
+            score = 0.0
+        return round(min(99.9, max(0.0, score)), 1), "service_primary"
 
-        raw_score = max(service_score, workload_pressure, fps_floor, hw_floor)
-
-        # De-escalation veto: healthy FPS and non-saturated GPU clamp L3 band below offload trigger
-        p2p_cfg = _EDGE_CFG.get("p2p", {}) if isinstance(_EDGE_CFG.get("p2p"), dict) else {}
-        ovld_thr = float(p2p_cfg.get("overload_threshold", 55.0))
-        l2_thr = float(p2p_cfg.get("offload_level2_threshold", 64.0))
-        rec_margin = float(p2p_cfg.get("reclaim_margin", 12.0))
-        gpu_pct = float(metrics.get("gpu_percent", 0.0)) if isinstance(metrics, dict) else 0.0
-        fps_conf = _finite_positive(wp_cfg.get("fps_confirm")) or 22.0
-
-        if (ovld_thr <= raw_score < l2_thr) and eff_fps >= fps_conf and gpu_pct < 70.0 and (fps_floor == 0.0 and hw_floor == 0.0):
-            raw_score = max(0.0, ovld_thr - rec_margin - 1.0)
-
-        composite = round(min(100.0, raw_score), 1)
-        return composite, "service_primary"
-
-    # ── Workload-primary + FPS-confirmation policy gating ────────
+    # ── Workload-primary demand/resource/service policy ──────────
     wp_cfg = ls_cfg.get("workload_policy", {})
     if isinstance(wp_cfg, dict) and wp_cfg.get("enabled") is True:
-        score = _calc_workload_pressure(wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor)
+        # Full demand/resource/service model (service axis via service_ema).
+        score = _calc_workload_pressure(
+            wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor,
+            metrics=metrics, service_ema=service_ema,
+            n_active=len(active_fps_vals),
+        )
 
-        # De-escalation veto: healthy FPS and non-saturated GPU clamp L3 band below offload trigger
-        p2p_cfg = _EDGE_CFG.get("p2p", {}) if isinstance(_EDGE_CFG.get("p2p"), dict) else {}
-        ovld_thr = float(p2p_cfg.get("overload_threshold", 55.0))
-        l2_thr = float(p2p_cfg.get("offload_level2_threshold", 64.0))
-        rec_margin = float(p2p_cfg.get("reclaim_margin", 12.0))
-        gpu_pct = float(metrics.get("gpu_percent", 0.0)) if isinstance(metrics, dict) else 0.0
-        fps_conf = _finite_positive(wp_cfg.get("fps_confirm")) or 22.0
-
-        if (ovld_thr <= score < l2_thr) and eff_fps >= fps_conf and gpu_pct < 70.0:
-            score = max(0.0, ovld_thr - rec_margin - 1.0)
+        # No de-escalation veto: healthy FPS must not mask high demand/resource.
 
         # Hardware emergency fuse
         hw_saturated = (
@@ -745,9 +746,9 @@ def _compute_load_score(
             )
         )
         if hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0:
-            score = max(score, hw_fuse_score_floor)
+            score = max(score, min(99.9, hw_fuse_score_floor))
 
-        return round(min(100.0, max(0.0, score)), 1), "workload_primary"
+        return round(min(99.9, max(0.0, score)), 1), "workload_primary"
 
     if fps_clamped >= float(TARGET_FPS):
         fps_score = 0.0
@@ -787,16 +788,6 @@ def _compute_load_score(
             elif temp_val > onset:
                 thermal_bonus = th_max * (temp_val - onset) / (critical - onset)
 
-    # ── Received crops bonus (offload_crops_received_per_s) ─────
-    recv_bonus = 0.0
-    recv_cfg = ls_cfg.get("recv", {})
-    if isinstance(recv_cfg, dict) and recv_cfg.get("enabled") is True and isinstance(metrics, dict):
-        recv_val = _finite_nonneg(metrics.get("offload_crops_received_per_s"))
-        recv_cap = _finite_positive(recv_cfg.get("capacity")) or 10.0
-        recv_max = _finite_positive(recv_cfg.get("max_bonus")) or 5.0
-        if recv_val is not None:
-            recv_bonus = min(recv_max, max(0.0, recv_max * (recv_val / recv_cap)))
-
     # ── FPS trend bonus (decline rate) ──────────────────────────
     trend_bonus = 0.0
     trend_cfg = ls_cfg.get("trend", {})
@@ -812,13 +803,14 @@ def _compute_load_score(
                     t_past, fps_past = t_h, f_h
                     break
             dt = now - t_past
+            slope = 0.0
             if dt >= 0.5:
                 slope = (avg_fps - fps_past) / dt
-                decline = max(0.0, -slope)
-                trend_bonus = min(tr_max, max(0.0, tr_max * (decline / max_decline)))
+            decline = max(0.0, -slope)
+            trend_bonus = min(tr_max, max(0.0, tr_max * (decline / max_decline)))
     _FPS_HISTORY.append((now, avg_fps))
 
-    raw_composite = fps_score + workload_bonus + thermal_bonus + recv_bonus + trend_bonus
+    raw_composite = fps_score + workload_bonus + thermal_bonus + trend_bonus
     composite = min(100.0, max(0.0, raw_composite))
 
     # ── Hardware emergency floor ────────────────────────────────
@@ -883,7 +875,8 @@ def _compute_load_score_breakdown(
     ]
     if active_fps_vals:
         avg_fps = sum(active_fps_vals) / len(active_fps_vals)
-    else:
+    elif not (isinstance(ls_cfg.get("workload_policy"), dict)
+              and ls_cfg["workload_policy"].get("enabled")):
         return {
             "fps_score": 0.0,
             "workload_bonus": 0.0,
@@ -893,6 +886,9 @@ def _compute_load_score_breakdown(
             "composite_score": 0.0,
             "load_score": 0.0,
         }
+    else:
+        # ADR-0001: score remains computable without FPS via workload/resource axes.
+        avg_fps = 0.0
 
     fps_clamped = max(0.0, min(float(TARGET_FPS), avg_fps))
     curr_wl = sum(_derive_camera_workload(feature_stats or {}, fps_stats, _starved).values()) if isinstance(feature_stats, dict) else 0.0
@@ -919,7 +915,10 @@ def _compute_load_score_breakdown(
 
         wp_cfg = ls_cfg.get("workload_policy", {})
         if isinstance(wp_cfg, dict) and wp_cfg.get("enabled", True):
-            workload_pressure = _calc_workload_pressure(wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor)
+            workload_pressure = _calc_workload_pressure(
+                wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor,
+                metrics=metrics, n_active=len(active_fps_vals),
+            )
         else:
             workload_pressure = 0.0
 
@@ -931,20 +930,17 @@ def _compute_load_score_breakdown(
             )
         )
         hw_floor = hw_fuse_score_floor if (hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0) else 0.0
-        raw_score = max(service_score, workload_pressure, fps_floor, hw_floor)
 
-        # De-escalation veto: healthy FPS and non-saturated GPU clamp L3 band below offload trigger
-        p2p_cfg = _EDGE_CFG.get("p2p", {}) if isinstance(_EDGE_CFG.get("p2p"), dict) else {}
-        ovld_thr = float(p2p_cfg.get("overload_threshold", 55.0))
-        l2_thr = float(p2p_cfg.get("offload_level2_threshold", 64.0))
-        rec_margin = float(p2p_cfg.get("reclaim_margin", 12.0))
-        gpu_pct = float(metrics.get("gpu_percent", 0.0)) if isinstance(metrics, dict) else 0.0
-        fps_conf = _finite_positive(wp_cfg.get("fps_confirm")) or 22.0
-
-        if (ovld_thr <= raw_score < l2_thr) and eff_fps >= fps_conf and gpu_pct < 70.0 and (fps_floor == 0.0 and hw_floor == 0.0):
-            raw_score = max(0.0, ovld_thr - rec_margin - 1.0)
-
-        load_score = round(min(100.0, raw_score), 1)
+        # Primary load_score = full asymptotic kernel (demand+resource+service).
+        if isinstance(wp_cfg, dict) and wp_cfg.get("enabled", True):
+            load_score = _calc_workload_pressure(
+                wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor,
+                metrics=metrics, service_ema=service_ema,
+                n_active=len(active_fps_vals),
+            )
+        else:
+            load_score = 0.0
+        load_score = round(min(99.9, max(0.0, load_score)), 1)
 
         if load_score >= 72.0:
             qos_state = "overloaded"
@@ -976,54 +972,17 @@ def _compute_load_score_breakdown(
             "service_cold_start": bool(service_cold_start),
         }
 
-    # Determine qos_state based on load/fps
+    # Determine qos_state based on demand/resource/service load
     wp_cfg = ls_cfg.get("workload_policy", {})
     if isinstance(wp_cfg, dict) and wp_cfg.get("enabled") is True:
-        w_low = _finite_positive(wp_cfg.get("w_low")) or 6.0
-        w_high = _finite_positive(wp_cfg.get("w_high")) or 10.0
-        fps_confirm = _finite_positive(wp_cfg.get("fps_confirm")) or 22.0
-        fps_critical = _finite_positive(wp_cfg.get("fps_critical")) or 15.0
-
-        # Threshold-state formula
-        if eff_wl < w_low:
-            base_score = 30.0 * max(0.0, eff_wl) / max(0.001, w_low)
-            if eff_fps < fps_critical:
-                load_score = max(base_score, hw_fuse_score_floor)
-            else:
-                load_score = base_score
-        elif eff_wl < w_high:
-            frac = (eff_wl - w_low) / max(0.001, (w_high - w_low))
-            base_score = 30.0 + 25.0 * max(0.0, min(1.0, frac))
-            if eff_fps < fps_critical:
-                load_score = max(base_score, hw_fuse_score_floor)
-            else:
-                load_score = base_score
-        else:
-            # eff_wl >= w_high
-            if eff_fps >= fps_confirm:
-                fps_range = max(0.001, float(TARGET_FPS) - fps_confirm)
-                fps_drop_ratio = max(0.0, min(1.0, (float(TARGET_FPS) - eff_fps) / fps_range))
-                base_score = 30.0 + 24.0 * fps_drop_ratio
-                load_score = base_score
-            elif eff_fps >= fps_critical:
-                fps_range = max(0.001, fps_confirm - fps_critical)
-                fps_drop_ratio = max(0.0, min(1.0, (fps_confirm - eff_fps) / fps_range))
-                base_score = 55.0 + 20.0 * fps_drop_ratio
-                load_score = base_score
-            else:
-                fps_drop_ratio = max(0.0, min(1.0, (fps_critical - eff_fps) / max(0.001, fps_critical)))
-                base_score = max(hw_fuse_score_floor, 76.0 + 24.0 * fps_drop_ratio)
-                load_score = base_score
-
-        # De-escalation veto: healthy FPS and non-saturated GPU clamp L3 band below offload trigger
-        p2p_cfg = _EDGE_CFG.get("p2p", {}) if isinstance(_EDGE_CFG.get("p2p"), dict) else {}
-        ovld_thr = float(p2p_cfg.get("overload_threshold", 55.0))
-        l2_thr = float(p2p_cfg.get("offload_level2_threshold", 64.0))
-        rec_margin = float(p2p_cfg.get("reclaim_margin", 12.0))
-        gpu_pct = float(metrics.get("gpu_percent", 0.0)) if isinstance(metrics, dict) else 0.0
-
-        if (ovld_thr <= load_score < l2_thr) and eff_fps >= fps_confirm and gpu_pct < 70.0:
-            load_score = max(0.0, ovld_thr - rec_margin - 1.0)
+        # Demand/resource/service pressure; full model (service axis via service_ema).
+        # No FPS-confirmation gating — FPS is emergency fuse only (ADR-0001).
+        base_score = _calc_workload_pressure(
+            wp_cfg, eff_wl, eff_fps, hw_fuse_score_floor,
+            metrics=metrics, service_ema=service_ema,
+            n_active=len(active_fps_vals),
+        )
+        load_score = base_score
 
         hw_saturated = (
             isinstance(metrics, dict) and (
@@ -1032,11 +991,11 @@ def _compute_load_score_breakdown(
             )
         )
         if hw_saturated and fps_clamped < float(TARGET_FPS) - 2.0:
-            load_score = max(load_score, hw_fuse_score_floor)
+            load_score = max(load_score, min(99.9, hw_fuse_score_floor))
 
-        load_score = min(100.0, max(0.0, load_score))
+        load_score = min(99.9, max(0.0, load_score))
 
-        if load_score >= 76.0 or eff_fps < fps_critical:
+        if load_score >= 76.0:
             qos_state = "overloaded"
         elif load_score >= 60.0:
             qos_state = "degraded"
@@ -1046,7 +1005,7 @@ def _compute_load_score_breakdown(
             qos_state = "healthy"
 
         fps_loss = max(0.0, (float(TARGET_FPS) - eff_fps) / float(TARGET_FPS))
-        wl_ratio = max(0.0, eff_wl / max(1.0, w_high))
+        wl_ratio = max(0.0, eff_wl / max(1.0, _finite_positive(wp_cfg.get("w_high")) or 20.0))
 
         return {
             "fps_score": round(100.0 * fps_loss, 1),
@@ -1099,15 +1058,6 @@ def _compute_load_score_breakdown(
             elif temp_val > onset:
                 thermal_bonus = th_max * (temp_val - onset) / (critical - onset)
 
-    recv_bonus = 0.0
-    recv_cfg = ls_cfg.get("recv", {})
-    if isinstance(recv_cfg, dict) and recv_cfg.get("enabled") is True and isinstance(metrics, dict):
-        recv_val = _finite_nonneg(metrics.get("offload_crops_received_per_s"))
-        recv_cap = _finite_positive(recv_cfg.get("capacity"))
-        recv_max = _finite_positive(recv_cfg.get("max_bonus")) or 5.0
-        if recv_val is not None and recv_cap is not None:
-            recv_bonus = min(recv_max, max(0.0, recv_max * (recv_val / recv_cap)))
-
     trend_bonus = 0.0
     trend_cfg = ls_cfg.get("trend", {})
     now = time.monotonic()
@@ -1126,7 +1076,7 @@ def _compute_load_score_breakdown(
                 decline = max(0.0, -slope)
                 trend_bonus = min(tr_max, max(0.0, tr_max * (decline / max_decline)))
 
-    raw_composite = fps_score + workload_bonus + thermal_bonus + recv_bonus + trend_bonus
+    raw_composite = fps_score + workload_bonus + thermal_bonus + trend_bonus
     composite = min(100.0, max(0.0, raw_composite))
 
     hw_saturated = (
@@ -1146,7 +1096,7 @@ def _compute_load_score_breakdown(
         "fps_score": round(fps_score, 1),
         "workload_bonus": round(workload_bonus, 1),
         "thermal_bonus": round(thermal_bonus, 1),
-        "recv_bonus": round(recv_bonus, 1),
+        "recv_bonus": 0.0,
         "trend_bonus": round(trend_bonus, 1),
         "composite_score": round(composite, 1),
         "load_score": round(load_score, 1),
@@ -1186,7 +1136,7 @@ class HealthAgent:
     WebSocket to push health payloads to the Central Monitor Server.
     """
 
-    def __init__(self, external_session=None, ownership_provider: Optional[Callable[[], Dict[str, dict]]] = None, held_provider: Optional[Callable[[], List[str]]] = None) -> None:
+    def __init__(self, external_session=None, ownership_provider: Optional[Callable[[], Dict[str, dict]]] = None, held_provider: Optional[Callable[[], List[str]]] = None, boot_id_provider: Optional[Callable[[], int]] = None) -> None:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._session = None
@@ -1194,6 +1144,9 @@ class HealthAgent:
         self._external_session = external_session
         self._ownership_provider = ownership_provider
         self._held_provider = held_provider
+        # P5 — provider returning THIS node's current monotonic boot_id, stamped
+        # into the heartbeat so peers can fence pre-reboot ADD/REMOVE commands.
+        self._boot_id_provider = boot_id_provider
         self._ready_event = threading.Event()
         self._jtop = None          # persistent jtop session
         self._monitor_client = None  # own WS client when run standalone
@@ -1771,10 +1724,20 @@ class HealthAgent:
 
                     now_ts = time.time()
                     bps_rx, bps_tx = self._sample_network_bps()
+                    # P5 — stamp this node's monotonic boot_id into the heartbeat
+                    # so peers can fence pre-reboot ADD/REMOVE commands.
+                    boot_id = 0
+                    if self._boot_id_provider is not None:
+                        try:
+                            boot_id = int(self._boot_id_provider() or 0)
+                        except Exception:
+                            boot_id = 0
+
                     payload = {
                         "type":          "health",
                         "node_id":       NODE_ID,
                         "advertise_ip":  ADVERTISE_IP,
+                        "boot_id":       boot_id,
                         "timestamp":     now_ts,
                         "ts":            now_ts,
                         "network_bps_rx": bps_rx,

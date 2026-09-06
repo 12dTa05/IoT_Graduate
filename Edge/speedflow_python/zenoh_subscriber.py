@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import msgpack
 
@@ -46,11 +46,21 @@ class ZenohCommandSubscriber:
         node_id: str,
         session=None,
         ack_timeout_s: Optional[float] = None,
+        boot_id: int = 0,
+        lease=None,
     ) -> None:
         self._camera_manager = camera_manager
         self._node_id = node_id
         self._external_session = session
         self._ack_timeout_s = ack_timeout_s
+        # P5: current boot_id (monotonic). Used as the receiver fence — a command
+        # must carry THIS node's current boot_id or it is a stale pre-reboot
+        # command and is rejected.
+        self._boot_id = int(boot_id)
+        # P5: lease state (optional). When provided, the persisted per-camera
+        # epoch high-water seeds the held-epoch floor and accepted epochs are
+        # recorded back so a future reboot keeps the floor.
+        self._lease = lease
 
         self._control_key = f"peers/control/{node_id}"
         self._status_key = f"peers/status/{node_id}"
@@ -59,10 +69,15 @@ class ZenohCommandSubscriber:
         self._running = False
 
         # Per-camera held epoch for stale ADD/REMOVE rejection
-        # Incremented on every applied ADD/REMOVE; receiver rejects
-        # commands with epoch < held_epoch to prevent partition-rejoin
-        # data-loss where stale REMOVE tears down new owner's stream.
-        self._held_epochs: Dict[str, int] = {}
+        # Seeded from the persisted epoch high-water (P5) so a freshly rebooted
+        # node rejects pre-reboot commands, then raised on every applied
+        # ADD/REMOVE. Receiver rejects commands with epoch < held_epoch to
+        # prevent partition-rejoin data-loss where a stale REMOVE tears down the
+        # new owner's stream.
+        if self._lease is not None:
+            self._held_epochs: Dict[str, int] = dict(self._lease.camera_epochs)
+        else:
+            self._held_epochs: Dict[str, int] = {}
 
         from concurrent.futures import ThreadPoolExecutor
         self._ack_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ZenohC2-ACK")
@@ -173,30 +188,109 @@ class ZenohCommandSubscriber:
     # Command handlers
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # P5 — boot / epoch fencing
+    # ------------------------------------------------------------------
+
+    def _lease_fence(self, cam_id: str, epoch, boot_id) -> Tuple[str, Optional[str]]:
+        """Decide whether a command may pass receiver fencing.
+
+        Returns (decision, reason) where decision is "accept" or "reject".
+        Two independent fences:
+
+          * boot_id fence: a command must carry THIS node's current boot_id.
+            Pre-reboot commands carry the node's OLD boot_id and are rejected,
+            so a stale ADD/REMOVE replayed after a restart cannot pass.
+          * epoch floor fence: within a boot, the command epoch must be >= the
+            persisted/observed high-water for the camera.
+
+        A command missing boot_id falls back to the epoch-only fence (legacy
+        wire compatibility). A command missing epoch skips the epoch fence.
+        """
+        # boot_id fence
+        if boot_id is not None:
+            try:
+                b = int(boot_id)
+            except (TypeError, ValueError):
+                b = None
+            if b is not None and b != self._boot_id:
+                return "reject", "stale_boot_id"
+
+        # epoch floor fence
+        if epoch is not None:
+            try:
+                e = int(epoch)
+            except (TypeError, ValueError):
+                return "reject", "malformed_epoch"
+            if e < self._held_epochs.get(cam_id, -1):
+                return "reject", "stale_epoch"
+
+        return "accept", None
+
+    def _lease_accept(self, cam_id: str, epoch) -> None:
+        """Raise the held-epoch floor and persist the high-water on accept."""
+        if epoch is None:
+            return
+        try:
+            e = int(epoch)
+        except (TypeError, ValueError):
+            return
+        if e > self._held_epochs.get(cam_id, -1):
+            self._held_epochs[cam_id] = e
+            if self._lease is not None:
+                try:
+                    self._lease.record_epoch(cam_id, e)
+                except Exception as exc:
+                    logger.warning("[Zenoh C2][P5] Failed to persist epoch high-water for '%s': %s", cam_id, exc)
+
     def _handle_add(self, payload: dict) -> None:
         try:
             cam_id    = payload["camera_id"]
             source_id = int(payload["source_id"])
             epoch     = payload.get("epoch")
+            boot_id   = payload.get("boot_id")
 
-            # Epoch fencing: reject stale ADD if we've already applied a newer one.
-            # Legacy payloads without epoch skip this guard (backward compatibility).
-            if epoch is not None:
+            # P5 — boot_id + epoch floor fencing. Reject stale pre-reboot or
+            # out-of-order commands before touching the pipeline.
+            decision, reason = self._lease_fence(cam_id, epoch, boot_id)
+            if decision == "reject":
                 held_epoch = self._held_epochs.get(cam_id, -1)
-                if int(epoch) < held_epoch:
-                    logger.info(
-                        "[Zenoh C2] ADD rejected for '%s': stale_epoch (epoch=%d < held_epoch=%d)",
-                        cam_id, int(epoch), held_epoch,
-                    )
-                    self.publish_status({
-                        "node_id": self._node_id,
-                        "event": "ADD_REJECTED",
-                        "camera_id": cam_id,
-                        "reason": "stale_epoch",
-                        "epoch": epoch,
-                        "held_epoch": held_epoch,
-                    })
-                    return
+                logger.info(
+                    "[Zenoh C2] ADD rejected for '%s': %s (epoch=%s, boot_id=%s, held_epoch=%d, self_boot_id=%d)",
+                    cam_id, reason, epoch, boot_id, held_epoch, self._boot_id,
+                )
+                self.publish_status({
+                    "node_id": self._node_id,
+                    "event": "ADD_REJECTED",
+                    "camera_id": cam_id,
+                    "reason": reason,
+                    "epoch": epoch,
+                    "boot_id": boot_id,
+                    "held_epoch": held_epoch,
+                    "self_boot_id": self._boot_id,
+                })
+                # P2: wake the requester's _wait_and_remove immediately (no 15s timeout)
+                # so it can fast-forward its epoch past held_epoch. Only stale_epoch is fast-forwardable.
+                if reason == "stale_epoch" and self._session is not None:
+                    try:
+                        now = time.time()
+                        self._session.put(f"peers/vote/ack/{cam_id}", msgpack.packb({
+                            "schema_version": 1,
+                            "version": 1,
+                            "node_id": self._node_id,
+                            "camera_id": cam_id,
+                            "event": "REJECTED",
+                            "reason": reason,
+                            "held_epoch": held_epoch,
+                            "epoch": epoch,
+                            "migration_id": payload.get("migration_id"),
+                            "timestamp": now,
+                            "ts": now,
+                        }, use_bin_type=True))
+                        logger.info("[Zenoh C2] Published REJECTED ack for '%s' (held_epoch=%d) to peers/vote/ack/%s", cam_id, held_epoch, cam_id)
+                    except Exception as exc:
+                        logger.warning("[Zenoh C2] Failed to publish REJECTED ack for '%s': %s", cam_id, exc)
+                return
 
             # Delegate config building + delta enqueue to CameraManager so the
             # same logic is shared with PeerOrchestrator's direct-dispatch path.
@@ -210,9 +304,8 @@ class ZenohCommandSubscriber:
                 })
                 return
 
-            # Update held_epoch on successful accept
-            if epoch is not None:
-                self._held_epochs[cam_id] = int(epoch)
+            # P5: raise held-epoch floor + persist high-water on accept.
+            self._lease_accept(cam_id, epoch)
 
             self.publish_status({
                 "node_id": self._node_id,
@@ -325,27 +418,30 @@ class ZenohCommandSubscriber:
         try:
             cam_id = payload["camera_id"]
             epoch = payload.get("epoch")
+            boot_id = payload.get("boot_id")
             migration_id = payload.get("migration_id")
 
-            # Epoch fencing: reject stale REMOVE if we've already applied a newer one.
-            # Legacy payloads without epoch skip this guard (backward compatibility).
-            if epoch is not None:
+            # P5 — boot_id + epoch floor fencing. Reject stale pre-reboot or
+            # out-of-order commands before touching the pipeline.
+            decision, reason = self._lease_fence(cam_id, epoch, boot_id)
+            if decision == "reject":
                 held_epoch = self._held_epochs.get(cam_id, -1)
-                if int(epoch) < held_epoch:
-                    logger.info(
-                        "[Zenoh C2] REMOVE rejected for '%s': stale_epoch (epoch=%d < held_epoch=%d)",
-                        cam_id, int(epoch), held_epoch,
-                    )
-                    self.publish_status({
-                        "node_id": self._node_id,
-                        "event": "REMOVE_REJECTED",
-                        "camera_id": cam_id,
-                        "reason": "stale_epoch",
-                        "epoch": epoch,
-                        "held_epoch": held_epoch,
-                        "migration_id": migration_id,
-                    })
-                    return
+                logger.info(
+                    "[Zenoh C2] REMOVE rejected for '%s': %s (epoch=%s, boot_id=%s, held_epoch=%d, self_boot_id=%d)",
+                    cam_id, reason, epoch, boot_id, held_epoch, self._boot_id,
+                )
+                self.publish_status({
+                    "node_id": self._node_id,
+                    "event": "REMOVE_REJECTED",
+                    "camera_id": cam_id,
+                    "reason": reason,
+                    "epoch": epoch,
+                    "boot_id": boot_id,
+                    "held_epoch": held_epoch,
+                    "self_boot_id": self._boot_id,
+                    "migration_id": migration_id,
+                })
+                return
 
             with self._camera_manager._lock:
                 cfg = self._camera_manager._configs.get(cam_id)
@@ -400,8 +496,8 @@ class ZenohCommandSubscriber:
                 source_id = cfg.source_id
                 cfg.enabled = False
                 self._camera_manager._rebuild_lookup()
-                if epoch is not None:
-                    self._held_epochs[cam_id] = int(epoch)
+                # P5: raise held-epoch floor + persist high-water on accept.
+                self._lease_accept(cam_id, epoch)
 
             def _on_teardown_done():
                 try:
