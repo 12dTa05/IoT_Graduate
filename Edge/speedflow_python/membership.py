@@ -498,6 +498,8 @@ class MembershipMixin:
                         self._reclaim_eligible_since = None
                 else:
                     self._self_state.overload_since = None
+                    self._ladder_l2_since = None
+                    self._ladder_l2_camera = None
                     now_ts = time.time()
                     if self._below_thr_since is None:
                         self._below_thr_since = now_ts
@@ -1761,11 +1763,40 @@ class MembershipMixin:
                 len(state.active_cameras),
             )
 
-        # Single transfer primitive: full-stream migration (L1) through the
-        # existing RFO / lease path. Owner-authoritative lease/epoch fencing,
-        # HRW claims, foreign/rescued guards, cooldown, vote, and the
-        # one-camera-invariant all live in _trigger_level1_if_due /
-        # _pick_camera_to_offload — preserved unchanged.
+        # ── Mandatory ladder L0 -> L2 -> L1 ──────────────────────────────
+        # Step 1: L2 (plate-crop) must be attempted before L1. Fast-escalate if
+        # L2 is unavailable (no peer or candidate is None), avoiding holding the node in overload.
+        # ponytail: L2 mandatory per user mandate; fast-escalate provides safety valve.
+        hold_s = float(cfg.get("ladder_l2_hold_s", 8.0))
+
+        if self._ladder_l2_since is None:
+            l2_cam = self._activate_ladder_l2(now, cfg)
+            if l2_cam is not None:
+                self._ladder_l2_since = now
+                self._ladder_l2_camera = l2_cam
+                logger.info("[PeerOrch] LADDER L0->L2: escalated '%s' to plate-crop offload; holding %.1fs before L1", l2_cam, hold_s)
+                return
+            logger.warning("[PeerOrch] LADDER L0->L2 unavailable (no peer/candidate); fast-escalating to L1")
+            self._ladder_l2_since = now
+            self._ladder_l2_camera = None
+
+        # Step 2: In L2 hold window. Only proceed to L1 if hold window expired (or fast-escalated)
+        if self._ladder_l2_camera is not None and (now - self._ladder_l2_since) < hold_s:
+            if self._maybe_log_block("ladder_l2_hold", now):
+                logger.info("[PeerOrch] LADDER L2 hold: %.1f/%.1fs elapsed, still overloaded — deferring L1", now - self._ladder_l2_since, hold_s)
+            return
+
+        # Hold window expired or fast-escalated: proceed to L1.
+        # Clear L2 ladder camera before proceeding to L1 to avoid orphaned L2 crops.
+        if self._ladder_l2_camera:
+            if self.get_offload_level(self._ladder_l2_camera) == 3:
+                logger.info(
+                    "[PeerOrch] LADDER L2->L1: cleared plate-crop offload on '%s' before L1 migration",
+                    self._ladder_l2_camera,
+                )
+                self.set_offload_level(self._ladder_l2_camera, 0, "")
+            self._ladder_l2_camera = None
+
         self._trigger_level1_if_due(state, now, cfg)
 
     def _is_peer_ready_for_yield(self, peer: Optional[PeerState], camera_id: str) -> bool:

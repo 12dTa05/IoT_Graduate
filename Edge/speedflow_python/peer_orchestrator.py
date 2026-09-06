@@ -145,6 +145,10 @@ class PeerOrchestrator(
         self._add_rejected: Dict[str, bool] = {}
         self._reject_retries: Dict[str, int] = {}
 
+        # Mandatory ladder L0->L2->L1 state
+        self._ladder_l2_since: Optional[float] = None
+        self._ladder_l2_camera: Optional[str] = None
+
         # Camera config lookup — relative to Edge/configs/
         if camera_configs_dir is None:
             camera_configs_dir = _ROOT / "configs"

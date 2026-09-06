@@ -149,6 +149,12 @@ class OffloadMixin:
             logger.debug("[PeerOrch] '%s' is a rescued camera; cannot be L1-migrated", cam_to_offload)
             return
 
+        # Ladder: if this camera is currently at L2 (plate-crop), clear L2 before
+        # L1 migration to avoid double-offloading the same camera.
+        if self.get_offload_level(cam_to_offload) == 3:
+            self.set_offload_level(cam_to_offload, 0, "")
+            logger.info("[PeerOrch] LADDER L2->L1: cleared plate-crop offload on '%s' before full-stream migration", cam_to_offload)
+
         last_mig = self._cam_cooldown.get(cam_to_offload, 0.0)
         time_since_mig = now - last_mig
         if time_since_mig < cfg.get("cooldown_s", 6.0):
@@ -156,9 +162,8 @@ class OffloadMixin:
                         cam_to_offload, time_since_mig, cfg.get("cooldown_s", 6.0))
             return
         trigger_reason = (
-            "fps_drop"
-            if (state.avg_fps and state.avg_fps < cfg.get("eps_fps_strict", 18.0))
-            else "load_score"
+            "load_score+stream_pressure"
+            + (";fps_witness_low" if (state.avg_fps and state.avg_fps < cfg.get("eps_fps_strict", 18.0)) else "")
         )
         logger.info(
             "[PeerOrch] OVERLOADED (%.1f%%, FPS=%s). Triggering RFO for '%s' (reason: %s)",
@@ -379,6 +384,28 @@ class OffloadMixin:
                     "[PeerOrch] LPR offload ESCALATE '%s' → peer '%s' (ratio=%.2f, sustained %.1fs)",
                     candidate, peer, ratio, now - self._lpr_over_thr_since,
                 )
+
+    def _activate_ladder_l2(self, now: float, cfg: dict) -> Optional[str]:
+        """Escalate a Level-0 camera to L2 plate-crop (offload_level==3)
+        for the mandatory ladder, independent of LPR-queue trigger.
+        Returns cam_id if successful, None if no candidate or peer available (caller fast-escalates to L1).
+        """
+        with self._lock:
+            if bool(getattr(self, "_pending_acks", {})):
+                return None
+        candidate = self._pick_camera_for_lpr_offload(cfg)
+        if candidate is None:
+            return None
+        if candidate in self._rescued_cameras:
+            return None
+        cooldown_s = float(cfg.get("lpr_offload_cooldown_s", 6.0))
+        if (now - self._cam_cooldown.get(candidate, 0.0)) < cooldown_s:
+            return None
+        peer = self._pick_best_peer(for_offload_level=1)
+        if peer is None:
+            return None
+        self.set_offload_level(candidate, 3, peer)
+        return candidate
 
     def _trigger_rfo(self, camera_id: str, relaxation_tier: int = 0) -> None:
         """

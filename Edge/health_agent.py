@@ -995,9 +995,9 @@ def _compute_load_score_breakdown(
 
         load_score = min(99.9, max(0.0, load_score))
 
-        if load_score >= 76.0:
+        if load_score >= 72.0:
             qos_state = "overloaded"
-        elif load_score >= 60.0:
+        elif load_score >= 55.0:
             qos_state = "degraded"
         elif load_score >= 30.0:
             qos_state = "moderate"

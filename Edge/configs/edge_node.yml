@@ -51,6 +51,7 @@ p2p:
   target_fps: 25.0             # decode/inference target FPS (bid scoring / eps tiers only; NOT a migration gate)
   workload_saturation_point: 10.0  # PROVISIONAL/INFERRED per-camera demand saturation (sum n_track+n_plate); mirrors load_score.workload_policy.w_high. Tune vs real telemetry.
   stream_pressure_threshold: 0.30  # min [0,1] workload/resource pressure to authorize L1 (fail closed below this)
+  ladder_l2_hold_s: 8.0        # observation window (seconds) holding L2 before considering L1 (mandatory ladder)
 
   # Static node-to-camera ownership mapping (for cluster topology & failover isolation)
   node_camera_map:
