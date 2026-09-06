@@ -966,36 +966,50 @@ def _teardown_source_branch(
         conv_pad = conv_elem.get_static_pad("src") if conv_elem else None
         mux_sinkpad = conv_pad.get_peer() if conv_pad and conv_pad.is_linked() else None
 
-        # P1: 1) Unlink conv->mux FIRST so the drain/EOS can never reach the shared
-        #        nvstreammux (which serves other cameras — EOS there would kill them).
-        if conv_pad and mux_sinkpad and conv_pad.is_linked():
-            conv_pad.unlink(mux_sinkpad)
-
-        # 2) Drain the decoder: inject EOS at the branch head and let nvv4l2decoder
-        #    flush its picture-buffer pool downstream into the now-dead-ended conv.
-        #    A blocking pad probe at conv:src catches the EOS so we know the decoder
-        #    has released every output surface BEFORE any element goes to NULL.
+        # 1) Install a buffer+EOS drop probe on conv:src BEFORE unlinking.
+        #    Dropping all buffers at the pad prevents any buffer from reaching
+        #    an unlinked pad (eliminating GST_FLOW_NOT_LINKED) while catching EOS.
         drained = threading.Event()
+        drain_probe_id = None
         if conv_pad is not None:
-            def _catch_eos(pad, info):
+            def _drain_probe(pad, info):
                 ev = info.get_event()
                 if ev and ev.type == Gst.EventType.EOS:
                     drained.set()
                     return Gst.PadProbeReturn.DROP
-                return Gst.PadProbeReturn.PASS
-            conv_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, _catch_eos)
-            src.send_event(Gst.Event.new_eos())
-            if not drained.wait(timeout=3.0):
-                logger.warning("[Pipeline] '%s' EOS drain timed out (3s); forcing teardown.", camera_id)
+                # DROP all buffers so nothing flows downstream into unlinked pad or mux
+                return Gst.PadProbeReturn.DROP
 
-        # 3) State down DOWNSTREAM-FIRST (conv -> q -> src): the decoder reaches NULL
+            drain_probe_id = conv_pad.add_probe(
+                Gst.PadProbeType.BUFFER | Gst.PadProbeType.EVENT_DOWNSTREAM,
+                _drain_probe,
+            )
+
+        # 2) Unlink conv->mux AFTER probe is active:
+        #    conv->mux is unlinked so drain/EOS cannot reach the shared nvstreammux.
+        if conv_pad and mux_sinkpad and conv_pad.is_linked():
+            conv_pad.unlink(mux_sinkpad)
+
+        # 3) Drain the decoder: inject EOS at the branch head and let nvv4l2decoder
+        #    flush its picture-buffer pool downstream into the now-dead-ended conv.
+        if conv_pad is not None:
+            src.send_event(Gst.Event.new_eos())
+            if not drained.wait(timeout=1.0):
+                logger.warning("[Pipeline] '%s' EOS drain timed out (1.0s); forcing teardown.", camera_id)
+            if drain_probe_id is not None:
+                try:
+                    conv_pad.remove_probe(drain_probe_id)
+                except Exception:
+                    pass
+
+        # 4) State down DOWNSTREAM-FIRST (conv -> q -> src): the decoder reaches NULL
         #    last, after its surfaces are already drained and unreferenced.
         branch_elements = [el for el in [conv_elem, q_elem, src] if el is not None]
         for target_state in (Gst.State.PAUSED, Gst.State.READY, Gst.State.NULL):
             for el in branch_elements:
                 el.set_state(target_state)
             for el in branch_elements:
-                state_ret, current_state, _ = el.get_state(5 * Gst.SECOND)
+                state_ret, current_state, _ = el.get_state(1 * Gst.SECOND)
                 if state_ret == Gst.StateChangeReturn.FAILURE:
                     raise RuntimeError(
                         f"Element {el.get_name()} failed to reach "
@@ -1071,9 +1085,11 @@ def dynamic_remove_stream(
     )
     # Synchronous teardown on the GLib main thread: avoids BLOCK_DOWNSTREAM pad
     # probe deadlocks when RTSP streams are stalled and buffers stop flowing.
-    _teardown_source_branch(pipeline, streammux, camera_id, source_id, tiler, source_bins)
-    if done_event is not None:
-        done_event.set()
+    try:
+        _teardown_source_branch(pipeline, streammux, camera_id, source_id, tiler, source_bins)
+    finally:
+        if done_event is not None:
+            done_event.set()
 
 
 # ---------------------------------------------------------------------------
@@ -1097,13 +1113,15 @@ def classify_pipeline_error(
 
     Returns one of:
       - "transient"   : benign, self-healing decoder starvation (NVDEC buffer
-                        exhaustion) — caller should keep the pipeline running.
+                        exhaustion) or teardown buffer artifact.
       - "publisher"   : the failure originated in an RTSP push publisher
                         (rtspclientsink / per-camera push branch) — isolate it.
       - "pipeline"    : any other genuine pipeline-level error.
     """
     text = f"{err_text} {debug_text or ''}"
     if "OutputBufferUnavailable" in text or "cbAllocPictureBuffer" in text:
+        return "transient"
+    if "not-linked" in text and any(src_name.startswith(pfx) for pfx in ("q_", "conv_", "src-")):
         return "transient"
     if is_rtsp_sink:
         return "publisher"

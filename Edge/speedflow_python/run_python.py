@@ -596,31 +596,46 @@ def run_rtsp_push_mode(args, camera_manager: CameraManager, peer_orch=None, offl
                         print(f"DEBUG INFO: {debug}", file=sys.stderr)
                     return
 
-                # If the error comes from a source bin, remove just that
-                # stream instead of killing the whole pipeline.
+                # If the error comes from a camera branch element (uridecodebin,
+                # queue, converter), remove just that stream instead of killing
+                # the whole pipeline.
                 cam_id = None
                 elem = message.src
                 while elem is not None:
                     n = elem.get_name()
-                    if n.startswith("src-"):
-                        cam_id = n[4:]
+                    for pfx in ("src-", "q_", "conv_"):
+                        if n.startswith(pfx):
+                            cand_id = n[len(pfx):]
+                            if cand_id in source_bins or cand_id in [c.camera_id for c in camera_manager.get_enabled_configs()]:
+                                cam_id = cand_id
+                                break
+                    if cam_id:
                         break
                     elem = elem.get_parent()
 
-                if cam_id and cam_id in source_bins and cam_id not in _removing:
-                    _removing.add(cam_id)
-                    print(f"ERROR (source) from {src_name} ({cam_id}): {err}", file=sys.stderr)
-                    if debug:
-                        print(f"DEBUG INFO: {debug}", file=sys.stderr)
-                    print(f"[Pipeline] Removing failed source '{cam_id}'", file=sys.stderr)
-                    sid = None
-                    for cfg in camera_manager.get_enabled_configs():
-                        if cfg.camera_id == cam_id:
-                            sid = cfg.source_id
-                            break
-                    if sid is not None:
-                        dynamic_remove_stream(pipeline, streammux, cam_id, sid, tiler, source_bins)
-                    return  # don't quit the pipeline
+                if cam_id:
+                    is_intentional = False
+                    if recovery is not None and hasattr(recovery, "is_intentional_teardown"):
+                        is_intentional = recovery.is_intentional_teardown(cam_id)
+                    if is_intentional or cam_id in _removing:
+                        # Teardown artifact (e.g. not-linked, flushing during intentional teardown)
+                        print(f"INFO (teardown artifact): absorbed {src_name} ({cam_id}): {err}", file=sys.stderr)
+                        return
+
+                    if cam_id in source_bins and cam_id not in _removing:
+                        _removing.add(cam_id)
+                        print(f"ERROR (source) from {src_name} ({cam_id}): {err}", file=sys.stderr)
+                        if debug:
+                            print(f"DEBUG INFO: {debug}", file=sys.stderr)
+                        print(f"[Pipeline] Removing failed source '{cam_id}'", file=sys.stderr)
+                        sid = None
+                        for cfg in camera_manager.get_enabled_configs():
+                            if cfg.camera_id == cam_id:
+                                sid = cfg.source_id
+                                break
+                        if sid is not None:
+                            dynamic_remove_stream(pipeline, streammux, cam_id, sid, tiler, source_bins)
+                        return  # don't quit the pipeline
 
                 # Distinguish RTSP push sink (rtsp_push_sink / rtspclientsink / per-camera sinks) vs other pipeline errors
                 is_rtsp_sink = False

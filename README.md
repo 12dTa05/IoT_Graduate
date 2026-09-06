@@ -94,35 +94,34 @@ streams together. Workload counts (`n_track`, `n_plate`) are the per-camera sign
 
 ---
 
-## Load Score — FPS-Primary Composite
+## Load Score — Asymptotic Multi-Dimensional Kernel
 
-`load_score` is a bounded 0–100 FPS-dominant scalar driving all decisions.
+`load_score` is a continuous pressure scalar in `[0.0, 100.0)` computed via an asymptotic kernel:
 
-**FPS piecewise-linear anchors** (input clamped to `[0, TARGET_FPS=27]`):
+$$\text{load\_score} = 100.0 \times \frac{\rho}{1.0 + \rho}$$
 
-| avg FPS | score | level anchor |
-|---------|-------|--------------|
-| ≥ 27    |   0   | healthy      |
-| 22      |  57   | L2 plate-crop region (≥55) |
-| 19      |  65   | — (legacy vehicle-crop anchor, retired) |
-| 17      |  75   | L1 migration region (≥72) |
-| 0       | 100   | unavailable  |
+where $\rho = \rho_s + \rho_d + \rho_r + \rho_v$ aggregates 4 orthogonal load dimensions:
 
-Linear interpolation between anchors; source-starved cameras excluded from the average
-(file cameras are never classified as starved); published FPS is bounded by the
-configured camera FPS to absorb bursts.
+1. **$\rho_s$ — Stream Concurrency**: Non-linear convex knee on the Jetson EMC LPDDR5 memory bus:
+   $$\rho_s = \left(\frac{\max(0.0, n_{\text{active}} - 1.0)}{k_s}\right)^{p_s}$$
+   (default $k_s = 2.5$, $p_s = 2.2$).
+2. **$\rho_d$ — Workload Demand**: Vehicle workload ratio vs capacity threshold:
+   $$\rho_d = \frac{\max(0.0, \text{eff\_wl})}{w_{\text{high}}}$$
+   (default $w_{\text{high}} = 10.0$).
+3. **$\rho_r$ — Hardware Resource Contention**: CPU and RAM saturation (GPU% is excluded from $\rho$ due to DVFS noise):
+   $$\rho_r = \begin{cases} 0.0 & \text{if } u \le u_{\text{safe}} \\ \frac{u - u_{\text{safe}}}{\max(0.05, 1.05 - u)} & \text{if } u > u_{\text{safe}} \end{cases}$$
+   where $u = \max(\text{CPU}\%, \text{RAM}\%) / 100.0$ (default $u_{\text{safe}} = 0.60$).
+4. **$\rho_v$ — Service Completion Deficit**: Bounded completion deficit vs floor (penalizes missed plates):
+   $$\rho_v = \rho_{v,\max} \times \max\left(0.0, \min\left(1.0, \frac{s_{\text{target}} - \text{svc}}{s_{\text{target}} - s_{\text{floor}}}\right)\right)$$
+   (default $s_{\text{target}} = 0.95$, $s_{\text{floor}} = 0.50$, $\rho_{v,\max} = 1.0$).
 
-**Additive bonuses** (config-gated in `edge_node.yml → load_score:`):
-- `workload`: ramp on total tracked+plate objects, up to `w_max` (8.0) at `w_cap` (45).
-- `thermal`: ramp on `gpu_temp_c` from onset (70 °C) to critical (85 °C), up to 4.0.
-- `trend`: early warning on sustained FPS-drop direction, up to 2.0.
-- `composite = min(100, fps_score + workload + thermal + recv + trend)`
+### Role of FPS (Safety Witness & Emergency Fuse Floor)
 
-**Hardware fuse floor** (non-additive): if CPU ≥ 90% or RAM ≥ 90% **and**
-`avg_fps < TARGET_FPS − 2`, then `score = max(composite, hw_fuse_score_floor=75)`.
-GPU utilisation is excluded from scoring (burst-aliased, DVFS-conflated); telemetry only.
+Per ADR-0001, FPS is a safety witness, not the primary driver of load calculation. FPS acts as an emergency fuse floor:
+- If `eff_fps < fps_emergency` (default 12.0), score is floored at `hw_fuse_score_floor` (75.0).
+- If GPU $\ge 99\%$ and `eff_fps < 15.0`, score is floored at `hw_fuse_score_floor` (75.0).
 
-Every health cycle publishes `load_score_breakdown` with the full decomposition.
+Every health cycle publishes `load_score_breakdown` containing `rho_s`, `rho_d`, `rho_r`, `rho_v`, and total `rho`.
 
 ### Workload-primary QoS mapping
 
@@ -130,7 +129,7 @@ When `workload_policy.enabled: true` (default), HealthAgent smooths telemetry wi
 EMA(α=0.33) and uses workload-primary bands: w_low=6 / w_high=10,
 fps_confirm=22, fps_critical=15. QoS states (healthy/moderate/degraded/overloaded)
 are published in the heartbeat; orchestration honours recognized states and falls back
-to legacy load-score behaviour otherwise.
+to load-score thresholds otherwise.
 
 ---
 
