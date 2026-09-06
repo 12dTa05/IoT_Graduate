@@ -98,7 +98,7 @@ streams together. Workload counts (`n_track`, `n_plate`) are the per-camera sign
 
 `load_score` is a continuous pressure scalar in `[0.0, 100.0)` computed via an asymptotic kernel:
 
-$$\text{load\_score} = 100.0 \times \frac{\rho}{1.0 + \rho}$$
+$$S_{\text{load}} = 100.0 \times \frac{\rho}{1.0 + \rho}$$
 
 where $\rho = \rho_s + \rho_d + \rho_r + \rho_v$ aggregates 4 orthogonal load dimensions:
 
@@ -106,8 +106,8 @@ where $\rho = \rho_s + \rho_d + \rho_r + \rho_v$ aggregates 4 orthogonal load di
    $$\rho_s = \left(\frac{\max(0.0, n_{\text{active}} - 1.0)}{k_s}\right)^{p_s}$$
    (default $k_s = 2.5$, $p_s = 2.2$).
 2. **$\rho_d$ — Workload Demand**: Vehicle workload ratio vs capacity threshold:
-   $$\rho_d = \frac{\max(0.0, \text{eff\_wl})}{w_{\text{high}}}$$
-   (default $w_{\text{high}} = 10.0$).
+   $$\rho_d = \frac{\max(0.0, w_{\text{eff}})}{w_{\text{high}}}$$
+   (default $w_{\text{high}} = 10.0$, where $w_{\text{eff}}$ is the effective vehicle count `eff_wl`).
 3. **$\rho_r$ — Hardware Resource Contention**: CPU and RAM saturation (GPU% is excluded from $\rho$ due to DVFS noise):
    $$\rho_r = \begin{cases} 0.0 & \text{if } u \le u_{\text{safe}} \\ \frac{u - u_{\text{safe}}}{\max(0.05, 1.05 - u)} & \text{if } u > u_{\text{safe}} \end{cases}$$
    where $u = \max(\text{CPU}\%, \text{RAM}\%) / 100.0$ (default $u_{\text{safe}} = 0.60$).
